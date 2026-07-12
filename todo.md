@@ -113,7 +113,8 @@
   - [x] 将 MySQL executor backend stream packet `unwrap()` 改为显式错误返回。
   - [x] 将 MySQL executor AVG 聚合改写时的 count/sum row part `unwrap()` 改为显式错误返回。
   - [x] 将 MySQL executor COUNT/SUM 聚合解码与 row part `unwrap()` 改为显式错误返回。
-  - [ ] 继续清理 MySQL executor min/max 聚合解码、packet/session/parser 路径中的 `unwrap()`。
+  - [x] 将 MySQL executor sharding sort 与 MIN/MAX 聚合解码、row part `unwrap()` 改为显式错误返回。
+  - [ ] 继续清理 MySQL packet/session/parser 路径中的 `unwrap()`。
 - [ ] 配置错误在启动阶段 fail fast，并输出明确错误信息。
 
 ## Admin API

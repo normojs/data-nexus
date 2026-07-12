@@ -252,20 +252,21 @@ where
             }
 
             if let Some(name) = &sharding_column.table {
-                if let Some(_) =
-                    column_update.ori_columns.iter().find(|col_info| col_info.column_name.eq(name))
-                {
-                    chunk.par_sort_by_cached_key(|x| {
-                        let mut row_data = row_data.clone();
-                        row_data.with_buf(&x[4..]);
-                        if is_binary {
-                            row_data.decode_with_name::<u64>(&name).unwrap().unwrap()
-                        } else {
-                            let value =
-                                row_data.decode_with_name::<String>(&name).unwrap().unwrap();
-                            value.parse::<u64>().unwrap()
-                        }
-                    })
+                if column_update.ori_columns.iter().any(|col_info| col_info.column_name.eq(name)) {
+                    let mut keyed_rows = chunk
+                        .par_iter()
+                        .map(|x| -> Result<(u64, BytesMut), Error> {
+                            let mut row_data = row_data.clone();
+                            row_data.with_buf(&x[4..]);
+                            let key = required_decode_u64(&mut row_data, name, is_binary)?;
+                            Ok((key, x.clone()))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    keyed_rows.par_sort_by_key(|(key, _)| *key);
+                    for (row, (_, sorted_row)) in chunk.iter_mut().zip(keyed_rows.into_iter()) {
+                        *row = sorted_row;
+                    }
                 }
             }
 
@@ -355,36 +356,39 @@ where
         for agg in agg_fields.iter() {
             match &agg.agg_func {
                 x @ FieldAggFunc::Min | x @ FieldAggFunc::Max => {
-                    if let FieldAggFunc::Max = x {
-                        chunk.par_sort_unstable_by(|a, b| {
+                    let row_values = chunk
+                        .par_iter()
+                        .enumerate()
+                        .map(|(idx, x)| -> Result<(usize, u64), Error> {
                             let mut row_data = row_data.clone();
-                            let (a, b) =
-                                get_min_max_value(&mut row_data, is_binary, &agg.name, a, b);
-                            b.cmp(&a)
-                        });
-                    }
+                            row_data.with_buf(&x[4..]);
+                            let value = required_decode_u64(&mut row_data, &agg.name, is_binary)?;
+                            Ok((idx, value))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
 
-                    if let FieldAggFunc::Min = x {
-                        chunk.par_sort_unstable_by(|a, b| {
-                            let mut row_data = row_data.clone();
-                            let (a, b) =
-                                get_min_max_value(&mut row_data, is_binary, &agg.name, a, b);
-                            a.cmp(&b)
-                        });
-                    };
-                    let chunk_data = &chunk[0];
+                    let selected_idx = match x {
+                        FieldAggFunc::Max => row_values.iter().max_by_key(|(_, value)| *value),
+                        FieldAggFunc::Min => row_values.iter().min_by_key(|(_, value)| *value),
+                        _ => None,
+                    }
+                    .map(|(idx, _)| *idx)
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("no rows available for '{}' aggregate", agg.name),
+                        ))))
+                    })?;
+
+                    let chunk_data = &chunk[selected_idx];
                     let ori_row_data = row_data.clone();
                     let mut row_data = row_data.clone();
                     row_data.with_buf(&chunk_data[4..]);
-                    let row_part_data = row_data
-                        .get_row_data_with_name(&agg.name)
-                        .map_err(|e| ErrorKind::Runtime(e))?
-                        .unwrap();
-                    chunk.par_iter_mut().for_each(|x| {
+                    let row_part_data = required_row_part_data(&mut row_data, &agg.name)?;
+                    for x in chunk.iter_mut() {
                         let mut row_data = ori_row_data.clone();
                         row_data.with_buf(&x[4..]);
-                        let ori_row_part_data =
-                            row_data.get_row_data_with_name(&agg.name).unwrap().unwrap();
+                        let ori_row_part_data = required_row_part_data(&mut row_data, &agg.name)?;
 
                         row_data_cut_merge(x, &ori_row_part_data, |data: &mut BytesMut| {
                             if is_binary {
@@ -394,7 +398,7 @@ where
                                 data.extend_from_slice(&row_part_data.data);
                             }
                         })
-                    });
+                    }
                 }
                 FieldAggFunc::Count => {
                     let count_sum = chunk
@@ -768,20 +772,4 @@ fn required_decode_u64(
                 format!("row field '{}' is missing or NULL", name),
             ))))
         })
-}
-
-fn get_min_max_value<'a>(
-    row_data: &mut RowDataTyp<&'a [u8]>,
-    is_binary: bool,
-    name: &'a str,
-    a: &'a BytesMut,
-    b: &'a BytesMut,
-) -> (u64, u64) {
-    row_data.with_buf(&a[4..]);
-    let a = decode_with_name::<&[u8], u64>(row_data, name, is_binary).unwrap().unwrap();
-
-    row_data.with_buf(&b[4..]);
-    let b = decode_with_name::<&[u8], u64>(row_data, name, is_binary).unwrap().unwrap();
-
-    (a, b)
 }
