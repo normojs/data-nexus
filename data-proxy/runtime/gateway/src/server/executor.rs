@@ -399,20 +399,20 @@ where
                 FieldAggFunc::Count => {
                     let count_sum = chunk
                         .par_iter()
-                        .map(|x| {
+                        .map(|x| -> Result<u64, Error> {
                             let mut row_data = row_data.clone();
                             row_data.with_buf(&x[4..]);
-                            decode_with_name::<&[u8], u64>(&mut row_data, &agg.name, is_binary)
-                                .unwrap()
-                                .unwrap()
+                            required_decode_u64(&mut row_data, &agg.name, is_binary)
                         })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .par_iter()
+                        .copied()
                         .sum::<u64>();
 
-                    chunk.par_iter_mut().for_each(|x| {
+                    for x in chunk.iter_mut() {
                         let mut row_data = row_data.clone();
                         row_data.with_buf(&x[4..]);
-                        let count_data =
-                            row_data.get_row_data_with_name(&agg.name).unwrap().unwrap();
+                        let count_data = required_row_part_data(&mut row_data, &agg.name)?;
                         let part_data = RowPartData {
                             data: vec![].into(),
                             start_idx: count_data.start_idx,
@@ -429,7 +429,7 @@ where
                                 data.extend_from_slice(count_sum_str.as_bytes());
                             }
                         });
-                    });
+                    }
                 }
                 FieldAggFunc::Sum => {
                     let sum_data: Vec<_> = chunk
@@ -450,15 +450,14 @@ where
 
                             Ok(sum)
                         })
-                        .collect::<Result<Vec<_>, _>>()
-                        .unwrap();
+                        .collect::<Result<Vec<_>, _>>()?;
 
                     let sum = sum_data.par_iter().sum::<f64>().to_string();
 
-                    chunk.par_iter_mut().for_each(|x| {
+                    for x in chunk.iter_mut() {
                         let mut row_data = row_data.clone();
                         row_data.with_buf(&x[4..]);
-                        let sum_data = row_data.get_row_data_with_name(&agg.name).unwrap().unwrap();
+                        let sum_data = required_row_part_data(&mut row_data, &agg.name)?;
                         let part_data = RowPartData {
                             data: vec![].into(),
                             start_idx: sum_data.start_idx,
@@ -470,7 +469,7 @@ where
                             data.put_lenc_int(sum.len() as u64, false);
                             data.extend_from_slice(sum.as_bytes());
                         });
-                    });
+                    }
                 }
                 _ => {}
             }
@@ -754,6 +753,21 @@ fn required_row_part_data(
             ))))
         },
     )
+}
+
+fn required_decode_u64(
+    row_data: &mut RowDataTyp<&[u8]>,
+    name: &str,
+    is_binary: bool,
+) -> Result<u64, Error> {
+    decode_with_name::<&[u8], u64>(row_data, name, is_binary)
+        .map_err(|error| ErrorKind::Runtime(error))?
+        .ok_or_else(|| {
+            Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("row field '{}' is missing or NULL", name),
+            ))))
+        })
 }
 
 fn get_min_max_value<'a>(
