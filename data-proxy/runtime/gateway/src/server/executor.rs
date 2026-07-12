@@ -323,11 +323,11 @@ where
             lexical_core::write_unchecked(sum / count as f64, &mut buffer)
         };
 
-        chunk.par_iter_mut().for_each(|x| {
+        for x in chunk.iter_mut() {
             let mut row_data = row_data.clone();
             row_data.with_buf(&x[4..]);
-            let count_data = row_data.get_row_data_with_name(&avg.count_field).unwrap().unwrap();
-            let sum_data = row_data.get_row_data_with_name(&avg.sum_field).unwrap().unwrap();
+            let count_data = required_row_part_data(&mut row_data, &avg.count_field)?;
+            let sum_data = required_row_part_data(&mut row_data, &avg.sum_field)?;
             let part_data = RowPartData {
                 data: vec![].into(),
                 start_idx: count_data.start_idx,
@@ -339,7 +339,7 @@ where
                 data.put_lenc_int(avg_format.len() as u64, false);
                 data.extend_from_slice(avg_format);
             });
-        });
+        }
 
         Ok(())
     }
@@ -740,6 +740,20 @@ where
     let _ = data_remain.split_to(row_part_data.part_encode_length + row_part_data.part_data_length);
     data.extend_from_slice(&data_remain);
     ori_data.extend_from_slice(&data);
+}
+
+fn required_row_part_data(
+    row_data: &mut RowDataTyp<&[u8]>,
+    name: &str,
+) -> Result<RowPartData, Error> {
+    row_data.get_row_data_with_name(name).map_err(|error| ErrorKind::Runtime(error))?.ok_or_else(
+        || {
+            Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("row field '{}' is missing or NULL", name),
+            ))))
+        },
+    )
 }
 
 fn get_min_max_value<'a>(
