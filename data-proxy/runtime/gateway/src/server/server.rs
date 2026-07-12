@@ -67,6 +67,15 @@ impl<T, C> MySqlBackendConnector<T, C> {
     }
 }
 
+fn decode_mysql_text_payload<'a>(method: &str, payload: &'a [u8]) -> Result<&'a str, Error> {
+    std::str::from_utf8(payload).map(|text| text.trim_matches(char::from(0))).map_err(|_| {
+        Error::new(ErrorKind::Protocol(ProtocolError::InvalidPacket {
+            method: method.into(),
+            data: payload.to_vec(),
+        }))
+    })
+}
+
 impl<T, C> MySqlBackendConnector<T, C>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send,
@@ -110,7 +119,7 @@ where
         client_conn: &mut PoolConn<ClientConn>,
         payload: &[u8],
     ) -> Result<(), Error> {
-        let db = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let db = decode_mysql_text_payload("COM_INIT_DB", payload)?;
 
         req.fsm.set_db(Some(db.to_string()));
 
@@ -143,7 +152,7 @@ where
         let stmt_id = req.stmt_id.load(Ordering::Relaxed);
         let sess = req.framed.codec_mut().get_session();
         let attrs = build_conn_attrs(sess);
-        let raw_sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let raw_sql = decode_mysql_text_payload("COM_STMT_PREPARE", payload)?;
         let (_, input_typ, rewrite_outputs) = Self::query_rewrite(req, raw_sql)?;
         req.rewrite_outputs = rewrite_outputs;
 
@@ -289,7 +298,7 @@ where
     async fn shard_query_inner(req: &mut ReqContext<T, C>, payload: &[u8]) -> Result<(), Error> {
         let sess = req.framed.codec_mut().get_session();
         let attrs = build_conn_attrs(sess);
-        let raw_sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let raw_sql = decode_mysql_text_payload("COM_QUERY", payload)?;
         let (is_get_conn, input_typ, rewrite_outputs) = Self::query_rewrite(req, raw_sql)?;
         req.rewrite_outputs = rewrite_outputs;
 
@@ -344,7 +353,7 @@ where
         // 构建连接属性
         let attrs = build_conn_attrs(sess);
         // 将payload转换为字符串并清理
-        let sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let sql = decode_mysql_text_payload("COM_QUERY", payload)?;
         // 进行查询重写和分析
         let (is_get_conn, input_typ, _rewrite_outputs) = Self::query_rewrite(req, sql)?;
 
@@ -726,7 +735,7 @@ where
 {
     async fn init_db(cx: &mut ReqContext<T, C>, payload: &[u8]) -> Result<RespContext, Error> {
         let now = Instant::now();
-        let db = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let db = decode_mysql_text_payload("COM_INIT_DB", payload)?;
         cx.framed.codec_mut().get_session().set_db(db.to_string());
 
         if cx.rewriter.is_some() {
@@ -797,7 +806,7 @@ where
             return Ok(RespContext { ep: None, duration: now.elapsed() });
         }
 
-        let sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let sql = decode_mysql_text_payload("COM_STMT_PREPARE", payload)?;
 
         let mut client_conn =
             Self::fsm_trigger(cx, TransEventName::PrepareEvent, RouteInputTyp::Statement, sql)
