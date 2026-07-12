@@ -27,6 +27,9 @@ name = "orders-primary"
 protocol = "my_sql"
 address = "127.0.0.1:3306"
 database = "orders"
+username = "root"
+password = "my-secret-pw"
+role = "readwrite"
 weight = 1
 
 [[endpoints]]
@@ -34,6 +37,9 @@ name = "orders-replica"
 protocol = "my_sql"
 address = "127.0.0.1:3307"
 database = "orders"
+username = "root"
+password = "my-secret-pw"
+role = "read"
 weight = 1
 
 [[route_policies]]
@@ -43,6 +49,11 @@ kind = "simple_load_balance"
 [[auth_policies]]
 name = "orders-users"
 kind = "static"
+
+[[auth_policies.users]]
+username = "app"
+password = "secret"
+databases = ["orders"]
 
 [[plugin_policies]]
 name = "orders-audit"

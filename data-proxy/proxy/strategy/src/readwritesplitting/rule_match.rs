@@ -405,6 +405,7 @@ mod test {
 
         let rw_endpoint = ReadWriteEndpoint {
             read: vec![Endpoint {
+                node_type: gateway_core::ProtocolKind::MySql,
                 weight: 1,
                 name: String::from("test1"),
                 db: String::from("db"),
@@ -413,6 +414,7 @@ mod test {
                 addr: String::from("127.0.0.1"),
             }],
             readwrite: vec![Endpoint {
+                node_type: gateway_core::ProtocolKind::MySql,
                 weight: 1,
                 name: String::from("test2"),
                 db: String::from("db"),

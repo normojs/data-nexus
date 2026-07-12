@@ -71,49 +71,80 @@ fn main() {
     // 4、重启
     let http_server = PisaHttpServerFactory::new(config.clone(), MetricsManager::new())
         .build_http_server(HttpServerKind::Axum);
-    match config.proxy.clone() {
-        Some(_) => {
-            // TODO: 使用map
-            // let mut serverMaps :HashMap<String, JoinHandle<()>> = HashMap::with_capacity(config.get_proxy().len() + 1);
-            let mut servers = Vec::with_capacity(config.get_proxy().len() + 1);
+    if config.has_gateway_config() {
+        let mut servers = Vec::with_capacity(config.gateway.listeners.len() + 1);
+        let version = config.get_version().to_string();
+        let gateway_config = config.gateway.clone();
 
-            build_runtime().block_on(async move {
-                for proxy_config in config.get_proxy() {
-                    let cfg = proxy_config;
-
-                    let factory = GatewayFactory::new(cfg.to_owned(), config.clone());
-                    servers.push(NodeInstance::new(
-                        cfg.name.clone(),
-                        tokio::spawn(start_gateway_server(factory.build_proxy())),
-                    ));
-                } // end for
-
-                // new_http_server(http_server).await;
-                // serverMaps.insert("httpserver-001".to_string(), );
+        build_runtime().block_on(async move {
+            for listener in &gateway_config.listeners {
+                let factory = GatewayFactory::from_gateway_config(
+                    gateway_config.clone(),
+                    listener.name.clone(),
+                    version.clone(),
+                );
                 servers.push(NodeInstance::new(
-                    "httpserver-001".to_string(),
-                    tokio::spawn(new_http_server(http_server)),
+                    listener.name.clone(),
+                    tokio::spawn(start_gateway_server(factory.build_proxy())),
                 ));
+            }
 
-                for serverInstance in &servers {
-                    debug!("server instance name is: {}", serverInstance.name);
-                    if serverInstance.name.starts_with("proxy") {
-                        // closeNode
-                    }
+            servers.push(NodeInstance::new(
+                "httpserver-001".to_string(),
+                tokio::spawn(new_http_server(http_server)),
+            ));
+
+            for serverInstance in servers {
+                if let Err(e) = serverInstance.joinHandle.await {
+                    error!("{:?}", e)
                 }
-                for serverInstance in servers {
-                    if let Err(e) = serverInstance.joinHandle.await {
-                        error!("{:?}", e)
+            }
+        });
+    } else {
+        match config.proxy.clone() {
+            Some(_) => {
+                // TODO: 使用map
+                // let mut serverMaps :HashMap<String, JoinHandle<()>> = HashMap::with_capacity(config.get_proxy().len() + 1);
+                let mut servers = Vec::with_capacity(config.get_proxy().len() + 1);
+
+                build_runtime().block_on(async move {
+                    for proxy_config in config.get_proxy() {
+                        let cfg = proxy_config;
+
+                        let factory = GatewayFactory::new(cfg.to_owned(), config.clone());
+                        servers.push(NodeInstance::new(
+                            cfg.name.clone(),
+                            tokio::spawn(start_gateway_server(factory.build_proxy())),
+                        ));
+                    } // end for
+
+                    // new_http_server(http_server).await;
+                    // serverMaps.insert("httpserver-001".to_string(), );
+                    servers.push(NodeInstance::new(
+                        "httpserver-001".to_string(),
+                        tokio::spawn(new_http_server(http_server)),
+                    ));
+
+                    for serverInstance in &servers {
+                        debug!("server instance name is: {}", serverInstance.name);
+                        if serverInstance.name.starts_with("proxy") {
+                            // closeNode
+                        }
                     }
-                }
-            }); // end build_runtime
-        } // end Some()
-        None => {
-            build_runtime().block_on(async move {
-                // if let Err(e) = tokio::spawn(new_http_server(http_server)).await {
-                //     error!("{:?}", e)
-                // }
-            });
+                    for serverInstance in servers {
+                        if let Err(e) = serverInstance.joinHandle.await {
+                            error!("{:?}", e)
+                        }
+                    }
+                }); // end build_runtime
+            } // end Some()
+            None => {
+                build_runtime().block_on(async move {
+                    // if let Err(e) = tokio::spawn(new_http_server(http_server)).await {
+                    //     error!("{:?}", e)
+                    // }
+                });
+            }
         }
     }
 }

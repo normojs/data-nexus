@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +28,27 @@ pub struct EndpointConfig {
     pub protocol: ProtocolKind,
     pub address: String,
     pub database: Option<String>,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub role: EndpointRole,
     pub weight: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointRole {
+    Read,
+    #[serde(alias = "read_write")]
+    ReadWrite,
+}
+
+impl Default for EndpointRole {
+    fn default() -> Self {
+        Self::ReadWrite
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +61,17 @@ pub struct RoutePolicyConfig {
 pub struct AuthPolicyConfig {
     pub name: String,
     pub kind: String,
+    #[serde(default)]
+    pub users: Vec<AuthPolicyUserConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPolicyUserConfig {
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub databases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,8 +106,8 @@ impl GatewayConfig {
         validate_unique("plugin policy", self.plugin_policies.iter().map(|item| &item.name))?;
 
         let services: HashSet<&str> = self.services.iter().map(|item| item.name.as_str()).collect();
-        let endpoints: HashSet<&str> =
-            self.endpoints.iter().map(|item| item.name.as_str()).collect();
+        let endpoints: HashMap<&str, &EndpointConfig> =
+            self.endpoints.iter().map(|item| (item.name.as_str(), item)).collect();
         let routes: HashSet<&str> =
             self.route_policies.iter().map(|item| item.name.as_str()).collect();
         let auth: HashSet<&str> =
@@ -112,10 +143,19 @@ impl GatewayConfig {
                 )));
             }
             for endpoint in &service.endpoints {
-                if !endpoints.contains(endpoint.as_str()) {
+                let Some(endpoint_config) = endpoints.get(endpoint.as_str()) else {
                     return Err(GatewayError::Configuration(format!(
                         "service '{}' references missing endpoint '{}'",
                         service.name, endpoint
+                    )));
+                };
+                if endpoint_config.protocol != service.backend_protocol {
+                    return Err(GatewayError::Configuration(format!(
+                        "service '{}' endpoint '{}' uses protocol '{}' but service backend protocol is '{}'",
+                        service.name,
+                        endpoint,
+                        endpoint_config.protocol,
+                        service.backend_protocol
                     )));
                 }
             }
@@ -140,6 +180,14 @@ impl GatewayConfig {
         for endpoint in &self.endpoints {
             require_non_empty("endpoint name", &endpoint.name)?;
             require_non_empty("endpoint address", &endpoint.address)?;
+        }
+
+        for policy in &self.auth_policies {
+            require_non_empty("auth policy name", &policy.name)?;
+            require_non_empty("auth policy kind", &policy.kind)?;
+            for user in &policy.users {
+                require_non_empty("auth policy user", &user.username)?;
+            }
         }
 
         Ok(())
@@ -189,6 +237,9 @@ mod tests {
                 protocol: ProtocolKind::MySql,
                 address: "127.0.0.1:3306".into(),
                 database: Some("orders".into()),
+                username: "root".into(),
+                password: "secret".into(),
+                role: EndpointRole::ReadWrite,
                 weight: 1,
             }],
             route_policies: vec![RoutePolicyConfig {
@@ -198,6 +249,11 @@ mod tests {
             auth_policies: vec![AuthPolicyConfig {
                 name: "local-users".into(),
                 kind: "static".into(),
+                users: vec![AuthPolicyUserConfig {
+                    username: "app".into(),
+                    password: "secret".into(),
+                    databases: vec!["orders".into()],
+                }],
             }],
             plugin_policies: vec![PluginPolicyConfig {
                 name: "audit".into(),
@@ -219,6 +275,19 @@ mod tests {
             config.validate(),
             Err(GatewayError::Configuration(
                 "listener 'mysql-public' references missing service 'missing'".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_service_endpoint_protocol_mismatches() {
+        let mut config = config();
+        config.endpoints[0].protocol = ProtocolKind::PostgreSql;
+        assert_eq!(
+            config.validate(),
+            Err(GatewayError::Configuration(
+                "service 'orders' endpoint 'orders-primary' uses protocol 'postgre_sql' but service backend protocol is 'my_sql'"
+                    .into()
             ))
         );
     }

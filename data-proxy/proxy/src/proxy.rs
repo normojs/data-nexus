@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use endpoint::endpoint::Endpoint;
+use gateway_core::ProtocolKind;
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use serde::{Deserialize, Serialize};
 use strategy::config::{ReadWriteSplitting, Sharding, TargetRole};
@@ -50,9 +51,6 @@ pub struct ProxyConfig {
     pub level: u8,
     #[serde(default = "default_auto_proxy_note_type")]
     pub node_type: String,
-    #[serde(default = "default_auto_proxy_backend_type")]
-    #[deprecated(note = "废弃")]
-    pub backend_type: String,
     #[serde(default = "default_auto_proxy_name")]
     pub name: String,
     #[serde(default = "default_auto_proxy_listen_addr")]
@@ -171,10 +169,6 @@ fn default_auto_proxy_auth_level() -> u8 {
     5
 }
 
-fn default_auto_proxy_backend_type() -> String {
-    "".into()
-}
-
 fn default_auto_pool_size() -> u8 {
     64
 }
@@ -211,18 +205,17 @@ fn default_unisql_node_weight() -> i64 {
     1
 }
 
-impl From<UniSQLNode> for Endpoint {
-    fn from(node: UniSQLNode) -> Self {
-        Self {
-            node_type: node.node_type,
-            weight: node.weight,
-            name: node.name,
-            db: node.db,
-            user: node.user,
-            password: node.password,
-            addr: format!("{}:{}", node.host, node.port),
-        }
-    }
+pub fn endpoint_from_unisql_node(node: &UniSQLNode) -> Result<Endpoint, String> {
+    let node_type = node.node_type.parse::<ProtocolKind>()?;
+    Ok(Endpoint {
+        node_type,
+        weight: node.weight,
+        name: node.name.clone(),
+        db: node.db.clone(),
+        user: node.user.clone(),
+        password: node.password.clone(),
+        addr: format!("{}:{}", node.host, node.port),
+    })
 }
 
 pub struct Proxy {
@@ -256,15 +249,9 @@ impl Proxy {
         for node in self.backend_nodes.clone() {
             match nodes.iter().find(|&x| x == node.name.as_str()) {
                 Some(_) => {
-                    let endpoint = Endpoint {
-                        node_type: node.node_type,
-                        name: node.name,
-                        addr: format!("{}:{}", node.host, node.port),
-                        db: node.db,
-                        user: node.user,
-                        password: node.password,
-                        weight: node.weight,
-                    };
+                    let endpoint = endpoint_from_unisql_node(&node).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+                    })?;
                     balancer.add(endpoint);
                 }
                 _ => continue,

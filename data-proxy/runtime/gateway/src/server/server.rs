@@ -61,6 +61,12 @@ pub struct MySqlBackendConnector<T, C> {
     _phat: PhantomData<(T, C)>,
 }
 
+impl<T, C> MySqlBackendConnector<T, C> {
+    pub fn new() -> Self {
+        Self { _phat: PhantomData }
+    }
+}
+
 impl<T, C> MySqlBackendConnector<T, C>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send,
@@ -69,10 +75,6 @@ where
         + Send
         + CommonPacket,
 {
-    pub fn new() -> Self {
-        Self { _phat: PhantomData }
-    }
-
     async fn fsm_trigger(
         req: &mut ReqContext<T, C>,
         state_name: TransEventName,
@@ -686,12 +688,8 @@ where
 #[async_trait]
 impl<T, C> BackendConnector for MySqlBackendConnector<T, C>
 where
-    T: AsyncRead + AsyncWrite + Unpin + Send + Sync,
-    C: Decoder<Item = BytesMut>
-        + Encoder<PacketSend<Box<[u8]>>, Error = ProtocolError>
-        + Send
-        + Sync
-        + CommonPacket,
+    T: Send + Sync,
+    C: Send + Sync,
 {
     fn protocol(&self) -> ProtocolKind {
         ProtocolKind::MySql

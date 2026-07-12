@@ -7,6 +7,7 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1.56"
 endpoint = { path = "./endpoint" }
+gateway_core = { path = "../gateway/core" }
 loadbalance = { path = "./loadbalance" }
 pisa_error = { path = "../error", package = "error" }
 plugin = { path = "../plugin" }

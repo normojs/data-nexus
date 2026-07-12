@@ -17,8 +17,9 @@ use std::sync::{atomic::AtomicU32, Arc};
 use common::ast_cache::ParserAstCache;
 use conn_pool::Pool;
 use endpoint::endpoint::Endpoint;
+use gateway_core::{EndpointConfig, EndpointRole, GatewayConfig, GatewayError, ProtocolKind};
 use indexmap::IndexMap;
-use loadbalance::balance::{Balance, LoadBalance};
+use loadbalance::balance::{AlgorithmName, Balance, LoadBalance};
 use mysql_parser::parser::Parser;
 use mysql_protocol::client::conn::ClientConn;
 use parking_lot::Mutex;
@@ -27,7 +28,7 @@ use plugin::build_phase::PluginPhase;
 use proxy::{
     factory::StartSource,
     listener::Listener,
-    proxy::{Proxy, ProxyConfig, UniSQLNode},
+    proxy::{endpoint_from_unisql_node, Proxy, ProxyConfig, UniSQLNode},
 };
 use strategy::{
     config::{NodeGroup, TargetRole},
@@ -35,10 +36,12 @@ use strategy::{
     route::RouteStrategy,
     sharding_rewrite::{ShardingRewrite, ShardingRewriteOutput},
 };
+use tokio::{sync::watch, task::JoinHandle};
 use tracing::{debug, error};
 
 use crate::{
     backend::mysql::MySqlBackendConnector,
+    core_engine::CoreGatewayRuntimePlan,
     frontend::mysql::{MySqlFrontendConnection, MySqlFrontendProtocol, ReqContext},
     server::{metrics::*, stmt_cache::StmtCache},
     transaction_fsm::*,
@@ -50,15 +53,108 @@ pub struct GatewayRuntime {
     pub node_group: Option<NodeGroup>,
     pub nodes: Vec<UniSQLNode>,
     pub pisa_version: String,
+    pub gateway_config: Option<GatewayConfig>,
+    pub runtime_plan: Option<CoreGatewayRuntimePlan>,
+    shutdown_tx: Option<watch::Sender<bool>>,
+    connection_handles: Vec<JoinHandle<()>>,
 }
 
 impl GatewayRuntime {
+    pub fn from_legacy(
+        proxy_config: ProxyConfig,
+        node_group: Option<NodeGroup>,
+        nodes: Vec<UniSQLNode>,
+        pisa_version: String,
+    ) -> Self {
+        Self {
+            proxy_config,
+            node_group,
+            nodes,
+            pisa_version,
+            gateway_config: None,
+            runtime_plan: None,
+            shutdown_tx: None,
+            connection_handles: Vec::new(),
+        }
+    }
+
+    pub fn from_gateway_config(
+        gateway_config: GatewayConfig,
+        listener_name: &str,
+        pisa_version: String,
+    ) -> Result<Self, GatewayError> {
+        let runtime_plan = CoreGatewayRuntimePlan::from_config(&gateway_config)?;
+        let listener_plan = runtime_plan.listener(listener_name).ok_or_else(|| {
+            GatewayError::Configuration(format!(
+                "gateway listener '{}' was not found",
+                listener_name
+            ))
+        })?;
+
+        if listener_plan.listener().protocol != ProtocolKind::MySql {
+            return Err(GatewayError::Unsupported(format!(
+                "frontend protocol '{}' is not supported by the legacy MySQL runtime path",
+                listener_plan.listener().protocol
+            )));
+        }
+        if listener_plan.service().backend_protocol != ProtocolKind::MySql {
+            return Err(GatewayError::Unsupported(format!(
+                "backend protocol '{}' is not supported by the legacy MySQL runtime path",
+                listener_plan.service().backend_protocol
+            )));
+        }
+
+        let auth_user = listener_plan.auth_policy().and_then(|policy| policy.users.first());
+        let database = listener_plan.default_database().unwrap_or_default().to_string();
+        let endpoint_names = listener_plan
+            .endpoints()
+            .iter()
+            .map(|endpoint| endpoint.name.clone())
+            .collect::<Vec<_>>();
+
+        let proxy_config = ProxyConfig {
+            name: listener_plan.listener().name.clone(),
+            node_type: listener_plan.listener().protocol.to_string(),
+            listen_addr: listener_plan.listener().listen_addr.clone(),
+            user: auth_user.map(|user| user.username.clone()).unwrap_or_default(),
+            password: auth_user.map(|user| user.password.clone()).unwrap_or_default(),
+            db: database,
+            simple_loadbalance: Some(proxy::proxy::ProxySimpleLoadBalance {
+                balance_type: AlgorithmName::Random,
+                nodes: endpoint_names,
+            }),
+            ..ProxyConfig::default()
+        };
+
+        let nodes = listener_plan
+            .endpoints()
+            .iter()
+            .map(|endpoint| endpoint_to_legacy_node(endpoint, &pisa_version))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            proxy_config,
+            node_group: None,
+            nodes,
+            pisa_version,
+            gateway_config: Some(gateway_config),
+            runtime_plan: Some(runtime_plan),
+            shutdown_tx: None,
+            connection_handles: Vec::new(),
+        })
+    }
+
     // 构建路由
     fn build_route(&self) -> Result<RouteStrategy, Error> {
         let length = self.nodes.len();
         let (mut rw, mut ro) = (Vec::with_capacity(length), Vec::with_capacity(length));
         for node in &self.nodes {
-            let ep = Endpoint::from(node.clone());
+            let ep = endpoint_from_unisql_node(node).map_err(|error| {
+                Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    error,
+                ))))
+            })?;
             match node.role {
                 TargetRole::Read => ro.push(ep),
                 TargetRole::ReadWrite => rw.push(ep),
@@ -115,11 +211,11 @@ impl GatewayRuntime {
         Ok(strategy)
     } // end build route
 
-    fn build_sharding_rewriter(&self) -> Option<ShardingRewrite> {
+    fn build_sharding_rewriter(&self) -> Result<Option<ShardingRewrite>, Error> {
         let config = self.proxy_config.sharding.clone();
 
         if config.is_none() {
-            return None;
+            return Ok(None);
         }
 
         let has_strategy = config.as_ref().unwrap().iter().all(|x| {
@@ -128,19 +224,68 @@ impl GatewayRuntime {
                 || x.database_table_strategy.is_some()
         });
         if !has_strategy {
-            return None;
+            return Ok(None);
         }
 
         let mut endpoints: Vec<Endpoint> = vec![];
         for node in &self.nodes {
-            let endpoint = Endpoint::from(node.clone());
+            let endpoint = endpoint_from_unisql_node(node).map_err(|error| {
+                Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    error,
+                ))))
+            })?;
             endpoints.push(endpoint);
         }
 
         let has_rw = self.proxy_config.read_write_splitting.is_some();
 
-        Some(ShardingRewrite::new(config.unwrap(), endpoints, self.node_group.clone(), has_rw))
+        Ok(Some(ShardingRewrite::new(config.unwrap(), endpoints, self.node_group.clone(), has_rw)))
     }
+}
+
+fn endpoint_to_legacy_node(
+    endpoint: &EndpointConfig,
+    version: &str,
+) -> Result<UniSQLNode, GatewayError> {
+    let (host, port) = split_endpoint_address(&endpoint.address)?;
+    Ok(UniSQLNode {
+        version: version.to_string(),
+        node_type: endpoint.protocol.to_string(),
+        name: endpoint.name.clone(),
+        db: endpoint.database.clone().unwrap_or_default(),
+        user: endpoint.username.clone(),
+        password: endpoint.password.clone(),
+        host,
+        port,
+        weight: endpoint.weight as i64,
+        role: match &endpoint.role {
+            EndpointRole::Read => TargetRole::Read,
+            EndpointRole::ReadWrite => TargetRole::ReadWrite,
+        },
+    })
+}
+
+fn split_endpoint_address(address: &str) -> Result<(String, u32), GatewayError> {
+    let (host, port) = address.rsplit_once(':').ok_or_else(|| {
+        GatewayError::Configuration(format!(
+            "endpoint address '{}' must be in host:port form",
+            address
+        ))
+    })?;
+    if host.trim().is_empty() {
+        return Err(GatewayError::Configuration(format!(
+            "endpoint address '{}' has empty host",
+            address
+        )));
+    }
+    let port = port.parse::<u32>().map_err(|_| {
+        GatewayError::Configuration(format!(
+            "endpoint address '{}' has invalid port '{}'",
+            address, port
+        ))
+    })?;
+    Ok((host.to_string(), port))
 }
 
 #[async_trait::async_trait]
@@ -154,10 +299,10 @@ impl proxy::factory::Proxy for GatewayRuntime {
 
     // async fn start(&mut self, &mut start_source: StartSource) -> Result<StartSource, Error> {
     async fn start(&mut self) -> Result<StartSource, Error> {
+        let protocol = self.listener_protocol()?;
         let listener = Listener {
             name: self.proxy_config.name.clone(),
-            node_type: self.proxy_config.node_type.clone(),
-            backend_type: self.proxy_config.backend_type.clone(),
+            protocol,
             listen_addr: self.proxy_config.listen_addr.clone(),
             server_version: self.proxy_config.server_version.clone(),
         };
@@ -180,7 +325,7 @@ impl proxy::factory::Proxy for GatewayRuntime {
         let route_strategy = Arc::new(Mutex::new(self.build_route()?));
 
         // Build sharding rewriter
-        let rewriter = self.build_sharding_rewriter();
+        let rewriter = self.build_sharding_rewriter()?;
 
         let mut plugin: Option<PluginPhase> = None;
         if let Some(config) = &self.proxy_config.plugin {
@@ -194,9 +339,23 @@ impl proxy::factory::Proxy for GatewayRuntime {
 
         let has_rw = self.proxy_config.read_write_splitting.is_some();
 
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        self.shutdown_tx = Some(shutdown_tx);
+
         loop {
             // TODO: need refactor
-            let socket = proxy.accept(&listener).await.map_err(ErrorKind::Io)?;
+            let socket = tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    match changed {
+                        Ok(_) if *shutdown_rx.borrow() => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                accept_result = proxy.accept(&listener) => {
+                    accept_result.map_err(ErrorKind::Io)?
+                }
+            };
 
             let route_strategy = route_strategy.clone();
             let plugin = plugin.clone();
@@ -216,7 +375,7 @@ impl proxy::factory::Proxy for GatewayRuntime {
             // TODO: 根据node_type创建实例
             let mut instance = MySqlFrontendConnection::new(MySqlBackendConnector::new());
             debug!("loop start....");
-            let _join_handle = tokio::spawn(async move {
+            let join_handle = tokio::spawn(async move {
                 let framed = match frontend.handshake(socket).await {
                     Ok(framed) => framed,
                     Err(e) => {
@@ -252,13 +411,203 @@ impl proxy::factory::Proxy for GatewayRuntime {
                 }
             }); // end  tokio::spawn
 
-            // start_source.thread_handles.push(join_handle);
+            self.connection_handles.push(join_handle);
         }
+
+        for handle in self.connection_handles.drain(..) {
+            handle.abort();
+        }
+
+        Ok(StartSource { thread_handles: Vec::new() })
     }
 
     // stop proxy server
     async fn stop(&mut self) -> Result<(), Error> {
-        // TODO：
+        if let Some(sender) = &self.shutdown_tx {
+            let _ = sender.send(true);
+        }
+        for handle in self.connection_handles.drain(..) {
+            handle.abort();
+        }
         Ok(())
+    }
+}
+
+impl GatewayRuntime {
+    fn listener_protocol(&self) -> Result<ProtocolKind, Error> {
+        if let Some(runtime_plan) = &self.runtime_plan {
+            if let Some(listener) = runtime_plan.listener(&self.proxy_config.name) {
+                return Ok(listener.listener().protocol.clone());
+            }
+        }
+
+        self.proxy_config.node_type.parse::<ProtocolKind>().map_err(|error| {
+            Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                error,
+            ))))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gateway_core::{
+        AuthPolicyConfig, AuthPolicyUserConfig, EndpointConfig, EndpointRole, GatewayConfig,
+        ListenerConfig, ProtocolKind, ServiceConfig,
+    };
+    use proxy::factory::Proxy as _;
+
+    use super::*;
+
+    fn gateway_config() -> GatewayConfig {
+        GatewayConfig {
+            listeners: vec![ListenerConfig {
+                name: "mysql-public".into(),
+                listen_addr: "127.0.0.1:3307".into(),
+                protocol: ProtocolKind::MySql,
+                service: "orders".into(),
+                auth_policy: Some("local-users".into()),
+            }],
+            services: vec![ServiceConfig {
+                name: "orders".into(),
+                backend_protocol: ProtocolKind::MySql,
+                endpoints: vec!["orders-primary".into(), "orders-replica".into()],
+                route_policy: None,
+                plugin_policies: vec![],
+            }],
+            endpoints: vec![
+                EndpointConfig {
+                    name: "orders-primary".into(),
+                    protocol: ProtocolKind::MySql,
+                    address: "127.0.0.1:3306".into(),
+                    database: Some("orders".into()),
+                    username: "root".into(),
+                    password: "backend-secret".into(),
+                    role: EndpointRole::ReadWrite,
+                    weight: 2,
+                },
+                EndpointConfig {
+                    name: "orders-replica".into(),
+                    protocol: ProtocolKind::MySql,
+                    address: "127.0.0.2:3306".into(),
+                    database: Some("orders".into()),
+                    username: "readonly".into(),
+                    password: "replica-secret".into(),
+                    role: EndpointRole::Read,
+                    weight: 1,
+                },
+            ],
+            auth_policies: vec![AuthPolicyConfig {
+                name: "local-users".into(),
+                kind: "static".into(),
+                users: vec![AuthPolicyUserConfig {
+                    username: "app".into(),
+                    password: "secret".into(),
+                    databases: vec!["orders".into()],
+                }],
+            }],
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn builds_legacy_mysql_runtime_from_v2_gateway_config() {
+        let runtime =
+            GatewayRuntime::from_gateway_config(gateway_config(), "mysql-public", "8.0".into())
+                .unwrap();
+
+        assert!(runtime.gateway_config.is_some());
+        assert!(runtime.runtime_plan.is_some());
+        assert_eq!(runtime.proxy_config.name, "mysql-public");
+        assert_eq!(runtime.proxy_config.node_type, "my_sql");
+        assert_eq!(runtime.proxy_config.listen_addr, "127.0.0.1:3307");
+        assert_eq!(runtime.proxy_config.user, "app");
+        assert_eq!(runtime.proxy_config.password, "secret");
+        assert_eq!(runtime.proxy_config.db, "orders");
+
+        let loadbalance = runtime.proxy_config.simple_loadbalance.as_ref().unwrap();
+        assert_eq!(loadbalance.nodes, vec!["orders-primary", "orders-replica"]);
+
+        assert_eq!(runtime.nodes.len(), 2);
+        assert_eq!(runtime.nodes[0].name, "orders-primary");
+        assert_eq!(runtime.nodes[0].host, "127.0.0.1");
+        assert_eq!(runtime.nodes[0].port, 3306);
+        assert_eq!(runtime.nodes[0].role, TargetRole::ReadWrite);
+        assert_eq!(runtime.nodes[1].role, TargetRole::Read);
+    }
+
+    #[test]
+    fn rejects_non_mysql_runtime_protocols_before_legacy_start() {
+        let mut config = gateway_config();
+        config.listeners[0].protocol = ProtocolKind::PostgreSql;
+
+        let error = match GatewayRuntime::from_gateway_config(config, "mysql-public", "8.0".into())
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expected unsupported protocol error"),
+        };
+
+        assert_eq!(
+            error,
+            GatewayError::Unsupported(
+                "frontend protocol 'postgre_sql' is not supported by the legacy MySQL runtime path"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_endpoint_addresses_without_ports() {
+        let mut config = gateway_config();
+        config.endpoints[0].address = "127.0.0.1".into();
+
+        let error = match GatewayRuntime::from_gateway_config(config, "mysql-public", "8.0".into())
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expected endpoint address error"),
+        };
+
+        assert_eq!(
+            error,
+            GatewayError::Configuration(
+                "endpoint address '127.0.0.1' must be in host:port form".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_sends_shutdown_and_clears_connection_handles() {
+        let mut runtime =
+            GatewayRuntime::from_legacy(ProxyConfig::default(), None, Vec::new(), "8.0".into());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        runtime.shutdown_tx = Some(shutdown_tx);
+        runtime.connection_handles.push(tokio::spawn(async {
+            futures::future::pending::<()>().await;
+        }));
+
+        runtime.stop().await.unwrap();
+
+        assert!(*shutdown_rx.borrow());
+        assert!(runtime.connection_handles.is_empty());
+    }
+
+    #[test]
+    fn resolves_listener_protocol_from_runtime_plan_before_legacy_string() {
+        let mut runtime =
+            GatewayRuntime::from_gateway_config(gateway_config(), "mysql-public", "8.0".into())
+                .unwrap();
+        runtime.proxy_config.node_type = "".into();
+
+        assert_eq!(runtime.listener_protocol().unwrap(), ProtocolKind::MySql);
+    }
+
+    #[test]
+    fn resolves_listener_protocol_from_legacy_node_type() {
+        let mut runtime =
+            GatewayRuntime::from_legacy(ProxyConfig::default(), None, Vec::new(), "8.0".into());
+        runtime.proxy_config.node_type = "mysql".into();
+
+        assert_eq!(runtime.listener_protocol().unwrap(), ProtocolKind::MySql);
     }
 }

@@ -107,6 +107,7 @@ mod test {
         // let mut balance = Balance.build_balance(AlgorithmName::Random);
         let mut balance = Balance.build_balance(AlgorithmName::RoundRobin);
         let ep1 = Endpoint {
+            node_type: gateway_core::ProtocolKind::MySql,
             weight: 1,
             name: String::from("dasheng001"),
             db: String::from("db001"),
@@ -115,6 +116,7 @@ mod test {
             addr: String::from("127.0.0.1:3306"),
         };
         let ep2 = Endpoint {
+            node_type: gateway_core::ProtocolKind::MySql,
             weight: 1,
             name: String::from("dasheng002"),
             db: String::from("db002"),

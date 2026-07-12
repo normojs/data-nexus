@@ -14,10 +14,11 @@
 
 use std::fmt;
 
+use gateway_core::ProtocolKind;
+
 #[derive(Clone, Default, Hash, PartialEq, Eq)]
 pub struct Endpoint {
-    // 同backend_type
-    pub node_type: String,
+    pub node_type: ProtocolKind,
     pub weight: i64,
     pub name: String,
     pub db: String,

@@ -239,6 +239,13 @@ impl PisaProxyConfigBuilder {
             config.version = Some(PisaProxyConfigBuilder::new().build_version()._version);
         }
 
+        if config.has_gateway_config() {
+            if let Err(error) = config.gateway.validate() {
+                eprintln!("invalid gateway configuration: {}", error);
+                std::process::exit(-1);
+            }
+        }
+
         trace!("configs: {:#?}", config);
         config
     }
@@ -247,6 +254,8 @@ impl PisaProxyConfigBuilder {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PisaProxyConfig {
     pub admin: Admin,
+    #[serde(flatten)]
+    pub gateway: GatewayConfig,
     pub proxy: Option<ProxiesConfig>,
     pub node_group: Option<NodeGroup>,
     pub nodes: Option<UniSQLNodes>,
@@ -259,6 +268,10 @@ impl PisaProxyConfig {
     pub fn new() -> Self {
         PisaProxyConfig::default()
     }
+    pub fn has_gateway_config(&self) -> bool {
+        !self.gateway.listeners.is_empty()
+    }
+
     pub fn get_proxy(&self) -> &Vec<ProxyConfig> {
         &self.proxy.as_ref().unwrap().config.as_ref().unwrap()
     }
@@ -357,5 +370,19 @@ mod test {
         assert_eq!(config.gateway.listeners.len(), 1);
         assert_eq!(config.gateway.services.len(), 1);
         assert_eq!(config.gateway.endpoints.len(), 2);
+        assert_eq!(config.gateway.endpoints[0].username, "root");
+        assert_eq!(config.gateway.auth_policies[0].users[0].username, "app");
+        assert_eq!(config.gateway.auth_policies[0].users[0].databases, vec!["orders"]);
+    }
+
+    #[test]
+    fn pisa_proxy_config_accepts_native_gateway_config() {
+        let config: PisaProxyConfig =
+            toml::from_str(include_str!("../../../examples/gateway-config.toml")).unwrap();
+
+        assert!(config.has_gateway_config());
+        assert_eq!(config.gateway.listeners[0].name, "orders-mysql");
+        assert_eq!(config.gateway.services[0].name, "orders");
+        assert!(config.proxy.is_none());
     }
 }

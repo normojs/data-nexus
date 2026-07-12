@@ -9,6 +9,7 @@ chrono = "0.4"
 conn_pool = { path = "../../proxy/pool" }
 crossbeam-channel = "0.3"
 endpoint = { path = "../endpoint" }
+gateway_core = { path = "../../gateway/core" }
 futures = "0.3.5"
 loadbalance = { path = "../loadbalance" }
 mysql_protocol = { path = "../../protocol/mysql", package = "mysql_protocol" }

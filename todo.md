@@ -43,7 +43,7 @@
 - [ ] 根据 `service.backend_protocol` 构建对应 backend connector。
 - [ ] 保持现有 MySQL 代理功能行为不变。
 - [x] 不保留旧 MySQL example config 的启动兼容，后续只支持 v2 Gateway 配置。
-- [ ] 补齐 runtime shutdown handle，避免 `stop()` 空实现。
+- [x] 补齐 runtime shutdown handle，避免 `stop()` 空实现。
 
 ## Phase 2：PostgreSQL 同协议中转
 
@@ -86,16 +86,20 @@
 - [x] 将 `runtime/unisql` 改名或逐步替换为 `runtime/gateway`。
 - [x] 将 `SQLProxy` 入口迁移为 `GatewayRuntime`。
 - [x] 将 `PisaProxyFactory` 演进为 `GatewayFactory`，启动路径改为 `runtime_gateway::gateway::GatewayRuntime`。
-- [ ] 将 `GatewayFactory` 改为按 listener/service 构建 runtime。
+- [x] 将 `GatewayFactory` 改为按 listener/service 构建 runtime。
 - [ ] 拆分 `ProxyConfig`，避免一个结构同时承载监听、认证、后端、路由、插件和云端配置。
-- [ ] 新增 `ListenerConfig`。
-- [ ] 新增 `ServiceConfig`。
-- [ ] 新增 `EndpointConfig`。
-- [ ] 新增 `RoutePolicyConfig`。
-- [ ] 新增 `AuthPolicyConfig`。
-- [ ] 新增 `PluginPolicyConfig`。
+- [x] 新增 `ListenerConfig`。
+- [x] 新增 `ServiceConfig`。
+- [x] 新增 `EndpointConfig`。
+- [x] 新增 `RoutePolicyConfig`。
+- [x] 新增 `AuthPolicyConfig`。
+- [x] 新增 `PluginPolicyConfig`。
 - [ ] 将 `UniSQLNode` 替换为更通用的 `EndpointConfig`。
 - [ ] 将 `node_type`、`backend_type` 字符串替换为 `ProtocolKind` enum。
+  - [x] 移除 legacy `backend_type` 字段。
+  - [x] 将 listener 运行时协议收敛为 `ProtocolKind`。
+  - [x] 将 runtime `Endpoint.node_type` 类型收敛为 `ProtocolKind`。
+  - [ ] 将 legacy `ProxyConfig.node_type` / `UniSQLNode.node_type` 继续收敛到配置解析边界。
 - [ ] 将事务 FSM 与 `mysql_protocol::client::conn::SessionAttr` 解耦。
 - [ ] 让 FSM 只负责事务状态和连接绑定决策。
 - [ ] 将协议 session 到通用 `SessionState` 的转换放在 frontend adapter。

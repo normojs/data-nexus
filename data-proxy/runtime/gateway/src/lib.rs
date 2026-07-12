@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod backend;
+pub mod core_engine;
 pub mod frontend;
 pub mod gateway;
 pub mod server;

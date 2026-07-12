@@ -14,6 +14,7 @@
 
 use std::io::Error;
 
+use gateway_core::ProtocolKind;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::info;
 
@@ -21,9 +22,7 @@ use tracing::info;
 pub struct Listener {
     pub name: String,
     pub listen_addr: String,
-    pub node_type: String,
-    #[deprecated(note = "使用node中的node_type确定后端数据库类型")]
-    pub backend_type: String,
+    pub protocol: ProtocolKind,
     pub server_version: String,
 }
 
@@ -31,7 +30,7 @@ impl Listener {
     pub fn build_listener(&mut self) -> Result<TcpListener, Error> {
         info!(
             "{:?} proxy {:?} is listening on: {:?} with server version: {:?}",
-            self.node_type.clone(),
+            self.protocol,
             self.name.clone(),
             self.listen_addr.clone(),
             self.server_version.clone()
@@ -55,8 +54,7 @@ impl Listener {
             Err(err) => return Err(err),
         };
 
-        // TODO: need refactor this log
-        info!("uni-proxy client_ip: {:?} - backend_type: {:?}", addr.ip(), self.backend_type);
+        info!("uni-proxy client_ip: {:?} - listener: {:?}", addr.ip(), self.name);
 
         socket.set_nodelay(true).unwrap();
         Ok(socket)

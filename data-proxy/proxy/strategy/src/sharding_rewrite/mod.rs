@@ -1634,6 +1634,7 @@ mod test {
             }],
             vec![
                 Endpoint {
+                    node_type: gateway_core::ProtocolKind::MySql,
                     weight: 1,
                     name: String::from("ds0"),
                     db: String::from("db0"),
@@ -1642,6 +1643,7 @@ mod test {
                     addr: String::from("127.0.0.1"),
                 },
                 Endpoint {
+                    node_type: gateway_core::ProtocolKind::MySql,
                     weight: 1,
                     name: String::from("ds1"),
                     db: String::from("db1"),
@@ -1671,6 +1673,7 @@ mod test {
             }],
             vec![
                 Endpoint {
+                    node_type: gateway_core::ProtocolKind::MySql,
                     weight: 1,
                     name: String::from("ds0"),
                     db: String::from("db0"),
@@ -1679,6 +1682,7 @@ mod test {
                     addr: String::from("127.0.0.1"),
                 },
                 Endpoint {
+                    node_type: gateway_core::ProtocolKind::MySql,
                     weight: 1,
                     name: String::from("ds1"),
                     db: String::from("db1"),
@@ -1708,6 +1712,7 @@ mod test {
                 database_table_strategy: None,
             }],
             vec![Endpoint {
+                node_type: gateway_core::ProtocolKind::MySql,
                 weight: 1,
                 name: String::from("ds001"),
                 db: String::from("db"),

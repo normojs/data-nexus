@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use config::config::PisaProxyConfig;
+use gateway_core::GatewayConfig;
 use proxy::{
     factory::{Proxy, ProxyFactory},
     proxy::ProxyConfig,
@@ -20,26 +21,58 @@ use proxy::{
 // use runtime_mysql::mysql;
 
 pub struct GatewayFactory {
-    pub proxy_config: ProxyConfig,
-    pub pisa_config: PisaProxyConfig,
+    source: GatewayFactorySource,
+}
+
+enum GatewayFactorySource {
+    Legacy { proxy_config: ProxyConfig, pisa_config: PisaProxyConfig },
+    NativeGateway { gateway_config: GatewayConfig, listener_name: String, version: String },
 }
 
 impl GatewayFactory {
     pub fn new(proxy_config: ProxyConfig, pisa_config: PisaProxyConfig) -> Self {
-        Self { proxy_config, pisa_config }
+        Self { source: GatewayFactorySource::Legacy { proxy_config, pisa_config } }
+    }
+
+    pub fn from_gateway_config(
+        gateway_config: GatewayConfig,
+        listener_name: String,
+        version: String,
+    ) -> Self {
+        Self {
+            source: GatewayFactorySource::NativeGateway { gateway_config, listener_name, version },
+        }
     }
 }
 
 impl ProxyFactory for GatewayFactory {
     fn build_proxy(&self) -> Box<dyn Proxy + Send> {
-        let config = self.proxy_config.clone();
-        let gateway_runtime = runtime_gateway::gateway::GatewayRuntime {
-            proxy_config: config,
-            node_group: self.pisa_config.node_group.clone(),
-            nodes: self.pisa_config.get_nodes().to_vec(),
-            pisa_version: self.pisa_config.get_version().to_string(),
-        };
-        return Box::new(gateway_runtime);
+        match &self.source {
+            GatewayFactorySource::Legacy { proxy_config, pisa_config } => {
+                let gateway_runtime = runtime_gateway::gateway::GatewayRuntime::from_legacy(
+                    proxy_config.clone(),
+                    pisa_config.node_group.clone(),
+                    pisa_config.get_nodes().to_vec(),
+                    pisa_config.get_version().to_string(),
+                );
+                Box::new(gateway_runtime)
+            }
+            GatewayFactorySource::NativeGateway { gateway_config, listener_name, version } => {
+                let gateway_runtime =
+                    runtime_gateway::gateway::GatewayRuntime::from_gateway_config(
+                        gateway_config.clone(),
+                        listener_name,
+                        version.clone(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "failed to build gateway runtime for listener '{}': {}",
+                            listener_name, error
+                        )
+                    });
+                Box::new(gateway_runtime)
+            }
+        }
 
         // 以下废弃
         // match kind {

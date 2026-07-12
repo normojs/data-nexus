@@ -45,8 +45,6 @@ password = "my-secret-pw"
 db = "test"
 #db = "data-nexus"
 node_type = "mysql"
-# 废弃配置后端数据源类型
-backend_type = "mysql"
 # proxy 与后端数据库建连连接池大小，值范围：1 ~ 255, 默认值：64
 pool_size = 1
 # 服务端版本

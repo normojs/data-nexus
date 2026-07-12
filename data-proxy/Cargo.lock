@@ -1162,6 +1162,9 @@ dependencies = [
 [[package]]
 name = "endpoint"
 version = "0.1.0"
+dependencies = [
+ "gateway_core",
+]
 
 [[package]]
 name = "enum-as-inner"
@@ -2216,6 +2219,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "endpoint",
+ "gateway_core",
  "rand 0.8.5",
  "rand_core 0.6.4",
  "rand_distr",
@@ -3058,6 +3062,7 @@ dependencies = [
  "async-trait",
  "endpoint",
  "error",
+ "gateway_core",
  "loadbalance",
  "plugin",
  "serde",
@@ -3638,6 +3643,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "config",
+ "gateway_core",
  "proxy",
  "runtime_gateway",
  "runtime_shardingsphereproxy",
@@ -3785,6 +3791,7 @@ dependencies = [
  "endpoint",
  "error",
  "futures",
+ "gateway_core",
  "indexmap 1.9.3",
  "itertools 0.10.5",
  "lazy_static",

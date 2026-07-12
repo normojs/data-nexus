@@ -10,8 +10,8 @@ mod model;
 mod transport;
 
 pub use config::{
-    AuthPolicyConfig, EndpointConfig, GatewayConfig, ListenerConfig, PluginPolicyConfig,
-    RoutePolicyConfig, ServiceConfig,
+    AuthPolicyConfig, AuthPolicyUserConfig, EndpointConfig, EndpointRole, GatewayConfig,
+    ListenerConfig, PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,
 };
 pub use error::{GatewayError, GatewayResult};
 pub use model::{

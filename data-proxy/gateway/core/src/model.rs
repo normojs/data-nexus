@@ -1,10 +1,41 @@
+use std::{fmt, str::FromStr};
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolKind {
+    #[serde(alias = "mysql")]
     MySql,
+    #[serde(alias = "postgres", alias = "postgresql")]
     PostgreSql,
+}
+
+impl Default for ProtocolKind {
+    fn default() -> Self {
+        Self::MySql
+    }
+}
+
+impl fmt::Display for ProtocolKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MySql => f.write_str("my_sql"),
+            Self::PostgreSql => f.write_str("postgre_sql"),
+        }
+    }
+}
+
+impl FromStr for ProtocolKind {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "mysql" | "my_sql" => Ok(Self::MySql),
+            "postgres" | "postgresql" | "postgre_sql" => Ok(Self::PostgreSql),
+            value => Err(format!("unsupported protocol kind '{}'", value)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,4 +105,22 @@ pub enum GatewayResponse {
     Prepared { statement_id: String, parameter_count: u16 },
     Pong,
     Bye,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_protocol_kind_aliases() {
+        assert_eq!("mysql".parse::<ProtocolKind>(), Ok(ProtocolKind::MySql));
+        assert_eq!("my_sql".parse::<ProtocolKind>(), Ok(ProtocolKind::MySql));
+        assert_eq!("postgres".parse::<ProtocolKind>(), Ok(ProtocolKind::PostgreSql));
+        assert_eq!("postgresql".parse::<ProtocolKind>(), Ok(ProtocolKind::PostgreSql));
+        assert_eq!("postgre_sql".parse::<ProtocolKind>(), Ok(ProtocolKind::PostgreSql));
+        assert_eq!(
+            "oracle".parse::<ProtocolKind>(),
+            Err("unsupported protocol kind 'oracle'".into())
+        );
+    }
 }
