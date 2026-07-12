@@ -295,8 +295,14 @@ where
 
                     cx.framed.codec_mut().reset_seq();
 
-                    if let Some(idx) = &cx.concurrency_control_rule_idx {
-                        cx.plugin.as_mut().unwrap().concurrency_control.add_permits(*idx);
+                    if let Some(idx) = cx.concurrency_control_rule_idx {
+                        let plugin = cx.plugin.as_mut().ok_or_else(|| {
+                            Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "concurrency control permit exists without plugin state",
+                            ))))
+                        })?;
+                        plugin.concurrency_control.add_permits(idx);
                         cx.concurrency_control_rule_idx = None;
                     }
 

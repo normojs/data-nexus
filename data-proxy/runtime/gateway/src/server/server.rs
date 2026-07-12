@@ -468,16 +468,10 @@ where
         };
 
         // 如果rewriter存在且可以重写，则执行重写操作
-        if req.rewriter.is_some() {
+        if let Some(rewriter) = req.rewriter.as_mut() {
             let default_db = req.framed.codec_mut().get_session().get_db();
-            let outputs = query_rewrite(
-                req.rewriter.as_mut().unwrap(),
-                sql.to_string(),
-                ast,
-                default_db,
-                can_rewrite,
-            )
-            .map_err(|e| ErrorKind::Runtime(e.into()))?;
+            let outputs = query_rewrite(rewriter, sql.to_string(), ast, default_db, can_rewrite)
+                .map_err(|e| ErrorKind::Runtime(e.into()))?;
             debug!("rewrite outputs {:?}", outputs);
             return Ok((is_get_conn, input, outputs));
         }
