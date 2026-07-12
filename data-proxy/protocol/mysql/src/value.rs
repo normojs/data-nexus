@@ -85,9 +85,9 @@ impl Convert<u64> for u64 {
 impl Convert<Duration> for Duration {
     fn new(mut val: &[u8]) -> Result<Duration> {
         let length = val.len();
-        let is_neg = val.get_u8();
         match length {
             8 | 12 => {
+                let is_neg = val.get_u8();
                 let day = val.get_uint_le(4) as i64;
                 let hour = val.get_u8() as i64;
                 let minute = val.get_u8() as i64;
@@ -125,9 +125,8 @@ impl Convert<NaiveDateTime> for NaiveDateTime {
                 let year = val.get_uint_le(2) as i32;
                 let month = val.get_u8();
                 let day = val.get_u8();
-                let d = NaiveDate::from_ymd_opt(year, month.into(), day.into()).unwrap();
-                let dt = d.and_hms_opt(0, 0, 0);
-                Ok(dt)
+                let d = valid_date(year, month, day)?;
+                Ok(Some(valid_datetime(d, 0, 0, 0, None)?))
             }
 
             7 | 11 => {
@@ -138,16 +137,16 @@ impl Convert<NaiveDateTime> for NaiveDateTime {
                 let minute = val.get_u8();
                 let second = val.get_u8();
 
-                let d = NaiveDate::from_ymd_opt(year, month.into(), day.into()).unwrap();
+                let d = valid_date(year, month, day)?;
 
-                let dt = if val.has_remaining() {
+                let micro_second = if val.has_remaining() {
                     let micro_second = val.get_u32_le();
-                    d.and_hms_micro_opt(hour.into(), minute.into(), second.into(), micro_second)
+                    Some(micro_second)
                 } else {
-                    d.and_hms_opt(hour.into(), minute.into(), second.into())
+                    None
                 };
 
-                Ok(dt)
+                Ok(Some(valid_datetime(d, hour, minute, second, micro_second)?))
             }
 
             x => Err(DecodeRowError::ColumnDateTimeLengthInvalid(x).into()),
@@ -188,22 +187,67 @@ impl Convert<NaiveTime> for NaiveTime {
 
                 let t = if val.has_remaining() {
                     let micro_second = val.get_u32_le();
-                    NaiveTime::from_hms_micro_opt(
-                        hour.into(),
-                        minute.into(),
-                        second.into(),
-                        micro_second,
-                    )
+                    valid_time(hour, minute, second, Some(micro_second))?
                 } else {
-                    NaiveTime::from_hms_opt(hour.into(), minute.into(), second.into())
+                    valid_time(hour, minute, second, None)?
                 };
 
-                Ok(t)
+                Ok(Some(t))
             }
 
             x => Err(DecodeRowError::ColumnDateTimeLengthInvalid(x).into()),
         }
     }
+}
+
+fn valid_date(year: i32, month: u8, day: u8) -> std::result::Result<NaiveDate, BoxError> {
+    NaiveDate::from_ymd_opt(year, month.into(), day.into()).ok_or_else(|| {
+        DecodeRowError::ColumnDateTimeInvalid(format!("invalid date {year:04}-{month:02}-{day:02}"))
+            .into()
+    })
+}
+
+fn valid_datetime(
+    date: NaiveDate,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    micro_second: Option<u32>,
+) -> std::result::Result<NaiveDateTime, BoxError> {
+    let dt = if let Some(micro_second) = micro_second {
+        date.and_hms_micro_opt(hour.into(), minute.into(), second.into(), micro_second)
+    } else {
+        date.and_hms_opt(hour.into(), minute.into(), second.into())
+    };
+
+    dt.ok_or_else(|| {
+        DecodeRowError::ColumnDateTimeInvalid(format!(
+            "invalid time {hour:02}:{minute:02}:{second:02}.{}",
+            micro_second.unwrap_or(0)
+        ))
+        .into()
+    })
+}
+
+fn valid_time(
+    hour: u8,
+    minute: u8,
+    second: u8,
+    micro_second: Option<u32>,
+) -> std::result::Result<NaiveTime, BoxError> {
+    let time = if let Some(micro_second) = micro_second {
+        NaiveTime::from_hms_micro_opt(hour.into(), minute.into(), second.into(), micro_second)
+    } else {
+        NaiveTime::from_hms_opt(hour.into(), minute.into(), second.into())
+    };
+
+    time.ok_or_else(|| {
+        DecodeRowError::ColumnTimeInvalid(format!(
+            "invalid time {hour:02}:{minute:02}:{second:02}.{}",
+            micro_second.unwrap_or(0)
+        ))
+        .into()
+    })
 }
 
 #[cfg(test)]

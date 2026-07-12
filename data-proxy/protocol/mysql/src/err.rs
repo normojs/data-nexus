@@ -82,4 +82,10 @@ pub enum DecodeRowError {
 
     #[error("{0:?}")]
     ColumnDateTimeLengthInvalid(usize),
+
+    #[error("{0:?}")]
+    ColumnDateTimeInvalid(String),
+
+    #[error("{0:?}")]
+    ColumnTimeInvalid(String),
 }
