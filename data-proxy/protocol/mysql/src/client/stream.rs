@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    io,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -38,13 +39,17 @@ impl LocalStream {
     //    LocalStream { wrapper }
     //}
 
-    pub async fn close(&mut self) {
+    pub async fn close(&mut self) -> Result<(), ProtocolError> {
         match self {
             Self::Plain(ref mut stream) => {
-                stream.take().unwrap();
+                stream.take().ok_or_else(|| {
+                    ProtocolError::ClientState("plain client stream is already closed".to_string())
+                })?;
             }
-            _ => unreachable!(),
+            Self::Secure(_) => {}
         }
+
+        Ok(())
     }
 
     pub async fn make_tls(&mut self) -> Result<(), ProtocolError> {
@@ -57,17 +62,18 @@ impl LocalStream {
         match self {
             Self::Plain(ref mut try_plain) => {
                 let connector = tokio_native_tls::TlsConnector::from(tlsconn);
-                let plain_stream = try_plain.take().unwrap();
+                let plain_stream = try_plain.take().ok_or_else(|| {
+                    ProtocolError::ClientState(
+                        "plain client stream is not available for tls upgrade".to_string(),
+                    )
+                })?;
 
-                let tls_stream = connector
-                    .connect(&plain_stream.peer_addr().unwrap().to_string(), plain_stream)
-                    .await
-                    .unwrap();
+                let tls_stream =
+                    connector.connect(&plain_stream.peer_addr()?.to_string(), plain_stream).await?;
 
-                LocalStream::from(tls_stream)
+                *self = LocalStream::from(tls_stream);
             }
-
-            _ => unreachable!(),
+            Self::Secure(_) => {}
         };
 
         Ok(())
@@ -83,7 +89,10 @@ impl AsyncRead for LocalStream {
         let mut this = self.project();
 
         match this {
-            LSProj::Plain(ref mut stream) => Pin::new(stream.as_mut().unwrap()).poll_read(cx, buf),
+            LSProj::Plain(ref mut stream) => poll_plain_stream(stream.as_mut()).map_or_else(
+                |error| Poll::Ready(Err(error)),
+                |stream| Pin::new(stream).poll_read(cx, buf),
+            ),
 
             LSProj::Secure(ref mut stream) => Pin::new(stream).as_mut().poll_read(cx, buf),
         }
@@ -99,7 +108,10 @@ impl AsyncWrite for LocalStream {
         let mut this = self.project();
 
         match this {
-            LSProj::Plain(ref mut stream) => Pin::new(stream.as_mut().unwrap()).poll_write(cx, buf),
+            LSProj::Plain(ref mut stream) => poll_plain_stream(stream.as_mut()).map_or_else(
+                |error| Poll::Ready(Err(error)),
+                |stream| Pin::new(stream).poll_write(cx, buf),
+            ),
 
             LSProj::Secure(ref mut stream) => Pin::new(stream).as_mut().poll_write(cx, buf),
         }
@@ -109,7 +121,10 @@ impl AsyncWrite for LocalStream {
         let mut this = self.project();
 
         match this {
-            LSProj::Plain(ref mut stream) => Pin::new(stream.as_mut().unwrap()).poll_flush(cx),
+            LSProj::Plain(ref mut stream) => poll_plain_stream(stream.as_mut()).map_or_else(
+                |error| Poll::Ready(Err(error)),
+                |stream| Pin::new(stream).poll_flush(cx),
+            ),
 
             LSProj::Secure(ref mut stream) => Pin::new(stream).as_mut().poll_flush(cx),
         }
@@ -119,7 +134,10 @@ impl AsyncWrite for LocalStream {
         let mut this = self.project();
 
         match this {
-            LSProj::Plain(ref mut stream) => Pin::new(stream.as_mut().unwrap()).poll_shutdown(cx),
+            LSProj::Plain(ref mut stream) => poll_plain_stream(stream.as_mut()).map_or_else(
+                |error| Poll::Ready(Err(error)),
+                |stream| Pin::new(stream).poll_shutdown(cx),
+            ),
 
             LSProj::Secure(ref mut stream) => Pin::new(stream).as_mut().poll_shutdown(cx),
         }
@@ -139,11 +157,19 @@ impl From<TlsStream<TcpStream>> for LocalStream {
 }
 
 impl LocalStream {
-    pub fn get_inner(&self) -> &TcpStream {
+    pub fn get_inner(&self) -> Result<&TcpStream, ProtocolError> {
         match self {
-            Self::Plain(stream) => stream.as_ref().unwrap(),
+            Self::Plain(stream) => stream.as_ref().ok_or_else(|| {
+                ProtocolError::ClientState("plain client stream is not available".to_string())
+            }),
 
-            Self::Secure(stream) => stream.get_ref().get_ref().get_ref(),
+            Self::Secure(stream) => Ok(stream.get_ref().get_ref().get_ref()),
         }
     }
+}
+
+fn poll_plain_stream(stream: Option<&mut TcpStream>) -> Result<&mut TcpStream, io::Error> {
+    stream.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotConnected, "plain client stream is not available")
+    })
 }

@@ -126,7 +126,10 @@ impl ClientCodec {
             Self::Common(framed) => framed.get_ref(),
         };
 
-        let underly_io = local_stream.get_inner();
+        let underly_io = match local_stream.get_inner() {
+            Ok(stream) => stream,
+            Err(_) => return false,
+        };
 
         let is_ready = underly_io.ready(Interest::READABLE | Interest::WRITABLE).await;
         match is_ready {
