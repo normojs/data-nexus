@@ -219,11 +219,8 @@ where
         };
 
         while let Some(chunk) = stream.next().await {
-            let mut chunk = chunk
-                .into_par_iter()
-                .map(|x| x.unwrap())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ErrorKind::from)?;
+            let mut chunk =
+                chunk.into_iter().collect::<Result<Vec<_>, _>>().map_err(ErrorKind::from)?;
 
             let ro = &req.rewrite_outputs;
 
