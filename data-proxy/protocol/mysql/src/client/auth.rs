@@ -27,7 +27,8 @@ use super::{codec::ClientCodec, stream::LocalStream};
 use crate::{charset::*, err::ProtocolError, mysql_const::*, util::*};
 
 lazy_static! {
-    static ref RE: Regex = Regex::new(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)").unwrap();
+    static ref RE: Regex = Regex::new(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)")
+        .expect("server version regex should compile");
 }
 
 /// Handshake state
@@ -55,16 +56,6 @@ pub struct ServerVersion {
     pub major: u8,
     pub minor: u8,
     pub patch: u8,
-}
-
-impl From<(&str, &str, &str)> for ServerVersion {
-    fn from(version: (&str, &str, &str)) -> ServerVersion {
-        let major = version.0.parse::<u8>().unwrap();
-        let minor = version.1.parse::<u8>().unwrap();
-        let patch = version.2.parse::<u8>().unwrap();
-
-        ServerVersion { major, minor, patch }
-    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -109,6 +100,7 @@ impl ClientAuth {
 
     // Read initial handshake packet from server
     fn read_initial_handshake(&mut self, data: &mut BytesMut) -> Result<Self, ProtocolError> {
+        ensure_packet_len("read_initial_handshake", data, 1)?;
         if data[0] == ERR_HEADER {
             //return Err(Error::new(ErrorKind::Other, "read initial handshake error"));
             return Err(ProtocolError::HandshakeError(data.to_vec()));
@@ -122,28 +114,22 @@ impl ClientAuth {
         let _ = data.split_to(1);
 
         // skip server version, end with 0x00
-        let pos = data.iter().position(|&x| x == 0x00).unwrap();
-        let version_bytes = data.split_to(pos + 1);
-        let version = str::from_utf8(&version_bytes).unwrap();
-        if let Some(caps) = RE.captures(version) {
-            let ver = ServerVersion::from((
-                caps.name("major").unwrap().as_str(),
-                caps.name("minor").unwrap().as_str(),
-                caps.name("patch").unwrap().as_str(),
-            ));
-
-            self.server_version = ver;
-        }
+        let version = read_null_terminated_string("read_initial_handshake", data)?;
+        self.server_version = parse_server_version(&version)?;
 
         // connection id length is 4
+        ensure_packet_len("read_initial_handshake", data, 4)?;
         self.connection_id = LittleEndian::read_u32(&data.split_to(4));
 
+        ensure_packet_len("read_initial_handshake", data, 8)?;
         self.salt.extend_from_slice(&data.split_to(8));
 
         // skip filter
+        ensure_packet_len("read_initial_handshake", data, 1)?;
         let _ = data.split_to(1);
 
         // capability lower 2 bytes
+        ensure_packet_len("read_initial_handshake", data, 2)?;
         self.capability = u32::from(LittleEndian::read_u16(&(data.split_to(2))));
 
         if self.capability & CLIENT_PROTOCOL_41 == 0 {
@@ -161,28 +147,30 @@ impl ClientAuth {
         // server charset
         // self.charset = data[pos]
         let charset_id = data.get_u8();
-        match self.server_version.major {
-            5 => self.charset = COLLATION_ID_NAME_MYSQL5[&charset_id].to_string(),
-            _ => self.charset = COLLATION_ID_NAME_MYSQL8[&charset_id].to_string(),
-        }
+        self.charset = server_charset_name(self.server_version.major, charset_id)?.to_string();
 
+        ensure_packet_len("read_initial_handshake", data, 2)?;
         self.status = LittleEndian::read_u16(&data.split_to(2));
 
+        ensure_packet_len("read_initial_handshake", data, 2)?;
         self.capability |= u32::from(LittleEndian::read_u16(&data.split_to(2))) << 16;
 
         // skip auth data len or [00]
         // skip reserved (all [00])
+        ensure_packet_len("read_initial_handshake", data, 11)?;
+        let auth_data_len = data.split_to(1)[0];
         let _ = data.split_to(10);
 
         let mut max_auth_data_len = 13 + 8;
 
-        let auth_data_len = data.split_to(1)[0] as u8;
         if self.capability & CLIENT_PLUGIN_AUTH != 0 && auth_data_len > max_auth_data_len {
-            max_auth_data_len = data[pos];
+            max_auth_data_len = auth_data_len;
         }
 
         // trim 0x00
-        self.salt.extend_from_slice(&data.split_to((max_auth_data_len - 8 - 1) as usize));
+        let salt_len = (max_auth_data_len - 8 - 1) as usize;
+        ensure_packet_len("read_initial_handshake", data, salt_len + 1)?;
+        self.salt.extend_from_slice(&data.split_to(salt_len));
 
         // skip 0x00
         let _ = data.split_to(1);
@@ -190,8 +178,11 @@ impl ClientAuth {
         // auth plugin
         if self.capability & CLIENT_PLUGIN_AUTH != 0 {
             let other_data = data.split();
+            if other_data.is_empty() {
+                return Err(invalid_packet("read_initial_handshake", &other_data));
+            }
             self.auth_plugin_name =
-                str::from_utf8(&other_data[0..&other_data.len() - 1]).unwrap().to_string();
+                utf8_to_string("read_initial_handshake", &other_data[..other_data.len() - 1])?;
         }
 
         Ok(self.clone())
@@ -200,7 +191,12 @@ impl ClientAuth {
     // gen_auth_response: generate auth response data according to auth plugin.
     pub fn gen_auth_response(&mut self, auth_data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
         match self.auth_plugin_name.as_str() {
-            AUTH_NATIVE_PASSWORD => Ok(calc_password(&auth_data[..20], self.password.as_bytes())),
+            AUTH_NATIVE_PASSWORD => {
+                if auth_data.len() < 20 {
+                    return Err(invalid_packet("gen_auth_response", auth_data));
+                }
+                Ok(calc_password(&auth_data[..20], self.password.as_bytes()))
+            }
 
             AUTH_CACHING_SHA2_PASSWORD => {
                 Ok(calc_caching_sha2password(auth_data, self.password.as_bytes()))
@@ -291,10 +287,7 @@ impl ClientAuth {
         //data[11] = 0x00;
 
         //charset [1 byte]
-        match self.server_version.major {
-            5 => data.put_u8(COLLATION_NAME_ID_MYSQL5[DEFAULT_CHARSET_NAME].try_into().unwrap()),
-            _ => data.put_u8(COLLATION_NAME_ID_MYSQL8[DEFAULT_CHARSET_NAME].try_into().unwrap()),
-        }
+        data.put_u8(default_charset_id(self.server_version.major)?);
 
         data.put_slice(&[0; 23]);
 
@@ -339,7 +332,7 @@ impl ClientAuth {
                 match is_pos {
                     Some(pos) => {
                         let auth_plugin_name =
-                            str::from_utf8(&data.split_to(pos)).unwrap().to_string();
+                            utf8_to_string("decode_handshake_result", &data.split_to(pos))?;
                         self.auth_plugin_name = auth_plugin_name;
                         // Eat the 0x00 by split_off.
                         let auth_data = data.split_off(1).split_to(20);
@@ -402,9 +395,12 @@ impl ClientAuth {
                 }
 
                 let pub_key =
-                    RsaPublicKey::from_public_key_pem(str::from_utf8(data).unwrap()).unwrap();
-                let enc_data =
-                    encrypt_password(self.password.as_bytes().to_vec(), self.salt.clone(), pub_key);
+                    RsaPublicKey::from_public_key_pem(&utf8_to_string("handle_auth_data", data)?)?;
+                let enc_data = encrypt_password(
+                    self.password.as_bytes().to_vec(),
+                    self.salt.clone(),
+                    pub_key,
+                )?;
 
                 Ok(Some((HandshakeState::WriteAuthPassword, BytesMut::from(&enc_data[..]))))
             }
@@ -442,7 +438,7 @@ impl Decoder for ClientAuth {
             return Ok(None);
         }
 
-        if (data.len() <= 3) {
+        if data.len() <= 3 {
             self.seq = data[data.len() - 1];
         } else {
             self.seq = data[3];
@@ -510,11 +506,18 @@ impl Decoder for ClientAuth {
 
             HandshakeState::GetPublicKey => {
                 self.next_state = HandshakeState::WriteAuthPassword;
+                ensure_packet_len("decode_get_public_key", data, 5)?;
                 let _ = data.split_to(5);
-                let pub_key = RsaPublicKey::from_public_key_pem(str::from_utf8(data).unwrap())?;
+                let pub_key = RsaPublicKey::from_public_key_pem(&utf8_to_string(
+                    "decode_get_public_key",
+                    data,
+                )?)?;
                 let _ = data.split();
-                let enc_data =
-                    encrypt_password(self.password.as_bytes().to_vec(), self.salt.clone(), pub_key);
+                let enc_data = encrypt_password(
+                    self.password.as_bytes().to_vec(),
+                    self.salt.clone(),
+                    pub_key,
+                )?;
                 Ok(Some(HandshakeDecoderReturn::EncryptPassword(BytesMut::from(&enc_data[..]))))
             }
 
@@ -532,8 +535,19 @@ impl Decoder for ClientAuth {
     }
 }
 
-fn encrypt_password(mut password: Vec<u8>, salt: Vec<u8>, pub_key: RsaPublicKey) -> Vec<u8> {
+fn encrypt_password(
+    mut password: Vec<u8>,
+    salt: Vec<u8>,
+    pub_key: RsaPublicKey,
+) -> Result<Vec<u8>, ProtocolError> {
     password.push(0x00);
+    if salt.is_empty() {
+        return Err(ProtocolError::InvalidPacket {
+            method: "encrypt_password".to_string(),
+            data: salt,
+        });
+    }
+
     let password_salt = password
         .iter()
         .enumerate()
@@ -545,7 +559,75 @@ fn encrypt_password(mut password: Vec<u8>, salt: Vec<u8>, pub_key: RsaPublicKey)
 
     let mut rng = OsRng;
     let padding = PaddingScheme::new_oaep::<Sha1>();
-    pub_key.encrypt(&mut rng, padding, &password_salt).unwrap()
+    pub_key
+        .encrypt(&mut rng, padding, &password_salt)
+        .map_err(|error| ProtocolError::ClientState(format!("encrypt password failed: {error:?}")))
+}
+
+fn ensure_packet_len(method: &str, data: &BytesMut, needed: usize) -> Result<(), ProtocolError> {
+    if data.len() < needed {
+        return Err(invalid_packet(method, data));
+    }
+
+    Ok(())
+}
+
+fn invalid_packet(method: &str, data: &[u8]) -> ProtocolError {
+    ProtocolError::InvalidPacket { method: method.to_string(), data: data.to_vec() }
+}
+
+fn utf8_to_string(method: &str, data: &[u8]) -> Result<String, ProtocolError> {
+    str::from_utf8(data).map(|value| value.to_string()).map_err(|_| invalid_packet(method, data))
+}
+
+fn read_null_terminated_string(method: &str, data: &mut BytesMut) -> Result<String, ProtocolError> {
+    let pos = data.iter().position(|&x| x == 0x00).ok_or_else(|| invalid_packet(method, data))?;
+    let value = data.split_to(pos + 1);
+    utf8_to_string(method, &value[..pos])
+}
+
+fn parse_server_version(version: &str) -> Result<ServerVersion, ProtocolError> {
+    let caps = RE
+        .captures(version)
+        .ok_or_else(|| invalid_packet("parse_server_version", version.as_bytes()))?;
+    let parse_part = |name: &str| -> Result<u8, ProtocolError> {
+        caps.name(name)
+            .ok_or_else(|| invalid_packet("parse_server_version", version.as_bytes()))?
+            .as_str()
+            .parse::<u8>()
+            .map_err(|_| invalid_packet("parse_server_version", version.as_bytes()))
+    };
+
+    Ok(ServerVersion {
+        major: parse_part("major")?,
+        minor: parse_part("minor")?,
+        patch: parse_part("patch")?,
+    })
+}
+
+fn default_charset_id(server_major: u8) -> Result<u8, ProtocolError> {
+    let charset_id = match server_major {
+        5 => COLLATION_NAME_ID_MYSQL5.get(DEFAULT_CHARSET_NAME),
+        _ => COLLATION_NAME_ID_MYSQL8.get(DEFAULT_CHARSET_NAME),
+    };
+
+    charset_id.copied().ok_or_else(|| {
+        ProtocolError::ClientState(format!(
+            "default charset '{}' is not configured",
+            DEFAULT_CHARSET_NAME
+        ))
+    })
+}
+
+fn server_charset_name(server_major: u8, charset_id: u8) -> Result<&'static str, ProtocolError> {
+    let charset_name = match server_major {
+        5 => COLLATION_ID_NAME_MYSQL5.get(&charset_id),
+        _ => COLLATION_ID_NAME_MYSQL8.get(&charset_id),
+    };
+
+    charset_name.copied().ok_or_else(|| {
+        ProtocolError::ClientState(format!("server charset id '{}' is not configured", charset_id))
+    })
 }
 
 impl Encoder<BytesMut> for ClientAuth {
