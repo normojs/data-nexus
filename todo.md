@@ -34,8 +34,8 @@
 
 - [x] 将 `runtime/gateway` 中的 MySQL 协议处理抽成 `MySqlFrontendProtocol`。
 - [x] 将 MySQL 后端连接和执行逻辑收口为 `MySqlBackendConnector`。
-- [ ] 让 `MySqlFrontendProtocol` 对接 `gateway_core::FrontendProtocolAdapter`。
-- [ ] 让 `MySqlBackendConnector` 对接 `gateway_core::BackendConnector`。
+- [x] 让 `MySqlFrontendProtocol` 对接 `gateway_core::FrontendProtocolAdapter`。
+- [x] 让 `MySqlBackendConnector` 对接 `gateway_core::BackendConnector`。
 - [x] 新增 `GatewayRuntime` 运行时入口（当前内部仍复用迁移中的 MySQL 主链路）。
 - [ ] 让 `GatewayRuntime` 只依赖 `GatewayCommand`、`GatewayResponse`、`SessionState` 等 core 类型。
 - [x] 让 `PisaProxyFactory` 演进为 `GatewayFactory`。
@@ -105,6 +105,8 @@
 - [ ] 将协议 session 到通用 `SessionState` 的转换放在 frontend adapter。
 - [ ] 将插件接口从 `String` 输入升级为 `PluginContext`。
 - [ ] 减少主链路中的 `unwrap()`，把请求级错误转换成客户端协议错误包。
+  - [x] 将 `GatewayRuntime` 启动监听、路由构建、legacy endpoint 协议解析中的关键 `unwrap()` 改为显式错误返回。
+  - [ ] 继续清理 MySQL 请求处理深处的 packet/session/parser `unwrap()`。
 - [ ] 配置错误在启动阶段 fail fast，并输出明确错误信息。
 
 ## Admin API

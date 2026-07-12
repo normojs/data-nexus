@@ -149,12 +149,7 @@ impl GatewayRuntime {
         let length = self.nodes.len();
         let (mut rw, mut ro) = (Vec::with_capacity(length), Vec::with_capacity(length));
         for node in &self.nodes {
-            let ep = endpoint_from_unisql_node(node).map_err(|error| {
-                Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    error,
-                ))))
-            })?;
+            let ep = endpoint_from_unisql_node(node).map_err(runtime_invalid_input)?;
             match node.role {
                 TargetRole::Read => ro.push(ep),
                 TargetRole::ReadWrite => rw.push(ep),
@@ -162,43 +157,40 @@ impl GatewayRuntime {
         }
 
         // 路由策略
-        let strategy = if self.proxy_config.read_write_splitting.is_some()
-            && self.proxy_config.sharding.is_some()
-        {
+        let read_write_splitting = self.proxy_config.read_write_splitting.as_ref();
+        let sharding = self.proxy_config.sharding.as_ref();
+
+        let strategy = if let Some(config) = read_write_splitting {
             let rw_endpoint = ReadWriteEndpoint { read: ro, readwrite: rw };
-            RouteStrategy::new(
-                self.proxy_config.read_write_splitting.as_ref().unwrap().clone(),
-                &self.node_group,
-                rw_endpoint,
-                true,
-            )
-            .map_err(|e| Error::new(ErrorKind::Runtime(e.into())))?
-        } else if self.proxy_config.read_write_splitting.is_some() {
-            let rw_endpoint = ReadWriteEndpoint { read: ro, readwrite: rw };
-            RouteStrategy::new(
-                self.proxy_config.read_write_splitting.as_ref().unwrap().clone(),
-                &self.node_group,
-                rw_endpoint,
-                false,
-            )
-            .map_err(|e| Error::new(ErrorKind::Runtime(e.into())))?
+            RouteStrategy::new(config.clone(), &self.node_group, rw_endpoint, sharding.is_some())
+                .map_err(|e| Error::new(ErrorKind::Runtime(e.into())))?
         } else {
             //let rw_endpoint = ReadWriteEndpoint { read: ro, readwrite: rw };
-            let balance_type =
-                self.proxy_config.simple_loadbalance.as_ref().unwrap().balance_type.clone();
+            let balance_type = self
+                .proxy_config
+                .simple_loadbalance
+                .as_ref()
+                .ok_or_else(|| {
+                    runtime_invalid_input(format!(
+                        "proxy '{}' requires simple_loadbalance when read_write_splitting is not configured",
+                        self.proxy_config.name
+                    ))
+                })?
+                .balance_type
+                .clone();
             let mut balance = Balance.build_balance(balance_type);
             rw.append(&mut ro);
             for ep in rw.into_iter() {
                 balance.add(ep)
             }
 
-            if self.proxy_config.sharding.is_some() {
-                let has_strategy = &self.proxy_config.sharding.as_ref().unwrap().iter().all(|x| {
+            if let Some(sharding) = sharding {
+                let has_strategy = sharding.iter().all(|x| {
                     x.table_strategy.is_some()
                         || x.database_strategy.is_some()
                         || x.database_table_strategy.is_some()
                 });
-                if *has_strategy {
+                if has_strategy {
                     RouteStrategy::new_with_sharding_only(balance)
                 } else {
                     RouteStrategy::new_with_simple_route(balance)
@@ -212,13 +204,11 @@ impl GatewayRuntime {
     } // end build route
 
     fn build_sharding_rewriter(&self) -> Result<Option<ShardingRewrite>, Error> {
-        let config = self.proxy_config.sharding.clone();
-
-        if config.is_none() {
+        let Some(config) = self.proxy_config.sharding.as_ref() else {
             return Ok(None);
-        }
+        };
 
-        let has_strategy = config.as_ref().unwrap().iter().all(|x| {
+        let has_strategy = config.iter().all(|x| {
             x.table_strategy.is_some()
                 || x.database_strategy.is_some()
                 || x.database_table_strategy.is_some()
@@ -229,18 +219,13 @@ impl GatewayRuntime {
 
         let mut endpoints: Vec<Endpoint> = vec![];
         for node in &self.nodes {
-            let endpoint = endpoint_from_unisql_node(node).map_err(|error| {
-                Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    error,
-                ))))
-            })?;
+            let endpoint = endpoint_from_unisql_node(node).map_err(runtime_invalid_input)?;
             endpoints.push(endpoint);
         }
 
         let has_rw = self.proxy_config.read_write_splitting.is_some();
 
-        Ok(Some(ShardingRewrite::new(config.unwrap(), endpoints, self.node_group.clone(), has_rw)))
+        Ok(Some(ShardingRewrite::new(config.clone(), endpoints, self.node_group.clone(), has_rw)))
     }
 }
 
@@ -314,7 +299,7 @@ impl proxy::factory::Proxy for GatewayRuntime {
             nodes: self.nodes.clone(),
         };
 
-        let listener = proxy.build_listener().unwrap();
+        let listener = proxy.build_listener().map_err(ErrorKind::Io)?;
 
         let pool = Pool::<ClientConn>::new(self.proxy_config.pool_size as usize);
 
@@ -441,13 +426,15 @@ impl GatewayRuntime {
             }
         }
 
-        self.proxy_config.node_type.parse::<ProtocolKind>().map_err(|error| {
-            Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                error,
-            ))))
-        })
+        self.proxy_config.node_type.parse::<ProtocolKind>().map_err(runtime_invalid_input)
     }
+}
+
+fn runtime_invalid_input(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message.into(),
+    ))))
 }
 
 #[cfg(test)]
@@ -609,5 +596,67 @@ mod tests {
         runtime.proxy_config.node_type = "mysql".into();
 
         assert_eq!(runtime.listener_protocol().unwrap(), ProtocolKind::MySql);
+    }
+
+    #[test]
+    fn build_route_rejects_missing_simple_loadbalance_config() {
+        let mut proxy_config = ProxyConfig::default();
+        proxy_config.name = "legacy-mysql".into();
+        proxy_config.node_type = "mysql".into();
+        proxy_config.simple_loadbalance = None;
+        let runtime = GatewayRuntime::from_legacy(
+            proxy_config,
+            None,
+            vec![legacy_node("mysql", TargetRole::ReadWrite)],
+            "8.0".into(),
+        );
+
+        let error = match runtime.build_route() {
+            Ok(_) => panic!("expected route config error"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("requires simple_loadbalance when read_write_splitting is not configured"));
+    }
+
+    #[test]
+    fn build_route_rejects_invalid_legacy_endpoint_protocol() {
+        let mut proxy_config = ProxyConfig::default();
+        proxy_config.name = "legacy-mysql".into();
+        proxy_config.node_type = "mysql".into();
+        proxy_config.simple_loadbalance = Some(proxy::proxy::ProxySimpleLoadBalance {
+            balance_type: AlgorithmName::Random,
+            nodes: vec!["orders-primary".into()],
+        });
+        let runtime = GatewayRuntime::from_legacy(
+            proxy_config,
+            None,
+            vec![legacy_node("oracle", TargetRole::ReadWrite)],
+            "8.0".into(),
+        );
+
+        let error = match runtime.build_route() {
+            Ok(_) => panic!("expected endpoint protocol error"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("unsupported protocol kind 'oracle'"));
+    }
+
+    fn legacy_node(node_type: &str, role: TargetRole) -> UniSQLNode {
+        UniSQLNode {
+            version: "8.0".into(),
+            node_type: node_type.into(),
+            name: "orders-primary".into(),
+            db: "orders".into(),
+            user: "root".into(),
+            password: "secret".into(),
+            host: "127.0.0.1".into(),
+            port: 3306,
+            weight: 1,
+            role,
+        }
     }
 }
