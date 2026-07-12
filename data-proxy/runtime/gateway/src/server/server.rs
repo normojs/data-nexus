@@ -76,6 +76,18 @@ fn decode_mysql_text_payload<'a>(method: &str, payload: &'a [u8]) -> Result<&'a 
     })
 }
 
+fn required_endpoint_addr<'a>(
+    command: &str,
+    endpoint: &'a Option<String>,
+) -> Result<&'a str, Error> {
+    endpoint.as_deref().ok_or_else(|| {
+        Error::new(ErrorKind::Protocol(ProtocolError::InvalidPacket {
+            method: command.into(),
+            data: b"missing backend endpoint after routing".to_vec(),
+        }))
+    })
+}
+
 impl<T, C> MySqlBackendConnector<T, C>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send,
@@ -749,16 +761,17 @@ where
         let mut client_conn =
             Self::fsm_trigger(cx, TransEventName::UseEvent, RouteInputTyp::Statement, db).await?;
         let ep = client_conn.get_endpoint();
+        let ep_addr = required_endpoint_addr("COM_INIT_DB", &ep)?;
 
-        collect_sql_processed_total!(cx, "COM_INIT_DB", ep.as_ref().unwrap());
-        collect_sql_under_processing_inc!(cx, "COM_INIT_DB", ep.as_ref().unwrap());
+        collect_sql_processed_total!(cx, "COM_INIT_DB", ep_addr);
+        collect_sql_under_processing_inc!(cx, "COM_INIT_DB", ep_addr);
 
         Self::init_db_inner(cx, &mut client_conn, payload).await?;
 
         cx.fsm.put_conn(client_conn);
 
-        collect_sql_under_processing_dec!(cx, "COM_INIT_DB", ep.as_ref().unwrap());
-        collect_sql_processed_duration!(cx, "COM_INIT_DB", ep.as_ref().unwrap(), now.elapsed());
+        collect_sql_under_processing_dec!(cx, "COM_INIT_DB", ep_addr);
+        collect_sql_processed_duration!(cx, "COM_INIT_DB", ep_addr, now.elapsed());
 
         Ok(RespContext { ep, duration: now.elapsed() })
     }
@@ -774,15 +787,16 @@ where
         let mut client_conn = Self::query_inner_get_conn(cx, payload).await?;
 
         let ep = client_conn.get_endpoint();
-        collect_sql_processed_total!(cx, "COM_QUERY", ep.as_ref().unwrap());
-        collect_sql_under_processing_inc!(cx, "COM_QUERY", ep.as_ref().unwrap());
+        let ep_addr = required_endpoint_addr("COM_QUERY", &ep)?;
+        collect_sql_processed_total!(cx, "COM_QUERY", ep_addr);
+        collect_sql_under_processing_inc!(cx, "COM_QUERY", ep_addr);
 
         let _ = Self::query_inner(cx, &mut client_conn, payload).await?;
 
         cx.fsm.put_conn(client_conn);
 
-        collect_sql_under_processing_dec!(cx, "COM_QUERY", ep.as_ref().unwrap());
-        collect_sql_processed_duration!(cx, "COM_QUERY", ep.as_ref().unwrap(), now.elapsed());
+        collect_sql_under_processing_dec!(cx, "COM_QUERY", ep_addr);
+        collect_sql_processed_duration!(cx, "COM_QUERY", ep_addr, now.elapsed());
 
         Ok(RespContext { ep, duration: now.elapsed() })
     }
@@ -812,15 +826,16 @@ where
             Self::fsm_trigger(cx, TransEventName::PrepareEvent, RouteInputTyp::Statement, sql)
                 .await?;
         let ep = client_conn.get_endpoint();
+        let ep_addr = required_endpoint_addr("COM_PREPARE", &ep)?;
 
-        collect_sql_processed_total!(cx, "COM_PREPARE", ep.as_ref().unwrap());
-        collect_sql_under_processing_inc!(cx, "COM_PREPARE", ep.as_ref().unwrap());
+        collect_sql_processed_total!(cx, "COM_PREPARE", ep_addr);
+        collect_sql_under_processing_inc!(cx, "COM_PREPARE", ep_addr);
 
         let res = Self::prepare_normal_inner(cx, &mut client_conn, payload).await;
         cx.fsm.put_conn(client_conn);
 
-        collect_sql_under_processing_dec!(cx, "COM_PREPARE", ep.as_ref().unwrap());
-        collect_sql_processed_duration!(cx, "COM_PREPARE", ep.as_ref().unwrap(), now.elapsed());
+        collect_sql_under_processing_dec!(cx, "COM_PREPARE", ep_addr);
+        collect_sql_processed_duration!(cx, "COM_PREPARE", ep_addr, now.elapsed());
 
         if let Err(ref err) = res {
             if let ErrorKind::Protocol(ProtocolError::PrepareError(data)) = err.kind() {
@@ -845,15 +860,16 @@ where
         let sess = cx.framed.codec_mut().get_session();
         let mut client_conn = cx.fsm.get_conn(&build_conn_attrs(sess)).await?;
         let ep = client_conn.get_endpoint();
+        let ep_addr = required_endpoint_addr("COM_EXECUTE", &ep)?;
 
-        collect_sql_processed_total!(cx, "COM_EXECUTE", ep.as_ref().unwrap());
-        collect_sql_under_processing_inc!(cx, "COM_EXECUTE", ep.as_ref().unwrap());
+        collect_sql_processed_total!(cx, "COM_EXECUTE", ep_addr);
+        collect_sql_under_processing_inc!(cx, "COM_EXECUTE", ep_addr);
 
         let _ = Self::execute_inner(cx, &mut client_conn, payload).await;
         cx.fsm.put_conn(client_conn);
 
-        collect_sql_under_processing_dec!(cx, "COM_EXECUTE", ep.as_ref().unwrap());
-        collect_sql_processed_duration!(cx, "COM_EXECUTE", ep.as_ref().unwrap(), now.elapsed());
+        collect_sql_under_processing_dec!(cx, "COM_EXECUTE", ep_addr);
+        collect_sql_processed_duration!(cx, "COM_EXECUTE", ep_addr, now.elapsed());
 
         Ok(RespContext { ep, duration: now.elapsed() })
     }
@@ -887,16 +903,17 @@ where
             Self::fsm_trigger(cx, TransEventName::QueryEvent, RouteInputTyp::None, "").await?;
 
         let ep = client_conn.get_endpoint();
+        let ep_addr = required_endpoint_addr("COM_FIELD_LIST", &ep)?;
 
-        collect_sql_processed_total!(cx, "COM_FIELD_LIST", ep.as_ref().unwrap());
-        collect_sql_under_processing_inc!(cx, "COM_FIELD_LIST", ep.as_ref().unwrap());
+        collect_sql_processed_total!(cx, "COM_FIELD_LIST", ep_addr);
+        collect_sql_under_processing_inc!(cx, "COM_FIELD_LIST", ep_addr);
 
         Self::field_list_inner(cx, &mut client_conn, payload).await?;
 
         cx.fsm.put_conn(client_conn);
 
-        collect_sql_under_processing_dec!(cx, "COM_FIELD_LIST", ep.as_ref().unwrap());
-        collect_sql_processed_duration!(cx, "COM_FIELD_LIST", ep.as_ref().unwrap(), now.elapsed());
+        collect_sql_under_processing_dec!(cx, "COM_FIELD_LIST", ep_addr);
+        collect_sql_processed_duration!(cx, "COM_FIELD_LIST", ep_addr, now.elapsed());
 
         Ok(RespContext { ep, duration: now.elapsed() })
     }

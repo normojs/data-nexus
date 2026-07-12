@@ -107,7 +107,8 @@
 - [ ] 减少主链路中的 `unwrap()`，把请求级错误转换成客户端协议错误包。
   - [x] 将 `GatewayRuntime` 启动监听、路由构建、legacy endpoint 协议解析中的关键 `unwrap()` 改为显式错误返回。
   - [x] 将 MySQL `COM_QUERY`、`COM_INIT_DB`、`COM_STMT_PREPARE` 文本 payload 的 UTF-8 `unwrap()` 改为协议错误返回。
-  - [ ] 继续清理 MySQL 请求处理深处的 endpoint metrics、packet/session/parser `unwrap()`。
+  - [x] 将 MySQL metrics 采集前的 endpoint `unwrap()` 改为缺失 endpoint 时返回协议错误。
+  - [ ] 继续清理 MySQL 请求处理深处的 rewriter、plugin、packet/session/parser `unwrap()`。
 - [ ] 配置错误在启动阶段 fail fast，并输出明确错误信息。
 
 ## Admin API
