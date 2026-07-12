@@ -62,7 +62,7 @@ impl ClientConn {
 
     pub async fn connect(&self) -> Result<ClientConn, ProtocolError> {
         let sock = TcpStream::connect(&self.endpoint).await?;
-        sock.set_nodelay(true).unwrap();
+        sock.set_nodelay(true)?;
 
         let local_stream = LocalStream::from(sock);
 
@@ -78,7 +78,7 @@ impl ClientConn {
         ))));
 
         // Handshake timeout is 10 seconds.
-        let res = timeout(Duration::from_secs(10), handshake(*(framed.take().unwrap())))
+        let res = timeout(Duration::from_secs(10), handshake(*take_framed(&mut framed)?))
             .await
             .map_err(|_| ProtocolError::Default)??;
 
@@ -93,7 +93,7 @@ impl ClientConn {
     }
 
     pub async fn handshake(&mut self) -> Result<(bool, Vec<u8>), ProtocolError> {
-        let res = handshake(*(self.framed.take().unwrap())).await?;
+        let res = handshake(*self.take_framed()?).await?;
         self.framed = Some(Box::new(ClientCodec::ClientAuth(res.0)));
 
         Ok((res.1, res.2))
@@ -103,7 +103,7 @@ impl ClientConn {
         &'a mut self,
         val: &'a [u8],
     ) -> Result<ResultsetStream<'a>, ProtocolError> {
-        let framed = self.framed.take().unwrap();
+        let framed = self.take_framed()?;
 
         let mut resultset_codec = framed.into_resultset();
 
@@ -111,11 +111,11 @@ impl ClientConn {
 
         self.framed = Some(Box::new(ClientCodec::Resultset(resultset_codec)));
 
-        Ok(ResultsetStream::new(self.framed.as_mut()))
+        ResultsetStream::new(self.framed.as_mut())
     }
 
     pub async fn send_prepare<'a>(&'a mut self, val: &[u8]) -> Result<Stmt, ProtocolError> {
-        let framed = self.framed.take().unwrap();
+        let framed = self.take_framed()?;
 
         let mut stmt_codec = framed.into_stmt();
         stmt_codec.send((COM_STMT_PREPARE, val)).await?;
@@ -156,7 +156,7 @@ impl ClientConn {
         &'a mut self,
         val: &'a [u8],
     ) -> Result<ResultsetStream<'a>, ProtocolError> {
-        let framed = self.framed.take().unwrap();
+        let framed = self.take_framed()?;
         let mut resultset_codec = framed.into_resultset();
         resultset_codec.codec_mut().with_binary(true);
 
@@ -164,14 +164,14 @@ impl ClientConn {
 
         self.framed = Some(Box::new(ClientCodec::Resultset(resultset_codec)));
 
-        Ok(ResultsetStream::new(self.framed.as_mut()))
+        ResultsetStream::new(self.framed.as_mut())
     }
 
     pub async fn send_use_db<'a>(
         &'a mut self,
         val: &str,
     ) -> Result<(BytesMut, bool), ProtocolError> {
-        let framed = self.framed.take().unwrap();
+        let framed = self.take_framed()?;
         let mut common_codec = framed.into_common();
 
         common_codec.send((COM_INIT_DB, val.as_bytes())).await?;
@@ -179,7 +179,11 @@ impl ClientConn {
         let res = match common_codec.next().await {
             Some(Ok(data)) => {
                 if is_ok_header(data.0[4]) {
-                    common_codec.codec_mut().auth_info.as_mut().unwrap().db = val.to_string();
+                    let auth_info =
+                        common_codec.codec_mut().auth_info.as_mut().ok_or_else(|| {
+                            ProtocolError::ClientState("common codec missing auth info".to_string())
+                        })?;
+                    auth_info.db = val.to_string();
                     Ok((data.0, true))
                 } else {
                     Ok((data.0, false))
@@ -196,7 +200,7 @@ impl ClientConn {
     }
 
     pub async fn send_ping(&mut self) -> Result<bool, ProtocolError> {
-        let framed = self.framed.take().unwrap();
+        let framed = self.take_framed()?;
         let mut common_codec = framed.into_common();
 
         common_codec.send((COM_PING, &[])).await?;
@@ -223,14 +227,14 @@ impl ClientConn {
         code: u8,
         val: &'a [u8],
     ) -> Result<CommonStream<'a>, ProtocolError> {
-        let framed = self.framed.take().unwrap();
+        let framed = self.take_framed()?;
         let mut common_codec = framed.into_common();
 
         common_codec.send((code, val)).await?;
 
         self.framed = Some(Box::new(ClientCodec::Common(common_codec)));
 
-        Ok(CommonStream::new(self.framed.as_mut()))
+        CommonStream::new(self.framed.as_mut())
     }
 
     pub async fn query_result<'a>(
@@ -295,7 +299,7 @@ impl ClientConn {
         &'a mut self,
         val: &'a [u8],
     ) -> Result<(), ProtocolError> {
-        let framed = self.framed.take().unwrap();
+        let framed = self.take_framed()?;
 
         let mut resultset_codec = framed.into_resultset();
 
@@ -310,7 +314,7 @@ impl ClientConn {
         &'a mut self,
         val: &'a [u8],
     ) -> Result<(), ProtocolError> {
-        let framed = self.framed.take().unwrap();
+        let framed = self.take_framed()?;
         let mut resultset_codec = framed.into_resultset();
         resultset_codec.codec_mut().with_binary(true);
 
@@ -322,7 +326,10 @@ impl ClientConn {
     }
 
     pub async fn is_ready(&self) -> bool {
-        self.framed.as_ref().unwrap().is_ready().await
+        match self.framed.as_ref() {
+            Some(framed) => framed.is_ready().await,
+            None => false,
+        }
     }
 
     pub fn get_endpoint(&self) -> Option<String> {
@@ -330,12 +337,30 @@ impl ClientConn {
     }
 
     pub fn set_charset(&mut self, name: &str) {
-        self.framed.as_mut().unwrap().charset = name.to_string()
+        if let Some(framed) = self.framed.as_mut() {
+            if let Ok(auth_info) = framed.auth_info_mut() {
+                auth_info.charset = name.to_string()
+            }
+        }
     }
 
     pub fn set_autocommit(&mut self, status: &str) {
-        self.framed.as_mut().unwrap().auotcommit = Some(status.to_string())
+        if let Some(framed) = self.framed.as_mut() {
+            if let Ok(auth_info) = framed.auth_info_mut() {
+                auth_info.auotcommit = Some(status.to_string())
+            }
+        }
     }
+
+    fn take_framed(&mut self) -> Result<Box<ClientCodec>, ProtocolError> {
+        take_framed(&mut self.framed)
+    }
+}
+
+fn take_framed(framed: &mut Option<Box<ClientCodec>>) -> Result<Box<ClientCodec>, ProtocolError> {
+    framed
+        .take()
+        .ok_or_else(|| ProtocolError::ClientState("client codec is not initialized".to_string()))
 }
 
 impl Clone for ClientConn {
@@ -367,13 +392,14 @@ impl ConnLike for ClientConn {
 /// Implements `ConnAttr` trait
 impl ConnAttr for ClientConn {
     fn get_host(&self) -> String {
-        let sock_addr: SocketAddr = self.endpoint.parse().unwrap();
-        sock_addr.ip().to_string()
+        self.endpoint
+            .parse::<SocketAddr>()
+            .map(|sock_addr| sock_addr.ip().to_string())
+            .unwrap_or_else(|_| self.endpoint.clone())
     }
 
     fn get_port(&self) -> u16 {
-        let sock_addr: SocketAddr = self.endpoint.parse().unwrap();
-        sock_addr.port()
+        self.endpoint.parse::<SocketAddr>().map(|sock_addr| sock_addr.port()).unwrap_or(0)
     }
 
     fn get_user(&self) -> String {
@@ -385,9 +411,7 @@ impl ConnAttr for ClientConn {
     }
 
     fn get_db(&self) -> Option<String> {
-        let codec = self.framed.as_ref();
-
-        if let Some(codec) = codec {
+        if let Some(codec) = self.framed.as_ref().and_then(|codec| codec.auth_info().ok()) {
             if codec.db.is_empty() {
                 None
             } else {
@@ -399,8 +423,7 @@ impl ConnAttr for ClientConn {
     }
 
     fn get_charset(&self) -> Option<String> {
-        let codec = self.framed.as_ref();
-        if let Some(codec) = codec {
+        if let Some(codec) = self.framed.as_ref().and_then(|codec| codec.auth_info().ok()) {
             Some(codec.charset.clone())
         } else {
             None
@@ -408,8 +431,7 @@ impl ConnAttr for ClientConn {
     }
 
     fn get_autocommit(&self) -> Option<String> {
-        let codec = self.framed.as_ref();
-        if let Some(codec) = codec {
+        if let Some(codec) = self.framed.as_ref().and_then(|codec| codec.auth_info().ok()) {
             codec.auotcommit.clone()
         } else {
             None

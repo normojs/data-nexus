@@ -59,6 +59,9 @@ pub enum ProtocolError {
     #[error("stmt id not found: {0}")]
     StmtIdNotFound(u32),
 
+    #[error("invalid client connection state: {0}")]
+    ClientState(String),
+
     #[error("DEFAULT, This errors is moot")]
     Default,
 }

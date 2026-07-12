@@ -108,7 +108,7 @@ where
         let mut shard_streams = Vec::with_capacity(shards_length);
 
         for conn in conns.iter_mut() {
-            let s = ResultsetStream::new(conn.framed.as_mut());
+            let s = ResultsetStream::new(conn.framed.as_mut()).map_err(ErrorKind::Protocol)?;
             shard_streams.push(s.fuse());
         }
 
@@ -685,7 +685,9 @@ where
         let shard_length = conns.len();
         let mut shard_streams = Vec::with_capacity(shard_length);
         for conn in conns.iter_mut() {
-            shard_streams.push(ResultsetStream::new(conn.1.framed.as_mut()).fuse());
+            shard_streams.push(
+                ResultsetStream::new(conn.1.framed.as_mut()).map_err(ErrorKind::Protocol)?.fuse(),
+            );
         }
 
         let sharding_column = req.stmt_cache.get_sharding_column(stmt_id);

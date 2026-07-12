@@ -56,9 +56,15 @@ impl Deref for ClientCodec {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::ClientAuth(framed) => framed.codec(),
-            Self::Resultset(framed) => framed.codec().auth_info.as_ref().unwrap(),
-            Self::Stmt(framed) => framed.codec().auth_info.as_ref().unwrap(),
-            Self::Common(framed) => framed.codec().auth_info.as_ref().unwrap(),
+            Self::Resultset(framed) => {
+                framed.codec().auth_info.as_ref().expect("resultset codec missing auth info")
+            }
+            Self::Stmt(framed) => {
+                framed.codec().auth_info.as_ref().expect("stmt codec missing auth info")
+            }
+            Self::Common(framed) => {
+                framed.codec().auth_info.as_ref().expect("common codec missing auth info")
+            }
         }
     }
 }
@@ -68,14 +74,50 @@ impl DerefMut for ClientCodec {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
             Self::ClientAuth(framed) => framed.codec_mut(),
-            Self::Resultset(framed) => framed.codec_mut().auth_info.as_mut().unwrap(),
-            Self::Stmt(framed) => framed.codec_mut().auth_info.as_mut().unwrap(),
-            Self::Common(framed) => framed.codec_mut().auth_info.as_mut().unwrap(),
+            Self::Resultset(framed) => {
+                framed.codec_mut().auth_info.as_mut().expect("resultset codec missing auth info")
+            }
+            Self::Stmt(framed) => {
+                framed.codec_mut().auth_info.as_mut().expect("stmt codec missing auth info")
+            }
+            Self::Common(framed) => {
+                framed.codec_mut().auth_info.as_mut().expect("common codec missing auth info")
+            }
         }
     }
 }
 
 impl ClientCodec {
+    pub fn auth_info(&self) -> Result<&ClientAuth, ProtocolError> {
+        match self {
+            Self::ClientAuth(framed) => Ok(framed.codec()),
+            Self::Resultset(framed) => framed.codec().auth_info.as_ref().ok_or_else(|| {
+                ProtocolError::ClientState("resultset codec missing auth info".to_string())
+            }),
+            Self::Stmt(framed) => framed.codec().auth_info.as_ref().ok_or_else(|| {
+                ProtocolError::ClientState("stmt codec missing auth info".to_string())
+            }),
+            Self::Common(framed) => framed.codec().auth_info.as_ref().ok_or_else(|| {
+                ProtocolError::ClientState("common codec missing auth info".to_string())
+            }),
+        }
+    }
+
+    pub fn auth_info_mut(&mut self) -> Result<&mut ClientAuth, ProtocolError> {
+        match self {
+            Self::ClientAuth(framed) => Ok(framed.codec_mut()),
+            Self::Resultset(framed) => framed.codec_mut().auth_info.as_mut().ok_or_else(|| {
+                ProtocolError::ClientState("resultset codec missing auth info".to_string())
+            }),
+            Self::Stmt(framed) => framed.codec_mut().auth_info.as_mut().ok_or_else(|| {
+                ProtocolError::ClientState("stmt codec missing auth info".to_string())
+            }),
+            Self::Common(framed) => framed.codec_mut().auth_info.as_mut().ok_or_else(|| {
+                ProtocolError::ClientState("common codec missing auth info".to_string())
+            }),
+        }
+    }
+
     pub async fn is_ready(&self) -> bool {
         let local_stream = match self {
             Self::ClientAuth(framed) => framed.get_ref(),
@@ -230,13 +272,24 @@ pub struct ResultsetStream<'a> {
 }
 
 impl<'a> ResultsetStream<'a> {
-    pub fn new(framed: Option<&'a mut Box<ClientCodec>>) -> ResultsetStream {
-        let framed = match framed.unwrap().as_mut() {
+    pub fn new(
+        framed: Option<&'a mut Box<ClientCodec>>,
+    ) -> Result<ResultsetStream<'a>, ProtocolError> {
+        let framed = framed.ok_or_else(|| {
+            ProtocolError::ClientState(
+                "resultset stream requires an active client codec".to_string(),
+            )
+        })?;
+        let framed = match framed.as_mut() {
             ClientCodec::Resultset(data) => data,
-            _ => unreachable! {},
+            _ => {
+                return Err(ProtocolError::ClientState(
+                    "resultset stream requires resultset codec".to_string(),
+                ))
+            }
         };
 
-        ResultsetStream { framed }
+        Ok(ResultsetStream { framed })
     }
 
     pub fn is_binary(&self) -> bool {
@@ -380,13 +433,22 @@ pub struct CommonStream<'a> {
 }
 
 impl<'a> CommonStream<'a> {
-    pub fn new(framed: Option<&'a mut Box<ClientCodec>>) -> CommonStream {
-        let framed = match framed.unwrap().as_mut() {
+    pub fn new(
+        framed: Option<&'a mut Box<ClientCodec>>,
+    ) -> Result<CommonStream<'a>, ProtocolError> {
+        let framed = framed.ok_or_else(|| {
+            ProtocolError::ClientState("common stream requires an active client codec".to_string())
+        })?;
+        let framed = match framed.as_mut() {
             ClientCodec::Common(data) => data,
-            _ => unreachable! {},
+            _ => {
+                return Err(ProtocolError::ClientState(
+                    "common stream requires common codec".to_string(),
+                ))
+            }
         };
 
-        CommonStream { framed }
+        Ok(CommonStream { framed })
     }
 }
 

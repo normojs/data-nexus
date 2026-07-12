@@ -81,7 +81,7 @@ impl Parser {
         if !errs.is_empty() {
             Err(errs)
         } else {
-            Ok(res.unwrap())
+            res.ok_or_else(|| vec![ParseError::new("parser returned no result".to_string())])
         }
     }
 }
