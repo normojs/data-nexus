@@ -1,0 +1,275 @@
+// Copyright 2022 SphereEx Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::sync::Arc;
+
+use endpoint::endpoint::Endpoint;
+use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
+use serde::{Deserialize, Serialize};
+use strategy::config::{ReadWriteSplitting, Sharding, TargetRole};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
+};
+
+use crate::listener::Listener;
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ProxiesConfig {
+    pub config: Option<Vec<ProxyConfig>>,
+}
+
+/// 代理权限配置
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ProxyAuthConfig {
+    #[serde(default = "default_auto_proxy_auth_level")]
+    pub level: u8,
+    #[serde(default = "default_auto_proxy_auth_db")]
+    pub db: String,
+    #[serde(default = "default_auto_proxy_user")]
+    pub user: String,
+    #[serde(default = "default_auto_proxy_password")]
+    pub password: String,
+}
+
+/// 代理配置
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ProxyConfig {
+    #[serde(default = "default_auto_proxy_level")]
+    pub level: u8,
+    #[serde(default = "default_auto_proxy_note_type")]
+    pub node_type: String,
+    #[serde(default = "default_auto_proxy_backend_type")]
+    #[deprecated(note = "废弃")]
+    pub backend_type: String,
+    #[serde(default = "default_auto_proxy_name")]
+    pub name: String,
+    #[serde(default = "default_auto_proxy_listen_addr")]
+    pub listen_addr: String,
+    #[serde(default = "default_auto_proxy_user")]
+    pub user: String,
+    #[serde(default = "default_auto_proxy_password")]
+    pub password: String,
+    #[serde(default = "default_auto_proxy_db")]
+    pub db: String,
+    #[serde(default = "default_auto_pool_size")]
+    pub pool_size: u8,
+    #[serde(default = "default_auto_strategy")]
+    pub strategy: String,
+    #[serde(default = "default_auto_server_version")]
+    pub server_version: String,
+    pub sharding: Option<Vec<Sharding>>,
+    pub simple_loadbalance: Option<ProxySimpleLoadBalance>,
+    pub plugin: Option<plugin::config::Plugin>,
+    // read write splitting config structure
+    pub read_write_splitting: Option<ReadWriteSplitting>,
+    pub cloud: Option<ProxyCloudConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProxyConfigMasterSlave {
+    master: Option<Vec<String>>,
+    slave: Option<Vec<String>>,
+    balance_type: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ProxyCloudConfig {
+    pub data_type: String,
+    pub node_type: String,
+    pub host: String,
+    pub user: String,
+    pub password: String,
+    pub db: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProxySimpleLoadBalance {
+    #[serde(default = "default_auto_balance_type")]
+    pub balance_type: AlgorithmName,
+    pub nodes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UniSQLNodes {
+    pub node: Option<Vec<UniSQLNode>>,
+}
+
+// #[derive(Debug, Serialize, Deserialize, Clone)]
+// pub struct MySQLNode {
+//     pub name: String,
+//     pub db: String,
+//     pub user: String,
+//     pub password: String,
+//     #[serde(default = "default_mysql_node_host")]
+//     pub host: String,
+//     #[serde(default = "default_mysql_node_port")]
+//     pub port: u32,
+//     #[serde(default = "default_mysql_node_weight")]
+//     pub weight: i64,
+//     pub role: TargetRole,
+// }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UniSQLNode {
+    pub version: String,
+    // 节点类型: mysql/postgresql等
+    #[serde(default = "default_auto_proxy_node_type")]
+    pub node_type: String,
+    pub name: String,
+    pub db: String,
+    pub user: String,
+    pub password: String,
+    #[serde(default = "default_unisql_node_host")]
+    pub host: String,
+    #[serde(default = "default_unisql_node_port")]
+    pub port: u32,
+    #[serde(default = "default_unisql_node_weight")]
+    pub weight: i64,
+    pub role: TargetRole,
+}
+
+fn default_auto_proxy_node_type() -> String {
+    "".into()
+}
+
+fn default_auto_proxy_name() -> String {
+    "".into()
+}
+
+fn default_auto_proxy_listen_addr() -> String {
+    "0.0.0.0:3306".into()
+}
+
+fn default_auto_proxy_user() -> String {
+    "".into()
+}
+
+fn default_auto_proxy_password() -> String {
+    "".into()
+}
+
+fn default_auto_proxy_note_type() -> String {
+    "".into()
+}
+
+fn default_auto_proxy_level() -> u8 {
+    1
+}
+fn default_auto_proxy_auth_level() -> u8 {
+    5
+}
+
+fn default_auto_proxy_backend_type() -> String {
+    "".into()
+}
+
+fn default_auto_pool_size() -> u8 {
+    64
+}
+
+fn default_auto_strategy() -> String {
+    "simple_balance".into()
+}
+
+fn default_auto_proxy_db() -> String {
+    "".into()
+}
+
+fn default_auto_proxy_auth_db() -> String {
+    "unisql-config".into()
+}
+
+fn default_auto_balance_type() -> AlgorithmName {
+    AlgorithmName::Random
+}
+
+fn default_unisql_node_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_unisql_node_port() -> u32 {
+    3306
+}
+
+fn default_auto_server_version() -> String {
+    "5.7.37".to_string()
+}
+
+fn default_unisql_node_weight() -> i64 {
+    1
+}
+
+impl From<UniSQLNode> for Endpoint {
+    fn from(node: UniSQLNode) -> Self {
+        Self {
+            node_type: node.node_type,
+            weight: node.weight,
+            name: node.name,
+            db: node.db,
+            user: node.user,
+            password: node.password,
+            addr: format!("{}:{}", node.host, node.port),
+        }
+    }
+}
+
+pub struct Proxy {
+    pub listener: Listener,
+    pub app: ProxyConfig,
+    pub backend_nodes: Vec<UniSQLNode>,
+    pub nodes: Vec<UniSQLNode>,
+}
+
+impl Proxy {
+    pub fn build_listener(&mut self) -> Result<TcpListener, std::io::Error> {
+        self.listener.build_listener()
+    }
+
+    pub async fn accept(&mut self, listener: &TcpListener) -> Result<TcpStream, std::io::Error> {
+        self.listener.accept(listener).await
+    }
+
+    pub fn build_loadbalance(
+        &mut self,
+        nodes: Vec<String>,
+    ) -> Result<Arc<Mutex<BalanceType>>, std::io::Error> {
+        let mut balance = Balance {};
+
+        let lb = match &self.app.simple_loadbalance {
+            Some(lb) => lb,
+            None => return Err(std::io::Error::new(std::io::ErrorKind::Other, "config error")),
+        };
+
+        let mut balancer = balance.build_balance(lb.balance_type.clone());
+        for node in self.backend_nodes.clone() {
+            match nodes.iter().find(|&x| x == node.name.as_str()) {
+                Some(_) => {
+                    let endpoint = Endpoint {
+                        node_type: node.node_type,
+                        name: node.name,
+                        addr: format!("{}:{}", node.host, node.port),
+                        db: node.db,
+                        user: node.user,
+                        password: node.password,
+                        weight: node.weight,
+                    };
+                    balancer.add(endpoint);
+                }
+                _ => continue,
+            }
+        }
+        Ok(Arc::new(Mutex::new(balancer)))
+    }
+}

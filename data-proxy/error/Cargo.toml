@@ -1,0 +1,13 @@
+
+[package]
+name = "error"
+version = "0.1.0"
+edition = "2021"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+mysql_parser = { path = "../parser/mysql" }
+mysql_protocol = { path = "../protocol/mysql", package = "mysql_protocol" }
+postgresql_protocol = { path = "../protocol/postgresql", package = "postgresql_protocol" }
+
+thiserror = "1.0"

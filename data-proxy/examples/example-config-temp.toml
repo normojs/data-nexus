@@ -1,0 +1,82 @@
+# run --package pisa-proxy --bin proxy daemon --config examples/example-config.toml
+# run --package pisa-proxy --bin proxy daemon --config data-proxy/examples/example-config.toml
+# api 配置块，对应命令行参数和环境变量
+[admin]
+# api 地址
+host = "0.0.0.0"
+# api 端口
+port = 8082
+# 日志级别
+log_level = "INFO"
+
+# pisa-proxy 代理配置块
+[proxy]
+# 权限配置 - 配置代理账号、数据库权限、表权限、视图权限、字段权限
+[[proxy.auth.config]]
+level = 5
+db = "data-nexus"
+# 数据库 user
+user = "root"
+# 数据库 password
+password = "my-secret-pw"
+# 数据库地址
+host = "192.168.1.254"
+# 数据库端口
+port = 3306
+
+# config a proxy
+[[proxy.config]]
+# 必须proxy开头
+name = "proxy001"
+# 数据库配置默认为5，数字越小优先级越大
+level = 1
+# proxy 代理地址
+listen_addr = "0.0.0.0:9088"
+# proxy 认证用户名
+user = "root"
+# proxy 认证密码
+password = "12345678"
+# proxy schema
+db = "test"
+node_type = "mysql"
+# 废弃配置后端数据源类型
+backend_type = "mysql"
+# proxy 与后端数据库建连连接池大小，值范围：1 ~ 255, 默认值：64
+pool_size = 3
+# 服务端版本
+server_version = "8.1.0"
+version = "5.7.37"
+
+# TODO: 云端配置，用以替换proxy.config部分参数
+# TODO: 调用/update接口更新配置
+# TODO: 本地配置
+#[proxy.config.cloud]
+#data_type = "database" # 暂时只支持数据库。 database | api
+#node_type = "mysql" # 暂时只支持MySQL
+#host = "192.168.1.254:3306"
+#user = "root"
+#password = "my-secret-pw"
+#db = "pandasql-config"
+
+
+
+# 后端数据源配置，cloud进行替代
+[nodes]
+[[nodes.node]]
+version = "8.1.0"
+node_type = "mysql"
+# 数据源 name
+name = "node001"
+# database name
+db = "uni-proxy"
+# 数据库 user
+user = "root"
+# 数据库 password
+password = "my-secret-pw"
+# 数据库地址
+host = "192.168.1.254"
+# 数据库端口
+port = 3306
+# 负载均衡节点权重
+weight = 1
+role = "read"

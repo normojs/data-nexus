@@ -1,0 +1,9 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lru = "0.7.6"
+mysql_parser = { path = "../../parser/mysql" }
+pisa_error = { path = "../../error", package = "error" }

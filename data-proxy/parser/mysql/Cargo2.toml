@@ -1,0 +1,27 @@
+[package]
+name = "mysql_parser"
+version = "0.1.1"
+authors = ["wujiandong@sphere-ex.com"]
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "mysql_parser"
+
+[build-dependencies]
+cfgrammar = "0.13.3"
+lrlex = "0.13.3"
+lrpar = "0.13.3"
+syn = { version = "2.0.38", features = ["full", "extra-traits"] }
+#syn = { version = "1.0.88", features = ["full", "extra-traits"] }
+
+[dependencies]
+cfgrammar = "0.13.3"
+enum-as-inner = "0.6.0"
+lazy_static = "1.4.0"
+lrlex = "0.13.3"
+lrpar = "0.13.3"
+lrtable = "0.13.3"
+thiserror = "1.0"
+
+

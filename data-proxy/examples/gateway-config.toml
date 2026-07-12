@@ -1,0 +1,49 @@
+# Native Data Nexus v2 configuration.
+# The frontend listener protocol and backend service protocol are independent.
+
+version = "2"
+
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+
+[[listeners]]
+name = "orders-mysql"
+listen_addr = "0.0.0.0:9088"
+protocol = "my_sql"
+service = "orders"
+auth_policy = "orders-users"
+
+[[services]]
+name = "orders"
+backend_protocol = "my_sql"
+endpoints = ["orders-primary", "orders-replica"]
+route_policy = "orders-balance"
+plugin_policies = ["orders-audit"]
+
+[[endpoints]]
+name = "orders-primary"
+protocol = "my_sql"
+address = "127.0.0.1:3306"
+database = "orders"
+weight = 1
+
+[[endpoints]]
+name = "orders-replica"
+protocol = "my_sql"
+address = "127.0.0.1:3307"
+database = "orders"
+weight = 1
+
+[[route_policies]]
+name = "orders-balance"
+kind = "simple_load_balance"
+
+[[auth_policies]]
+name = "orders-users"
+kind = "static"
+
+[[plugin_policies]]
+name = "orders-audit"
+kind = "audit"

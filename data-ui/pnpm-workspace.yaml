@@ -1,0 +1,15 @@
+workspaces:
+  - 'packages/*'
+
+ignoredBuiltDependencies:
+  - '@parcel/watcher'
+  # - better-sqlite3
+  - esbuild
+  - sharp
+  - unrs-resolver
+
+# issues: Cannot start nuxt:  Could not locate the bindings file. Tried:
+# fix: https://github.com/nuxt/content/issues/3329
+# pnpm approve-builds && pnpm rebuild
+onlyBuiltDependencies:
+  - better-sqlite3
