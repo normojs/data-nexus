@@ -131,7 +131,7 @@ pub fn route(
     input_typ: RouteInputTyp,
     raw_sql: &str,
     strategy: Arc<parking_lot::Mutex<RouteStrategy>>,
-) -> Endpoint {
+) -> Result<Endpoint, Error> {
     let mut strategy = strategy.lock();
     let input = match input_typ {
         RouteInputTyp::Statement => RouteInput::Statement(raw_sql),
@@ -139,13 +139,13 @@ pub fn route(
         _ => RouteInput::None,
     };
 
-    let dispatch_res = strategy.dispatch(&input).unwrap();
+    let dispatch_res = strategy.dispatch(&input).map_err(route_runtime_error)?;
     debug!(
         "route_strategy rw + sharding to {:?} for input typ: {:?}, sql: {:?}",
         dispatch_res, input_typ, raw_sql
     );
 
-    return dispatch_res.0.unwrap();
+    dispatch_res.0.ok_or_else(|| missing_route_endpoint(input_typ, raw_sql))
 }
 
 pub fn route_sharding(
@@ -153,7 +153,7 @@ pub fn route_sharding(
     raw_sql: &str,
     strategy: Arc<parking_lot::Mutex<RouteStrategy>>,
     rewrite_outputs: &mut ShardingRewriteOutput,
-) {
+) -> Result<(), Error> {
     let mut strategy = strategy.lock();
     for o in rewrite_outputs.results.iter_mut() {
         match &o.ds_idx.ds {
@@ -184,17 +184,31 @@ pub fn route_sharding(
                     _ => RouteInput::None,
                 };
 
-                let dispatch_res = strategy.dispatch(&input).unwrap();
+                let dispatch_res = strategy.dispatch(&input).map_err(route_runtime_error)?;
                 debug!(
                     "route_strategy rw + sharding to {:?} for input typ: {:?}, sql: {:?}",
                     dispatch_res, input_typ, raw_sql
                 );
                 // reassign data_source, type should is DataSource::Endpoint
-                o.ds_idx.ds = DataSource::Endpoint(dispatch_res.0.unwrap());
+                o.ds_idx.ds = DataSource::Endpoint(
+                    dispatch_res.0.ok_or_else(|| missing_route_endpoint(input_typ, raw_sql))?,
+                );
             }
             _ => unreachable!(),
         }
     }
+    Ok(())
+}
+
+fn route_runtime_error(error: BoxError) -> Error {
+    Error::new(ErrorKind::Runtime(error))
+}
+
+fn missing_route_endpoint(input_typ: RouteInputTyp, raw_sql: &str) -> Error {
+    Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("route dispatch returned no endpoint for {:?}: {}", input_typ, raw_sql),
+    ))))
 }
 pub struct TransEvent {
     name: TransEventName,
@@ -439,7 +453,12 @@ impl TransFsm {
         _attrs: &[SessionAttr],
     ) -> Result<PoolConn<ClientConn>, Error> {
         let conn = self.client_conn.take();
-        Ok(conn.unwrap())
+        conn.ok_or_else(|| {
+            Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "transaction FSM has no bound backend connection",
+            ))))
+        })
         //let addr = self.endpoint.as_ref().unwrap().addr.as_ref();
         //match conn {
         //    Some(client_conn) => Ok(client_conn),
@@ -473,12 +492,19 @@ impl TransFsm {
 }
 
 #[inline]
-pub fn build_conn_attrs(sess: &ServerHandshakeCodec) -> Vec<SessionAttr> {
-    vec![
+pub fn build_conn_attrs(sess: &ServerHandshakeCodec) -> Result<Vec<SessionAttr>, Error> {
+    let charset = sess.get_charset().ok_or_else(|| {
+        Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mysql session charset is missing",
+        ))))
+    })?;
+
+    Ok(vec![
         SessionAttr::DB(sess.get_db()),
-        SessionAttr::Charset(sess.get_charset().unwrap()),
+        SessionAttr::Charset(charset),
         SessionAttr::Autocommit(sess.get_autocommit()),
-    ]
+    ])
 }
 
 #[cfg(test)]

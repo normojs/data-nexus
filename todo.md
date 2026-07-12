@@ -109,7 +109,8 @@
   - [x] 将 MySQL `COM_QUERY`、`COM_INIT_DB`、`COM_STMT_PREPARE` 文本 payload 的 UTF-8 `unwrap()` 改为协议错误返回。
   - [x] 将 MySQL metrics 采集前的 endpoint `unwrap()` 改为缺失 endpoint 时返回协议错误。
   - [x] 将 MySQL sharding rewriter 与 concurrency-control plugin 状态 `unwrap()` 改为显式错误返回。
-  - [ ] 继续清理 MySQL FSM、executor、packet/session/parser 路径中的 `unwrap()`。
+  - [x] 将 MySQL FSM route dispatch、事务连接、session charset `unwrap()` 改为显式错误返回。
+  - [ ] 继续清理 MySQL executor、packet/session/parser 路径中的 `unwrap()`。
 - [ ] 配置错误在启动阶段 fail fast，并输出明确错误信息。
 
 ## Admin API

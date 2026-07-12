@@ -103,13 +103,13 @@ where
         raw_sql: &str,
     ) -> Result<PoolConn<ClientConn>, Error> {
         let sess = req.framed.codec_mut().get_session();
-        let attrs = build_conn_attrs(sess);
+        let attrs = build_conn_attrs(sess)?;
         let is_get_conn = req.fsm.trigger(state_name);
         if is_get_conn {
             return Self::fsm_get_new_conn(req, raw_sql, input_typ, &attrs).await;
         }
 
-        let endpoint = route(input_typ, raw_sql, req.route_strategy.clone());
+        let endpoint = route(input_typ, raw_sql, req.route_strategy.clone())?;
         req.fsm.get_conn_with_endpoint(endpoint, &attrs).await
     }
 
@@ -119,7 +119,7 @@ where
         input_typ: RouteInputTyp,
         attrs: &[SessionAttr],
     ) -> Result<PoolConn<ClientConn>, Error> {
-        let endpoint = route(input_typ, raw_sql, req.route_strategy.clone());
+        let endpoint = route(input_typ, raw_sql, req.route_strategy.clone())?;
         let factory =
             ClientConn::with_opts(endpoint.user, endpoint.password, endpoint.addr.clone());
         req.pool.set_factory(&endpoint.addr, factory);
@@ -163,7 +163,7 @@ where
         req.stmt_id.fetch_add(1, Ordering::Relaxed);
         let stmt_id = req.stmt_id.load(Ordering::Relaxed);
         let sess = req.framed.codec_mut().get_session();
-        let attrs = build_conn_attrs(sess);
+        let attrs = build_conn_attrs(sess)?;
         let raw_sql = decode_mysql_text_payload("COM_STMT_PREPARE", payload)?;
         let (_, input_typ, rewrite_outputs) = Self::query_rewrite(req, raw_sql)?;
         req.rewrite_outputs = rewrite_outputs;
@@ -185,7 +185,7 @@ where
             return res;
         }
 
-        route_sharding(input_typ, raw_sql, req.route_strategy.clone(), &mut req.rewrite_outputs);
+        route_sharding(input_typ, raw_sql, req.route_strategy.clone(), &mut req.rewrite_outputs)?;
         let sharding_column = req.rewrite_outputs.results[0].ds_idx.column.clone();
         debug!(
             "prepare rewrite outputs {:?} {:?} {:?}",
@@ -309,7 +309,7 @@ where
 
     async fn shard_query_inner(req: &mut ReqContext<T, C>, payload: &[u8]) -> Result<(), Error> {
         let sess = req.framed.codec_mut().get_session();
-        let attrs = build_conn_attrs(sess);
+        let attrs = build_conn_attrs(sess)?;
         let raw_sql = decode_mysql_text_payload("COM_QUERY", payload)?;
         let (is_get_conn, input_typ, rewrite_outputs) = Self::query_rewrite(req, raw_sql)?;
         req.rewrite_outputs = rewrite_outputs;
@@ -322,7 +322,7 @@ where
             return res;
         }
 
-        route_sharding(input_typ, raw_sql, req.route_strategy.clone(), &mut req.rewrite_outputs);
+        route_sharding(input_typ, raw_sql, req.route_strategy.clone(), &mut req.rewrite_outputs)?;
         Executor::shard_query_executor(req, attrs, is_get_conn).await?;
         Ok(())
     }
@@ -363,7 +363,7 @@ where
         // 获取会话信息
         let sess = req.framed.codec_mut().get_session();
         // 构建连接属性
-        let attrs = build_conn_attrs(sess);
+        let attrs = build_conn_attrs(sess)?;
         // 将payload转换为字符串并清理
         let sql = decode_mysql_text_payload("COM_QUERY", payload)?;
         // 进行查询重写和分析
@@ -372,7 +372,7 @@ where
         // 判断是否需要获取新连接
         if is_get_conn {
             // 根据输入类型和SQL进行路由，确定目标数据库地址
-            let endpoint = route(input_typ, sql, req.route_strategy.clone());
+            let endpoint = route(input_typ, sql, req.route_strategy.clone())?;
             // 创建新的客户端连接工厂
             let factory =
                 ClientConn::with_opts(endpoint.user, endpoint.password, endpoint.addr.clone());
@@ -852,7 +852,8 @@ where
         }
 
         let sess = cx.framed.codec_mut().get_session();
-        let mut client_conn = cx.fsm.get_conn(&build_conn_attrs(sess)).await?;
+        let attrs = build_conn_attrs(sess)?;
+        let mut client_conn = cx.fsm.get_conn(&attrs).await?;
         let ep = client_conn.get_endpoint();
         let ep_addr = required_endpoint_addr("COM_EXECUTE", &ep)?;
 
