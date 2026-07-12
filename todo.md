@@ -117,6 +117,7 @@
   - [x] 将 MySQL parser 顶层结果、client framed/session state、result/common stream 构造中的关键 `unwrap()` 改为显式错误或非 panic 路径。
   - [x] 将 MySQL client auth 握手包解析、auth switch、公钥认证中的关键 `unwrap()` 改为协议错误返回。
   - [x] 将 MySQL client/server stream TLS 升级与 Plain stream poll 中的关键 `unwrap()` 改为协议错误或 IO 错误返回。
+  - [x] 将 MySQL server auth 握手响应中的用户名、认证数据、schema、插件名解析 `unwrap()` 改为协议错误返回。
   - [ ] 继续清理 MySQL packet/session/parser 路径中的 `unwrap()`。
 - [ ] 配置错误在启动阶段 fail fast，并输出明确错误信息。
 

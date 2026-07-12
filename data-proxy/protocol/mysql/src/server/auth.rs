@@ -20,7 +20,7 @@ use std::{
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
 use tokio_util::codec::{Decoder, Encoder, Framed};
-use tracing::{debug, error, field::debug};
+use tracing::{debug, error};
 
 use super::{err::MySQLError, stream::LocalStream};
 use crate::{
@@ -107,6 +107,50 @@ pub struct ServerHandshakeCodec {
     autocommit: Option<String>,
     /// 下一个握手状态
     next_handshake_status: ServerHandshakeStatus,
+}
+
+fn ensure_packet_len(method: &str, data: &BytesMut, needed: usize) -> Result<(), ProtocolError> {
+    if data.len() < needed {
+        return Err(invalid_packet(method, data));
+    }
+
+    Ok(())
+}
+
+fn invalid_packet(method: &str, data: &[u8]) -> ProtocolError {
+    ProtocolError::InvalidPacket { method: method.to_string(), data: data.to_vec() }
+}
+
+fn read_null_terminated_bytes(
+    method: &str,
+    data: &mut BytesMut,
+) -> Result<BytesMut, ProtocolError> {
+    let idx = data.iter().position(|&x| x == 0).ok_or_else(|| invalid_packet(method, data))?;
+    let value = data.split_to(idx);
+    ensure_packet_len(method, data, 1)?;
+    let _ = data.get_u8();
+    Ok(value)
+}
+
+fn read_null_terminated_string(method: &str, data: &mut BytesMut) -> Result<String, ProtocolError> {
+    let value = read_null_terminated_bytes(method, data)?;
+    str::from_utf8(&value)
+        .map(|value| value.to_string())
+        .map_err(|_| invalid_packet(method, &value))
+}
+
+fn read_length_encoded_bytes(
+    method: &str,
+    data: &mut BytesMut,
+) -> Result<(Vec<u8>, bool), ProtocolError> {
+    ensure_packet_len(method, data, 1)?;
+    let (length, is_null, _) = data.get_lenc_int();
+    if length < 1 {
+        return Ok((vec![0xfb], is_null));
+    }
+
+    ensure_packet_len(method, data, length as usize)?;
+    Ok((data.split_to(length as usize).to_vec(), false))
 }
 
 impl ServerHandshakeCodec {
@@ -210,10 +254,7 @@ impl ServerHandshakeCodec {
     }
 
     fn decode_handshake_response(&mut self, data: &mut BytesMut) -> Result<(), ProtocolError> {
-        // 这个函数的功能是找到一个字节切片data中第一个值为0的元素的索引，并返回该索引。如果字节切片中没有值为0的元素，则会抛出一个unwrap错误。
-        let idx = data.iter().position(|&x| x == 0).unwrap();
-        // 将字节切片data中从索引idx开始到末尾的部分转换为一个字符串user
-        let user = str::from_utf8(&data.split_to(idx)).unwrap().to_string();
+        let user = read_null_terminated_string("decode_handshake_response", data)?;
 
         // 如果user与self.user不相等，则会使用数据库里的数据进行处理，并抛出一个ProtocolError::AuthFailed错误。
         if user != self.user {
@@ -223,49 +264,42 @@ impl ServerHandshakeCodec {
             return Err(ProtocolError::AuthFailed(self.make_auth_err_info()));
         }
 
-        let _ = data.get_u8();
-
         // length encoded data
         // CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA：这个标志位通常用于指示客户端支持使用长度编码的插件认证数据
         // @see mysql_const.rs:196#CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
         if self.capability & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA > 0 {
             // 长编码数据
-            let (auth_data, is_null) = length_encoded_string(data);
+            let (auth_data, is_null) =
+                read_length_encoded_bytes("decode_handshake_response", data)?;
             if is_null {
                 return Err(ProtocolError::AuthFailed(self.make_auth_lenc_err_info()));
             }
             self.auth_data = BytesMut::from(&auth_data[..]);
             debug!("capability support `CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA`");
         } else if self.capability & CLIENT_SECURE_CONNECTION > 0 {
+            ensure_packet_len("decode_handshake_response", data, 1)?;
             let n = data.get_u8() as usize;
+            ensure_packet_len("decode_handshake_response", data, n)?;
             self.auth_data = data.split_to(n);
             debug!("capability support `CLIENT_SECURE_CONNECTION`");
         } else {
-            let idx = data.iter().position(|&x| x == 0).unwrap();
-            self.auth_data = data.split_to(idx);
-            let _ = data.get_u8();
+            self.auth_data = read_null_terminated_bytes("decode_handshake_response", data)?;
             debug!("capability support `CLIENT_SECURE_CONNECTION`");
         }
 
         // 携带了数据库信息
         if self.capability & CLIENT_CONNECT_WITH_DB > 0 && !data.is_empty() {
-            let idx = data.iter().position(|&x| x == 0).unwrap();
-            let db = str::from_utf8(&data.split_to(idx)).unwrap().to_string();
+            let db = read_null_terminated_string("decode_handshake_response", data)?;
             // TODO：使用数据库配置，判断是否有改权限
             if self.db != db {
                 self.db = db;
                 // TODO: 错误改成权限错误
                 return Err(ProtocolError::AuthFailed(self.make_schema_err_info()));
             }
-
-            // Eat db \0
-            let _ = data.get_u8();
         }
 
         if self.capability & CLIENT_PLUGIN_AUTH > 0 {
-            let idx = data.iter().position(|&x| x == 0).unwrap();
-            self.auth_plugin_name = str::from_utf8(&data.split_to(idx)).unwrap().to_string();
-            let _ = data.get_u8();
+            self.auth_plugin_name = read_null_terminated_string("decode_handshake_response", data)?;
         } else {
             self.auth_plugin_name = AUTH_NATIVE_PASSWORD.to_string()
         }
