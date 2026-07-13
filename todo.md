@@ -53,7 +53,6 @@
 - [ ] 支持 PostgreSQL 后端连接池。
 - [ ] 支持 PostgreSQL simple query 基础链路。
 - [ ] 支持 PostgreSQL session 状态同步。
-- [ ] 增加 PostgreSQL v2 example config。
 - [ ] 支持 MySQL listener 和 PostgreSQL listener 同时存在。
 - [ ] 在 metrics 中区分 service、frontend protocol、backend protocol、endpoint。
 

@@ -380,6 +380,8 @@ impl std::error::Error for GatewayConfigLoadError {}
 
 #[cfg(test)]
 mod test {
+    use gateway_core::ProtocolKind;
+
     use super::*;
 
     #[test]
@@ -419,6 +421,24 @@ mod test {
         assert_eq!(config.gateway.listeners.len(), 1);
         assert_eq!(config.gateway.services.len(), 1);
         assert_eq!(config.gateway.endpoints.len(), 2);
+    }
+
+    #[test]
+    fn parses_and_validates_postgresql_gateway_config() {
+        let config = GatewayConfigDocument::from_toml(include_str!(
+            "../../../examples/postgresql-gateway-config.toml"
+        ))
+        .unwrap();
+
+        assert_eq!(config.gateway.listeners.len(), 1);
+        assert_eq!(config.gateway.listeners[0].protocol, ProtocolKind::PostgreSql);
+        assert_eq!(config.gateway.services[0].backend_protocol, ProtocolKind::PostgreSql);
+        assert_eq!(config.gateway.endpoints.len(), 2);
+        assert!(config
+            .gateway
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.protocol == ProtocolKind::PostgreSql));
     }
 
     #[test]
