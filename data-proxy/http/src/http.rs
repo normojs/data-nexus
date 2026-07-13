@@ -19,13 +19,14 @@ use axum::{
     extract::State,
     http::{header, StatusCode},
     response::Response,
-    routing::{get, post},
+    routing::get,
     Router,
 };
-use config::config::PisaProxyConfig;
+use config::config::{GatewayConfigDocument, PisaProxyConfig};
 use pisa_error::error::*;
 use pisa_metrics::metrics::MetricsManager;
-use tracing::{error, info};
+use serde::Serialize;
+use tracing::info;
 use ver::version::get_version;
 
 #[async_trait::async_trait]
@@ -45,11 +46,28 @@ pub enum HttpServerKind {
 #[derive(Debug)]
 pub struct PisaHttpServerFactory {
     pisa_config: PisaProxyConfig,
+    gateway_config: Option<GatewayConfigDocument>,
     metrics_manager: MetricsManager,
 }
 impl PisaHttpServerFactory {
     pub fn new(pcfg: PisaProxyConfig, mgr: MetricsManager) -> PisaHttpServerFactory {
-        PisaHttpServerFactory { pisa_config: pcfg, metrics_manager: mgr }
+        PisaHttpServerFactory { pisa_config: pcfg, gateway_config: None, metrics_manager: mgr }
+    }
+
+    pub fn new_gateway(
+        gateway_config: GatewayConfigDocument,
+        mgr: MetricsManager,
+    ) -> PisaHttpServerFactory {
+        let pisa_config = PisaProxyConfig {
+            admin: gateway_config.admin.clone(),
+            version: gateway_config.version.clone(),
+            ..PisaProxyConfig::default()
+        };
+        PisaHttpServerFactory {
+            pisa_config,
+            gateway_config: Some(gateway_config),
+            metrics_manager: mgr,
+        }
     }
 }
 
@@ -59,13 +77,10 @@ impl HttpFactory for PisaHttpServerFactory {
             HttpServerKind::Axum => {
                 let xx = AxumServer {
                     pisa_config: self.pisa_config.clone(),
+                    gateway_config: self.gateway_config.clone(),
                     metrics_manager: self.metrics_manager.clone(),
                 };
                 return Box::new(xx);
-            }
-            _ => {
-                error!("参数错误，无法启动：{:?}", kind);
-                panic!("参数错误，无法启动");
             }
         }
     }
@@ -78,6 +93,7 @@ pub async fn new_http_server(mut s: Box<dyn HttpServer + Send>) {
 #[derive(Clone, Debug)]
 pub struct AxumServer {
     pisa_config: PisaProxyConfig,
+    gateway_config: Option<GatewayConfigDocument>,
     metrics_manager: MetricsManager,
 }
 
@@ -90,9 +106,11 @@ impl AxumServer {
             .route("/version", get(Self::version))
             .route("/healthz", get(Self::healthz))
             .route("/metrics", get(Self::metrics))
-            // TODO：添加配置管理
-            // .route("/config", get(Self::get_config))
-            // .route("/config", post(Self::post_config))
+            .route("/config", get(Self::admin_config))
+            .route("/admin/config", get(Self::admin_config))
+            .route("/admin/listeners", get(Self::admin_listeners))
+            .route("/admin/services", get(Self::admin_services))
+            .route("/admin/endpoints", get(Self::admin_endpoints))
             .with_state(state)
     }
 
@@ -114,25 +132,58 @@ impl AxumServer {
             .unwrap()
     }
 
-    async fn get_config(&mut self, _state: State<Self>) -> Response<Body> {
-        let cfg = self.pisa_config.clone();
-        let json_string = serde_json::to_string(&cfg).unwrap();
-        Response::builder()
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json_string))
-            .unwrap()
+    async fn admin_config(State(state): State<Self>) -> Response<Body> {
+        match &state.gateway_config {
+            Some(config) => json_response(config),
+            None => json_response(&state.pisa_config),
+        }
     }
 
-    // 设置config
-    async fn post_config(&mut self, _state: State<Self>, cfg: Body) -> Response<Body> {
-        // let cfg = cfg.parse::<PisaProxyConfig>().unwrap();
-        // self.pisa_config = cfg;
-        info!("config changed: {:?}", cfg);
-        Response::builder()
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from("success"))
-            .unwrap()
+    async fn admin_listeners(State(state): State<Self>) -> Response<Body> {
+        match &state.gateway_config {
+            Some(config) => json_response(&config.gateway.listeners),
+            None => gateway_config_not_available(),
+        }
     }
+
+    async fn admin_services(State(state): State<Self>) -> Response<Body> {
+        match &state.gateway_config {
+            Some(config) => json_response(&config.gateway.services),
+            None => gateway_config_not_available(),
+        }
+    }
+
+    async fn admin_endpoints(State(state): State<Self>) -> Response<Body> {
+        match &state.gateway_config {
+            Some(config) => json_response(&config.gateway.endpoints),
+            None => gateway_config_not_available(),
+        }
+    }
+}
+
+fn json_response<T: Serialize>(value: &T) -> Response<Body> {
+    match serde_json::to_vec(value) {
+        Ok(body) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap_or_else(|error| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(error.to_string()))
+                    .expect("static internal server error response is valid")
+            }),
+        Err(error) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(error.to_string()))
+            .expect("static internal server error response is valid"),
+    }
+}
+
+fn gateway_config_not_available() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::from("gateway config is not available"))
+        .expect("static not found response is valid")
 }
 
 #[async_trait::async_trait]
@@ -148,5 +199,96 @@ impl HttpServer for AxumServer {
             .await
             .map_err(|e| ErrorKind::Runtime(e.into()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::Request;
+    use hyper::body::to_bytes;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn gateway_config() -> GatewayConfigDocument {
+        GatewayConfigDocument::from_toml(include_str!("../../examples/gateway-config.toml"))
+            .unwrap()
+    }
+
+    fn gateway_server() -> AxumServer {
+        let gateway_config = gateway_config();
+        AxumServer {
+            pisa_config: PisaProxyConfig {
+                admin: gateway_config.admin.clone(),
+                version: gateway_config.version.clone(),
+                ..PisaProxyConfig::default()
+            },
+            gateway_config: Some(gateway_config),
+            metrics_manager: MetricsManager::new(),
+        }
+    }
+
+    async fn get_json(path: &str) -> (StatusCode, Value) {
+        let response = gateway_server()
+            .routes()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body()).await.unwrap();
+        let value = serde_json::from_slice(&body).unwrap();
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn admin_config_returns_native_gateway_config() {
+        let (status, value) = get_json("/admin/config").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["listeners"][0]["name"], "orders-mysql");
+        assert_eq!(value["services"][0]["name"], "orders");
+        assert_eq!(value["endpoints"][0]["name"], "orders-primary");
+    }
+
+    #[tokio::test]
+    async fn legacy_config_route_returns_native_gateway_config() {
+        let (status, value) = get_json("/config").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["version"], "2");
+    }
+
+    #[tokio::test]
+    async fn admin_topology_routes_return_gateway_sections() {
+        let (status, listeners) = get_json("/admin/listeners").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listeners.as_array().unwrap().len(), 1);
+        assert_eq!(listeners[0]["protocol"], "my_sql");
+
+        let (status, services) = get_json("/admin/services").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(services.as_array().unwrap().len(), 1);
+        assert_eq!(services[0]["backend_protocol"], "my_sql");
+
+        let (status, endpoints) = get_json("/admin/endpoints").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(endpoints.as_array().unwrap().len(), 2);
+        assert_eq!(endpoints[1]["address"], "127.0.0.1:3307");
+    }
+
+    #[tokio::test]
+    async fn topology_routes_report_missing_gateway_config_for_legacy_state() {
+        let response = AxumServer {
+            pisa_config: PisaProxyConfig::default(),
+            gateway_config: None,
+            metrics_manager: MetricsManager::new(),
+        }
+        .routes()
+        .oneshot(Request::builder().uri("/admin/listeners").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

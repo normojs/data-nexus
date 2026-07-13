@@ -105,10 +105,6 @@
 
 ## Admin API
 
-- [ ] 恢复或重做配置查询 API。
-- [ ] 新增 `GET /admin/listeners`。
-- [ ] 新增 `GET /admin/services`。
-- [ ] 新增 `GET /admin/endpoints`。
 - [ ] 新增 `GET /admin/pools`。
 - [ ] 新增 `GET /admin/sessions`。
 - [ ] 新增 `POST /admin/reload`。
