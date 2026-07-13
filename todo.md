@@ -74,6 +74,7 @@
   - [x] `PostgreSqlBackendConnector` 内置按 endpoint 复用的已 startup TCP 连接池，simple query 与事务命令执行成功后归还连接。
   - [x] `BEGIN` / `COMMIT` / `ROLLBACK` 在配置 PostgreSQL endpoint 时走真实后端连接，未配置 endpoint 的单元测试路径保留 session-only 行为。
   - [x] PostgreSQL backend `ErrorResponse` 改为读到后续 `ReadyForQuery` 后再返回，避免错误响应污染可复用连接。
+  - [x] PostgreSQL core backend 的 transaction dispatch 与连接池 lease 不再使用请求级 `unreachable!()` / `expect()`。
   - [x] `cargo test -p runtime_gateway postgresql` 通过，mock backend 覆盖同一后端连接连续执行 `BEGIN`、`select 1`、`COMMIT`。
 - [x] 支持 PostgreSQL simple query 基础链路。
   - [x] frontend socket startup + query frame、core command dispatch、backend simple query 短连接、ResultSet response encode 已贯通；mock backend 测试覆盖 `select 1` 返回一行结果。

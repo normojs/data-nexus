@@ -85,16 +85,10 @@ impl BackendConnector for PostgreSqlBackendConnector {
                 session.database = Some(database);
                 Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
             }
-            GatewayCommand::Begin => {
-                self.execute_transaction_command("BEGIN", session).await
-            }
-            GatewayCommand::Commit | GatewayCommand::Rollback => {
-                let sql = match command {
-                    GatewayCommand::Commit => "COMMIT",
-                    GatewayCommand::Rollback => "ROLLBACK",
-                    _ => unreachable!(),
-                };
-                self.execute_transaction_command(sql, session).await
+            GatewayCommand::Begin => self.execute_transaction_command("BEGIN", session).await,
+            GatewayCommand::Commit => self.execute_transaction_command("COMMIT", session).await,
+            GatewayCommand::Rollback => {
+                self.execute_transaction_command("ROLLBACK", session).await
             }
             GatewayCommand::Query { sql } => self.execute_simple_query(&sql, session).await,
             command => Err(GatewayError::Unsupported(format!(
@@ -146,7 +140,12 @@ impl PostgreSqlBackendConnector {
     ) -> GatewayResult<PostgreSqlBackendConnection> {
         let mut pool = self.pool.lock().await;
         if let Some(position) = pool.iter().position(|conn| conn.endpoint_name == endpoint.name) {
-            return Ok(pool.remove(position).expect("pool position just matched"));
+            return pool.remove(position).ok_or_else(|| {
+                GatewayError::Backend(format!(
+                    "postgresql connection pool lost endpoint '{}' while leasing it",
+                    endpoint.name
+                ))
+            });
         }
         drop(pool);
 
