@@ -17,34 +17,17 @@
 
 mod node;
 
-use std::{
-    collections::HashMap,
-    hash::Hash,
-    str::FromStr,
-    thread,
-    time::{Duration, Instant},
-};
+use std::str::FromStr;
 
 use ::server::server::{start_gateway_server, GatewayFactory};
-use tokio::{
-    runtime::{Builder, Runtime},
-    task::JoinHandle,
-};
-use tracing::{
-    error, info,
-    log::{debug, kv::Source},
-    warn, Level,
-};
+use tokio::runtime::{Builder, Runtime};
+use tracing::{error, info, log::debug, Level};
 
 extern crate tokio;
 
 use config::config::{PisaProxyConfig, PisaProxyConfigBuilder};
 use http::http::{new_http_server, HttpFactory, HttpServerKind, PisaHttpServerFactory};
 use pisa_metrics::metrics::MetricsManager;
-use proxy::{
-    factory::{ProxyFactory, ProxyKind},
-    proxy::ProxyConfig,
-};
 
 use crate::node::NodeInstance;
 
@@ -55,11 +38,17 @@ fn main() {
     // error!("uni-proxy error");
     // print!("xxxxx");
     // return;
-    let config: PisaProxyConfig = PisaProxyConfigBuilder::new().collect_from_cmd().build();
+    let config = match PisaProxyConfigBuilder::new().collect_from_cmd().build_gateway() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{}", error);
+            std::process::exit(-1);
+        }
+    };
     tracing_subscriber::fmt()
-        .with_max_level(Level::from_str(config.get_admin().log_level.as_str()).ok())
+        .with_max_level(Level::from_str(config.admin.log_level.as_str()).ok())
         .init();
-    info!("uni-proxy start: {}", config.version.as_ref().unwrap());
+    info!("data-nexus gateway start: {}", config.version.as_deref().unwrap_or("unknown"));
 
     // TODO: 获取数据库中的配置
     // TODO：动态修改配置
@@ -69,53 +58,47 @@ fn main() {
     // 2、启动
     // 3、停止
     // 4、重启
-    let http_server = PisaHttpServerFactory::new(config.clone(), MetricsManager::new())
+    let http_config = PisaProxyConfig {
+        admin: config.admin.clone(),
+        version: config.version.clone(),
+        ..PisaProxyConfig::default()
+    };
+    let http_server = PisaHttpServerFactory::new(http_config, MetricsManager::new())
         .build_http_server(HttpServerKind::Axum);
-    match config.proxy.clone() {
-        Some(_) => {
-            // TODO: 使用map
-            // let mut serverMaps :HashMap<String, JoinHandle<()>> = HashMap::with_capacity(config.get_proxy().len() + 1);
-            let mut servers = Vec::with_capacity(config.get_proxy().len() + 1);
 
-            build_runtime().block_on(async move {
-                for proxy_config in config.get_proxy() {
-                    let cfg = proxy_config;
-
-                    let factory = GatewayFactory::new(cfg.to_owned(), config.clone());
-                    servers.push(NodeInstance::new(
-                        cfg.name.clone(),
-                        tokio::spawn(start_gateway_server(factory.build_proxy())),
-                    ));
-                } // end for
-
-                // new_http_server(http_server).await;
-                // serverMaps.insert("httpserver-001".to_string(), );
-                servers.push(NodeInstance::new(
-                    "httpserver-001".to_string(),
-                    tokio::spawn(new_http_server(http_server)),
-                ));
-
-                for serverInstance in &servers {
-                    debug!("server instance name is: {}", serverInstance.name);
-                    if serverInstance.name.starts_with("proxy") {
-                        // closeNode
-                    }
-                }
-                for serverInstance in servers {
-                    if let Err(e) = serverInstance.joinHandle.await {
-                        error!("{:?}", e)
-                    }
-                }
-            }); // end build_runtime
-        } // end Some()
-        None => {
-            build_runtime().block_on(async move {
-                // if let Err(e) = tokio::spawn(new_http_server(http_server)).await {
-                //     error!("{:?}", e)
-                // }
-            });
+    let factory = GatewayFactory::from_gateway_config(config);
+    let proxy_instances = match factory.try_build_proxies() {
+        Ok(instances) => instances,
+        Err(error) => {
+            error!("failed to build gateway proxy: {}", error);
+            std::process::exit(-1);
         }
-    }
+    };
+
+    let mut servers = Vec::with_capacity(proxy_instances.len() + 1);
+
+    build_runtime().block_on(async move {
+        for instance in proxy_instances {
+            servers.push(NodeInstance::new(
+                instance.name,
+                tokio::spawn(start_gateway_server(instance.proxy)),
+            ));
+        }
+
+        servers.push(NodeInstance::new(
+            "httpserver-001".to_string(),
+            tokio::spawn(new_http_server(http_server)),
+        ));
+
+        for server_instance in &servers {
+            debug!("server instance name is: {}", server_instance.name);
+        }
+        for server_instance in servers {
+            if let Err(e) = server_instance.joinHandle.await {
+                error!("{:?}", e)
+            }
+        }
+    });
 }
 
 // TODO: 新增的方法

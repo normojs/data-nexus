@@ -86,7 +86,7 @@
 - [x] 将 `runtime/unisql` 改名或逐步替换为 `runtime/gateway`。
 - [x] 将 `SQLProxy` 入口迁移为 `GatewayRuntime`。
 - [x] 将 `PisaProxyFactory` 演进为 `GatewayFactory`，启动路径改为 `runtime_gateway::gateway::GatewayRuntime`。
-- [ ] 将 `GatewayFactory` 改为按 listener/service 构建 runtime。
+- [x] 将 `GatewayFactory` 改为按 listener/service 构建 runtime。
 - [ ] 拆分 `ProxyConfig`，避免一个结构同时承载监听、认证、后端、路由、插件和云端配置。
 - [x] 新增 `ListenerConfig`。
 - [x] 新增 `ServiceConfig`。
@@ -101,7 +101,7 @@
 - [ ] 将协议 session 到通用 `SessionState` 的转换放在 frontend adapter。
 - [ ] 将插件接口从 `String` 输入升级为 `PluginContext`。
 - [ ] 减少主链路中的 `unwrap()`，把请求级错误转换成客户端协议错误包。
-- [ ] 配置错误在启动阶段 fail fast，并输出明确错误信息。
+- [x] 配置错误在启动阶段 fail fast，并输出明确错误信息。
 
 ## Admin API
 

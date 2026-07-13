@@ -77,6 +77,16 @@ impl PisaProxyConfigBuilder {
         Ok(resp)
     }
 
+    pub fn build_gateway_from_file(
+        self,
+        path: String,
+    ) -> Result<GatewayConfigDocument, GatewayConfigLoadError> {
+        let mut file = File::open(path).map_err(GatewayConfigLoadError::Io)?;
+        let mut config_str = String::new();
+        file.read_to_string(&mut config_str).map_err(GatewayConfigLoadError::Io)?;
+        GatewayConfigDocument::from_toml(&config_str)
+    }
+
     pub fn collect_from_cmd(mut self) -> Self {
         let mut matches = Command::new("Pisa-Proxy")
             .subcommand(
@@ -242,6 +252,39 @@ impl PisaProxyConfigBuilder {
         trace!("configs: {:#?}", config);
         config
     }
+
+    pub fn build_gateway(self) -> Result<GatewayConfigDocument, GatewayConfigLoadError> {
+        if !self._local {
+            return Err(GatewayConfigLoadError::Unsupported(
+                "loading v2 gateway config from controller is not implemented yet".into(),
+            ));
+        }
+
+        let builder = PisaProxyConfigBuilder::new();
+        let mut config = builder.build_gateway_from_file(self._config_path)?;
+
+        if !self._log_level.is_empty() {
+            config.admin.log_level = self._log_level;
+        }
+        if !self._port.is_empty() {
+            config.admin.port = self._port.parse::<u16>().map_err(|error| {
+                GatewayConfigLoadError::Validation(GatewayError::Configuration(format!(
+                    "invalid admin port '{}': {}",
+                    self._port, error
+                )))
+            })?;
+        }
+        if !self._host.is_empty() {
+            config.admin.host = self._host;
+        }
+
+        if config.version.is_none() {
+            config.version = Some(PisaProxyConfigBuilder::new().build_version()._version);
+        }
+
+        trace!("gateway configs: {:#?}", config);
+        Ok(config)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -304,16 +347,22 @@ impl GatewayConfigDocument {
 
 #[derive(Debug)]
 pub enum GatewayConfigLoadError {
+    Io(std::io::Error),
     Parse(toml::de::Error),
     Validation(GatewayError),
+    Unsupported(String),
 }
 
 impl std::fmt::Display for GatewayConfigLoadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Io(error) => write!(formatter, "failed to read gateway configuration: {}", error),
             Self::Parse(error) => write!(formatter, "invalid gateway configuration: {}", error),
             Self::Validation(error) => {
                 write!(formatter, "invalid gateway configuration: {}", error)
+            }
+            Self::Unsupported(message) => {
+                write!(formatter, "unsupported gateway configuration source: {}", message)
             }
         }
     }
@@ -326,6 +375,7 @@ mod test {
     use super::*;
 
     #[test]
+    #[ignore = "requires a live Pisa controller fixture"]
     fn test_build_from_http() {
         let mut builder = PisaProxyConfigBuilder::new();
         builder._host = "localhost:8080".to_string();
@@ -341,10 +391,14 @@ mod test {
 
     #[test]
     fn test_build_from_file() {
-        let mut builder = PisaProxyConfigBuilder::new();
-        builder._config_path = "absolute_path".to_string();
-        let path = builder._config_path.clone();
-        let config: PisaProxyConfig = builder.build_from_file(path);
+        let path = std::env::temp_dir()
+            .join(format!("data-nexus-test-config-{}.toml", std::process::id()));
+        std::fs::write(&path, include_str!("../../../examples/example-config.toml")).unwrap();
+
+        let config: PisaProxyConfig =
+            PisaProxyConfigBuilder::new().build_from_file(path.to_string_lossy().into_owned());
+        let _ = std::fs::remove_file(path);
+
         assert_eq!(config.admin.host, "0.0.0.0");
     }
 
@@ -357,5 +411,19 @@ mod test {
         assert_eq!(config.gateway.listeners.len(), 1);
         assert_eq!(config.gateway.services.len(), 1);
         assert_eq!(config.gateway.endpoints.len(), 2);
+    }
+
+    #[test]
+    fn builds_native_gateway_config_from_file() {
+        let path = std::env::temp_dir()
+            .join(format!("data-nexus-gateway-config-{}.toml", std::process::id()));
+        std::fs::write(&path, include_str!("../../../examples/gateway-config.toml")).unwrap();
+
+        let config = PisaProxyConfigBuilder::new()
+            .build_gateway_from_file(path.to_string_lossy().into_owned())
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(config.gateway.listeners[0].name, "orders-mysql");
     }
 }

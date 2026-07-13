@@ -265,13 +265,13 @@ databases = ["test", "analytics"]
 问题：
 
 - `ProxyKind` 和 `backend_type` 基本失效。
-- 当前启动路径已从 `PisaProxyFactory` 迁到 `GatewayFactory`，但仍从旧 `ProxyConfig` 构造单个 `GatewayRuntime`。
+- 当前启动路径已从 `PisaProxyFactory` 迁到 `GatewayFactory`，并可从 v2 `GatewayConfigDocument` 按 listener 构造 `GatewayRuntime`。
+- `GatewayRuntime::start()` 内部仍复用迁移中的 legacy MySQL accept loop，因此 v2 MySQL listener 会先派生最小 `ProxyConfig`/`UniSQLNode` 过渡结构。
 
 建议：
 
-- 让 `GatewayFactory` 读取 v2 `listeners`、`services`、`endpoints`，按 listener/service 构建 runtime。
-- 输入 `ListenerConfig + ServiceConfig + GatewayConfig`。
-- 根据 `listener.protocol` 构建不同 frontend。
+- 继续把 `GatewayRuntime::start()` 迁到 core connection，不再派生 `ProxyConfig`/`UniSQLNode`。
+- PostgreSQL frontend/backend 完成后，让同一个 v2 factory 同时启动 MySQL 和 PostgreSQL listener。
 
 ### 3. `ProxyConfig` 职责过重
 

@@ -17,9 +17,9 @@ use std::sync::{atomic::AtomicU32, Arc};
 use common::ast_cache::ParserAstCache;
 use conn_pool::Pool;
 use endpoint::endpoint::Endpoint;
-use gateway_core::{GatewayConfig, GatewayError, GatewayResult};
+use gateway_core::{EndpointConfig, GatewayConfig, GatewayError, GatewayResult, ProtocolKind};
 use indexmap::IndexMap;
-use loadbalance::balance::{Balance, LoadBalance};
+use loadbalance::balance::{AlgorithmName, Balance, LoadBalance};
 use mysql_parser::parser::Parser;
 use mysql_protocol::client::conn::ClientConn;
 use parking_lot::Mutex;
@@ -40,7 +40,7 @@ use tracing::{debug, error};
 
 use crate::{
     backend::mysql::MySqlBackendConnector,
-    core_engine::{CoreGatewayConnection, CoreGatewayRuntimePlan},
+    core_engine::{CoreGatewayConnection, CoreGatewayListenerPlan, CoreGatewayRuntimePlan},
     frontend::mysql::{MySqlFrontendConnection, MySqlFrontendProtocol, ReqContext},
     server::{metrics::*, stmt_cache::StmtCache},
     transaction_fsm::*,
@@ -57,10 +57,30 @@ pub struct GatewayRuntime {
 
 impl GatewayRuntime {
     pub fn from_core_config(config: &GatewayConfig) -> GatewayResult<Self> {
-        Ok(Self {
-            core_plan: Some(CoreGatewayRuntimePlan::from_config(config)?),
-            ..Default::default()
-        })
+        let listener_name =
+            config.listeners.first().map(|listener| listener.name.as_str()).ok_or_else(|| {
+                GatewayError::Configuration(
+                    "gateway config must contain at least one listener".into(),
+                )
+            })?;
+        Self::from_core_config_for_listener(config, listener_name)
+    }
+
+    pub fn from_core_config_for_listener(
+        config: &GatewayConfig,
+        listener_name: &str,
+    ) -> GatewayResult<Self> {
+        let core_plan = CoreGatewayRuntimePlan::from_config(config)?;
+        let listener_plan = core_plan.listener(listener_name).ok_or_else(|| {
+            GatewayError::Configuration(format!(
+                "gateway config has no listener '{}'",
+                listener_name
+            ))
+        })?;
+        let proxy_config = legacy_proxy_config_from_core_plan(listener_plan)?;
+        let nodes = legacy_nodes_from_core_plan(listener_plan)?;
+
+        Ok(Self { proxy_config, nodes, core_plan: Some(core_plan), ..Default::default() })
     }
 
     pub fn set_core_config(&mut self, config: &GatewayConfig) -> GatewayResult<()> {
@@ -169,6 +189,82 @@ impl GatewayRuntime {
         let has_rw = self.proxy_config.read_write_splitting.is_some();
 
         Some(ShardingRewrite::new(config.unwrap(), endpoints, self.node_group.clone(), has_rw))
+    }
+}
+
+fn legacy_proxy_config_from_core_plan(
+    plan: &CoreGatewayListenerPlan,
+) -> GatewayResult<ProxyConfig> {
+    if plan.listener().protocol != ProtocolKind::MySql {
+        return Err(GatewayError::Unsupported(format!(
+            "{:?} listener '{}' cannot run on the legacy mysql accept loop yet",
+            plan.listener().protocol,
+            plan.listener().name
+        )));
+    }
+    if plan.service().backend_protocol != ProtocolKind::MySql {
+        return Err(GatewayError::Unsupported(format!(
+            "{:?} service '{}' cannot run on the legacy mysql accept loop yet",
+            plan.service().backend_protocol,
+            plan.service().name
+        )));
+    }
+
+    Ok(ProxyConfig {
+        name: plan.listener().name.clone(),
+        node_type: protocol_name(&plan.listener().protocol).into(),
+        backend_type: protocol_name(&plan.service().backend_protocol).into(),
+        listen_addr: plan.listener().listen_addr.clone(),
+        db: plan.default_database().unwrap_or_default().into(),
+        pool_size: 64,
+        server_version: "8.0".into(),
+        simple_loadbalance: Some(proxy::proxy::ProxySimpleLoadBalance {
+            balance_type: AlgorithmName::Random,
+            nodes: plan.endpoints().iter().map(|endpoint| endpoint.name.clone()).collect(),
+        }),
+        ..ProxyConfig::default()
+    })
+}
+
+fn legacy_nodes_from_core_plan(plan: &CoreGatewayListenerPlan) -> GatewayResult<Vec<UniSQLNode>> {
+    plan.endpoints().iter().map(legacy_node_from_endpoint).collect()
+}
+
+fn legacy_node_from_endpoint(endpoint: &EndpointConfig) -> GatewayResult<UniSQLNode> {
+    let (host, port) = parse_endpoint_address(&endpoint.address)?;
+
+    Ok(UniSQLNode {
+        version: String::new(),
+        node_type: protocol_name(&endpoint.protocol).into(),
+        name: endpoint.name.clone(),
+        db: endpoint.database.clone().unwrap_or_default(),
+        user: endpoint.username.clone(),
+        password: endpoint.password.clone(),
+        host,
+        port,
+        weight: endpoint.weight as i64,
+        role: TargetRole::ReadWrite,
+    })
+}
+
+fn parse_endpoint_address(address: &str) -> GatewayResult<(String, u32)> {
+    let (host, port) = address.rsplit_once(':').ok_or_else(|| {
+        GatewayError::Configuration(format!("endpoint address '{}' must include a port", address))
+    })?;
+    let port = port.parse::<u32>().map_err(|error| {
+        GatewayError::Configuration(format!(
+            "endpoint address '{}' has invalid port: {}",
+            address, error
+        ))
+    })?;
+
+    Ok((host.into(), port))
+}
+
+fn protocol_name(protocol: &ProtocolKind) -> &'static str {
+    match protocol {
+        ProtocolKind::MySql => "mysql",
+        ProtocolKind::PostgreSql => "postgresql",
     }
 }
 
@@ -338,6 +434,24 @@ mod tests {
         assert_eq!(connection.frontend_protocol(), ProtocolKind::MySql);
         assert_eq!(connection.backend_protocol(), ProtocolKind::MySql);
         assert_eq!(connection.session().database, Some("orders_db".into()));
+    }
+
+    #[test]
+    fn derives_legacy_mysql_runtime_fields_from_v2_config() {
+        let runtime = GatewayRuntime::from_core_config(&mysql_config()).unwrap();
+
+        assert_eq!(runtime.proxy_config.name, "mysql-listener");
+        assert_eq!(runtime.proxy_config.listen_addr, "127.0.0.1:3307");
+        assert_eq!(runtime.proxy_config.db, "orders_db");
+        assert_eq!(
+            runtime.proxy_config.simple_loadbalance.as_ref().unwrap().nodes,
+            vec!["orders-primary".to_string()]
+        );
+        assert_eq!(runtime.nodes.len(), 1);
+        assert_eq!(runtime.nodes[0].name, "orders-primary");
+        assert_eq!(runtime.nodes[0].host, "127.0.0.1");
+        assert_eq!(runtime.nodes[0].port, 3306);
+        assert_eq!(runtime.nodes[0].user, "root");
     }
 
     #[test]

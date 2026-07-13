@@ -3638,6 +3638,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "config",
+ "gateway_core",
  "proxy",
  "runtime_gateway",
  "runtime_shardingsphereproxy",

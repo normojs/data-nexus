@@ -12,34 +12,121 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use config::config::PisaProxyConfig;
+use std::{error::Error, fmt};
+
+use config::config::{GatewayConfigDocument, PisaProxyConfig};
 use proxy::{
     factory::{Proxy, ProxyFactory},
     proxy::ProxyConfig,
 };
 // use runtime_mysql::mysql;
 
+#[derive(Clone)]
+enum GatewayFactoryConfig {
+    Legacy { proxy_config: ProxyConfig, pisa_config: PisaProxyConfig },
+    Native(GatewayConfigDocument),
+}
+
 pub struct GatewayFactory {
-    pub proxy_config: ProxyConfig,
-    pub pisa_config: PisaProxyConfig,
+    config: GatewayFactoryConfig,
+}
+
+pub struct GatewayProxyInstance {
+    pub name: String,
+    pub proxy: Box<dyn Proxy + Send>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayFactoryError {
+    message: String,
+}
+
+impl GatewayFactoryError {
+    fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into() }
+    }
+}
+
+impl fmt::Display for GatewayFactoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for GatewayFactoryError {}
+
+impl From<gateway_core::GatewayError> for GatewayFactoryError {
+    fn from(error: gateway_core::GatewayError) -> Self {
+        Self::new(error.to_string())
+    }
 }
 
 impl GatewayFactory {
     pub fn new(proxy_config: ProxyConfig, pisa_config: PisaProxyConfig) -> Self {
-        Self { proxy_config, pisa_config }
+        Self { config: GatewayFactoryConfig::Legacy { proxy_config, pisa_config } }
+    }
+
+    pub fn from_gateway_config(config: GatewayConfigDocument) -> Self {
+        Self { config: GatewayFactoryConfig::Native(config) }
+    }
+
+    pub fn try_build_proxy(&self) -> Result<Box<dyn Proxy + Send>, GatewayFactoryError> {
+        self.try_build_proxies()?
+            .into_iter()
+            .next()
+            .map(|instance| instance.proxy)
+            .ok_or_else(|| GatewayFactoryError::new("gateway config has no listeners"))
+    }
+
+    pub fn try_build_proxies(&self) -> Result<Vec<GatewayProxyInstance>, GatewayFactoryError> {
+        match &self.config {
+            GatewayFactoryConfig::Legacy { proxy_config, pisa_config } => {
+                Ok(vec![GatewayProxyInstance {
+                    name: proxy_config.name.clone(),
+                    proxy: Box::new(runtime_gateway::gateway::GatewayRuntime {
+                        proxy_config: proxy_config.clone(),
+                        node_group: pisa_config.node_group.clone(),
+                        nodes: pisa_config.get_nodes().to_vec(),
+                        pisa_version: pisa_config.get_version().to_string(),
+                        core_plan: None,
+                    }),
+                }])
+            }
+            GatewayFactoryConfig::Native(config) => {
+                if config.gateway.listeners.is_empty() {
+                    return Err(GatewayFactoryError::new("gateway config has no listeners"));
+                }
+
+                config
+                    .gateway
+                    .listeners
+                    .iter()
+                    .map(|listener| {
+                        let mut gateway_runtime =
+                            runtime_gateway::gateway::GatewayRuntime::from_core_config_for_listener(
+                                &config.gateway,
+                                &listener.name,
+                            )?;
+                        gateway_runtime.pisa_version =
+                            config.version.clone().unwrap_or_else(|| "2".into());
+
+                        Ok(GatewayProxyInstance {
+                            name: listener.name.clone(),
+                            proxy: Box::new(gateway_runtime),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, gateway_core::GatewayError>>()
+                    .map_err(Into::into)
+            }
+        }
     }
 }
 
 impl ProxyFactory for GatewayFactory {
     fn build_proxy(&self) -> Box<dyn Proxy + Send> {
-        let config = self.proxy_config.clone();
-        let gateway_runtime = runtime_gateway::gateway::GatewayRuntime {
-            proxy_config: config,
-            node_group: self.pisa_config.node_group.clone(),
-            nodes: self.pisa_config.get_nodes().to_vec(),
-            pisa_version: self.pisa_config.get_version().to_string(),
-        };
-        return Box::new(gateway_runtime);
+        return self.try_build_proxy().unwrap_or_else(|error| {
+            panic!("failed to build gateway proxy: {}", error);
+        });
 
         // 以下废弃
         // match kind {
@@ -65,4 +152,38 @@ impl ProxyFactory for GatewayFactory {
 pub async fn start_gateway_server(mut s: Box<dyn proxy::factory::Proxy + Send>) {
     // let xx = s.start().await.unwrap();
     s.start().await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use config::config::GatewayConfigDocument;
+
+    use super::*;
+
+    fn gateway_config() -> GatewayConfigDocument {
+        GatewayConfigDocument::from_toml(include_str!("../../../examples/gateway-config.toml"))
+            .unwrap()
+    }
+
+    #[test]
+    fn builds_one_proxy_per_v2_listener() {
+        let factory = GatewayFactory::from_gateway_config(gateway_config());
+
+        let proxies = factory.try_build_proxies().unwrap();
+
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].name, "orders-mysql");
+    }
+
+    #[test]
+    fn rejects_v2_config_without_listeners() {
+        let factory = GatewayFactory::from_gateway_config(GatewayConfigDocument::default());
+
+        let error = match factory.try_build_proxies() {
+            Ok(_) => panic!("empty gateway config should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, GatewayFactoryError::new("gateway config has no listeners"));
+    }
 }

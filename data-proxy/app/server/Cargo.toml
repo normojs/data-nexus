@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 config = { path = "../config" }
+gateway_core = { path = "../../gateway/core" }
 proxy = { path = "../../proxy" }
 runtime_gateway = { path = "../../runtime/gateway" }
 #runtime_mysql = { path = "../../runtime/mysql" }
