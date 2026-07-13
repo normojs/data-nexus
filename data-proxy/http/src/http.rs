@@ -29,7 +29,9 @@ use axum::{
 use config::config::{GatewayConfigDocument, PisaProxyConfig};
 use pisa_error::error::*;
 use pisa_metrics::metrics::MetricsManager;
-use proxy::factory::{PoolSnapshot, PoolSnapshotter, ShutdownHandle};
+use proxy::factory::{
+    PoolSnapshot, PoolSnapshotter, SessionEntrySnapshot, SessionSnapshotter, ShutdownHandle,
+};
 use serde::Serialize;
 use tracing::info;
 use ver::version::get_version;
@@ -117,6 +119,7 @@ pub async fn new_http_server(mut s: Box<dyn HttpServer + Send>) {
 pub struct AdminRuntimeState {
     listener_shutdown_handles: HashMap<String, ShutdownHandle>,
     listener_pool_snapshotters: HashMap<String, PoolSnapshotter>,
+    listener_session_snapshotters: HashMap<String, SessionSnapshotter>,
 }
 
 impl fmt::Debug for AdminRuntimeState {
@@ -125,6 +128,7 @@ impl fmt::Debug for AdminRuntimeState {
             .debug_struct("AdminRuntimeState")
             .field("listener_shutdown_handles", &self.listener_shutdown_handles)
             .field("listener_pool_snapshotter_count", &self.listener_pool_snapshotters.len())
+            .field("listener_session_snapshotter_count", &self.listener_session_snapshotters.len())
             .finish()
     }
 }
@@ -143,17 +147,37 @@ impl AdminRuntimeState {
     pub fn new_with_pool_snapshotters(
         listener_runtimes: impl IntoIterator<Item = (String, ShutdownHandle, Option<PoolSnapshotter>)>,
     ) -> Self {
+        Self::new_with_runtime_snapshotters(listener_runtimes.into_iter().map(
+            |(name, shutdown_handle, pool_snapshotter)| {
+                (name, shutdown_handle, pool_snapshotter, None)
+            },
+        ))
+    }
+
+    pub fn new_with_runtime_snapshotters(
+        listener_runtimes: impl IntoIterator<
+            Item = (String, ShutdownHandle, Option<PoolSnapshotter>, Option<SessionSnapshotter>),
+        >,
+    ) -> Self {
         let mut listener_shutdown_handles = HashMap::new();
         let mut listener_pool_snapshotters = HashMap::new();
+        let mut listener_session_snapshotters = HashMap::new();
 
-        for (name, shutdown_handle, pool_snapshotter) in listener_runtimes {
+        for (name, shutdown_handle, pool_snapshotter, session_snapshotter) in listener_runtimes {
             listener_shutdown_handles.insert(name.clone(), shutdown_handle);
             if let Some(pool_snapshotter) = pool_snapshotter {
-                listener_pool_snapshotters.insert(name, pool_snapshotter);
+                listener_pool_snapshotters.insert(name.clone(), pool_snapshotter);
+            }
+            if let Some(session_snapshotter) = session_snapshotter {
+                listener_session_snapshotters.insert(name, session_snapshotter);
             }
         }
 
-        Self { listener_shutdown_handles, listener_pool_snapshotters }
+        Self {
+            listener_shutdown_handles,
+            listener_pool_snapshotters,
+            listener_session_snapshotters,
+        }
     }
 
     fn stop_listener(&self, name: &str) -> Option<ListenerRuntimeStatus> {
@@ -176,6 +200,18 @@ impl AdminRuntimeState {
             .collect::<Vec<_>>();
         statuses.sort_by(|left, right| left.name.cmp(&right.name));
         statuses
+    }
+
+    fn session_statuses(&self) -> Vec<SessionEntrySnapshot> {
+        let mut sessions = self
+            .listener_session_snapshotters
+            .values()
+            .flat_map(|snapshotter| snapshotter().sessions)
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| {
+            left.listener.cmp(&right.listener).then_with(|| left.id.cmp(&right.id))
+        });
+        sessions
     }
 }
 
@@ -216,6 +252,7 @@ impl AxumServer {
             .route("/admin/services", get(Self::admin_services))
             .route("/admin/endpoints", get(Self::admin_endpoints))
             .route("/admin/pools", get(Self::admin_pools))
+            .route("/admin/sessions", get(Self::admin_sessions))
             .with_state(state)
     }
 
@@ -268,6 +305,13 @@ impl AxumServer {
     async fn admin_pools(State(state): State<Self>) -> Response<Body> {
         match &state.runtime_state {
             Some(runtime_state) => json_response(&runtime_state.pool_statuses()),
+            None => admin_runtime_not_found("admin runtime state is not available"),
+        }
+    }
+
+    async fn admin_sessions(State(state): State<Self>) -> Response<Body> {
+        match &state.runtime_state {
+            Some(runtime_state) => json_response(&runtime_state.session_statuses()),
             None => admin_runtime_not_found("admin runtime state is not available"),
         }
     }
@@ -340,7 +384,7 @@ mod tests {
 
     use axum::http::{Method, Request};
     use hyper::body::to_bytes;
-    use proxy::factory::PoolEndpointSnapshot;
+    use proxy::factory::{PoolEndpointSnapshot, SessionEntrySnapshot, SessionSnapshot};
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -476,6 +520,37 @@ mod tests {
         assert_eq!(value[0]["capacity"], 64);
         assert_eq!(value[0]["endpoints"][0]["endpoint"], "127.0.0.1:3306");
         assert_eq!(value[0]["endpoints"][0]["idle_connections"], 1);
+    }
+
+    #[tokio::test]
+    async fn admin_sessions_returns_runtime_session_snapshots() {
+        let shutdown_handle = ShutdownHandle::new();
+        let session_snapshotter: SessionSnapshotter = Arc::new(|| SessionSnapshot {
+            sessions: vec![SessionEntrySnapshot {
+                id: 7,
+                listener: "orders-mysql".to_string(),
+                peer_addr: Some("127.0.0.1:52144".to_string()),
+                frontend_protocol: "mysql".to_string(),
+                database: Some("orders".to_string()),
+            }],
+        });
+        let server = gateway_server_with_runtime_state(
+            AdminRuntimeState::new_with_runtime_snapshotters(vec![(
+                "orders-mysql".to_string(),
+                shutdown_handle,
+                None,
+                Some(session_snapshotter),
+            )]),
+        );
+
+        let (status, value) = get_json_from(server, "/admin/sessions").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value[0]["id"], 7);
+        assert_eq!(value[0]["listener"], "orders-mysql");
+        assert_eq!(value[0]["peer_addr"], "127.0.0.1:52144");
+        assert_eq!(value[0]["frontend_protocol"], "mysql");
+        assert_eq!(value[0]["database"], "orders");
     }
 
     #[tokio::test]

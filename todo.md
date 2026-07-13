@@ -104,7 +104,6 @@
 
 ## Admin API
 
-- [ ] 新增 `GET /admin/sessions`。
 - [ ] 新增 `POST /admin/reload`。
 - [ ] 热更新前实现 config diff。
 - [ ] 支持新增 listener。

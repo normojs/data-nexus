@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{atomic::AtomicU32, Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{atomic::AtomicU32, Arc},
+};
 
 use common::ast_cache::ParserAstCache;
 use conn_pool::Pool;
@@ -26,7 +29,10 @@ use parking_lot::Mutex;
 use pisa_error::error::{Error, ErrorKind};
 use plugin::build_phase::PluginPhase;
 use proxy::{
-    factory::{PoolEndpointSnapshot, PoolSnapshot, PoolSnapshotter, ShutdownHandle, StartSource},
+    factory::{
+        PoolEndpointSnapshot, PoolSnapshot, PoolSnapshotter, SessionEntrySnapshot, SessionSnapshot,
+        SessionSnapshotter, ShutdownHandle, StartSource,
+    },
     listener::Listener,
     proxy::{Proxy, ProxyConfig, UniSQLNode},
 };
@@ -55,6 +61,7 @@ pub struct GatewayRuntime {
     pub core_plan: Option<CoreGatewayRuntimePlan>,
     pub shutdown_handle: ShutdownHandle,
     pub pool: Option<Pool<ClientConn>>,
+    pub sessions: Option<SessionRegistry>,
 }
 
 impl GatewayRuntime {
@@ -221,6 +228,12 @@ impl GatewayRuntime {
 
         Arc::new(move || build_pool_snapshot(&pool, &configured_endpoints))
     }
+
+    pub fn session_snapshotter(&mut self) -> SessionSnapshotter {
+        let registry = self.sessions.get_or_insert_with(SessionRegistry::default).clone();
+
+        Arc::new(move || registry.snapshot())
+    }
 }
 
 fn runtime_configuration_error(message: impl Into<String>) -> Error {
@@ -334,6 +347,58 @@ fn build_pool_snapshot(pool: &Pool<ClientConn>, configured_endpoints: &[String])
     }
 }
 
+#[derive(Clone, Default)]
+pub struct SessionRegistry {
+    inner: Arc<Mutex<SessionRegistryInner>>,
+}
+
+#[derive(Default)]
+struct SessionRegistryInner {
+    next_id: u64,
+    sessions: BTreeMap<u64, SessionEntrySnapshot>,
+}
+
+impl SessionRegistry {
+    pub fn register(&self, mut session: SessionEntrySnapshot) -> SessionRegistration {
+        let mut inner = self.inner.lock();
+        inner.next_id += 1;
+        let id = inner.next_id;
+        session.id = id;
+        inner.sessions.insert(id, session);
+
+        SessionRegistration { registry: self.clone(), id }
+    }
+
+    pub fn snapshot(&self) -> SessionSnapshot {
+        let inner = self.inner.lock();
+
+        SessionSnapshot { sessions: inner.sessions.values().cloned().collect() }
+    }
+
+    fn remove(&self, id: u64) {
+        self.inner.lock().sessions.remove(&id);
+    }
+}
+
+pub struct SessionRegistration {
+    registry: SessionRegistry,
+    id: u64,
+}
+
+impl Drop for SessionRegistration {
+    fn drop(&mut self) {
+        self.registry.remove(self.id);
+    }
+}
+
+fn optional_database(database: &str) -> Option<String> {
+    if database.is_empty() {
+        None
+    } else {
+        Some(database.to_owned())
+    }
+}
+
 #[async_trait::async_trait]
 impl proxy::factory::Proxy for GatewayRuntime {
     // TODO：优雅退出
@@ -382,6 +447,7 @@ impl proxy::factory::Proxy for GatewayRuntime {
 
         let has_rw = self.proxy_config.read_write_splitting.is_some();
         let mut start_source = StartSource::new(self.shutdown_handle.clone());
+        let session_registry = self.sessions.get_or_insert_with(SessionRegistry::default).clone();
 
         loop {
             let socket = tokio::select! {
@@ -400,6 +466,11 @@ impl proxy::factory::Proxy for GatewayRuntime {
             let ast_cache = ast_cache.clone();
             let pool = pool.clone();
             let proxy_name = self.proxy_config.name.clone();
+            let session_listener = proxy_name.clone();
+            let session_registry = session_registry.clone();
+            let peer_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
+            let frontend_protocol = self.frontend_protocol_name();
+            let database = optional_database(&self.proxy_config.db);
             let rewriter = rewriter.clone();
 
             let frontend = MySqlFrontendProtocol::new(
@@ -413,6 +484,14 @@ impl proxy::factory::Proxy for GatewayRuntime {
             let mut instance = MySqlFrontendConnection::new(MySqlBackendConnector::new());
             debug!("loop start....");
             let join_handle = tokio::spawn(async move {
+                let _session_registration = session_registry.register(SessionEntrySnapshot {
+                    id: 0,
+                    listener: session_listener,
+                    peer_addr,
+                    frontend_protocol,
+                    database,
+                });
+
                 let framed = match frontend.handshake(socket).await {
                     Ok(framed) => framed,
                     Err(e) => {
@@ -618,5 +697,27 @@ mod tests {
         assert!(snapshot.endpoints[0].configured);
         assert!(!snapshot.endpoints[0].factory_registered);
         assert_eq!(snapshot.endpoints[0].idle_connections, 0);
+    }
+
+    #[test]
+    fn session_registry_tracks_active_sessions_until_guard_drops() {
+        let registry = SessionRegistry::default();
+        let registration = registry.register(SessionEntrySnapshot {
+            id: 0,
+            listener: "mysql-listener".to_string(),
+            peer_addr: Some("127.0.0.1:52144".to_string()),
+            frontend_protocol: "mysql".to_string(),
+            database: Some("orders_db".to_string()),
+        });
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].id, 1);
+        assert_eq!(snapshot.sessions[0].listener, "mysql-listener");
+        assert_eq!(snapshot.sessions[0].peer_addr.as_deref(), Some("127.0.0.1:52144"));
+
+        drop(registration);
+
+        assert!(registry.snapshot().sessions.is_empty());
     }
 }

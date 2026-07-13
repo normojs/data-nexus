@@ -90,6 +90,22 @@ pub struct PoolEndpointSnapshot {
 
 pub type PoolSnapshotter = Arc<dyn Fn() -> PoolSnapshot + Send + Sync>;
 
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub sessions: Vec<SessionEntrySnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct SessionEntrySnapshot {
+    pub id: u64,
+    pub listener: String,
+    pub peer_addr: Option<String>,
+    pub frontend_protocol: String,
+    pub database: Option<String>,
+}
+
+pub type SessionSnapshotter = Arc<dyn Fn() -> SessionSnapshot + Send + Sync>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -69,11 +69,12 @@ fn main() {
         }
     };
     let runtime_state =
-        AdminRuntimeState::new_with_pool_snapshotters(proxy_instances.iter().map(|instance| {
+        AdminRuntimeState::new_with_runtime_snapshotters(proxy_instances.iter().map(|instance| {
             (
                 instance.name.clone(),
                 instance.shutdown_handle.clone(),
                 instance.pool_snapshotter.clone(),
+                instance.session_snapshotter.clone(),
             )
         }));
     let http_server = PisaHttpServerFactory::new_gateway_with_runtime_state(

@@ -16,7 +16,7 @@ use std::{error::Error, fmt};
 
 use config::config::{GatewayConfigDocument, PisaProxyConfig};
 use proxy::{
-    factory::{PoolSnapshotter, Proxy, ProxyFactory, ShutdownHandle},
+    factory::{PoolSnapshotter, Proxy, ProxyFactory, SessionSnapshotter, ShutdownHandle},
     proxy::ProxyConfig,
 };
 // use runtime_mysql::mysql;
@@ -36,6 +36,7 @@ pub struct GatewayProxyInstance {
     pub proxy: Box<dyn Proxy + Send>,
     pub shutdown_handle: ShutdownHandle,
     pub pool_snapshotter: Option<PoolSnapshotter>,
+    pub session_snapshotter: Option<SessionSnapshotter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,12 +94,14 @@ impl GatewayFactory {
                 };
                 let shutdown_handle = runtime.shutdown_handle();
                 let pool_snapshotter = Some(runtime.pool_snapshotter());
+                let session_snapshotter = Some(runtime.session_snapshotter());
 
                 Ok(vec![GatewayProxyInstance {
                     name: proxy_config.name.clone(),
                     proxy: Box::new(runtime),
                     shutdown_handle,
                     pool_snapshotter,
+                    session_snapshotter,
                 }])
             }
             GatewayFactoryConfig::Native(config) => {
@@ -121,12 +124,14 @@ impl GatewayFactory {
 
                         let shutdown_handle = gateway_runtime.shutdown_handle();
                         let pool_snapshotter = Some(gateway_runtime.pool_snapshotter());
+                        let session_snapshotter = Some(gateway_runtime.session_snapshotter());
 
                         Ok(GatewayProxyInstance {
                             name: listener.name.clone(),
                             proxy: Box::new(gateway_runtime),
                             shutdown_handle,
                             pool_snapshotter,
+                            session_snapshotter,
                         })
                     })
                     .collect::<Result<Vec<_>, gateway_core::GatewayError>>()
@@ -204,6 +209,9 @@ mod tests {
         assert_eq!(pool_snapshot.endpoints.len(), 2);
         assert_eq!(pool_snapshot.endpoints[0].endpoint, "127.0.0.1:3306");
         assert_eq!(pool_snapshot.endpoints[1].endpoint, "127.0.0.1:3307");
+
+        let session_snapshot = proxies[0].session_snapshotter.as_ref().unwrap()();
+        assert!(session_snapshot.sessions.is_empty());
     }
 
     #[test]
