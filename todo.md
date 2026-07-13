@@ -48,7 +48,7 @@
 
 - [x] 支持 PostgreSQL simple query 基础链路。
 - [x] 支持 PostgreSQL session 状态同步。
-- [ ] 支持 MySQL listener 和 PostgreSQL listener 同时存在。
+- [x] 支持 MySQL listener 和 PostgreSQL listener 同时存在。
 - [ ] 在 metrics 中区分 service、frontend protocol、backend protocol、endpoint。
 
 ## Phase 3：治理能力协议无关化

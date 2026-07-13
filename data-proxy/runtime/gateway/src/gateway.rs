@@ -43,12 +43,16 @@ use strategy::{
     route::RouteStrategy,
     sharding_rewrite::{ShardingRewrite, ShardingRewriteOutput},
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error};
 
 use crate::{
     backend::mysql::MySqlBackendConnector,
     core_engine::{CoreGatewayConnection, CoreGatewayListenerPlan, CoreGatewayRuntimePlan},
-    frontend::mysql::{MySqlFrontendConnection, MySqlFrontendProtocol, ReqContext},
+    frontend::{
+        mysql::{MySqlFrontendConnection, MySqlFrontendProtocol, ReqContext},
+        postgresql::PostgreSqlFrontendProtocol,
+    },
     server::{metrics::*, stmt_cache::StmtCache},
     transaction_fsm::*,
 };
@@ -245,26 +249,195 @@ impl GatewayRuntime {
 
         Arc::new(move || registry.snapshot())
     }
+
+    async fn start_postgresql_core(&mut self) -> Result<StartSource, Error> {
+        let listener_config = self.build_listener_config();
+
+        let mut proxy = Proxy {
+            listener: listener_config,
+            app: self.proxy_config.clone(),
+            backend_nodes: self.nodes.clone(),
+            nodes: self.nodes.clone(),
+        };
+
+        let listener = proxy.build_listener().map_err(ErrorKind::Io)?;
+        let core_plan = self.core_plan.clone().ok_or_else(|| {
+            runtime_configuration_error("postgresql gateway runtime requires v2 core config")
+        })?;
+        let listener_name = self.proxy_config.name.clone();
+        let server_version = self.proxy_config.server_version.clone();
+        let session_registry = self.sessions.get_or_insert_with(SessionRegistry::default).clone();
+        let mut start_source = StartSource::new(self.shutdown_handle.clone());
+
+        loop {
+            let socket = tokio::select! {
+                _ = self.shutdown_handle.cancelled() => {
+                    debug!("postgresql gateway '{}' shutdown requested", self.proxy_config.name);
+                    break;
+                }
+                accepted = proxy.accept(&listener) => {
+                    accepted.map_err(ErrorKind::Io)?
+                }
+            };
+
+            let core_plan = core_plan.clone();
+            let listener_name = listener_name.clone();
+            let server_version = server_version.clone();
+            let session_registry = session_registry.clone();
+            let peer_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
+
+            let join_handle = tokio::spawn(async move {
+                run_postgresql_core_session(
+                    socket,
+                    core_plan,
+                    listener_name,
+                    server_version,
+                    session_registry,
+                    peer_addr,
+                )
+                .await;
+            });
+
+            start_source.thread_handles.push(join_handle);
+        }
+
+        Ok(start_source)
+    }
 }
 
 fn runtime_configuration_error(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Runtime(Box::new(GatewayError::Configuration(message.into()))))
 }
 
+const MAX_POSTGRESQL_FRONTEND_MESSAGE_LEN: usize = 16 * 1024 * 1024;
+
+async fn run_postgresql_core_session(
+    socket: tokio::net::TcpStream,
+    core_plan: CoreGatewayRuntimePlan,
+    listener_name: String,
+    server_version: String,
+    session_registry: SessionRegistry,
+    peer_addr: Option<String>,
+) {
+    let frontend = PostgreSqlFrontendProtocol::new(server_version);
+    let handshake = match frontend.handshake(socket).await {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            error!("postgresql handshake error {:?}", error);
+            return;
+        }
+    };
+
+    let mut stream = handshake.stream;
+    let mut connection = match core_plan.build_connection(&listener_name) {
+        Ok(connection) => connection,
+        Err(error) => {
+            error!("postgresql core connection build error {:?}", error);
+            return;
+        }
+    };
+
+    let mut session = handshake.session;
+    if session.database.is_none() {
+        session.database = connection.session().database.clone();
+    }
+    *connection.session_mut() = session.clone();
+
+    let _session_registration = session_registry.register(SessionEntrySnapshot {
+        id: 0,
+        listener: listener_name,
+        peer_addr,
+        frontend_protocol: protocol_name(&ProtocolKind::PostgreSql).to_owned(),
+        database: session.database.clone(),
+    });
+
+    loop {
+        let frame = match read_postgresql_frontend_frame(&mut stream).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(error) => {
+                error!("postgresql frontend frame read error {:?}", error);
+                break;
+            }
+        };
+        let terminate = frame.first() == Some(&b'X');
+
+        let packets = match connection.handle_frame(&frame).await {
+            Ok(packets) => packets,
+            Err(error) => {
+                error!("postgresql core frame handling error {:?}", error);
+                break;
+            }
+        };
+
+        for packet in packets {
+            if let Err(error) = stream.write_all(&packet).await {
+                error!("postgresql response write error {:?}", error);
+                return;
+            }
+        }
+        if let Err(error) = stream.flush().await {
+            error!("postgresql response flush error {:?}", error);
+            return;
+        }
+
+        if terminate {
+            break;
+        }
+    }
+}
+
+async fn read_postgresql_frontend_frame<S>(stream: &mut S) -> GatewayResult<Option<Vec<u8>>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut header = [0; 5];
+    match stream.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => {
+            return Err(GatewayError::Protocol(format!(
+                "postgresql read frontend frame header failed: {}",
+                error
+            )));
+        }
+    }
+
+    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+    if len < 4 {
+        return Err(GatewayError::Protocol(format!(
+            "invalid postgresql frontend message length {}",
+            len
+        )));
+    }
+
+    let len = len as usize;
+    if len + 1 > MAX_POSTGRESQL_FRONTEND_MESSAGE_LEN {
+        return Err(GatewayError::Protocol(format!(
+            "postgresql frontend message length {} exceeds limit {}",
+            len + 1,
+            MAX_POSTGRESQL_FRONTEND_MESSAGE_LEN
+        )));
+    }
+
+    let mut frame = vec![0; len + 1];
+    frame[..5].copy_from_slice(&header);
+    stream.read_exact(&mut frame[5..]).await.map_err(|error| {
+        GatewayError::Protocol(format!("postgresql read frontend frame body failed: {}", error))
+    })?;
+
+    Ok(Some(frame))
+}
+
 #[allow(deprecated)]
 fn legacy_proxy_config_from_core_plan(
     plan: &CoreGatewayListenerPlan,
 ) -> GatewayResult<ProxyConfig> {
-    if plan.listener().protocol != ProtocolKind::MySql {
+    if plan.listener().protocol != plan.service().backend_protocol {
         return Err(GatewayError::Unsupported(format!(
-            "{:?} listener '{}' cannot run on the legacy mysql accept loop yet",
+            "{:?} listener '{}' with {:?} service '{}' cannot run in the gateway runtime yet",
             plan.listener().protocol,
-            plan.listener().name
-        )));
-    }
-    if plan.service().backend_protocol != ProtocolKind::MySql {
-        return Err(GatewayError::Unsupported(format!(
-            "{:?} service '{}' cannot run on the legacy mysql accept loop yet",
+            plan.listener().name,
             plan.service().backend_protocol,
             plan.service().name
         )));
@@ -277,7 +450,10 @@ fn legacy_proxy_config_from_core_plan(
         listen_addr: plan.listener().listen_addr.clone(),
         db: plan.default_database().unwrap_or_default().into(),
         pool_size: 64,
-        server_version: "8.0".into(),
+        server_version: match plan.listener().protocol {
+            ProtocolKind::MySql => "8.0".into(),
+            ProtocolKind::PostgreSql => "14.0".into(),
+        },
         simple_loadbalance: Some(proxy::proxy::ProxySimpleLoadBalance {
             balance_type: AlgorithmName::Random,
             nodes: plan.endpoints().iter().map(|endpoint| endpoint.name.clone()).collect(),
@@ -447,6 +623,14 @@ impl proxy::factory::Proxy for GatewayRuntime {
 
     // async fn start(&mut self, &mut start_source: StartSource) -> Result<StartSource, Error> {
     async fn start(&mut self) -> Result<StartSource, Error> {
+        if self
+            .core_listener_plan()
+            .map(|plan| plan.listener().protocol == ProtocolKind::PostgreSql)
+            .unwrap_or(false)
+        {
+            return self.start_postgresql_core().await;
+        }
+
         let listener = self.build_listener_config();
 
         let mut proxy = Proxy {
@@ -621,6 +805,35 @@ mod tests {
         }
     }
 
+    fn postgresql_config() -> GatewayConfig {
+        GatewayConfig {
+            listeners: vec![ListenerConfig {
+                name: "postgresql-listener".into(),
+                listen_addr: "127.0.0.1:5433".into(),
+                protocol: ProtocolKind::PostgreSql,
+                service: "analytics".into(),
+                auth_policy: None,
+            }],
+            services: vec![ServiceConfig {
+                name: "analytics".into(),
+                backend_protocol: ProtocolKind::PostgreSql,
+                endpoints: vec!["analytics-primary".into()],
+                route_policy: None,
+                plugin_policies: vec![],
+            }],
+            endpoints: vec![EndpointConfig {
+                name: "analytics-primary".into(),
+                protocol: ProtocolKind::PostgreSql,
+                address: "127.0.0.1:5432".into(),
+                database: Some("analytics_db".into()),
+                username: "postgres".into(),
+                password: "backend-secret".into(),
+                weight: 1,
+            }],
+            ..GatewayConfig::default()
+        }
+    }
+
     #[test]
     fn builds_core_connection_from_v2_config() {
         let runtime = GatewayRuntime::from_core_config(&mysql_config()).unwrap();
@@ -648,6 +861,30 @@ mod tests {
         assert_eq!(runtime.nodes[0].host, "127.0.0.1");
         assert_eq!(runtime.nodes[0].port, 3306);
         assert_eq!(runtime.nodes[0].user, "root");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn derives_postgresql_runtime_fields_from_v2_config() {
+        let runtime = GatewayRuntime::from_core_config_for_listener(
+            &postgresql_config(),
+            "postgresql-listener",
+        )
+        .unwrap();
+
+        assert_eq!(runtime.proxy_config.name, "postgresql-listener");
+        assert_eq!(runtime.proxy_config.node_type, "postgresql");
+        assert_eq!(runtime.proxy_config.backend_type, "postgresql");
+        assert_eq!(runtime.proxy_config.server_version, "14.0");
+        assert_eq!(runtime.proxy_config.listen_addr, "127.0.0.1:5433");
+        assert_eq!(runtime.proxy_config.db, "analytics_db");
+        assert_eq!(runtime.nodes.len(), 1);
+        assert_eq!(runtime.nodes[0].node_type, "postgresql");
+        assert_eq!(runtime.nodes[0].port, 5432);
+
+        let connection = runtime.build_core_connection("postgresql-listener").unwrap();
+        assert_eq!(connection.frontend_protocol(), ProtocolKind::PostgreSql);
+        assert_eq!(connection.backend_protocol(), ProtocolKind::PostgreSql);
     }
 
     #[test]
@@ -715,6 +952,27 @@ mod tests {
         )
         .await
         .expect("shutdown should stop the accept loop")
+        .unwrap();
+
+        assert!(start_source.shutdown_handle.is_shutdown_requested());
+        assert!(start_source.thread_handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn postgresql_start_returns_when_shutdown_is_requested() {
+        let mut config = postgresql_config();
+        config.listeners[0].listen_addr = "127.0.0.1:0".into();
+        let mut runtime =
+            GatewayRuntime::from_core_config_for_listener(&config, "postgresql-listener").unwrap();
+        let shutdown_handle = runtime.shutdown_handle();
+        shutdown_handle.shutdown();
+
+        let start_source = tokio::time::timeout(
+            Duration::from_secs(1),
+            proxy::factory::Proxy::start(&mut runtime),
+        )
+        .await
+        .expect("shutdown should stop the postgresql accept loop")
         .unwrap();
 
         assert!(start_source.shutdown_handle.is_shutdown_requested());

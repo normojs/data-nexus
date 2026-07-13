@@ -232,12 +232,41 @@ pub async fn start_gateway_server(mut s: Box<dyn proxy::factory::Proxy + Send>) 
 #[cfg(test)]
 mod tests {
     use config::config::GatewayConfigDocument;
+    use gateway_core::{EndpointConfig, ListenerConfig, ProtocolKind, ServiceConfig};
 
     use super::*;
 
     fn gateway_config() -> GatewayConfigDocument {
         GatewayConfigDocument::from_toml(include_str!("../../../examples/gateway-config.toml"))
             .unwrap()
+    }
+
+    fn mixed_gateway_config() -> GatewayConfigDocument {
+        let mut config = gateway_config();
+        config.gateway.listeners.push(ListenerConfig {
+            name: "analytics-postgresql".into(),
+            listen_addr: "0.0.0.0:15432".into(),
+            protocol: ProtocolKind::PostgreSql,
+            service: "analytics".into(),
+            auth_policy: None,
+        });
+        config.gateway.services.push(ServiceConfig {
+            name: "analytics".into(),
+            backend_protocol: ProtocolKind::PostgreSql,
+            endpoints: vec!["analytics-primary".into()],
+            route_policy: None,
+            plugin_policies: vec![],
+        });
+        config.gateway.endpoints.push(EndpointConfig {
+            name: "analytics-primary".into(),
+            protocol: ProtocolKind::PostgreSql,
+            address: "127.0.0.1:5432".into(),
+            database: Some("analytics".into()),
+            username: "postgres".into(),
+            password: "secret".into(),
+            weight: 1,
+        });
+        config
     }
 
     #[test]
@@ -263,6 +292,20 @@ mod tests {
 
         let session_snapshot = proxies[0].session_snapshotter.as_ref().unwrap()();
         assert!(session_snapshot.sessions.is_empty());
+    }
+
+    #[test]
+    fn builds_mysql_and_postgresql_v2_listener_instances() {
+        let factory = GatewayFactory::from_gateway_config(mixed_gateway_config());
+
+        let proxies = factory.try_build_proxies().unwrap();
+        let names = proxies.iter().map(|proxy| proxy.name.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["orders-mysql", "analytics-postgresql"]);
+        for proxy in proxies {
+            assert!(!proxy.shutdown_handle.is_shutdown_requested());
+            assert!(proxy.session_snapshotter.as_ref().unwrap()().sessions.is_empty());
+        }
     }
 
     #[test]
