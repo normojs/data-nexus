@@ -43,7 +43,6 @@
 - [x] 根据 `service.backend_protocol` 构建对应 backend connector。
 - [ ] 保持现有 MySQL 代理功能行为不变。
 - [x] 不保留旧 MySQL example config 的启动兼容，后续只支持 v2 Gateway 配置。
-- [ ] 补齐 runtime shutdown handle，避免 `stop()` 空实现。
 
 ## Phase 2：PostgreSQL 同协议中转
 

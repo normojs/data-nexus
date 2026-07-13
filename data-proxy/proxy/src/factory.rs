@@ -14,6 +14,7 @@
 
 use pisa_error::error::Error;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 pub enum ProxyKind {
     #[deprecated(note = "使用UNISQL")]
@@ -23,9 +24,66 @@ pub enum ProxyKind {
     PostgreSQL,
 }
 
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    token: CancellationToken,
+}
+
+impl ShutdownHandle {
+    pub fn new() -> Self {
+        Self { token: CancellationToken::new() }
+    }
+
+    pub fn shutdown(&self) {
+        self.token.cancel();
+    }
+
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+}
+
+impl Default for ShutdownHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct StartSource {
     pub thread_handles: Vec<JoinHandle<()>>,
-    // pub sender: crossbeam_channel::Sender<()>,
+    pub shutdown_handle: ShutdownHandle,
+}
+
+impl StartSource {
+    pub fn new(shutdown_handle: ShutdownHandle) -> Self {
+        Self { thread_handles: Vec::new(), shutdown_handle }
+    }
+}
+
+impl Default for StartSource {
+    fn default() -> Self {
+        Self::new(ShutdownHandle::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_handle_notifies_clones() {
+        let handle = ShutdownHandle::new();
+        let cloned = handle.clone();
+
+        handle.shutdown();
+        cloned.cancelled().await;
+
+        assert!(cloned.is_shutdown_requested());
+    }
 }
 
 #[async_trait::async_trait]
@@ -33,6 +91,7 @@ pub trait Proxy {
     // async fn start(&mut self, start_source: &StartSource) -> Result<StartSource, Error>;
     async fn start(&mut self) -> Result<StartSource, Error>;
     async fn stop(&mut self) -> Result<(), Error>;
+    fn shutdown_handle(&self) -> ShutdownHandle;
 }
 
 pub trait ProxyFactory {

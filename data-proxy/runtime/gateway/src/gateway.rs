@@ -26,7 +26,7 @@ use parking_lot::Mutex;
 use pisa_error::error::{Error, ErrorKind};
 use plugin::build_phase::PluginPhase;
 use proxy::{
-    factory::StartSource,
+    factory::{ShutdownHandle, StartSource},
     listener::Listener,
     proxy::{Proxy, ProxyConfig, UniSQLNode},
 };
@@ -53,6 +53,7 @@ pub struct GatewayRuntime {
     pub nodes: Vec<UniSQLNode>,
     pub pisa_version: String,
     pub core_plan: Option<CoreGatewayRuntimePlan>,
+    pub shutdown_handle: ShutdownHandle,
 }
 
 impl GatewayRuntime {
@@ -335,10 +336,18 @@ impl proxy::factory::Proxy for GatewayRuntime {
         //let metrics_collector = MySQLServerMetricsCollector::new();
 
         let has_rw = self.proxy_config.read_write_splitting.is_some();
+        let mut start_source = StartSource::new(self.shutdown_handle.clone());
 
         loop {
-            // TODO: need refactor
-            let socket = proxy.accept(&listener).await.map_err(ErrorKind::Io)?;
+            let socket = tokio::select! {
+                _ = self.shutdown_handle.cancelled() => {
+                    debug!("gateway '{}' shutdown requested", self.proxy_config.name);
+                    break;
+                }
+                accepted = proxy.accept(&listener) => {
+                    accepted.map_err(ErrorKind::Io)?
+                }
+            };
 
             let route_strategy = route_strategy.clone();
             let plugin = plugin.clone();
@@ -358,7 +367,7 @@ impl proxy::factory::Proxy for GatewayRuntime {
             // TODO: 根据node_type创建实例
             let mut instance = MySqlFrontendConnection::new(MySqlBackendConnector::new());
             debug!("loop start....");
-            let _join_handle = tokio::spawn(async move {
+            let join_handle = tokio::spawn(async move {
                 let framed = match frontend.handshake(socket).await {
                     Ok(framed) => framed,
                     Err(e) => {
@@ -394,22 +403,31 @@ impl proxy::factory::Proxy for GatewayRuntime {
                 }
             }); // end  tokio::spawn
 
-            // start_source.thread_handles.push(join_handle);
+            start_source.thread_handles.push(join_handle);
         }
+
+        Ok(start_source)
     }
 
     // stop proxy server
     async fn stop(&mut self) -> Result<(), Error> {
-        // TODO：
+        self.shutdown_handle.shutdown();
         Ok(())
+    }
+
+    fn shutdown_handle(&self) -> ShutdownHandle {
+        self.shutdown_handle.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use gateway_core::{
         EndpointConfig, GatewayConfig, ListenerConfig, ProtocolKind, ServiceConfig,
     };
+    use proxy::factory::Proxy as _;
 
     use super::*;
 
@@ -510,5 +528,35 @@ mod tests {
             error,
             GatewayError::Configuration("gateway runtime has no v2 core config".into())
         );
+    }
+
+    #[tokio::test]
+    async fn stop_requests_shutdown() {
+        let mut runtime = GatewayRuntime::from_core_config(&mysql_config()).unwrap();
+        let shutdown_handle = runtime.shutdown_handle();
+
+        proxy::factory::Proxy::stop(&mut runtime).await.unwrap();
+
+        assert!(shutdown_handle.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn start_returns_when_shutdown_is_requested() {
+        let mut config = mysql_config();
+        config.listeners[0].listen_addr = "127.0.0.1:0".into();
+        let mut runtime = GatewayRuntime::from_core_config(&config).unwrap();
+        let shutdown_handle = runtime.shutdown_handle();
+        shutdown_handle.shutdown();
+
+        let start_source = tokio::time::timeout(
+            Duration::from_secs(1),
+            proxy::factory::Proxy::start(&mut runtime),
+        )
+        .await
+        .expect("shutdown should stop the accept loop")
+        .unwrap();
+
+        assert!(start_source.shutdown_handle.is_shutdown_requested());
+        assert!(start_source.thread_handles.is_empty());
     }
 }

@@ -77,19 +77,21 @@ fn main() {
             servers.push(NodeInstance::new(
                 instance.name,
                 tokio::spawn(start_gateway_server(instance.proxy)),
+                Some(instance.shutdown_handle),
             ));
         }
 
         servers.push(NodeInstance::new(
             "httpserver-001".to_string(),
             tokio::spawn(new_http_server(http_server)),
+            None,
         ));
 
         for server_instance in &servers {
             debug!("server instance name is: {}", server_instance.name);
         }
         for server_instance in servers {
-            if let Err(e) = server_instance.joinHandle.await {
+            if let Err(e) = server_instance.join_handle.await {
                 error!("{:?}", e)
             }
         }
@@ -114,7 +116,7 @@ fn main() {
 //     server.abort();
 // }
 
-fn restart_node(name: String) {
+fn restart_node(_name: String) {
     //     TODO: restart node
 }
 

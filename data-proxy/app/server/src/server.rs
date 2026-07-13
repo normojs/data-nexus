@@ -16,7 +16,7 @@ use std::{error::Error, fmt};
 
 use config::config::{GatewayConfigDocument, PisaProxyConfig};
 use proxy::{
-    factory::{Proxy, ProxyFactory},
+    factory::{Proxy, ProxyFactory, ShutdownHandle},
     proxy::ProxyConfig,
 };
 // use runtime_mysql::mysql;
@@ -34,6 +34,7 @@ pub struct GatewayFactory {
 pub struct GatewayProxyInstance {
     pub name: String,
     pub proxy: Box<dyn Proxy + Send>,
+    pub shutdown_handle: ShutdownHandle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,15 +82,20 @@ impl GatewayFactory {
     pub fn try_build_proxies(&self) -> Result<Vec<GatewayProxyInstance>, GatewayFactoryError> {
         match &self.config {
             GatewayFactoryConfig::Legacy { proxy_config, pisa_config } => {
+                let runtime = runtime_gateway::gateway::GatewayRuntime {
+                    proxy_config: proxy_config.clone(),
+                    node_group: pisa_config.node_group.clone(),
+                    nodes: pisa_config.get_nodes().to_vec(),
+                    pisa_version: pisa_config.get_version().to_string(),
+                    core_plan: None,
+                    ..Default::default()
+                };
+                let shutdown_handle = runtime.shutdown_handle();
+
                 Ok(vec![GatewayProxyInstance {
                     name: proxy_config.name.clone(),
-                    proxy: Box::new(runtime_gateway::gateway::GatewayRuntime {
-                        proxy_config: proxy_config.clone(),
-                        node_group: pisa_config.node_group.clone(),
-                        nodes: pisa_config.get_nodes().to_vec(),
-                        pisa_version: pisa_config.get_version().to_string(),
-                        core_plan: None,
-                    }),
+                    proxy: Box::new(runtime),
+                    shutdown_handle,
                 }])
             }
             GatewayFactoryConfig::Native(config) => {
@@ -110,9 +116,12 @@ impl GatewayFactory {
                         gateway_runtime.pisa_version =
                             config.version.clone().unwrap_or_else(|| "2".into());
 
+                        let shutdown_handle = gateway_runtime.shutdown_handle();
+
                         Ok(GatewayProxyInstance {
                             name: listener.name.clone(),
                             proxy: Box::new(gateway_runtime),
+                            shutdown_handle,
                         })
                     })
                     .collect::<Result<Vec<_>, gateway_core::GatewayError>>()
@@ -150,8 +159,17 @@ impl ProxyFactory for GatewayFactory {
 }
 /// 启动代理服务器
 pub async fn start_gateway_server(mut s: Box<dyn proxy::factory::Proxy + Send>) {
-    if let Err(error) = s.start().await {
-        eprintln!("gateway server stopped with error: {}", error);
+    match s.start().await {
+        Ok(start_source) => {
+            for handle in start_source.thread_handles {
+                if let Err(error) = handle.await {
+                    eprintln!("gateway connection task stopped with error: {}", error);
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("gateway server stopped with error: {}", error);
+        }
     }
 }
 
@@ -174,6 +192,7 @@ mod tests {
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(proxies[0].name, "orders-mysql");
+        assert!(!proxies[0].shutdown_handle.is_shutdown_requested());
     }
 
     #[test]
