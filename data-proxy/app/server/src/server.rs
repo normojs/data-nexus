@@ -81,6 +81,42 @@ impl GatewayFactory {
             .ok_or_else(|| GatewayFactoryError::new("gateway config has no listeners"))
     }
 
+    pub fn try_build_proxy_for_listener(
+        &self,
+        listener_name: &str,
+    ) -> Result<GatewayProxyInstance, GatewayFactoryError> {
+        match &self.config {
+            GatewayFactoryConfig::Legacy { proxy_config, .. } => {
+                if proxy_config.name != listener_name {
+                    return Err(GatewayFactoryError::new(format!(
+                        "listener '{}' is not defined",
+                        listener_name
+                    )));
+                }
+
+                self.try_build_proxies()?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| GatewayFactoryError::new("gateway config has no listeners"))
+            }
+            GatewayFactoryConfig::Native(config) => {
+                let listener = config
+                    .gateway
+                    .listeners
+                    .iter()
+                    .find(|listener| listener.name == listener_name)
+                    .ok_or_else(|| {
+                        GatewayFactoryError::new(format!(
+                            "listener '{}' is not defined",
+                            listener_name
+                        ))
+                    })?;
+
+                Self::build_native_proxy_instance(config, &listener.name)
+            }
+        }
+    }
+
     pub fn try_build_proxies(&self) -> Result<Vec<GatewayProxyInstance>, GatewayFactoryError> {
         match &self.config {
             GatewayFactoryConfig::Legacy { proxy_config, pisa_config } => {
@@ -113,31 +149,34 @@ impl GatewayFactory {
                     .gateway
                     .listeners
                     .iter()
-                    .map(|listener| {
-                        let mut gateway_runtime =
-                            runtime_gateway::gateway::GatewayRuntime::from_core_config_for_listener(
-                                &config.gateway,
-                                &listener.name,
-                            )?;
-                        gateway_runtime.pisa_version =
-                            config.version.clone().unwrap_or_else(|| "2".into());
-
-                        let shutdown_handle = gateway_runtime.shutdown_handle();
-                        let pool_snapshotter = Some(gateway_runtime.pool_snapshotter());
-                        let session_snapshotter = Some(gateway_runtime.session_snapshotter());
-
-                        Ok(GatewayProxyInstance {
-                            name: listener.name.clone(),
-                            proxy: Box::new(gateway_runtime),
-                            shutdown_handle,
-                            pool_snapshotter,
-                            session_snapshotter,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, gateway_core::GatewayError>>()
-                    .map_err(Into::into)
+                    .map(|listener| Self::build_native_proxy_instance(config, &listener.name))
+                    .collect()
             }
         }
+    }
+
+    fn build_native_proxy_instance(
+        config: &GatewayConfigDocument,
+        listener_name: &str,
+    ) -> Result<GatewayProxyInstance, GatewayFactoryError> {
+        let mut gateway_runtime =
+            runtime_gateway::gateway::GatewayRuntime::from_core_config_for_listener(
+                &config.gateway,
+                listener_name,
+            )?;
+        gateway_runtime.pisa_version = config.version.clone().unwrap_or_else(|| "2".into());
+
+        let shutdown_handle = gateway_runtime.shutdown_handle();
+        let pool_snapshotter = Some(gateway_runtime.pool_snapshotter());
+        let session_snapshotter = Some(gateway_runtime.session_snapshotter());
+
+        Ok(GatewayProxyInstance {
+            name: listener_name.to_owned(),
+            proxy: Box::new(gateway_runtime),
+            shutdown_handle,
+            pool_snapshotter,
+            session_snapshotter,
+        })
     }
 }
 

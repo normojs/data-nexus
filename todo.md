@@ -104,7 +104,6 @@
 
 ## Admin API
 
-- [ ] 支持新增 listener。
 - [ ] 支持替换 route policy。
 - [ ] 支持刷新 endpoint pool。
 

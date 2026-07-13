@@ -16,23 +16,26 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{Arc, RwLock},
 };
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Json, Path, State},
     http::{header, StatusCode},
     response::Response,
     routing::{get, post},
     Router,
 };
 use config::config::{GatewayConfigDocument, GatewayConfigLoadError, PisaProxyConfig};
+use gateway_core::ListenerConfig;
 use pisa_error::error::*;
 use pisa_metrics::metrics::MetricsManager;
 use proxy::factory::{
     PoolSnapshot, PoolSnapshotter, SessionEntrySnapshot, SessionSnapshotter, ShutdownHandle,
 };
 use serde::Serialize;
+use server::server::{start_gateway_server, GatewayFactory};
 use tracing::info;
 use ver::version::get_version;
 
@@ -53,7 +56,7 @@ pub enum HttpServerKind {
 #[derive(Debug)]
 pub struct PisaHttpServerFactory {
     pisa_config: PisaProxyConfig,
-    gateway_config: Option<GatewayConfigDocument>,
+    gateway_config: Option<SharedGatewayConfig>,
     gateway_config_source: Option<GatewayConfigSource>,
     runtime_state: Option<AdminRuntimeState>,
     metrics_manager: MetricsManager,
@@ -80,7 +83,7 @@ impl PisaHttpServerFactory {
         };
         PisaHttpServerFactory {
             pisa_config,
-            gateway_config: Some(gateway_config),
+            gateway_config: Some(shared_gateway_config(gateway_config)),
             gateway_config_source: None,
             runtime_state: None,
             metrics_manager: mgr,
@@ -157,8 +160,19 @@ impl GatewayConfigSource {
     }
 }
 
+type SharedGatewayConfig = Arc<RwLock<GatewayConfigDocument>>;
+
+fn shared_gateway_config(config: GatewayConfigDocument) -> SharedGatewayConfig {
+    Arc::new(RwLock::new(config))
+}
+
 #[derive(Clone, Default)]
 pub struct AdminRuntimeState {
+    inner: Arc<RwLock<AdminRuntimeStateInner>>,
+}
+
+#[derive(Default)]
+struct AdminRuntimeStateInner {
     listener_shutdown_handles: HashMap<String, ShutdownHandle>,
     listener_pool_snapshotters: HashMap<String, PoolSnapshotter>,
     listener_session_snapshotters: HashMap<String, SessionSnapshotter>,
@@ -166,11 +180,21 @@ pub struct AdminRuntimeState {
 
 impl fmt::Debug for AdminRuntimeState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = match self.inner.read() {
+            Ok(inner) => inner,
+            Err(_) => {
+                return formatter
+                    .debug_struct("AdminRuntimeState")
+                    .field("poisoned", &true)
+                    .finish()
+            }
+        };
+
         formatter
             .debug_struct("AdminRuntimeState")
-            .field("listener_shutdown_handles", &self.listener_shutdown_handles)
-            .field("listener_pool_snapshotter_count", &self.listener_pool_snapshotters.len())
-            .field("listener_session_snapshotter_count", &self.listener_session_snapshotters.len())
+            .field("listener_shutdown_handles", &inner.listener_shutdown_handles)
+            .field("listener_pool_snapshotter_count", &inner.listener_pool_snapshotters.len())
+            .field("listener_session_snapshotter_count", &inner.listener_session_snapshotters.len())
             .finish()
     }
 }
@@ -201,29 +225,48 @@ impl AdminRuntimeState {
             Item = (String, ShutdownHandle, Option<PoolSnapshotter>, Option<SessionSnapshotter>),
         >,
     ) -> Self {
-        let mut listener_shutdown_handles = HashMap::new();
-        let mut listener_pool_snapshotters = HashMap::new();
-        let mut listener_session_snapshotters = HashMap::new();
+        let mut inner = AdminRuntimeStateInner::default();
 
         for (name, shutdown_handle, pool_snapshotter, session_snapshotter) in listener_runtimes {
-            listener_shutdown_handles.insert(name.clone(), shutdown_handle);
+            inner.listener_shutdown_handles.insert(name.clone(), shutdown_handle);
             if let Some(pool_snapshotter) = pool_snapshotter {
-                listener_pool_snapshotters.insert(name.clone(), pool_snapshotter);
+                inner.listener_pool_snapshotters.insert(name.clone(), pool_snapshotter);
             }
             if let Some(session_snapshotter) = session_snapshotter {
-                listener_session_snapshotters.insert(name, session_snapshotter);
+                inner.listener_session_snapshotters.insert(name, session_snapshotter);
             }
         }
 
-        Self {
-            listener_shutdown_handles,
-            listener_pool_snapshotters,
-            listener_session_snapshotters,
+        Self { inner: Arc::new(RwLock::new(inner)) }
+    }
+
+    fn register_listener(
+        &self,
+        name: String,
+        shutdown_handle: ShutdownHandle,
+        pool_snapshotter: Option<PoolSnapshotter>,
+        session_snapshotter: Option<SessionSnapshotter>,
+    ) -> Result<(), String> {
+        let mut inner =
+            self.inner.write().map_err(|_| "admin runtime state lock is poisoned".to_string())?;
+
+        if inner.listener_shutdown_handles.contains_key(&name) {
+            return Err(format!("listener runtime '{}' is already registered", name));
         }
+
+        inner.listener_shutdown_handles.insert(name.clone(), shutdown_handle);
+        if let Some(pool_snapshotter) = pool_snapshotter {
+            inner.listener_pool_snapshotters.insert(name.clone(), pool_snapshotter);
+        }
+        if let Some(session_snapshotter) = session_snapshotter {
+            inner.listener_session_snapshotters.insert(name, session_snapshotter);
+        }
+
+        Ok(())
     }
 
     fn stop_listener(&self, name: &str) -> Option<ListenerRuntimeStatus> {
-        let shutdown_handle = self.listener_shutdown_handles.get(name)?;
+        let shutdown_handle = self.inner.read().ok()?.listener_shutdown_handles.get(name)?.clone();
         shutdown_handle.shutdown();
         Some(ListenerRuntimeStatus {
             name: name.to_owned(),
@@ -232,8 +275,18 @@ impl AdminRuntimeState {
     }
 
     fn pool_statuses(&self) -> Vec<ListenerPoolRuntimeStatus> {
-        let mut statuses = self
-            .listener_pool_snapshotters
+        let snapshotters = self
+            .inner
+            .read()
+            .map(|inner| {
+                inner
+                    .listener_pool_snapshotters
+                    .iter()
+                    .map(|(name, snapshotter)| (name.clone(), snapshotter.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut statuses = snapshotters
             .iter()
             .map(|(name, snapshotter)| ListenerPoolRuntimeStatus {
                 name: name.clone(),
@@ -245,11 +298,13 @@ impl AdminRuntimeState {
     }
 
     fn session_statuses(&self) -> Vec<SessionEntrySnapshot> {
-        let mut sessions = self
-            .listener_session_snapshotters
-            .values()
-            .flat_map(|snapshotter| snapshotter().sessions)
-            .collect::<Vec<_>>();
+        let snapshotters = self
+            .inner
+            .read()
+            .map(|inner| inner.listener_session_snapshotters.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut sessions =
+            snapshotters.iter().flat_map(|snapshotter| snapshotter().sessions).collect::<Vec<_>>();
         sessions.sort_by(|left, right| {
             left.listener.cmp(&right.listener).then_with(|| left.id.cmp(&right.id))
         });
@@ -277,6 +332,13 @@ struct GatewayReloadResponse {
     applied: bool,
     changed: bool,
     diff: GatewayConfigDiff,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminAddListenerResponse {
+    status: &'static str,
+    name: String,
+    listen_addr: String,
 }
 
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
@@ -392,7 +454,7 @@ struct AdminErrorResponse {
 #[derive(Clone, Debug)]
 pub struct AxumServer {
     pisa_config: PisaProxyConfig,
-    gateway_config: Option<GatewayConfigDocument>,
+    gateway_config: Option<SharedGatewayConfig>,
     gateway_config_source: Option<GatewayConfigSource>,
     runtime_state: Option<AdminRuntimeState>,
     metrics_manager: MetricsManager,
@@ -409,7 +471,7 @@ impl AxumServer {
             .route("/metrics", get(Self::metrics))
             .route("/config", get(Self::admin_config))
             .route("/admin/config", get(Self::admin_config))
-            .route("/admin/listeners", get(Self::admin_listeners))
+            .route("/admin/listeners", get(Self::admin_listeners).post(Self::admin_add_listener))
             .route("/admin/listeners/:name/stop", post(Self::admin_stop_listener))
             .route("/admin/services", get(Self::admin_services))
             .route("/admin/endpoints", get(Self::admin_endpoints))
@@ -439,30 +501,118 @@ impl AxumServer {
 
     async fn admin_config(State(state): State<Self>) -> Response<Body> {
         match &state.gateway_config {
-            Some(config) => json_response(config),
+            Some(config) => match gateway_config_snapshot(config) {
+                Ok(config) => json_response(&config),
+                Err(response) => response,
+            },
             None => json_response(&state.pisa_config),
         }
     }
 
     async fn admin_listeners(State(state): State<Self>) -> Response<Body> {
         match &state.gateway_config {
-            Some(config) => json_response(&config.gateway.listeners),
+            Some(config) => match gateway_config_snapshot(config) {
+                Ok(config) => json_response(&config.gateway.listeners),
+                Err(response) => response,
+            },
             None => gateway_config_not_available(),
         }
     }
 
     async fn admin_services(State(state): State<Self>) -> Response<Body> {
         match &state.gateway_config {
-            Some(config) => json_response(&config.gateway.services),
+            Some(config) => match gateway_config_snapshot(config) {
+                Ok(config) => json_response(&config.gateway.services),
+                Err(response) => response,
+            },
             None => gateway_config_not_available(),
         }
     }
 
     async fn admin_endpoints(State(state): State<Self>) -> Response<Body> {
         match &state.gateway_config {
-            Some(config) => json_response(&config.gateway.endpoints),
+            Some(config) => match gateway_config_snapshot(config) {
+                Ok(config) => json_response(&config.gateway.endpoints),
+                Err(response) => response,
+            },
             None => gateway_config_not_available(),
         }
+    }
+
+    async fn admin_add_listener(
+        State(state): State<Self>,
+        Json(listener): Json<ListenerConfig>,
+    ) -> Response<Body> {
+        let gateway_config = match &state.gateway_config {
+            Some(gateway_config) => gateway_config.clone(),
+            None => return gateway_config_not_available(),
+        };
+        let runtime_state = match &state.runtime_state {
+            Some(runtime_state) => runtime_state.clone(),
+            None => return admin_runtime_unavailable("admin runtime state is not available"),
+        };
+        let listener_name = listener.name.clone();
+        let listen_addr = listener.listen_addr.clone();
+
+        let listener_runtime = {
+            let mut current_config = match gateway_config.write() {
+                Ok(current_config) => current_config,
+                Err(_) => {
+                    return admin_json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "gateway listener add failed",
+                        "gateway config lock is poisoned".to_string(),
+                    )
+                }
+            };
+            let mut next_config = current_config.clone();
+            next_config.gateway.listeners.push(listener);
+
+            if let Err(error) = next_config.gateway.validate() {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "gateway listener add failed",
+                    format!("invalid gateway configuration: {}", error),
+                );
+            }
+
+            let listener_runtime = match GatewayFactory::from_gateway_config(next_config.clone())
+                .try_build_proxy_for_listener(&listener_name)
+            {
+                Ok(listener_runtime) => listener_runtime,
+                Err(error) => {
+                    return admin_json_error(
+                        StatusCode::BAD_REQUEST,
+                        "gateway listener add failed",
+                        format!("failed to build listener runtime: {}", error),
+                    )
+                }
+            };
+
+            if let Err(error) = runtime_state.register_listener(
+                listener_runtime.name.clone(),
+                listener_runtime.shutdown_handle.clone(),
+                listener_runtime.pool_snapshotter.clone(),
+                listener_runtime.session_snapshotter.clone(),
+            ) {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "gateway listener add failed",
+                    error,
+                );
+            }
+
+            *current_config = next_config;
+            listener_runtime
+        };
+
+        tokio::spawn(start_gateway_server(listener_runtime.proxy));
+
+        json_response(&AdminAddListenerResponse {
+            status: "started",
+            name: listener_name,
+            listen_addr,
+        })
     }
 
     async fn admin_pools(State(state): State<Self>) -> Response<Body> {
@@ -481,7 +631,10 @@ impl AxumServer {
 
     async fn admin_reload(State(state): State<Self>) -> Response<Body> {
         let current_config = match &state.gateway_config {
-            Some(config) => config,
+            Some(config) => match gateway_config_snapshot(config) {
+                Ok(config) => config,
+                Err(response) => return response,
+            },
             None => return gateway_config_not_available(),
         };
         let config_source = match &state.gateway_config_source {
@@ -493,7 +646,7 @@ impl AxumServer {
             Ok(config) => config,
             Err(error) => return gateway_config_load_error(error),
         };
-        let diff = GatewayConfigDiff::between(current_config, &next_config);
+        let diff = GatewayConfigDiff::between(&current_config, &next_config);
         let changed = diff.has_changes();
 
         json_response(&GatewayReloadResponse {
@@ -537,6 +690,18 @@ fn json_response<T: Serialize>(value: &T) -> Response<Body> {
     }
 }
 
+fn gateway_config_snapshot(
+    config: &SharedGatewayConfig,
+) -> Result<GatewayConfigDocument, Response<Body>> {
+    config.read().map(|config| config.clone()).map_err(|_| {
+        admin_json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "gateway config unavailable",
+            "gateway config lock is poisoned".to_string(),
+        )
+    })
+}
+
 fn gateway_config_not_available() -> Response<Body> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
@@ -544,11 +709,35 @@ fn gateway_config_not_available() -> Response<Body> {
         .expect("static not found response is valid")
 }
 
+fn admin_runtime_unavailable(message: &'static str) -> Response<Body> {
+    admin_json_error(StatusCode::SERVICE_UNAVAILABLE, "admin runtime unavailable", message)
+}
+
 fn admin_runtime_not_found(message: &'static str) -> Response<Body> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Body::from(message))
         .expect("static not found response is valid")
+}
+
+fn admin_json_error(
+    status: StatusCode,
+    error: &'static str,
+    message: impl Into<String>,
+) -> Response<Body> {
+    let value = AdminErrorResponse { error, message: message.into() };
+
+    match serde_json::to_vec(&value) {
+        Ok(body) => Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("static admin error response is valid"),
+        Err(error) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(error.to_string()))
+            .expect("static internal server error response is valid"),
+    }
 }
 
 fn gateway_config_load_error(error: GatewayConfigLoadError) -> Response<Body> {
@@ -559,20 +748,7 @@ fn gateway_config_load_error(error: GatewayConfigLoadError) -> Response<Body> {
         }
         GatewayConfigLoadError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
     };
-    let value =
-        AdminErrorResponse { error: "gateway config reload failed", message: error.to_string() };
-
-    match serde_json::to_vec(&value) {
-        Ok(body) => Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .expect("static gateway config error response is valid"),
-        Err(error) => Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from(error.to_string()))
-            .expect("static internal server error response is valid"),
-    }
+    admin_json_error(status, "gateway config reload failed", error.to_string())
 }
 
 #[async_trait::async_trait]
@@ -598,7 +774,7 @@ mod tests {
     use axum::http::{Method, Request};
     use hyper::body::to_bytes;
     use proxy::factory::{PoolEndpointSnapshot, SessionEntrySnapshot, SessionSnapshot};
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use tower::ServiceExt;
 
     use super::*;
@@ -616,7 +792,7 @@ mod tests {
                 version: gateway_config.version.clone(),
                 ..PisaProxyConfig::default()
             },
-            gateway_config: Some(gateway_config),
+            gateway_config: Some(shared_gateway_config(gateway_config)),
             gateway_config_source: None,
             runtime_state: None,
             metrics_manager: MetricsManager::new(),
@@ -677,6 +853,26 @@ mod tests {
         (status, value)
     }
 
+    async fn post_json_body(server: AxumServer, path: &str, value: Value) -> (StatusCode, Value) {
+        let body = serde_json::to_vec(&value).unwrap();
+        let response = server
+            .routes()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body()).await.unwrap();
+        let value = serde_json::from_slice(&body).unwrap();
+        (status, value)
+    }
+
     #[tokio::test]
     async fn admin_config_returns_native_gateway_config() {
         let (status, value) = get_json("/admin/config").await;
@@ -727,6 +923,61 @@ mod tests {
         assert_eq!(value["name"], "orders-mysql");
         assert_eq!(value["shutdown_requested"], true);
         assert!(shutdown_handle.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn admin_add_listener_updates_config_and_runtime_registry() {
+        let server = gateway_server_with_runtime_state(AdminRuntimeState::default());
+
+        let (status, value) = post_json_body(
+            server.clone(),
+            "/admin/listeners",
+            json!({
+                "name": "orders-mysql-extra",
+                "listen_addr": "127.0.0.1:0",
+                "protocol": "my_sql",
+                "service": "orders",
+                "auth_policy": null
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["status"], "started");
+        assert_eq!(value["name"], "orders-mysql-extra");
+        assert_eq!(value["listen_addr"], "127.0.0.1:0");
+
+        let (status, listeners) = get_json_from(server.clone(), "/admin/listeners").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listeners.as_array().unwrap().len(), 2);
+        assert_eq!(listeners[1]["name"], "orders-mysql-extra");
+
+        let (status, pools) = get_json_from(server, "/admin/pools").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(pools[0]["name"], "orders-mysql-extra");
+        assert_eq!(pools[0]["capacity"], 64);
+    }
+
+    #[tokio::test]
+    async fn admin_add_listener_rejects_duplicate_listener_name() {
+        let server = gateway_server_with_runtime_state(AdminRuntimeState::default());
+
+        let (status, value) = post_json_body(
+            server,
+            "/admin/listeners",
+            json!({
+                "name": "orders-mysql",
+                "listen_addr": "127.0.0.1:0",
+                "protocol": "my_sql",
+                "service": "orders",
+                "auth_policy": null
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["error"], "gateway listener add failed");
+        assert!(value["message"].as_str().unwrap().contains("duplicate listener"));
     }
 
     #[tokio::test]
