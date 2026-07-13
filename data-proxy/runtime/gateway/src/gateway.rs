@@ -102,6 +102,34 @@ impl GatewayRuntime {
         plan.build_connection(listener_name)
     }
 
+    fn core_listener_plan(&self) -> Option<&CoreGatewayListenerPlan> {
+        self.core_plan.as_ref().and_then(|plan| plan.listener(&self.proxy_config.name))
+    }
+
+    fn frontend_protocol_name(&self) -> String {
+        self.core_listener_plan()
+            .map(|plan| protocol_name(&plan.listener().protocol).to_owned())
+            .unwrap_or_else(|| self.proxy_config.node_type.clone())
+    }
+
+    #[allow(deprecated)]
+    fn backend_protocol_name(&self) -> String {
+        self.core_listener_plan()
+            .map(|plan| protocol_name(&plan.service().backend_protocol).to_owned())
+            .unwrap_or_else(|| self.proxy_config.backend_type.clone())
+    }
+
+    #[allow(deprecated)]
+    fn build_listener_config(&self) -> Listener {
+        Listener {
+            name: self.proxy_config.name.clone(),
+            node_type: self.frontend_protocol_name(),
+            backend_type: self.backend_protocol_name(),
+            listen_addr: self.proxy_config.listen_addr.clone(),
+            server_version: self.proxy_config.server_version.clone(),
+        }
+    }
+
     // 构建路由
     fn build_route(&self) -> Result<RouteStrategy, Error> {
         let length = self.nodes.len();
@@ -115,43 +143,37 @@ impl GatewayRuntime {
         }
 
         // 路由策略
-        let strategy = if self.proxy_config.read_write_splitting.is_some()
-            && self.proxy_config.sharding.is_some()
-        {
+        let strategy = if let Some(read_write_splitting) = &self.proxy_config.read_write_splitting {
             let rw_endpoint = ReadWriteEndpoint { read: ro, readwrite: rw };
             RouteStrategy::new(
-                self.proxy_config.read_write_splitting.as_ref().unwrap().clone(),
+                read_write_splitting.clone(),
                 &self.node_group,
                 rw_endpoint,
-                true,
-            )
-            .map_err(|e| Error::new(ErrorKind::Runtime(e.into())))?
-        } else if self.proxy_config.read_write_splitting.is_some() {
-            let rw_endpoint = ReadWriteEndpoint { read: ro, readwrite: rw };
-            RouteStrategy::new(
-                self.proxy_config.read_write_splitting.as_ref().unwrap().clone(),
-                &self.node_group,
-                rw_endpoint,
-                false,
+                self.proxy_config.sharding.is_some(),
             )
             .map_err(|e| Error::new(ErrorKind::Runtime(e.into())))?
         } else {
             //let rw_endpoint = ReadWriteEndpoint { read: ro, readwrite: rw };
-            let balance_type =
-                self.proxy_config.simple_loadbalance.as_ref().unwrap().balance_type.clone();
+            let simple_loadbalance = self.proxy_config.simple_loadbalance.as_ref().ok_or_else(|| {
+                runtime_configuration_error(format!(
+                    "gateway '{}' requires simple_loadbalance when read_write_splitting is not configured",
+                    self.proxy_config.name
+                ))
+            })?;
+            let balance_type = simple_loadbalance.balance_type.clone();
             let mut balance = Balance.build_balance(balance_type);
             rw.append(&mut ro);
             for ep in rw.into_iter() {
                 balance.add(ep)
             }
 
-            if self.proxy_config.sharding.is_some() {
-                let has_strategy = &self.proxy_config.sharding.as_ref().unwrap().iter().all(|x| {
+            if let Some(sharding) = &self.proxy_config.sharding {
+                let has_strategy = sharding.iter().all(|x| {
                     x.table_strategy.is_some()
                         || x.database_strategy.is_some()
                         || x.database_table_strategy.is_some()
                 });
-                if *has_strategy {
+                if has_strategy {
                     RouteStrategy::new_with_sharding_only(balance)
                 } else {
                     RouteStrategy::new_with_simple_route(balance)
@@ -165,13 +187,9 @@ impl GatewayRuntime {
     } // end build route
 
     fn build_sharding_rewriter(&self) -> Option<ShardingRewrite> {
-        let config = self.proxy_config.sharding.clone();
+        let config = self.proxy_config.sharding.clone()?;
 
-        if config.is_none() {
-            return None;
-        }
-
-        let has_strategy = config.as_ref().unwrap().iter().all(|x| {
+        let has_strategy = config.iter().all(|x| {
             x.table_strategy.is_some()
                 || x.database_strategy.is_some()
                 || x.database_table_strategy.is_some()
@@ -188,10 +206,15 @@ impl GatewayRuntime {
 
         let has_rw = self.proxy_config.read_write_splitting.is_some();
 
-        Some(ShardingRewrite::new(config.unwrap(), endpoints, self.node_group.clone(), has_rw))
+        Some(ShardingRewrite::new(config, endpoints, self.node_group.clone(), has_rw))
     }
 }
 
+fn runtime_configuration_error(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::Runtime(Box::new(GatewayError::Configuration(message.into()))))
+}
+
+#[allow(deprecated)]
 fn legacy_proxy_config_from_core_plan(
     plan: &CoreGatewayListenerPlan,
 ) -> GatewayResult<ProxyConfig> {
@@ -279,13 +302,7 @@ impl proxy::factory::Proxy for GatewayRuntime {
 
     // async fn start(&mut self, &mut start_source: StartSource) -> Result<StartSource, Error> {
     async fn start(&mut self) -> Result<StartSource, Error> {
-        let listener = Listener {
-            name: self.proxy_config.name.clone(),
-            node_type: self.proxy_config.node_type.clone(),
-            backend_type: self.proxy_config.backend_type.clone(),
-            listen_addr: self.proxy_config.listen_addr.clone(),
-            server_version: self.proxy_config.server_version.clone(),
-        };
+        let listener = self.build_listener_config();
 
         let mut proxy = Proxy {
             listener,
@@ -294,7 +311,7 @@ impl proxy::factory::Proxy for GatewayRuntime {
             nodes: self.nodes.clone(),
         };
 
-        let listener = proxy.build_listener().unwrap();
+        let listener = proxy.build_listener().map_err(ErrorKind::Io)?;
 
         let pool = Pool::<ClientConn>::new(self.proxy_config.pool_size as usize);
 
@@ -452,6 +469,32 @@ mod tests {
         assert_eq!(runtime.nodes[0].host, "127.0.0.1");
         assert_eq!(runtime.nodes[0].port, 3306);
         assert_eq!(runtime.nodes[0].user, "root");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn listener_protocols_prefer_core_plan_over_legacy_strings() {
+        let mut runtime = GatewayRuntime::from_core_config(&mysql_config()).unwrap();
+        runtime.proxy_config.node_type = "legacy-front".into();
+        runtime.proxy_config.backend_type = "legacy-back".into();
+
+        let listener = runtime.build_listener_config();
+
+        assert_eq!(listener.node_type, "mysql");
+        assert_eq!(listener.backend_type, "mysql");
+    }
+
+    #[test]
+    fn build_route_reports_missing_simple_loadbalance() {
+        let mut runtime = GatewayRuntime::default();
+        runtime.proxy_config.name = "broken".into();
+
+        let error = match runtime.build_route() {
+            Ok(_) => panic!("missing simple_loadbalance should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("gateway 'broken' requires simple_loadbalance"));
     }
 
     #[test]

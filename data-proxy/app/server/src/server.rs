@@ -150,8 +150,9 @@ impl ProxyFactory for GatewayFactory {
 }
 /// 启动代理服务器
 pub async fn start_gateway_server(mut s: Box<dyn proxy::factory::Proxy + Send>) {
-    // let xx = s.start().await.unwrap();
-    s.start().await.unwrap();
+    if let Err(error) = s.start().await {
+        eprintln!("gateway server stopped with error: {}", error);
+    }
 }
 
 #[cfg(test)]

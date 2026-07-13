@@ -58,7 +58,7 @@ impl Listener {
         // TODO: need refactor this log
         info!("uni-proxy client_ip: {:?} - backend_type: {:?}", addr.ip(), self.backend_type);
 
-        socket.set_nodelay(true).unwrap();
+        socket.set_nodelay(true)?;
         Ok(socket)
     }
 }

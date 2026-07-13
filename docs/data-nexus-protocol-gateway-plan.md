@@ -267,6 +267,7 @@ databases = ["test", "analytics"]
 - `ProxyKind` 和 `backend_type` 基本失效。
 - 当前启动路径已从 `PisaProxyFactory` 迁到 `GatewayFactory`，并可从 v2 `GatewayConfigDocument` 按 listener 构造 `GatewayRuntime`。
 - `GatewayRuntime::start()` 内部仍复用迁移中的 legacy MySQL accept loop，因此 v2 MySQL listener 会先派生最小 `ProxyConfig`/`UniSQLNode` 过渡结构。
+- v2 runtime path 的 listener/backend 协议名已从 core plan 推导，旧 `backend_type` 字符串只作为 legacy fallback。
 
 建议：
 

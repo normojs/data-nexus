@@ -122,7 +122,7 @@
 
 - [x] 不保留 v1 MySQL example config 的运行兼容（项目尚未发布）。
 - [ ] v2 MySQL config 可以运行同样链路。
-- [ ] runtime 主路径不再依赖 `backend_type` 字符串。
+- [x] runtime 主路径不再依赖 `backend_type` 字符串。
 - [ ] 配置错误能在启动时给出明确错误。
 - [ ] MySQL 客户端可以通过 Data Nexus 连接 MySQL 后端。
 - [ ] PostgreSQL 客户端可以通过 Data Nexus 连接 PostgreSQL 后端。
