@@ -46,7 +46,6 @@
 
 ## Phase 2：PostgreSQL 同协议中转
 
-- [ ] 补全 PostgreSQL frontend handshake。
 - [ ] 实现 PostgreSQL frontend command decode。
 - [ ] 实现 PostgreSQL response encode。
 - [ ] 实现 PostgreSQL backend connector。
