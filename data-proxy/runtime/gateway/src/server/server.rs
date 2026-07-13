@@ -21,7 +21,7 @@ use conn_pool::PoolConn;
 use futures::{SinkExt, StreamExt};
 use gateway_core::{
     BackendConnector, GatewayCommand, GatewayError, GatewayResponse, GatewayResult, ProtocolKind,
-    SessionState,
+    SessionState, TransactionState,
 };
 use mysql_parser::ast::*;
 use mysql_protocol::{
@@ -775,6 +775,14 @@ where
             GatewayCommand::Quit => Ok(GatewayResponse::Bye),
             GatewayCommand::UseDatabase { database } => {
                 session.database = Some(database);
+                Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
+            }
+            GatewayCommand::Begin => {
+                session.transaction_state = TransactionState::Active;
+                Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
+            }
+            GatewayCommand::Commit | GatewayCommand::Rollback => {
+                session.transaction_state = TransactionState::Idle;
                 Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
             }
             command => Err(GatewayError::Unsupported(format!(

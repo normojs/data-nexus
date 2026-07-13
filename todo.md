@@ -41,6 +41,7 @@
   - [x] 将 v2 Gateway listener plan 到 legacy MySQL runtime 的适配收口到显式桥接层，避免转换逻辑散落在启动入口。
   - [x] 将 `FrontendProtocolAdapter::encode` 升级为多 wire-frame 响应模型，Gateway Core 负责扁平化返回帧，支持 MySQL 这类多包结果集。
   - [x] `MySqlFrontendProtocol` 支持将 `GatewayResponse::ResultSet` 编码为 MySQL text resultset payload 序列，覆盖列定义、EOF、NULL、空字节串和基础标量值。
+  - [x] `MySqlBackendConnector` core trait 支持 `Begin` / `Commit` / `Rollback` 的 session-only 执行路径，与 PostgreSQL core connector 的基础事务语义对齐。
 - [x] 让 `PisaProxyFactory` 演进为 `GatewayFactory`。
 - [x] 根据 `listener.protocol` 构建对应 frontend adapter。
 - [x] 根据 `service.backend_protocol` 构建对应 backend connector。

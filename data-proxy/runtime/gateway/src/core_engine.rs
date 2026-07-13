@@ -359,6 +359,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handles_mysql_transaction_commands_through_core_traits() {
+        let mut connection = mysql_connection();
+        let mut begin = vec![COM_QUERY];
+        begin.extend_from_slice(b"begin");
+
+        let packets = connection.handle_frame(&begin).await;
+
+        assert_eq!(packets, Ok(vec![ok_packet()[4..].to_vec()]));
+        assert_eq!(connection.session().transaction_state, TransactionState::Active);
+
+        let mut commit = vec![COM_QUERY];
+        commit.extend_from_slice(b"commit");
+
+        let packets = connection.handle_frame(&commit).await;
+
+        assert_eq!(packets, Ok(vec![ok_packet()[4..].to_vec()]));
+        assert_eq!(connection.session().transaction_state, TransactionState::Idle);
+    }
+
+    #[tokio::test]
     async fn handles_mysql_quit_through_core_traits() {
         let mut connection = mysql_connection();
 
