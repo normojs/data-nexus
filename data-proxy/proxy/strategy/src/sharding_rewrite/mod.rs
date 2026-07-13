@@ -32,7 +32,7 @@ use self::{
 use crate::{
     config::{NodeGroup, Sharding, ShardingAlgorithmName},
     get_meta_detail,
-    rewrite::{ShardingRewriteInput, ShardingRewriter},
+    rewrite::{DialectAst, ShardingRewriteInput, ShardingRewriter},
     sharding_rewrite::{
         meta::{FieldAggFunc, GroupMeta, OrderMeta},
         rewrite_const::*,
@@ -177,6 +177,9 @@ pub enum ShardingRewriteError {
 
     #[error("parse str to u64 error {0:?}")]
     ParseIntError(#[from] std::num::ParseIntError),
+
+    #[error("sharding rewrite does not support {dialect} AST for sql: {sql}")]
+    UnsupportedDialectAst { dialect: gateway_core::ProtocolKind, sql: String },
 
     #[error("parse str to u64 error {0:?}")]
     ParseFloatError(#[from] std::num::ParseFloatError),
@@ -1571,7 +1574,17 @@ impl ShardingRewriter<ShardingRewriteInput> for ShardingRewrite {
         self.set_raw_sql(input.raw_sql);
         self.set_default_db(input.default_db);
 
-        let meta = self.get_meta(&mut input.ast);
+        let ast = match &mut input.ast {
+            DialectAst::MySql(ast) => ast,
+            DialectAst::Unsupported { dialect, sql } => {
+                return Err(ShardingRewriteError::UnsupportedDialectAst {
+                    dialect: dialect.clone(),
+                    sql: sql.clone(),
+                })
+            }
+        };
+
+        let meta = self.get_meta(ast);
         self.query_metas = meta.get_queries().clone();
         self.field_block_metas = meta.get_field_blocks().clone();
 
@@ -1603,13 +1616,13 @@ mod test {
     use endpoint::endpoint::Endpoint;
     use mysql_parser::parser::Parser;
 
-    use super::ShardingRewrite;
+    use super::{ShardingRewrite, ShardingRewriteError};
     use crate::{
         config::{
             DatabaseStrategyConfig, DatabaseTableStrategyConfig, Sharding, ShardingAlgorithmName,
             StrategyType,
         },
-        rewrite::{ShardingRewriteInput, ShardingRewriter},
+        rewrite::{DialectAst, ShardingRewriteInput, ShardingRewriter},
         sharding_rewrite::DataSource,
     };
 
@@ -1724,6 +1737,30 @@ mod test {
     }
 
     #[test]
+    fn sharding_rewrite_rejects_unsupported_dialect_ast() {
+        let config = get_database_table_sharding_config();
+        let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
+        let input = ShardingRewriteInput {
+            raw_sql: "select * from orders".into(),
+            ast: DialectAst::unsupported(
+                gateway_core::ProtocolKind::PostgreSql,
+                "select * from orders",
+            ),
+            default_db: Some("orders".into()),
+        };
+
+        let error = sr.rewrite(input).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ShardingRewriteError::UnsupportedDialectAst {
+                dialect: gateway_core::ProtocolKind::PostgreSql,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_database_table_sharding_strategy() {
         let config = get_database_table_sharding_config();
         let raw_sql = "SELECT * FROM db.tshard where idx > 3";
@@ -1735,7 +1772,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: Some("db".to_string()),
         };
         let res = sr.rewrite(input).unwrap();
@@ -1759,7 +1796,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1772,7 +1809,7 @@ mod test {
         let ast = parser.parse(raw_sql).unwrap();
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
 
@@ -1787,7 +1824,7 @@ mod test {
         let ast = parser.parse(raw_sql).unwrap();
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
 
@@ -1806,7 +1843,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1824,7 +1861,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1834,7 +1871,7 @@ mod test {
         let ast = parser.parse(raw_sql).unwrap();
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1844,7 +1881,7 @@ mod test {
         let ast = parser.parse(raw_sql).unwrap();
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1860,7 +1897,7 @@ mod test {
         let ast = parser.parse(raw_sql).unwrap();
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1881,7 +1918,7 @@ mod test {
         let ast = parser.parse(&raw_sql).unwrap();
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
@@ -1900,7 +1937,7 @@ mod test {
         let ast = parser.parse(&raw_sql).unwrap();
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
@@ -1914,7 +1951,7 @@ mod test {
         let ast = parser.parse(&raw_sql).unwrap();
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1924,7 +1961,7 @@ mod test {
         let ast = parser.parse(&raw_sql).unwrap();
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1948,7 +1985,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1971,7 +2008,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.clone(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1983,7 +2020,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.clone(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -1994,7 +2031,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.clone(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -2005,7 +2042,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -2017,7 +2054,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.clone(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
 
@@ -2034,7 +2071,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -2047,7 +2084,7 @@ mod test {
         let ast = parser.parse(raw_sql).unwrap();
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: None,
         };
         let res = sr.rewrite(input).unwrap();
@@ -2066,7 +2103,7 @@ mod test {
         let mut sr = ShardingRewrite::new(config.0.clone(), config.1.clone(), None, false);
         let input = ShardingRewriteInput {
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
             default_db: Some("db".to_string()),
         };
         let res = sr.rewrite(input).unwrap();
@@ -2086,7 +2123,7 @@ mod test {
         let input = ShardingRewriteInput {
             default_db: None,
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
         };
         let res = sr.rewrite(input).unwrap();
         assert_eq!(
@@ -2100,7 +2137,7 @@ mod test {
         let input = ShardingRewriteInput {
             default_db: None,
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
         };
         let res = sr.rewrite(input).unwrap();
         assert_eq!(
@@ -2115,7 +2152,7 @@ mod test {
         let input = ShardingRewriteInput {
             default_db: None,
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
         };
         let res = sr.rewrite(input).unwrap();
         assert_eq!(
@@ -2129,7 +2166,7 @@ mod test {
         let input = ShardingRewriteInput {
             default_db: None,
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
         };
         let res = sr.rewrite(input).unwrap();
         assert_eq!(
@@ -2144,7 +2181,7 @@ mod test {
         let input = ShardingRewriteInput {
             default_db: None,
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
         };
         let res = sr.rewrite(input).unwrap();
         assert_eq!(
@@ -2158,7 +2195,7 @@ mod test {
         let input = ShardingRewriteInput {
             default_db: None,
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
         };
         let res = sr.rewrite(input).unwrap();
         assert_eq!(res.results[0].target_sql, "SELECT id FROM `db`.tshard_00000 ORDER BY `id`");
@@ -2169,7 +2206,7 @@ mod test {
         let input = ShardingRewriteInput {
             default_db: None,
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
         };
         let res = sr.rewrite(input).unwrap();
         assert_eq!(
@@ -2188,7 +2225,7 @@ mod test {
         let input = ShardingRewriteInput {
             default_db: None,
             raw_sql: raw_sql.to_string(),
-            ast: ast[0].clone(),
+            ast: DialectAst::mysql(ast[0].clone()),
         };
         let res = sr.rewrite(input).unwrap();
         assert_eq!(res.results[0].ds_idx.ds, DataSource::NodeGroup("ds001".to_string()));

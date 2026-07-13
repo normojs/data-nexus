@@ -1058,6 +1058,7 @@ dependencies = [
  "num_cpus",
  "pprof",
  "proxy",
+ "runtime_gateway",
  "serde",
  "server",
  "tokio",
@@ -1697,11 +1698,14 @@ dependencies = [
  "axum",
  "config",
  "error",
+ "gateway_core",
  "metrics",
  "once_cell",
+ "runtime_gateway",
  "serde",
  "serde_json",
  "server",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "version",
@@ -2864,6 +2868,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 name = "plugin"
 version = "0.1.0"
 dependencies = [
+ "gateway_core",
  "parking_lot 0.12.3",
  "regex",
  "serde",

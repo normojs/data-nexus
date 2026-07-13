@@ -49,8 +49,8 @@ pub struct ProxyAuthConfig {
 pub struct ProxyConfig {
     #[serde(default = "default_auto_proxy_level")]
     pub level: u8,
-    #[serde(default = "default_auto_proxy_note_type")]
-    pub node_type: String,
+    #[serde(default = "default_auto_proxy_node_type")]
+    pub node_type: ProtocolKind,
     #[serde(default = "default_auto_proxy_name")]
     pub name: String,
     #[serde(default = "default_auto_proxy_listen_addr")]
@@ -85,7 +85,8 @@ pub struct ProxyConfigMasterSlave {
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ProxyCloudConfig {
     pub data_type: String,
-    pub node_type: String,
+    #[serde(default = "default_auto_proxy_node_type")]
+    pub node_type: ProtocolKind,
     pub host: String,
     pub user: String,
     pub password: String,
@@ -124,7 +125,7 @@ pub struct UniSQLNode {
     pub version: String,
     // 节点类型: mysql/postgresql等
     #[serde(default = "default_auto_proxy_node_type")]
-    pub node_type: String,
+    pub node_type: ProtocolKind,
     pub name: String,
     pub db: String,
     pub user: String,
@@ -138,8 +139,8 @@ pub struct UniSQLNode {
     pub role: TargetRole,
 }
 
-fn default_auto_proxy_node_type() -> String {
-    "".into()
+fn default_auto_proxy_node_type() -> ProtocolKind {
+    ProtocolKind::MySql
 }
 
 fn default_auto_proxy_name() -> String {
@@ -155,10 +156,6 @@ fn default_auto_proxy_user() -> String {
 }
 
 fn default_auto_proxy_password() -> String {
-    "".into()
-}
-
-fn default_auto_proxy_note_type() -> String {
     "".into()
 }
 
@@ -206,9 +203,8 @@ fn default_unisql_node_weight() -> i64 {
 }
 
 pub fn endpoint_from_unisql_node(node: &UniSQLNode) -> Result<Endpoint, String> {
-    let node_type = node.node_type.parse::<ProtocolKind>()?;
     Ok(Endpoint {
-        node_type,
+        node_type: node.node_type.clone(),
         weight: node.weight,
         name: node.name.clone(),
         db: node.db.clone(),

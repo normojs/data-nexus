@@ -2,6 +2,8 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
+use crate::EndpointConfig;
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolKind {
@@ -17,12 +19,18 @@ impl Default for ProtocolKind {
     }
 }
 
+impl ProtocolKind {
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            Self::MySql => "my_sql",
+            Self::PostgreSql => "postgre_sql",
+        }
+    }
+}
+
 impl fmt::Display for ProtocolKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MySql => f.write_str("my_sql"),
-            Self::PostgreSql => f.write_str("postgre_sql"),
-        }
+        f.write_str(self.as_label())
     }
 }
 
@@ -107,6 +115,32 @@ pub enum GatewayResponse {
     Bye,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "payload")]
+pub enum RoutePlan {
+    Single { target: RouteTarget },
+    Broadcast { targets: Vec<RouteTarget> },
+    Sharded { targets: Vec<RouteTarget> },
+    Reject { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteTarget {
+    pub endpoint: EndpointConfig,
+}
+
+impl RoutePlan {
+    pub fn from_endpoints(endpoints: Vec<EndpointConfig>) -> Self {
+        match endpoints.len() {
+            0 => Self::Reject { reason: "route plan has no endpoints".into() },
+            1 => Self::Single { target: RouteTarget { endpoint: endpoints[0].clone() } },
+            _ => Self::Broadcast {
+                targets: endpoints.into_iter().map(|endpoint| RouteTarget { endpoint }).collect(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +155,35 @@ mod tests {
         assert_eq!(
             "oracle".parse::<ProtocolKind>(),
             Err("unsupported protocol kind 'oracle'".into())
+        );
+    }
+
+    #[test]
+    fn builds_route_plan_from_endpoint_count() {
+        let endpoint = EndpointConfig {
+            name: "orders-primary".into(),
+            protocol: ProtocolKind::MySql,
+            address: "127.0.0.1:3306".into(),
+            database: Some("orders".into()),
+            username: "root".into(),
+            password: "secret".into(),
+            role: crate::EndpointRole::ReadWrite,
+            weight: 1,
+        };
+
+        assert_eq!(
+            RoutePlan::from_endpoints(vec![]),
+            RoutePlan::Reject { reason: "route plan has no endpoints".into() }
+        );
+        assert_eq!(
+            RoutePlan::from_endpoints(vec![endpoint.clone()]),
+            RoutePlan::Single { target: RouteTarget { endpoint: endpoint.clone() } }
+        );
+        assert_eq!(
+            RoutePlan::from_endpoints(vec![endpoint.clone(), endpoint.clone()]),
+            RoutePlan::Broadcast {
+                targets: vec![RouteTarget { endpoint: endpoint.clone() }, RouteTarget { endpoint },]
+            }
         );
     }
 }

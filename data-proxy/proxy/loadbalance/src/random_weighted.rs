@@ -16,18 +16,24 @@ use chrono::prelude::*;
 use endpoint::endpoint::Endpoint;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
-use crate::balance::LoadBalance;
+use crate::balance::{BalanceTarget, LoadBalance};
 
 #[derive(Debug, Clone)]
-pub struct RandomWeighted {
-    pub items: Vec<Endpoint>,
+pub struct RandomWeighted<T = Endpoint>
+where
+    T: BalanceTarget,
+{
+    pub items: Vec<T>,
     pub n: i64,
     pub sum_of_weights: i64,
     pub r: StdRng,
 }
 
-impl Default for RandomWeighted {
-    fn default() -> RandomWeighted {
+impl<T> Default for RandomWeighted<T>
+where
+    T: BalanceTarget,
+{
+    fn default() -> RandomWeighted<T> {
         RandomWeighted {
             items: vec![],
             n: 0,
@@ -37,9 +43,12 @@ impl Default for RandomWeighted {
     }
 }
 
-impl LoadBalance for RandomWeighted {
+impl<T> LoadBalance<T> for RandomWeighted<T>
+where
+    T: BalanceTarget,
+{
     // next: get next endpoint
-    fn next(&mut self) -> Option<Endpoint> {
+    fn next(&mut self) -> Option<T> {
         if self.n == 0 {
             return None;
         }
@@ -49,7 +58,7 @@ impl LoadBalance for RandomWeighted {
         }
         let mut random_weight = self.r.gen_range(0..self.sum_of_weights) + 1;
         for i in &self.items {
-            random_weight -= i.weight;
+            random_weight -= i.balance_weight();
             if random_weight <= 0 {
                 return Some(i.clone());
             }
@@ -59,36 +68,40 @@ impl LoadBalance for RandomWeighted {
     }
 
     // add: add endpoint
-    fn add(&mut self, endpoint: Endpoint) {
+    fn add(&mut self, endpoint: T) {
         if !self.item_exists(&endpoint) {
-            self.sum_of_weights += endpoint.weight;
+            self.sum_of_weights += endpoint.balance_weight();
             self.n += 1;
             self.items.push(endpoint);
         }
     }
 
     // item_exists: endpoint exists
-    fn item_exists(&self, endpoint: &Endpoint) -> bool {
-        match self.items.iter().find(|&x| x.name == endpoint.name) {
-            None => false,
-            _ => true,
-        }
+    fn item_exists(&self, endpoint: &T) -> bool {
+        self.items.iter().any(|x| x.balance_name() == endpoint.balance_name())
     }
 
     // get_all: get all endpoint
-    fn get_all(&mut self) -> &Vec<Endpoint> {
+    fn get_all(&mut self) -> &Vec<T> {
         &self.items
     }
 
     // remove_item: remove item
-    fn remove_item(&mut self, endpoint: Endpoint) {
-        let index = self.items.iter().position(|x| *x.name == *endpoint.name).unwrap();
-        self.items.remove(index);
+    fn remove_item(&mut self, endpoint: T) {
+        if let Some(index) =
+            self.items.iter().position(|x| x.balance_name() == endpoint.balance_name())
+        {
+            let removed = self.items.remove(index);
+            self.sum_of_weights -= removed.balance_weight();
+            self.n -= 1;
+        }
     }
 
     // remove_all: remove all item
     fn remove_all(&mut self) {
         self.items = vec![];
+        self.n = 0;
+        self.sum_of_weights = 0;
         self.r = StdRng::seed_from_u64(Utc::now().timestamp_subsec_nanos().into());
     }
 }

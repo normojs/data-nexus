@@ -91,18 +91,22 @@ impl ResultsetCodec {
         }
     }
 
-    fn decode_column_count(&mut self, length: usize, data: &mut BytesMut) -> (BytesMut, bool) {
+    fn decode_column_count(
+        &mut self,
+        length: usize,
+        data: &mut BytesMut,
+    ) -> Result<(BytesMut, bool), ProtocolError> {
         if data[4] == ERR_HEADER {
             //return Err(ProtocolError::PacketError(data.split().to_vec()))
             self.next_state = DecodeResultsetState::Complete;
-            return (data.split(), true);
+            return Ok((data.split(), true));
         }
 
         let is_ok = self.decode_try_ok(length, data);
 
         if let Some(data) = is_ok {
             self.next_state = DecodeResultsetState::Complete;
-            return (data, true);
+            return Ok((data, true));
         }
 
         self.next_state = DecodeResultsetState::ColumnInfo;
@@ -112,10 +116,10 @@ impl ResultsetCodec {
 
         let _ = payload.split_to(4);
 
-        let (col, is_null, _) = payload.get_lenc_int();
+        let (col, is_null, _) = payload.try_get_lenc_int()?;
         self.col = col;
 
-        (payload_clone, is_null)
+        Ok((payload_clone, is_null))
     }
 
     fn decode_column_info(&mut self, length: usize, data: &mut BytesMut) -> (BytesMut, bool) {
@@ -168,7 +172,7 @@ impl Decoder for ResultsetCodec {
     type Error = ProtocolError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.is_empty() || src.len() < 3 {
+        if src.len() < 4 {
             return Ok(None);
         }
 
@@ -179,7 +183,7 @@ impl Decoder for ResultsetCodec {
 
         self.seq = src[3];
         match self.next_state {
-            DecodeResultsetState::ColumnCount => Ok(Some(self.decode_column_count(length, src))),
+            DecodeResultsetState::ColumnCount => Ok(Some(self.decode_column_count(length, src)?)),
 
             DecodeResultsetState::ColumnInfo => Ok(Some(self.decode_column_info(length, src))),
 

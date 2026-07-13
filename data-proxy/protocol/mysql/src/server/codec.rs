@@ -121,7 +121,7 @@ impl Decoder for PacketCodec {
 
     /// Decode data from src to item
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.is_empty() || src.len() < 3 {
+        if src.len() < 4 {
             return Ok(None);
         }
 

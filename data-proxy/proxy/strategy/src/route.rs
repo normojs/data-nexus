@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use endpoint::endpoint::Endpoint;
+use gateway_core::{EndpointConfig, EndpointRole, RoutePlan, RouteTarget};
 use indexmap::{IndexMap, IndexSet};
-use loadbalance::balance::{BalanceType, LoadBalance};
+use loadbalance::balance::{BalanceTarget, BalanceType, LoadBalance};
 use thiserror::Error;
 
 use crate::{
@@ -73,11 +74,60 @@ pub enum ReadWriteSplittingRouteInput<'a> {
 pub trait Route {
     type Error;
 
-    // The dispatch function, return a endpoint and role.
-    fn dispatch(
-        &mut self,
-        input: &RouteInput,
-    ) -> Result<(Option<Endpoint>, TargetRole), Self::Error>;
+    // The dispatch function returns a protocol-neutral route plan.
+    fn dispatch(&mut self, input: &RouteInput) -> Result<RoutePlan, Self::Error>;
+}
+
+pub fn endpoint_to_route_target(endpoint: Endpoint, role: TargetRole) -> RouteTarget {
+    let weight = u32::try_from(endpoint.weight).ok().filter(|weight| *weight > 0).unwrap_or(1);
+    RouteTarget {
+        endpoint: EndpointConfig {
+            name: endpoint.name,
+            protocol: endpoint.node_type,
+            address: endpoint.addr,
+            database: if endpoint.db.is_empty() { None } else { Some(endpoint.db) },
+            username: endpoint.user,
+            password: endpoint.password,
+            role: target_role_to_endpoint_role(role),
+            weight,
+        },
+    }
+}
+
+pub fn route_target_to_endpoint(target: RouteTarget) -> Endpoint {
+    Endpoint {
+        node_type: target.endpoint.protocol,
+        weight: i64::from(target.endpoint.weight),
+        name: target.endpoint.name,
+        db: target.endpoint.database.unwrap_or_default(),
+        user: target.endpoint.username,
+        password: target.endpoint.password,
+        addr: target.endpoint.address,
+    }
+}
+
+pub fn route_plan_single_endpoint(plan: RoutePlan) -> Result<Endpoint, BoxError> {
+    match plan {
+        RoutePlan::Single { target } => Ok(route_target_to_endpoint(target)),
+        RoutePlan::Reject { reason } => {
+            Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, reason)))
+        }
+        RoutePlan::Broadcast { .. } => Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "route plan contains multiple broadcast targets where one endpoint is required",
+        ))),
+        RoutePlan::Sharded { .. } => Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "route plan contains multiple sharded targets where one endpoint is required",
+        ))),
+    }
+}
+
+fn target_role_to_endpoint_role(role: TargetRole) -> EndpointRole {
+    match role {
+        TargetRole::Read => EndpointRole::Read,
+        TargetRole::ReadWrite => EndpointRole::ReadWrite,
+    }
 }
 
 /// Route rule, Currrently support `Regex` only.
@@ -86,8 +136,11 @@ pub trait RouteRuleMatch {
 }
 
 /// RouteBalance trait, Used with RouteRuleMatch trait to get a balance type.
-pub trait RouteBalance {
-    fn get(&mut self, input: &RouteInput) -> (&mut BalanceType, TargetRole);
+pub trait RouteBalance<T = Endpoint>
+where
+    T: BalanceTarget,
+{
+    fn get(&mut self, input: &RouteInput) -> (&mut BalanceType<T>, TargetRole);
 }
 
 /// Supported routing strategies
@@ -209,7 +262,7 @@ impl RouteStrategy {
     fn readwritesplitting_dispatch(
         strategy: &mut ReadWriteSplittingRouteStrategy,
         input: &RouteInput,
-    ) -> Result<(Option<Endpoint>, TargetRole), BoxError> {
+    ) -> Result<RoutePlan, BoxError> {
         match strategy {
             ReadWriteSplittingRouteStrategy::Static(ins) => ins.dispatch(input),
             ReadWriteSplittingRouteStrategy::Dynamic(ins) => ins.dispatch(input),
@@ -221,10 +274,7 @@ impl RouteStrategy {
 impl Route for RouteStrategy {
     type Error = BoxError;
 
-    fn dispatch(
-        &mut self,
-        input: &RouteInput,
-    ) -> Result<(Option<Endpoint>, TargetRole), Self::Error> {
+    fn dispatch(&mut self, input: &RouteInput) -> Result<RoutePlan, Self::Error> {
         match self {
             Self::ReadWriteSplitting(strategy) => {
                 Self::readwritesplitting_dispatch(strategy, input)
@@ -236,15 +286,96 @@ impl Route for RouteStrategy {
 
             Self::Sharding(ins) => {
                 if let RouteInput::Sharding(input) = input {
-                    Ok((Some(input.clone()), TargetRole::ReadWrite))
+                    Ok(RoutePlan::Single {
+                        target: endpoint_to_route_target(input.clone(), TargetRole::ReadWrite),
+                    })
                 } else {
-                    Ok((ins.next(), TargetRole::ReadWrite))
+                    Ok(ins
+                        .next()
+                        .map(|endpoint| RoutePlan::Single {
+                            target: endpoint_to_route_target(endpoint, TargetRole::ReadWrite),
+                        })
+                        .unwrap_or_else(|| RoutePlan::Reject {
+                            reason: "route strategy selected no sharding endpoint".into(),
+                        }))
                 }
             }
 
-            Self::Simple(ins) => Ok((ins.next(), TargetRole::ReadWrite)),
+            Self::Simple(ins) => Ok(ins
+                .next()
+                .map(|endpoint| RoutePlan::Single {
+                    target: endpoint_to_route_target(endpoint, TargetRole::ReadWrite),
+                })
+                .unwrap_or_else(|| RoutePlan::Reject {
+                    reason: "route strategy selected no simple endpoint".into(),
+                })),
 
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use endpoint::endpoint::Endpoint;
+    use gateway_core::{EndpointRole, ProtocolKind, RoutePlan};
+    use loadbalance::balance::{AlgorithmName, Balance, LoadBalance};
+
+    use super::{route_plan_single_endpoint, Route, RouteInput, RouteStrategy};
+
+    fn endpoint(name: &str, addr: &str) -> Endpoint {
+        Endpoint {
+            node_type: ProtocolKind::MySql,
+            weight: 2,
+            name: name.into(),
+            db: "orders".into(),
+            user: "root".into(),
+            password: "secret".into(),
+            addr: addr.into(),
+        }
+    }
+
+    #[test]
+    fn simple_route_dispatches_protocol_neutral_single_plan() {
+        let mut balance = Balance.build_balance(AlgorithmName::Random);
+        balance.add(endpoint("orders-primary", "127.0.0.1:3306"));
+        let mut strategy = RouteStrategy::new_with_simple_route(balance);
+
+        let plan = strategy.dispatch(&RouteInput::Statement("select 1")).unwrap();
+
+        assert!(matches!(
+            plan,
+            RoutePlan::Single { target }
+                if target.endpoint.name == "orders-primary"
+                    && target.endpoint.address == "127.0.0.1:3306"
+                    && target.endpoint.database == Some("orders".into())
+                    && target.endpoint.role == EndpointRole::ReadWrite
+                    && target.endpoint.weight == 2
+        ));
+    }
+
+    #[test]
+    fn route_plan_single_endpoint_converts_back_for_legacy_callers() {
+        let mut balance = Balance.build_balance(AlgorithmName::Random);
+        balance.add(endpoint("orders-primary", "127.0.0.1:3306"));
+        let mut strategy = RouteStrategy::new_with_simple_route(balance);
+
+        let endpoint = route_plan_single_endpoint(
+            strategy.dispatch(&RouteInput::Statement("select 1")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(endpoint.name, "orders-primary");
+        assert_eq!(endpoint.addr, "127.0.0.1:3306");
+        assert_eq!(endpoint.db, "orders");
+        assert_eq!(endpoint.weight, 2);
+    }
+
+    #[test]
+    fn route_plan_single_endpoint_rejects_multi_target_plans() {
+        let error =
+            route_plan_single_endpoint(RoutePlan::Broadcast { targets: vec![] }).unwrap_err();
+
+        assert!(error.to_string().contains("multiple broadcast targets"));
     }
 }

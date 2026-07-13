@@ -19,12 +19,16 @@ use std::collections::HashMap;
 
 pub use dynamic_rw::*;
 use endpoint::endpoint::Endpoint;
+use loadbalance::balance::BalanceTarget;
 pub use static_rw::*;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ReadWriteEndpoint {
-    pub read: Vec<Endpoint>,
-    pub readwrite: Vec<Endpoint>,
+pub struct ReadWriteEndpoint<T = Endpoint>
+where
+    T: BalanceTarget,
+{
+    pub read: Vec<T>,
+    pub readwrite: Vec<T>,
 }
 
 lazy_static! {

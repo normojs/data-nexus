@@ -21,6 +21,7 @@ use std::{
     collections::HashMap,
     hash::Hash,
     str::FromStr,
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -45,6 +46,7 @@ use proxy::{
     factory::{ProxyFactory, ProxyKind},
     proxy::ProxyConfig,
 };
+use runtime_gateway::supervisor::GatewayRuntimeSupervisor;
 
 use crate::node::NodeInstance;
 
@@ -69,35 +71,23 @@ fn main() {
     // 2、启动
     // 3、停止
     // 4、重启
-    let http_server = PisaHttpServerFactory::new(config.clone(), MetricsManager::new())
-        .build_http_server(HttpServerKind::Axum);
     if config.has_gateway_config() {
-        let mut servers = Vec::with_capacity(config.gateway.listeners.len() + 1);
         let version = config.get_version().to_string();
         let gateway_config = config.gateway.clone();
+        let http_config = config.clone();
 
         build_runtime().block_on(async move {
-            for listener in &gateway_config.listeners {
-                let factory = GatewayFactory::from_gateway_config(
-                    gateway_config.clone(),
-                    listener.name.clone(),
-                    version.clone(),
-                );
-                servers.push(NodeInstance::new(
-                    listener.name.clone(),
-                    tokio::spawn(start_gateway_server(factory.build_proxy())),
-                ));
-            }
-
-            servers.push(NodeInstance::new(
-                "httpserver-001".to_string(),
-                tokio::spawn(new_http_server(http_server)),
+            let gateway_supervisor = Arc::new(tokio::sync::Mutex::new(
+                GatewayRuntimeSupervisor::new(gateway_config, version).unwrap(),
             ));
+            gateway_supervisor.lock().await.start_all().unwrap();
 
-            for serverInstance in servers {
-                if let Err(e) = serverInstance.joinHandle.await {
-                    error!("{:?}", e)
-                }
+            let http_server = PisaHttpServerFactory::new(http_config, MetricsManager::new())
+                .with_gateway_supervisor(gateway_supervisor)
+                .build_http_server(HttpServerKind::Axum);
+
+            if let Err(e) = tokio::spawn(new_http_server(http_server)).await {
+                error!("{:?}", e)
             }
         });
     } else {
@@ -108,6 +98,10 @@ fn main() {
                 let mut servers = Vec::with_capacity(config.get_proxy().len() + 1);
 
                 build_runtime().block_on(async move {
+                    let http_server =
+                        PisaHttpServerFactory::new(config.clone(), MetricsManager::new())
+                            .build_http_server(HttpServerKind::Axum);
+
                     for proxy_config in config.get_proxy() {
                         let cfg = proxy_config;
 

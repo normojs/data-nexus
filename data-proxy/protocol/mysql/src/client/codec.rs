@@ -15,7 +15,6 @@
 use std::{
     convert::From,
     default::Default,
-    ops::{Deref, DerefMut},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -48,43 +47,6 @@ pub enum ClientCodec {
     Resultset(Framed<LocalStream, ResultsetCodec>),
     Stmt(Framed<LocalStream, Stmt>),
     Common(Framed<LocalStream, CommonCodec>),
-}
-
-// Access `AuthInfo` struct by dereferencing the `ClientCodec` struct.
-impl Deref for ClientCodec {
-    type Target = ClientAuth;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::ClientAuth(framed) => framed.codec(),
-            Self::Resultset(framed) => {
-                framed.codec().auth_info.as_ref().expect("resultset codec missing auth info")
-            }
-            Self::Stmt(framed) => {
-                framed.codec().auth_info.as_ref().expect("stmt codec missing auth info")
-            }
-            Self::Common(framed) => {
-                framed.codec().auth_info.as_ref().expect("common codec missing auth info")
-            }
-        }
-    }
-}
-
-// Modify `AuthInfo` struct by dereferencing the `ClientCodec` struct.
-impl DerefMut for ClientCodec {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::ClientAuth(framed) => framed.codec_mut(),
-            Self::Resultset(framed) => {
-                framed.codec_mut().auth_info.as_mut().expect("resultset codec missing auth info")
-            }
-            Self::Stmt(framed) => {
-                framed.codec_mut().auth_info.as_mut().expect("stmt codec missing auth info")
-            }
-            Self::Common(framed) => {
-                framed.codec_mut().auth_info.as_mut().expect("common codec missing auth info")
-            }
-        }
-    }
 }
 
 impl ClientCodec {
@@ -398,7 +360,7 @@ impl Decoder for CommonCodec {
     type Error = ProtocolError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.is_empty() {
+        if src.len() < 4 {
             return Ok(None);
         }
 
@@ -493,8 +455,62 @@ pub fn write_command<'a>(item: SendCommand<'a>, dst: &'a mut BytesMut) {
 #[cfg(test)]
 mod test {
     use tokio_stream::StreamExt;
+    use tokio_util::codec::Framed;
 
-    use crate::client::conn::ClientConn;
+    use super::*;
+    use crate::client::{conn::ClientConn, stmt::Stmt, stream::LocalStream};
+
+    fn assert_missing_auth_info(codec: &mut ClientCodec, expected: &str) {
+        match codec.auth_info() {
+            Err(ProtocolError::ClientState(message)) => assert_eq!(message, expected),
+            other => panic!("expected missing auth info error, got {:?}", other),
+        }
+
+        match codec.auth_info_mut() {
+            Err(ProtocolError::ClientState(message)) => assert_eq!(message, expected),
+            other => panic!("expected missing mutable auth info error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auth_info_reports_missing_resultset_auth_state() {
+        let mut codec =
+            ClientCodec::Resultset(Framed::new(LocalStream::Plain(None), ResultsetCodec::new()));
+
+        assert_missing_auth_info(&mut codec, "resultset codec missing auth info");
+    }
+
+    #[test]
+    fn auth_info_reports_missing_stmt_auth_state() {
+        let mut codec = ClientCodec::Stmt(Framed::new(LocalStream::Plain(None), Stmt::new()));
+
+        assert_missing_auth_info(&mut codec, "stmt codec missing auth info");
+    }
+
+    #[test]
+    fn auth_info_reports_missing_common_auth_state() {
+        let mut codec = ClientCodec::Common(Framed::new(
+            LocalStream::Plain(None),
+            CommonCodec::with_auth_info(None),
+        ));
+
+        assert_missing_auth_info(&mut codec, "common codec missing auth info");
+    }
+
+    #[test]
+    fn common_codec_waits_for_complete_header() {
+        let header = [0x01, 0x02, 0x03];
+        let mut codec = CommonCodec::with_auth_info(None);
+
+        for len in 1..4 {
+            let mut src = BytesMut::from(&header[..len]);
+
+            let decoded = codec.decode(&mut src).unwrap();
+
+            assert!(decoded.is_none());
+            assert_eq!(&src[..], &header[..len]);
+        }
+    }
 
     #[tokio::test]
     async fn test_handshake() {

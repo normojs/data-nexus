@@ -16,7 +16,7 @@ use std::error::Error;
 
 use endpoint::endpoint::Endpoint;
 use indexmap::IndexMap;
-use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
+use loadbalance::balance::{AlgorithmName, Balance, BalanceTarget, BalanceType, LoadBalance};
 use regex::Regex;
 
 use super::ReadWriteEndpoint;
@@ -30,13 +30,16 @@ use crate::{
 pub struct RulesMatchBuilder;
 
 impl RulesMatchBuilder {
-    pub fn build(
+    pub fn build<T>(
         rules: Vec<ReadWriteSplittingRule>,
         default_target: TargetRole,
         _node_group_config: Option<NodeGroup>,
-        endpoint_group: IndexMap<String, ReadWriteEndpoint>,
-        rw_endpoint: ReadWriteEndpoint,
-    ) -> RulesMatch {
+        endpoint_group: IndexMap<String, ReadWriteEndpoint<T>>,
+        rw_endpoint: ReadWriteEndpoint<T>,
+    ) -> RulesMatch<T>
+    where
+        T: BalanceTarget,
+    {
         let inner = RulesMatchBuilder::build_rules(
             rules.clone(),
             endpoint_group,
@@ -59,14 +62,18 @@ impl RulesMatchBuilder {
         return rules_match;
     }
 
-    pub fn build_rules(
+    pub fn build_rules<T>(
         rules: Vec<ReadWriteSplittingRule>,
-        endpoint_group: IndexMap<String, ReadWriteEndpoint>,
-        rw_endpoint: ReadWriteEndpoint,
+        endpoint_group: IndexMap<String, ReadWriteEndpoint<T>>,
+        rw_endpoint: ReadWriteEndpoint<T>,
         default_target: TargetRole,
-    ) -> Vec<RulesMatchInner> {
-        let mut instances: Vec<RulesMatchInner> = Vec::with_capacity(rules.clone().len());
-        let mut generic_instances: Vec<RulesMatchInner> = Vec::with_capacity(rules.clone().len());
+    ) -> Vec<RulesMatchInner<T>>
+    where
+        T: BalanceTarget,
+    {
+        let mut instances: Vec<RulesMatchInner<T>> = Vec::with_capacity(rules.clone().len());
+        let mut generic_instances: Vec<RulesMatchInner<T>> =
+            Vec::with_capacity(rules.clone().len());
         for r in &rules {
             match r {
                 ReadWriteSplittingRule::Regex(r) => {
@@ -94,10 +101,13 @@ impl RulesMatchBuilder {
         instances
     }
 
-    pub fn build_default_balance(
+    pub fn build_default_balance<T>(
         default_target: &TargetRole,
-        rw_endpoint: ReadWriteEndpoint,
-    ) -> BalanceType {
+        rw_endpoint: ReadWriteEndpoint<T>,
+    ) -> BalanceType<T>
+    where
+        T: BalanceTarget,
+    {
         let mut default_balance = Balance.build_balance(AlgorithmName::Random);
         match default_target {
             TargetRole::Read => balance_add_endpoint(&mut default_balance, rw_endpoint.read),
@@ -109,23 +119,32 @@ impl RulesMatchBuilder {
     }
 }
 
-pub struct RulesMatch {
+pub struct RulesMatch<T = Endpoint>
+where
+    T: BalanceTarget,
+{
     pub default_target: TargetRole,
-    pub default_balance: BalanceType,
+    pub default_balance: BalanceType<T>,
     // Default transaction balance
-    pub default_trans_balance: BalanceType,
-    pub inner: Vec<RulesMatchInner>,
+    pub default_trans_balance: BalanceType<T>,
+    pub inner: Vec<RulesMatchInner<T>>,
 }
 
-#[derive(Debug, Clone)]
-pub enum RulesMatchInner {
-    Regex(RegexRuleMatchInner),
-    Generic(GenericRuleMatchInner),
+#[derive(Clone)]
+pub enum RulesMatchInner<T = Endpoint>
+where
+    T: BalanceTarget,
+{
+    Regex(RegexRuleMatchInner<T>),
+    Generic(GenericRuleMatchInner<T>),
 }
 
 // Retrun balance when match success, otherwise return default_balance
-impl RouteBalance for RulesMatch {
-    fn get(&mut self, input: &RouteInput) -> (&mut BalanceType, TargetRole) {
+impl<T> RouteBalance<T> for RulesMatch<T>
+where
+    T: BalanceTarget,
+{
+    fn get(&mut self, input: &RouteInput) -> (&mut BalanceType<T>, TargetRole) {
         // Currently, if RouteInput variant type is Transaction, return readwrite balnace directly.
         if let RouteInput::Transaction(_) = input {
             return (&mut self.default_trans_balance, TargetRole::ReadWrite);
@@ -150,19 +169,25 @@ impl RouteBalance for RulesMatch {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct RegexRuleMatchInner {
+#[derive(Clone)]
+pub struct RegexRuleMatchInner<T = Endpoint>
+where
+    T: BalanceTarget,
+{
     rule: RegexRule,
     regexs: Vec<Regex>,
-    balance: IndexMap<String, BalanceType>,
+    balance: IndexMap<String, BalanceType<T>>,
 }
 
-impl RegexRuleMatchInner {
+impl<T> RegexRuleMatchInner<T>
+where
+    T: BalanceTarget,
+{
     fn new(
         rule: RegexRule,
-        endpoint_group: IndexMap<String, ReadWriteEndpoint>,
-        rw_endpoint: ReadWriteEndpoint,
-    ) -> Result<RegexRuleMatchInner, Box<dyn Error>> {
+        endpoint_group: IndexMap<String, ReadWriteEndpoint<T>>,
+        rw_endpoint: ReadWriteEndpoint<T>,
+    ) -> Result<RegexRuleMatchInner<T>, Box<dyn Error>> {
         let balance = RegexRuleMatchInner::build_balance(
             &rule,
             rule.algorithm_name.clone(),
@@ -181,18 +206,20 @@ impl RegexRuleMatchInner {
     fn build_balance(
         rule: &RegexRule,
         algorithm_name: AlgorithmName,
-        endpoint_group: IndexMap<String, ReadWriteEndpoint>,
-        rw_endpoint: ReadWriteEndpoint,
-    ) -> Result<IndexMap<String, BalanceType>, Box<dyn Error>> {
+        endpoint_group: IndexMap<String, ReadWriteEndpoint<T>>,
+        rw_endpoint: ReadWriteEndpoint<T>,
+    ) -> Result<IndexMap<String, BalanceType<T>>, Box<dyn Error>> {
         let target = &rule.target;
-        let mut balances = IndexMap::<String, BalanceType>::new();
-        // Global endpoint
+        let mut balances = IndexMap::<String, BalanceType<T>>::new();
+        let mut global_balance = Balance.build_balance(algorithm_name.clone());
+        Self::build_balance_inner(&mut global_balance, target, rw_endpoint.clone());
+
         if endpoint_group.is_empty() || rule.node_group_name.is_empty() {
-            let mut balance = Balance.build_balance(algorithm_name);
-            Self::build_balance_inner(&mut balance, target, rw_endpoint);
-            balances.insert("GLOBAL".to_string(), balance);
+            balances.insert("GLOBAL".to_string(), global_balance);
             return Ok(balances);
         }
+
+        balances.insert("GLOBAL".to_string(), global_balance);
 
         for group in rule.node_group_name.iter() {
             let mut balance = Balance.build_balance(algorithm_name.clone());
@@ -214,9 +241,9 @@ impl RegexRuleMatchInner {
     }
 
     fn build_balance_inner(
-        balance: &mut BalanceType,
+        balance: &mut BalanceType<T>,
         target: &TargetRole,
-        rw_endpoint: ReadWriteEndpoint,
+        rw_endpoint: ReadWriteEndpoint<T>,
     ) {
         match target {
             TargetRole::Read => {
@@ -234,7 +261,10 @@ impl RegexRuleMatchInner {
     }
 }
 
-impl RouteRuleMatch for RegexRuleMatchInner {
+impl<T> RouteRuleMatch for RegexRuleMatchInner<T>
+where
+    T: BalanceTarget,
+{
     fn is_match(&self, input: &RouteInput) -> bool {
         match input {
             RouteInput::Statement(val) | RouteInput::Transaction(val) => {
@@ -251,39 +281,66 @@ impl RouteRuleMatch for RegexRuleMatchInner {
     }
 }
 
-impl RouteBalance for RegexRuleMatchInner {
-    fn get(&mut self, input: &RouteInput) -> (&mut BalanceType, TargetRole) {
+impl<T> RouteBalance<T> for RegexRuleMatchInner<T>
+where
+    T: BalanceTarget,
+{
+    fn get(&mut self, input: &RouteInput) -> (&mut BalanceType<T>, TargetRole) {
         match input {
             RouteInput::ShardingStatement(_, node_group)
             | RouteInput::ShardingTransaction(_, node_group) => {
-                (self.balance.get_mut(node_group).unwrap(), self.rule.target.clone())
+                let key = if self.balance.contains_key(node_group) {
+                    node_group.as_str()
+                } else {
+                    "GLOBAL"
+                };
+                let balance = self
+                    .balance
+                    .get_mut(key)
+                    .expect("regex rule balance is initialized with at least one target group");
+                (balance, self.rule.target.clone())
             }
 
-            _ => (self.balance.get_mut("GLOBAL").unwrap(), self.rule.target.clone()),
+            _ => {
+                let balance = self
+                    .balance
+                    .get_mut("GLOBAL")
+                    .expect("regex rule balance is initialized with a GLOBAL target group");
+                (balance, self.rule.target.clone())
+            }
         }
     }
 }
 
-fn balance_add_endpoint(balance: &mut BalanceType, endpoints: Vec<Endpoint>) {
+fn balance_add_endpoint<T>(balance: &mut BalanceType<T>, endpoints: Vec<T>)
+where
+    T: BalanceTarget,
+{
     for ep in endpoints {
         balance.add(ep);
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct GenericRuleMatchInner {
-    r_balance: BalanceType,
-    rw_balance: BalanceType,
-    default_balance: BalanceType,
+#[derive(Clone)]
+pub struct GenericRuleMatchInner<T = Endpoint>
+where
+    T: BalanceTarget,
+{
+    r_balance: BalanceType<T>,
+    rw_balance: BalanceType<T>,
+    default_balance: BalanceType<T>,
     default_target_role: TargetRole,
 }
 
-impl GenericRuleMatchInner {
+impl<T> GenericRuleMatchInner<T>
+where
+    T: BalanceTarget,
+{
     fn new(
         rule: GenericRule,
         default_target_role: TargetRole,
-        rw_endpoint: ReadWriteEndpoint,
-    ) -> GenericRuleMatchInner {
+        rw_endpoint: ReadWriteEndpoint<T>,
+    ) -> GenericRuleMatchInner<T> {
         let r_balance = GenericRuleMatchInner::build_balance(
             TargetRole::Read,
             rule.algorithm_name.clone(),
@@ -305,8 +362,8 @@ impl GenericRuleMatchInner {
     fn build_balance(
         role: TargetRole,
         algorithm_name: AlgorithmName,
-        rw_endpoint: ReadWriteEndpoint,
-    ) -> BalanceType {
+        rw_endpoint: ReadWriteEndpoint<T>,
+    ) -> BalanceType<T> {
         let mut balance = Balance.build_balance(algorithm_name);
 
         match role {
@@ -326,7 +383,10 @@ impl GenericRuleMatchInner {
     }
 }
 
-impl RouteRuleMatch for GenericRuleMatchInner {
+impl<T> RouteRuleMatch for GenericRuleMatchInner<T>
+where
+    T: BalanceTarget,
+{
     fn is_match(&self, input: &RouteInput) -> bool {
         match input {
             RouteInput::Statement(sql) | RouteInput::Transaction(sql) => {
@@ -345,8 +405,11 @@ impl RouteRuleMatch for GenericRuleMatchInner {
     }
 }
 
-impl RouteBalance for GenericRuleMatchInner {
-    fn get(&mut self, input: &RouteInput) -> (&mut BalanceType, TargetRole) {
+impl<T> RouteBalance<T> for GenericRuleMatchInner<T>
+where
+    T: BalanceTarget,
+{
+    fn get(&mut self, input: &RouteInput) -> (&mut BalanceType<T>, TargetRole) {
         match input {
             RouteInput::Statement(sql) => match sql.split_once(' ') {
                 Some(key_word) => {
@@ -374,11 +437,25 @@ impl RouteBalance for GenericRuleMatchInner {
 #[cfg(test)]
 mod test {
     use endpoint::endpoint::Endpoint;
+    use gateway_core::{EndpointConfig, EndpointRole, ProtocolKind};
     use indexmap::IndexMap;
     use loadbalance::balance::*;
 
     use super::RulesMatchBuilder;
     use crate::{config::*, readwritesplitting::ReadWriteEndpoint, RouteBalance, RouteInput};
+
+    fn gateway_endpoint(name: &str, role: EndpointRole) -> EndpointConfig {
+        EndpointConfig {
+            name: name.into(),
+            protocol: ProtocolKind::PostgreSql,
+            address: format!("127.0.0.1:{}", if role == EndpointRole::Read { 5433 } else { 5432 }),
+            database: Some("orders".into()),
+            username: "app".into(),
+            password: "secret".into(),
+            role,
+            weight: 1,
+        }
+    }
 
     #[test]
     fn test_regex_match() {
@@ -435,5 +512,41 @@ mod test {
         let endpoint = b.next();
         assert_eq!(target, TargetRole::ReadWrite);
         assert_eq!(endpoint.unwrap().name, "test2");
+    }
+
+    #[test]
+    fn rules_match_gateway_endpoint_config_targets() {
+        let rules = vec![ReadWriteSplittingRule::Generic(GenericRule {
+            name: "generic".into(),
+            rule_type: "generic".into(),
+            algorithm_name: AlgorithmName::RoundRobin,
+            node_group_name: vec![],
+        })];
+
+        let rw_endpoint = ReadWriteEndpoint {
+            read: vec![gateway_endpoint("pg-replica", EndpointRole::Read)],
+            readwrite: vec![gateway_endpoint("pg-primary", EndpointRole::ReadWrite)],
+        };
+
+        let endpoint_group = IndexMap::new();
+        let mut matcher = RulesMatchBuilder::build(
+            rules,
+            TargetRole::ReadWrite,
+            None,
+            endpoint_group,
+            rw_endpoint,
+        );
+
+        let (balance, target) = matcher.get(&RouteInput::Statement("select 1"));
+        let selected = balance.next().unwrap();
+        assert_eq!(target, TargetRole::Read);
+        assert_eq!(selected.name, "pg-replica");
+        assert_eq!(selected.protocol, ProtocolKind::PostgreSql);
+
+        let (balance, target) = matcher.get(&RouteInput::Statement("insert into t values (1)"));
+        let selected = balance.next().unwrap();
+        assert_eq!(target, TargetRole::ReadWrite);
+        assert_eq!(selected.name, "pg-primary");
+        assert_eq!(selected.protocol, ProtocolKind::PostgreSql);
     }
 }

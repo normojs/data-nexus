@@ -24,8 +24,8 @@ use common::ast_cache::ParserAstCache;
 use conn_pool::Pool;
 use futures::{SinkExt, StreamExt};
 use gateway_core::{
-    FrontendProtocolAdapter, GatewayCommand, GatewayError, GatewayResponse, GatewayResult,
-    ProtocolKind, SessionState, TransactionState,
+    DialectParser, FrontendProtocolAdapter, GatewayCommand, GatewayError, GatewayResponse,
+    GatewayResult, ProtocolKind, SessionState, TransactionState,
 };
 use mysql_parser::parser::Parser;
 use mysql_protocol::{
@@ -45,7 +45,7 @@ use mysql_protocol::{
 };
 use parking_lot::Mutex;
 use pisa_error::error::{Error, ErrorKind};
-use plugin::{build_phase::PluginPhase, err::BoxError, layer::Service};
+use plugin::{build_phase::PluginPhase, err::BoxError, PluginContext, PluginDecision};
 use strategy::{route::RouteStrategy, sharding_rewrite::ShardingRewrite};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -55,7 +55,10 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing::error;
 
 use crate::{
-    server::{metrics::MySQLServerMetricsCollector, stmt_cache::StmtCache},
+    server::{
+        metrics::{GatewayMetricsContext, MySQLServerMetricsCollector},
+        stmt_cache::StmtCache,
+    },
     transaction_fsm::TransFsm,
 };
 
@@ -65,11 +68,12 @@ pub struct MySqlFrontendProtocol {
     password: String,
     database: String,
     server_version: String,
+    dialect_parser: MySqlDialectParser,
 }
 
 impl MySqlFrontendProtocol {
     pub fn new(user: String, password: String, database: String, server_version: String) -> Self {
-        Self { user, password, database, server_version }
+        Self { user, password, database, server_version, dialect_parser: MySqlDialectParser }
     }
 
     pub async fn handshake(
@@ -100,6 +104,67 @@ impl MySqlFrontendProtocol {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct MySqlDialectParser;
+
+impl DialectParser for MySqlDialectParser {
+    fn dialect(&self) -> ProtocolKind {
+        ProtocolKind::MySql
+    }
+
+    fn parse_query(
+        &self,
+        sql: String,
+        session: &mut SessionState,
+    ) -> GatewayResult<GatewayCommand> {
+        match sql.trim().to_ascii_lowercase().as_str() {
+            "begin" | "start transaction" => {
+                session.transaction_state = TransactionState::Active;
+                Ok(GatewayCommand::Begin)
+            }
+            "commit" => {
+                session.transaction_state = TransactionState::Idle;
+                Ok(GatewayCommand::Commit)
+            }
+            "rollback" => {
+                session.transaction_state = TransactionState::Idle;
+                Ok(GatewayCommand::Rollback)
+            }
+            _ => Ok(GatewayCommand::Query { sql }),
+        }
+    }
+}
+
+pub fn session_state_from_mysql_session<S>(mysql_session: &S) -> GatewayResult<SessionState>
+where
+    S: Session,
+{
+    let charset = mysql_session
+        .get_charset()
+        .ok_or_else(|| GatewayError::Protocol("mysql session charset is missing".into()))?;
+
+    let autocommit =
+        mysql_session.get_autocommit().map(|value| parse_mysql_autocommit(&value)).transpose()?;
+
+    Ok(SessionState {
+        database: mysql_session.get_db(),
+        charset: Some(charset),
+        autocommit,
+        ..SessionState::default()
+    })
+}
+
+fn parse_mysql_autocommit(value: &str) -> GatewayResult<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Ok(true),
+        "0" | "off" | "false" => Ok(false),
+        other => Err(GatewayError::Protocol(format!(
+            "invalid mysql autocommit session value '{}'",
+            other
+        ))),
+    }
+}
+
 impl FrontendProtocolAdapter for MySqlFrontendProtocol {
     fn protocol(&self) -> ProtocolKind {
         ProtocolKind::MySql
@@ -121,7 +186,7 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
                 session.database = Some(database.clone());
                 GatewayCommand::UseDatabase { database }
             }
-            COM_QUERY => decode_query_command(payload, session)?,
+            COM_QUERY => self.dialect_parser.parse_query(decode_text_payload(payload)?, session)?,
             COM_PING => GatewayCommand::Ping,
             COM_STMT_PREPARE => GatewayCommand::Prepare { sql: decode_text_payload(payload)? },
             COM_STMT_EXECUTE => GatewayCommand::Execute {
@@ -166,28 +231,6 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
     }
 }
 
-fn decode_query_command(
-    payload: &[u8],
-    session: &mut SessionState,
-) -> GatewayResult<GatewayCommand> {
-    let sql = decode_text_payload(payload)?;
-    match sql.trim().to_ascii_lowercase().as_str() {
-        "begin" | "start transaction" => {
-            session.transaction_state = TransactionState::Active;
-            Ok(GatewayCommand::Begin)
-        }
-        "commit" => {
-            session.transaction_state = TransactionState::Idle;
-            Ok(GatewayCommand::Commit)
-        }
-        "rollback" => {
-            session.transaction_state = TransactionState::Idle;
-            Ok(GatewayCommand::Rollback)
-        }
-        _ => Ok(GatewayCommand::Query { sql }),
-    }
-}
-
 fn decode_text_payload(payload: &[u8]) -> GatewayResult<String> {
     let text = std::str::from_utf8(payload)
         .map_err(|error| GatewayError::Protocol(format!("invalid mysql utf8 payload: {}", error)))?
@@ -216,6 +259,7 @@ pub struct ReqContext<T, C> {
     pub ast_cache: Arc<Mutex<ParserAstCache>>,
     pub plugin: Option<PluginPhase>,
     pub metrics_collector: MySQLServerMetricsCollector,
+    pub metrics_context: GatewayMetricsContext,
     // `concurrency_control_rule_idx` is index of concurrency_control rules
     // required to add permits when the concurrency_control layer service is enabled.
     pub concurrency_control_rule_idx: Option<usize>,
@@ -274,9 +318,6 @@ where
             + Encoder<PacketSend<Box<[u8]>>>
             + CommonPacket,
     {
-        let db = cx.framed.codec_mut().get_session().get_db();
-        cx.fsm.set_db(db);
-
         while let Some(data) = cx.framed.next().await {
             match data {
                 Ok(data) => {
@@ -327,7 +368,7 @@ where
         let com = data.get_u8();
         let payload = data.split();
 
-        if let Err(err) = self.plugin_run(cx, &payload) {
+        if let Err(err) = self.plugin_run(cx, com, &payload) {
             let err_info = make_err_packet(MySQLError::new(
                 1047,
                 "08S01".as_bytes().to_vec(),
@@ -380,30 +421,40 @@ where
         }
     }
 
-    fn plugin_run(&mut self, cx: &mut ReqContext<T, C>, payload: &[u8]) -> Result<(), BoxError> {
+    fn plugin_run(
+        &mut self,
+        cx: &mut ReqContext<T, C>,
+        command: u8,
+        payload: &[u8],
+    ) -> Result<(), BoxError> {
         if let Some(plugin) = cx.plugin.as_mut() {
-            let input = unsafe { std::str::from_utf8_unchecked(payload).to_string() };
+            let context = PluginContext::new(
+                ProtocolKind::MySql,
+                ComType::from(command).as_ref().to_string(),
+                String::from_utf8_lossy(payload).to_string(),
+            );
 
-            plugin.circuit_break.handle(input.clone())?;
-
-            let res = plugin.concurrency_control.handle(input);
-
-            match res {
-                Ok(data) => {
-                    cx.concurrency_control_rule_idx = data.0;
-                    return Ok(());
+            let (permit_idx, decision) = plugin.handle(context)?;
+            match decision {
+                PluginDecision::Continue => {
+                    cx.concurrency_control_rule_idx = permit_idx;
+                    Ok(())
                 }
-
-                Err(err) => return Err(err),
+                PluginDecision::Reject { reason } => {
+                    Err(Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason)))
+                }
+                PluginDecision::Rewrite { .. } => Ok(()),
             }
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use mysql_protocol::session::SessionMut;
+
     use super::*;
 
     fn adapter() -> MySqlFrontendProtocol {
@@ -472,5 +523,42 @@ mod tests {
         );
 
         assert!(matches!(error, Ok(packet) if packet.first() == Some(&0xff)));
+    }
+
+    #[test]
+    fn converts_mysql_protocol_session_to_core_session_state() {
+        let mut mysql_session =
+            ServerHandshakeCodec::new("app".into(), "secret".into(), "orders".into(), "8.0".into());
+        mysql_session.set_charset("utf8mb4".into());
+        mysql_session.set_autocommit("OFF".into());
+
+        let session = session_state_from_mysql_session(&mysql_session).unwrap();
+
+        assert_eq!(session.database, Some("orders".into()));
+        assert_eq!(session.charset, Some("utf8mb4".into()));
+        assert_eq!(session.autocommit, Some(false));
+        assert_eq!(session.transaction_state, TransactionState::Idle);
+    }
+
+    #[test]
+    fn mysql_dialect_parser_classifies_transactions() {
+        let parser = MySqlDialectParser;
+        let mut session = SessionState::default();
+
+        assert_eq!(parser.dialect(), ProtocolKind::MySql);
+        assert_eq!(
+            parser.parse_query("start transaction".into(), &mut session),
+            Ok(GatewayCommand::Begin)
+        );
+        assert_eq!(session.transaction_state, TransactionState::Active);
+        assert_eq!(
+            parser.parse_query("rollback".into(), &mut session),
+            Ok(GatewayCommand::Rollback)
+        );
+        assert_eq!(session.transaction_state, TransactionState::Idle);
+        assert_eq!(
+            parser.parse_query("select 1".into(), &mut session),
+            Ok(GatewayCommand::Query { sql: "select 1".into() })
+        );
     }
 }

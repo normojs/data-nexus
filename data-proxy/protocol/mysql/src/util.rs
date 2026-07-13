@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cmp::Ordering, io::Read, ptr::copy_nonoverlapping};
+use std::cmp::Ordering;
 
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Buf, BufMut, BytesMut};
@@ -20,7 +20,10 @@ use chrono::prelude::*;
 use crypto::{self, digest::Digest};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
-use crate::mysql_const::{EOF_HEADER, OK_HEADER};
+use crate::{
+    err::ProtocolError,
+    mysql_const::{EOF_HEADER, OK_HEADER},
+};
 
 // random_buf: generate random byte vector
 #[inline]
@@ -109,45 +112,93 @@ pub fn compare(a: &[u8], b: &[u8]) -> bool {
 
 #[inline]
 pub fn length_encode_int(data: &[u8]) -> (u64, bool, u64) {
-    match data[0] {
+    try_length_encode_int(data).expect("length encoded integer should be valid")
+}
+
+#[inline]
+pub fn try_length_encode_int(data: &[u8]) -> Result<(u64, bool, u64), ProtocolError> {
+    let first = *data.first().ok_or_else(|| invalid_packet("length_encode_int", data))?;
+    let value = match first {
         0xfb => (0, true, 1),
-        0xfc => (LittleEndian::read_uint(&data[1..], 2), false, 3),
-        0xfd => (LittleEndian::read_uint(&data[1..], 3), false, 4),
-        0xfe => (LittleEndian::read_uint(&data[1..], 8), false, 9),
+        0xfc => {
+            ensure_len("length_encode_int", data, 3)?;
+            (LittleEndian::read_uint(&data[1..], 2), false, 3)
+        }
+        0xfd => {
+            ensure_len("length_encode_int", data, 4)?;
+            (LittleEndian::read_uint(&data[1..], 3), false, 4)
+        }
+        0xfe => {
+            ensure_len("length_encode_int", data, 9)?;
+            (LittleEndian::read_uint(&data[1..], 8), false, 9)
+        }
         x => (x as u64, false, 1),
-    }
+    };
+
+    Ok(value)
 }
 
 pub trait BufExt: Buf {
     fn get_lenc_int(&mut self) -> (u64, bool, u8) {
-        let first = self.get_u8();
-        match first {
-            0xfb => (0, true, 1),
-            0xfc => (self.get_uint_le(2), false, 3),
-            0xfd => (self.get_uint_le(3), false, 4),
-            0xfe => (self.get_uint_le(8), false, 9),
-            _ => (first as u64, false, 1),
+        self.try_get_lenc_int().expect("length encoded integer should be valid")
+    }
+
+    fn try_get_lenc_int(&mut self) -> Result<(u64, bool, u8), ProtocolError> {
+        if !self.has_remaining() {
+            return Err(ProtocolError::InvalidPacket {
+                method: "get_lenc_int".to_string(),
+                data: vec![],
+            });
         }
+        let first = self.get_u8();
+        let res = match first {
+            0xfb => (0, true, 1),
+            0xfc => {
+                ensure_remaining("get_lenc_int", self, 2)?;
+                (self.get_uint_le(2), false, 3)
+            }
+            0xfd => {
+                ensure_remaining("get_lenc_int", self, 3)?;
+                (self.get_uint_le(3), false, 4)
+            }
+            0xfe => {
+                ensure_remaining("get_lenc_int", self, 8)?;
+                (self.get_uint_le(8), false, 9)
+            }
+            _ => (first as u64, false, 1),
+        };
+        Ok(res)
     }
 
     fn get_lenc_str_bytes(&mut self) -> (Vec<u8>, bool) {
-        let (length, is_null, _) = self.get_lenc_int();
+        self.try_get_lenc_str_bytes().expect("length encoded string should be valid")
+    }
+
+    fn try_get_lenc_str_bytes(&mut self) -> Result<(Vec<u8>, bool), ProtocolError> {
+        let (length, is_null, _) = self.try_get_lenc_int()?;
 
         // When length < 1 means that the origin bytes is 0x00 or 0xfb,
         // In the str context, means the str is null, so return true here.
         if length < 1 || is_null || !self.has_remaining() {
-            return (vec![0], true);
+            return Ok((vec![0], true));
         }
 
+        ensure_remaining("get_lenc_str_bytes", self, length as usize)?;
         let mut data = vec![0; length as usize];
-        let _ = self.reader().read(&mut data).unwrap();
+        self.copy_to_slice(&mut data);
 
-        (data, is_null)
+        Ok((data, is_null))
     }
 
     fn skip_lenc_length(&mut self) {
-        let (length, ..) = self.get_lenc_int();
-        self.advance(length as usize)
+        self.try_skip_lenc_length().expect("length encoded string should be valid")
+    }
+
+    fn try_skip_lenc_length(&mut self) -> Result<(), ProtocolError> {
+        let (length, ..) = self.try_get_lenc_int()?;
+        ensure_remaining("skip_lenc_length", self, length as usize)?;
+        self.advance(length as usize);
+        Ok(())
     }
 }
 
@@ -187,29 +238,56 @@ impl BufMutExt for Vec<u8> {}
 impl BufMutExt for BytesMut {}
 
 pub fn length_encoded_string(data: &mut BytesMut) -> (Vec<u8>, bool) {
-    let (num, is_null, _) = data.get_lenc_int();
+    try_length_encoded_string(data).expect("length encoded string should be valid")
+}
+
+pub fn try_length_encoded_string(data: &mut BytesMut) -> Result<(Vec<u8>, bool), ProtocolError> {
+    let (num, is_null, _) = data.try_get_lenc_int()?;
 
     if num < 1 {
-        return (vec![0xfb], is_null);
+        return Ok((vec![0xfb], is_null));
     }
 
     if data.is_empty() {
-        return (vec![], false);
+        return Ok((vec![], false));
     }
 
-    (data.split_to(num as usize).to_vec(), false)
+    ensure_len("length_encoded_string", data, num as usize)?;
+    Ok((data.split_to(num as usize).to_vec(), false))
 }
 
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_eof_packet.html
 #[inline]
 pub fn is_eof(data: &[u8]) -> bool {
-    data.len() <= 9 && *unsafe { data.get_unchecked(4) } == EOF_HEADER
+    data.len() >= 5 && data.len() <= 9 && data[4] == EOF_HEADER
 }
 
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_ok_packet.html
 #[inline]
 pub fn is_ok(data: &[u8]) -> bool {
-    data.len() > 7 && *unsafe { data.get_unchecked(4) } == OK_HEADER
+    data.len() > 7 && data[4] == OK_HEADER
+}
+
+fn ensure_len(method: &str, data: &[u8], needed: usize) -> Result<(), ProtocolError> {
+    if data.len() < needed {
+        return Err(invalid_packet(method, data));
+    }
+    Ok(())
+}
+
+fn ensure_remaining<B: Buf + ?Sized>(
+    method: &str,
+    data: &B,
+    needed: usize,
+) -> Result<(), ProtocolError> {
+    if data.remaining() < needed {
+        return Err(ProtocolError::InvalidPacket { method: method.to_string(), data: vec![] });
+    }
+    Ok(())
+}
+
+fn invalid_packet(method: &str, data: &[u8]) -> ProtocolError {
+    ProtocolError::InvalidPacket { method: method.to_string(), data: data.to_vec() }
 }
 
 #[inline]
@@ -222,12 +300,14 @@ pub fn is_ok_header(data: u8) -> bool {
 
 #[inline]
 pub fn get_length(buf: &[u8]) -> usize {
-    let mut out = 0u64;
-    let ptr_out = &mut out as *mut u64 as *mut u8;
-    unsafe {
-        copy_nonoverlapping(buf.as_ptr(), ptr_out, 3);
-    }
-    out.to_le() as usize
+    try_get_length(buf).expect("packet header should contain a three-byte payload length")
+}
+
+/// Decode the three-byte little-endian payload length in a MySQL packet header.
+#[inline]
+pub fn try_get_length(buf: &[u8]) -> Result<usize, ProtocolError> {
+    ensure_len("get_length", buf, 3)?;
+    Ok(buf[0] as usize | ((buf[1] as usize) << 8) | ((buf[2] as usize) << 16))
 }
 
 #[cfg(test)]
@@ -237,6 +317,7 @@ mod test {
     use super::{length_encoded_string, BufExt};
     use crate::util::{
         calc_caching_sha2password, calc_password, compare, get_length, is_eof, is_ok, random_buf,
+        try_get_length,
     };
 
     #[test]
@@ -385,5 +466,11 @@ mod test {
         let data = [0x05, 0x00, 0x00, 0x05, 0x00, 0x00];
         let result = get_length(&data[..]);
         assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn test_try_get_length_rejects_truncated_header() {
+        assert!(try_get_length(&[]).is_err());
+        assert!(try_get_length(&[0x01, 0x00]).is_err());
     }
 }

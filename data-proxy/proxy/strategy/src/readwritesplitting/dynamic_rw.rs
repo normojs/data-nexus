@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use endpoint::endpoint::Endpoint;
+use gateway_core::RoutePlan;
 use indexmap::IndexMap;
 use loadbalance::balance::LoadBalance;
 
@@ -32,7 +32,7 @@ use crate::{
         read_only_monitor::ReadOnlyMonitorResponse,
         replication_lag_monitor::ReplicationLagMonitorResponse,
     },
-    route::{BoxError, RouteBalance, RouteStrategy},
+    route::{endpoint_to_route_target, BoxError, RouteBalance, RouteStrategy},
     Route, RouteInput,
 };
 
@@ -121,12 +121,9 @@ pub struct ReadWriteSplittingDynamic {
 impl Route for ReadWriteSplittingDynamic {
     type Error = BoxError;
 
-    fn dispatch(
-        &mut self,
-        input: &RouteInput,
-    ) -> Result<(Option<Endpoint>, TargetRole), Self::Error> {
+    fn dispatch(&mut self, input: &RouteInput) -> Result<RoutePlan, Self::Error> {
         let v: Vec<_> = self.rx.try_iter().collect();
-        match v.last() {
+        let (endpoint, role) = match v.last() {
             Some(rw_endpoint) => {
                 self.rules_match.default_balance = RulesMatchBuilder::build_default_balance(
                     &self.rules_match.default_target,
@@ -149,13 +146,19 @@ impl Route for ReadWriteSplittingDynamic {
                 );
 
                 let b = self.rules_match.get(input);
-                Ok((b.0.next(), b.1))
+                (b.0.next(), b.1)
             }
 
             None => {
                 let b = self.rules_match.get(input);
-                Ok((b.0.next(), b.1))
+                (b.0.next(), b.1)
             }
-        }
+        };
+
+        Ok(endpoint
+            .map(|endpoint| RoutePlan::Single { target: endpoint_to_route_target(endpoint, role) })
+            .unwrap_or_else(|| RoutePlan::Reject {
+                reason: "dynamic read/write splitting selected no endpoint".into(),
+            }))
     }
 }

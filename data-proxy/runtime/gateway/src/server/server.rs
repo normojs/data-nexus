@@ -38,7 +38,7 @@ use mysql_protocol::{
         err::MySQLError,
     },
     session::{Session, SessionMut},
-    util::{is_eof, length_encode_int},
+    util::{is_eof, try_length_encode_int},
 };
 use pisa_error::error::{Error, ErrorKind};
 use strategy::{route::RouteInputTyp, sharding_rewrite::ShardingRewriteOutput};
@@ -51,11 +51,19 @@ use super::{
     util::{filter_avg_column, get_avg_change},
 };
 use crate::{
-    frontend::mysql::{MySqlCommandService, ReqContext, RespContext},
-    transaction_fsm::{
-        build_conn_attrs, check_get_conn, query_rewrite, route, route_sharding, TransEventName,
+    backend_conn::check_get_conn,
+    frontend::mysql::{
+        session_state_from_mysql_session, MySqlCommandService, ReqContext, RespContext,
     },
+    transaction_fsm::{query_rewrite, route, route_sharding, TransEventName},
 };
+
+#[derive(Debug, PartialEq, Clone)]
+struct BackendSessionAttrs {
+    db: Option<String>,
+    charset: String,
+    autocommit: Option<String>,
+}
 
 pub struct MySqlBackendConnector<T, C> {
     _phat: PhantomData<(T, C)>,
@@ -65,6 +73,44 @@ impl<T, C> MySqlBackendConnector<T, C> {
     pub fn new() -> Self {
         Self { _phat: PhantomData }
     }
+}
+
+#[inline]
+fn build_conn_attrs(session: &SessionState) -> Result<Vec<SessionAttr>, Error> {
+    let charset = session.charset.clone().ok_or_else(|| {
+        Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mysql session charset is missing",
+        ))))
+    })?;
+
+    let attrs = BackendSessionAttrs {
+        db: session.database.clone(),
+        charset,
+        autocommit: session.autocommit.map(mysql_autocommit_attr),
+    };
+
+    Ok(vec![
+        SessionAttr::DB(attrs.db),
+        SessionAttr::Charset(attrs.charset),
+        SessionAttr::Autocommit(attrs.autocommit),
+    ])
+}
+
+fn mysql_autocommit_attr(enabled: bool) -> String {
+    if enabled { "1" } else { "0" }.into()
+}
+
+fn current_session_state<T, C>(req: &mut ReqContext<T, C>) -> Result<SessionState, Error>
+where
+    C: CommonPacket,
+{
+    session_state_from_mysql_session(req.framed.codec_mut().get_session()).map_err(|error| {
+        Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        ))))
+    })
 }
 
 fn decode_mysql_text_payload<'a>(method: &str, payload: &'a [u8]) -> Result<&'a str, Error> {
@@ -102,15 +148,15 @@ where
         input_typ: RouteInputTyp,
         raw_sql: &str,
     ) -> Result<PoolConn<ClientConn>, Error> {
-        let sess = req.framed.codec_mut().get_session();
-        let attrs = build_conn_attrs(sess)?;
+        let session = current_session_state(req)?;
+        let attrs = build_conn_attrs(&session)?;
         let is_get_conn = req.fsm.trigger(state_name);
         if is_get_conn {
             return Self::fsm_get_new_conn(req, raw_sql, input_typ, &attrs).await;
         }
 
         let endpoint = route(input_typ, raw_sql, req.route_strategy.clone())?;
-        req.fsm.get_conn_with_endpoint(endpoint, &attrs).await
+        Self::fsm_get_conn_for_endpoint(req, endpoint, &attrs).await
     }
 
     async fn fsm_get_new_conn(
@@ -126,14 +172,27 @@ where
         check_get_conn(req.pool.clone(), &endpoint.addr, attrs).await
     }
 
+    async fn fsm_get_conn_for_endpoint(
+        req: &mut ReqContext<T, C>,
+        endpoint: endpoint::endpoint::Endpoint,
+        attrs: &[SessionAttr],
+    ) -> Result<PoolConn<ClientConn>, Error> {
+        if let Some(client_conn) = req.fsm.take_conn_if_bound() {
+            return Ok(client_conn);
+        }
+
+        let factory =
+            ClientConn::with_opts(endpoint.user, endpoint.password, endpoint.addr.clone());
+        req.pool.set_factory(&endpoint.addr, factory);
+        check_get_conn(req.pool.clone(), &endpoint.addr, attrs).await
+    }
+
     async fn init_db_inner<'b>(
         req: &mut ReqContext<T, C>,
         client_conn: &mut PoolConn<ClientConn>,
         payload: &[u8],
     ) -> Result<(), Error> {
         let db = decode_mysql_text_payload("COM_INIT_DB", payload)?;
-
-        req.fsm.set_db(Some(db.to_string()));
 
         let res = client_conn.send_use_db(db).await.map_err(ErrorKind::from)?;
 
@@ -162,8 +221,8 @@ where
     async fn prepare_shard_inner(req: &mut ReqContext<T, C>, payload: &[u8]) -> Result<(), Error> {
         req.stmt_id.fetch_add(1, Ordering::Relaxed);
         let stmt_id = req.stmt_id.load(Ordering::Relaxed);
-        let sess = req.framed.codec_mut().get_session();
-        let attrs = build_conn_attrs(sess)?;
+        let session = current_session_state(req)?;
+        let attrs = build_conn_attrs(&session)?;
         let raw_sql = decode_mysql_text_payload("COM_STMT_PREPARE", payload)?;
         let (_, input_typ, rewrite_outputs) = Self::query_rewrite(req, raw_sql)?;
         req.rewrite_outputs = rewrite_outputs;
@@ -257,7 +316,8 @@ where
         if !stmt.cols_data.is_empty() {
             let mut is_added_avg_column = false;
             for col_data in stmt.cols_data {
-                let column_info = (&col_data[4..]).decode_column();
+                let column_info =
+                    (&col_data[4..]).try_decode_column().map_err(ErrorKind::Protocol)?;
                 if let Some(change) = avg_change {
                     let filter_res = filter_avg_column(change, &column_info, is_added_avg_column);
                     if filter_res.1.is_some() {
@@ -308,8 +368,8 @@ where
     }
 
     async fn shard_query_inner(req: &mut ReqContext<T, C>, payload: &[u8]) -> Result<(), Error> {
-        let sess = req.framed.codec_mut().get_session();
-        let attrs = build_conn_attrs(sess)?;
+        let session = current_session_state(req)?;
+        let attrs = build_conn_attrs(&session)?;
         let raw_sql = decode_mysql_text_payload("COM_QUERY", payload)?;
         let (is_get_conn, input_typ, rewrite_outputs) = Self::query_rewrite(req, raw_sql)?;
         req.rewrite_outputs = rewrite_outputs;
@@ -360,10 +420,8 @@ where
         req: &mut ReqContext<T, C>,
         payload: &[u8],
     ) -> Result<PoolConn<ClientConn>, Error> {
-        // 获取会话信息
-        let sess = req.framed.codec_mut().get_session();
-        // 构建连接属性
-        let attrs = build_conn_attrs(sess)?;
+        let session = current_session_state(req)?;
+        let attrs = build_conn_attrs(&session)?;
         // 将payload转换为字符串并清理
         let sql = decode_mysql_text_payload("COM_QUERY", payload)?;
         // 进行查询重写和分析
@@ -383,7 +441,7 @@ where
         }
 
         // 使用现有连接
-        req.fsm.get_conn(&attrs).await
+        req.fsm.take_conn()
     }
 
     /// 重写查询SQL的方法
@@ -490,7 +548,6 @@ where
                 SetOpts::SetNames(name) => {
                     if let Some(name) = &name.charset_name {
                         req.framed.codec_mut().get_session().set_charset(name.clone());
-                        req.fsm.set_charset(name.clone());
                         let _ = req.fsm.reset_fsm_state();
                         return (true, RouteInputTyp::Statement);
                     }
@@ -527,7 +584,6 @@ where
                                         .codec_mut()
                                         .get_session()
                                         .set_autocommit(value.clone());
-                                    req.fsm.set_autocommit(value.clone());
                                     return (true, RouteInputTyp::Statement);
                                 }
                                 _ => {}
@@ -537,7 +593,6 @@ where
                                     .codec_mut()
                                     .get_session()
                                     .set_autocommit(String::from("ON"));
-                                req.fsm.set_autocommit(String::from("ON"));
                                 //let _ = req.fsm.reset_fsm_state(RouteInput::Statement(input)).await;
                                 req.fsm.reset_fsm_state();
 
@@ -599,7 +654,7 @@ where
             return Ok(());
         }
 
-        let (cols, ..) = length_encode_int(&header[4..]);
+        let (cols, ..) = try_length_encode_int(&header[4..])?;
 
         let mut buf = BytesMut::with_capacity(1 << 16);
 
@@ -851,9 +906,7 @@ where
             return Ok(RespContext { ep: None, duration: now.elapsed() });
         }
 
-        let sess = cx.framed.codec_mut().get_session();
-        let attrs = build_conn_attrs(sess)?;
-        let mut client_conn = cx.fsm.get_conn(&attrs).await?;
+        let mut client_conn = cx.fsm.take_conn()?;
         let ep = client_conn.get_endpoint();
         let ep_addr = required_endpoint_addr("COM_EXECUTE", &ep)?;
 

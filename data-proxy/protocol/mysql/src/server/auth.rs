@@ -144,7 +144,7 @@ fn read_length_encoded_bytes(
     data: &mut BytesMut,
 ) -> Result<(Vec<u8>, bool), ProtocolError> {
     ensure_packet_len(method, data, 1)?;
-    let (length, is_null, _) = data.get_lenc_int();
+    let (length, is_null, _) = data.try_get_lenc_int()?;
     if length < 1 {
         return Ok((vec![0xfb], is_null));
     }
@@ -451,7 +451,7 @@ impl Decoder for ServerHandshakeCodec {
         整个函数的结果类型为Result<Option<()>, Self::Error>，表示解码过程可能出现错误且可能无法解出有效消息。
     */
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.is_empty() || src.len() < 3 {
+        if src.len() < 4 {
             return Ok(None);
         }
 

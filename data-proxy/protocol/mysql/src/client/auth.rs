@@ -311,7 +311,9 @@ impl ClientAuth {
         &mut self,
         data: &mut BytesMut,
     ) -> Result<Option<BytesMut>, ProtocolError> {
-        let length = get_length(data) as usize;
+        ensure_packet_len("decode_handshake_result.header", data, 5)?;
+        let length = try_get_length(data)?;
+        ensure_packet_len("decode_handshake_result.payload", data, 4 + length)?;
 
         match data[4] {
             OK_HEADER => Ok(None),
@@ -434,15 +436,15 @@ impl Decoder for ClientAuth {
     type Error = ProtocolError;
 
     fn decode(&mut self, data: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if data.is_empty() {
+        if data.len() < 4 {
             return Ok(None);
         }
 
-        if data.len() <= 3 {
-            self.seq = data[data.len() - 1];
-        } else {
-            self.seq = data[3];
+        let payload_length = try_get_length(data)?;
+        if data.len() < 4 + payload_length {
+            return Ok(None);
         }
+        self.seq = data[3];
 
         match self.next_state {
             HandshakeState::InitialHandshake => {
@@ -731,7 +733,7 @@ pub async fn handshake(
 mod test {
     use bytes::BytesMut;
     use tokio::net::TcpStream;
-    use tokio_util::codec::Framed;
+    use tokio_util::codec::{Decoder, Framed};
 
     use super::{handshake, ClientAuth};
     use crate::client::{codec::ClientCodec, stream::LocalStream};
@@ -756,6 +758,15 @@ mod test {
         assert_eq!(c.salt[c.salt.len() - 1], 0x59);
         assert_eq!(c.auth_plugin_name, "caching_sha2_password".to_string());
         assert_eq!(c.charset, "utf8mb4");
+    }
+
+    #[test]
+    fn test_decoder_waits_for_complete_packet_header() {
+        let mut auth = ClientAuth::new();
+        for packet in [vec![], vec![0], vec![0, 0], vec![0, 0, 0], vec![1, 0, 0, 0]] {
+            let mut packet = BytesMut::from(packet.as_slice());
+            assert!(auth.decode(&mut packet).unwrap().is_none());
+        }
     }
 
     // test auth success with mysql_native_password plugin

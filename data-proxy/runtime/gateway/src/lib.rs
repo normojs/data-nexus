@@ -13,8 +13,10 @@
 // limitations under the License.
 
 pub mod backend;
+pub mod backend_conn;
 pub mod core_engine;
 pub mod frontend;
 pub mod gateway;
 pub mod server;
+pub mod supervisor;
 pub mod transaction_fsm;

@@ -15,12 +15,28 @@ protocol = "my_sql"
 service = "orders"
 auth_policy = "orders-users"
 
+[[listeners]]
+name = "orders-postgresql"
+listen_addr = "0.0.0.0:5433"
+protocol = "postgre_sql"
+service = "orders-pg"
+auth_policy = "orders-pg-users"
+
 [[services]]
 name = "orders"
+frontend_protocols = ["my_sql"]
 backend_protocol = "my_sql"
 endpoints = ["orders-primary", "orders-replica"]
 route_policy = "orders-balance"
 plugin_policies = ["orders-audit"]
+
+[[services]]
+name = "orders-pg"
+frontend_protocols = ["postgre_sql"]
+backend_protocol = "postgre_sql"
+endpoints = ["orders-pg-primary"]
+route_policy = "orders-pg-primary-only"
+plugin_policies = ["orders-pg-audit"]
 
 [[endpoints]]
 name = "orders-primary"
@@ -42,9 +58,23 @@ password = "my-secret-pw"
 role = "read"
 weight = 1
 
+[[endpoints]]
+name = "orders-pg-primary"
+protocol = "postgre_sql"
+address = "127.0.0.1:5432"
+database = "orders"
+username = "postgres"
+password = "postgres-secret"
+role = "readwrite"
+weight = 1
+
 [[route_policies]]
 name = "orders-balance"
 kind = "simple_load_balance"
+
+[[route_policies]]
+name = "orders-pg-primary-only"
+kind = "single"
 
 [[auth_policies]]
 name = "orders-users"
@@ -55,6 +85,19 @@ username = "app"
 password = "secret"
 databases = ["orders"]
 
+[[auth_policies]]
+name = "orders-pg-users"
+kind = "static"
+
+[[auth_policies.users]]
+username = "pgapp"
+password = "pg-secret"
+databases = ["orders"]
+
 [[plugin_policies]]
 name = "orders-audit"
+kind = "audit"
+
+[[plugin_policies]]
+name = "orders-pg-audit"
 kind = "audit"

@@ -367,12 +367,41 @@ mod test {
             GatewayConfigDocument::from_toml(include_str!("../../../examples/gateway-config.toml"))
                 .unwrap();
 
-        assert_eq!(config.gateway.listeners.len(), 1);
-        assert_eq!(config.gateway.services.len(), 1);
-        assert_eq!(config.gateway.endpoints.len(), 2);
+        assert_eq!(config.gateway.listeners.len(), 2);
+        assert_eq!(config.gateway.listeners[1].name, "orders-postgresql");
+        assert_eq!(config.gateway.listeners[1].protocol, gateway_core::ProtocolKind::PostgreSql);
+        assert_eq!(config.gateway.services.len(), 2);
+        assert_eq!(
+            config.gateway.services[0].frontend_protocols,
+            vec![gateway_core::ProtocolKind::MySql]
+        );
+        assert_eq!(
+            config.gateway.services[1].frontend_protocols,
+            vec![gateway_core::ProtocolKind::PostgreSql]
+        );
+        assert_eq!(
+            config.gateway.services[1].backend_protocol,
+            gateway_core::ProtocolKind::PostgreSql
+        );
+        assert_eq!(config.gateway.endpoints.len(), 3);
         assert_eq!(config.gateway.endpoints[0].username, "root");
+        assert_eq!(config.gateway.endpoints[2].protocol, gateway_core::ProtocolKind::PostgreSql);
+        assert_eq!(config.gateway.endpoints[2].username, "postgres");
         assert_eq!(config.gateway.auth_policies[0].users[0].username, "app");
         assert_eq!(config.gateway.auth_policies[0].users[0].databases, vec!["orders"]);
+        assert_eq!(config.gateway.auth_policies[1].users[0].username, "pgapp");
+    }
+
+    #[test]
+    fn rejects_invalid_native_gateway_config() {
+        let invalid_config = include_str!("../../../examples/gateway-config.toml")
+            .replace("frontend_protocols = [\"my_sql\"]", "frontend_protocols = [\"postgre_sql\"]");
+        let error = GatewayConfigDocument::from_toml(&invalid_config).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid gateway configuration: configuration error: listener 'orders-mysql' uses protocol 'my_sql' but service 'orders' allows frontend protocols [postgre_sql]"
+        );
     }
 
     #[test]
@@ -384,5 +413,53 @@ mod test {
         assert_eq!(config.gateway.listeners[0].name, "orders-mysql");
         assert_eq!(config.gateway.services[0].name, "orders");
         assert!(config.proxy.is_none());
+    }
+
+    #[test]
+    fn pisa_proxy_config_parses_legacy_proxy_node_type_as_protocol_kind() {
+        let config = r#"
+[admin]
+
+[proxy]
+[[proxy.config]]
+name = "legacy-proxy"
+listen_addr = "127.0.0.1:3306"
+node_type = "mysql"
+
+[proxy.config.cloud]
+data_type = "database"
+node_type = "mysql"
+host = "127.0.0.1:3306"
+user = "root"
+password = "secret"
+db = "orders"
+"#;
+
+        let parsed: PisaProxyConfig = toml::from_str(config).unwrap();
+        let proxy = parsed.proxy.unwrap();
+        let proxy_configs = proxy.config.unwrap();
+        let proxy_config = &proxy_configs[0];
+
+        assert_eq!(proxy_config.node_type, gateway_core::ProtocolKind::MySql);
+        assert_eq!(
+            proxy_config.cloud.as_ref().unwrap().node_type,
+            gateway_core::ProtocolKind::MySql
+        );
+    }
+
+    #[test]
+    fn pisa_proxy_config_rejects_invalid_legacy_proxy_node_type() {
+        let config = r#"
+[admin]
+
+[proxy]
+[[proxy.config]]
+name = "legacy-proxy"
+listen_addr = "127.0.0.1:3306"
+node_type = "oracle"
+"#;
+
+        let error = toml::from_str::<PisaProxyConfig>(config).unwrap_err();
+        assert!(error.to_string().contains("unknown variant `oracle`"));
     }
 }

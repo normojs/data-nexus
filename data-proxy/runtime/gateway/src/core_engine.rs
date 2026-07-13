@@ -17,10 +17,13 @@ use std::sync::Arc;
 use gateway_core::{
     AuthPolicyConfig, AuthPolicyUserConfig, BackendConnector, EndpointConfig,
     FrontendProtocolAdapter, GatewayConfig, GatewayError, GatewayResponse, GatewayResult,
-    ListenerConfig, ProtocolKind, ServiceConfig, SessionState,
+    ListenerConfig, ProtocolKind, RoutePlan, ServiceConfig, SessionState,
 };
 
-use crate::{backend::mysql::MySqlBackendConnector, frontend::mysql::MySqlFrontendProtocol};
+use crate::{
+    backend::{mysql::MySqlBackendConnector, postgresql::PostgreSqlBackendConnector},
+    frontend::{mysql::MySqlFrontendProtocol, postgresql::PostgreSqlFrontendProtocol},
+};
 
 /// Protocol-neutral execution path for one frontend connection.
 ///
@@ -48,6 +51,10 @@ impl CoreGatewayConnection {
 
     pub fn backend_protocol(&self) -> ProtocolKind {
         self.backend.protocol()
+    }
+
+    pub fn last_backend_endpoint_label(&self) -> Option<String> {
+        self.backend.last_endpoint_label()
     }
 
     pub fn session(&self) -> &SessionState {
@@ -133,6 +140,7 @@ pub struct CoreGatewayListenerPlan {
     listener: ListenerConfig,
     service: ServiceConfig,
     endpoints: Vec<EndpointConfig>,
+    route_plan: RoutePlan,
     auth_policy: Option<AuthPolicyConfig>,
 }
 
@@ -184,7 +192,15 @@ impl CoreGatewayListenerPlan {
             })
             .transpose()?;
 
-        Ok(Self { listener: listener.clone(), service: service.clone(), endpoints, auth_policy })
+        let route_plan = RoutePlan::from_endpoints(endpoints.clone());
+
+        Ok(Self {
+            listener: listener.clone(),
+            service: service.clone(),
+            endpoints,
+            route_plan,
+            auth_policy,
+        })
     }
 
     pub fn listener(&self) -> &ListenerConfig {
@@ -199,6 +215,10 @@ impl CoreGatewayListenerPlan {
         &self.endpoints
     }
 
+    pub fn route_plan(&self) -> &RoutePlan {
+        &self.route_plan
+    }
+
     pub fn auth_policy(&self) -> Option<&AuthPolicyConfig> {
         self.auth_policy.as_ref()
     }
@@ -211,7 +231,7 @@ impl CoreGatewayListenerPlan {
         let database = self.default_database().map(ToOwned::to_owned);
         let frontend =
             build_frontend_protocol(&self.listener, self.auth_policy.as_ref(), database.clone())?;
-        let backend = build_backend_connector(&self.service)?;
+        let backend = build_backend_connector(&self.service, &self.endpoints)?;
         let session = SessionState { database, ..SessionState::default() };
 
         Ok(CoreGatewayConnection::new(frontend, backend, session))
@@ -231,10 +251,7 @@ fn build_frontend_protocol(
             database.unwrap_or_default(),
             "8.0".into(),
         ))),
-        ProtocolKind::PostgreSql => Err(GatewayError::Unsupported(format!(
-            "frontend protocol '{}' is not implemented for listener '{}'",
-            listener.protocol, listener.name
-        ))),
+        ProtocolKind::PostgreSql => Ok(Box::new(PostgreSqlFrontendProtocol::new())),
     }
 }
 
@@ -242,19 +259,22 @@ fn default_auth_user(auth_policy: Option<&AuthPolicyConfig>) -> Option<&AuthPoli
     auth_policy.and_then(|policy| policy.users.first())
 }
 
-fn build_backend_connector(service: &ServiceConfig) -> GatewayResult<Arc<dyn BackendConnector>> {
+fn build_backend_connector(
+    service: &ServiceConfig,
+    endpoints: &[EndpointConfig],
+) -> GatewayResult<Arc<dyn BackendConnector>> {
     match &service.backend_protocol {
         ProtocolKind::MySql => Ok(Arc::new(MySqlBackendConnector::<(), ()>::new())),
-        ProtocolKind::PostgreSql => Err(GatewayError::Unsupported(format!(
-            "backend protocol '{}' is not implemented for service '{}'",
-            service.backend_protocol, service.name
-        ))),
+        ProtocolKind::PostgreSql => {
+            Ok(Arc::new(PostgreSqlBackendConnector::new(endpoints.to_vec())))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use gateway_core::EndpointRole;
+    use byteorder::{BigEndian, ByteOrder};
+    use gateway_core::{EndpointRole, TransactionState};
     use mysql_protocol::{
         mysql_const::{COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT},
         server::codec::ok_packet,
@@ -286,6 +306,7 @@ mod tests {
             }],
             services: vec![ServiceConfig {
                 name: "orders".into(),
+                frontend_protocols: vec![ProtocolKind::MySql],
                 backend_protocol: ProtocolKind::MySql,
                 endpoints: vec!["orders-primary".into()],
                 route_policy: None,
@@ -373,6 +394,36 @@ mod tests {
         assert_eq!(listener.endpoints()[0].name, "orders-primary");
         assert_eq!(listener.endpoints()[0].username, "root");
         assert_eq!(listener.default_database(), Some("orders_db"));
+        assert!(matches!(
+            listener.route_plan(),
+            RoutePlan::Single { target } if target.endpoint.name == "orders-primary"
+        ));
+    }
+
+    #[test]
+    fn builds_broadcast_route_plan_for_multi_endpoint_service() {
+        let mut config = mysql_config();
+        config.services[0].endpoints.push("orders-replica".into());
+        config.endpoints.push(EndpointConfig {
+            name: "orders-replica".into(),
+            protocol: ProtocolKind::MySql,
+            address: "127.0.0.1:3307".into(),
+            database: Some("orders_db".into()),
+            username: "root".into(),
+            password: "backend-secret".into(),
+            role: EndpointRole::Read,
+            weight: 1,
+        });
+
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+        let listener = plan.listener("mysql-listener").unwrap();
+
+        assert!(matches!(
+            listener.route_plan(),
+            RoutePlan::Broadcast { targets }
+                if targets.iter().map(|target| target.endpoint.name.as_str()).collect::<Vec<_>>()
+                    == vec!["orders-primary", "orders-replica"]
+        ));
     }
 
     #[test]
@@ -401,20 +452,49 @@ mod tests {
     }
 
     #[test]
-    fn reports_unsupported_backend_protocol_from_runtime_plan() {
+    fn builds_postgresql_backend_connector_from_runtime_plan() {
         let mut config = mysql_config();
         config.services[0].backend_protocol = ProtocolKind::PostgreSql;
         config.endpoints[0].protocol = ProtocolKind::PostgreSql;
         let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
 
-        match plan.build_connection("mysql-listener") {
-            Err(error) => assert_eq!(
-                error,
-                GatewayError::Unsupported(
-                    "backend protocol 'postgre_sql' is not implemented for service 'orders'".into()
-                )
-            ),
-            Ok(_) => panic!("expected unsupported backend protocol error"),
-        }
+        let connection = plan.build_connection("mysql-listener").unwrap();
+
+        assert_eq!(connection.frontend_protocol(), ProtocolKind::MySql);
+        assert_eq!(connection.backend_protocol(), ProtocolKind::PostgreSql);
+    }
+
+    #[test]
+    fn builds_postgresql_frontend_adapter_from_runtime_plan() {
+        let mut config = mysql_config();
+        config.listeners[0].protocol = ProtocolKind::PostgreSql;
+        config.services[0].frontend_protocols = vec![ProtocolKind::PostgreSql, ProtocolKind::MySql];
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+
+        let connection = plan.build_connection("mysql-listener").unwrap();
+
+        assert_eq!(connection.frontend_protocol(), ProtocolKind::PostgreSql);
+        assert_eq!(connection.backend_protocol(), ProtocolKind::MySql);
+    }
+
+    #[tokio::test]
+    async fn handles_postgresql_begin_through_core_traits() {
+        let mut connection = CoreGatewayConnection::new(
+            Box::new(PostgreSqlFrontendProtocol::new()),
+            Arc::new(PostgreSqlBackendConnector::new(Vec::new())),
+            SessionState::default(),
+        );
+
+        let mut frame = vec![b'Q', 0, 0, 0, 0];
+        BigEndian::write_u32(&mut frame[1..5], 10);
+        frame.extend_from_slice(b"BEGIN\0");
+
+        let packets = connection.handle_frame(&frame).await.unwrap();
+
+        let mut expected = vec![b'C', 0, 0, 0, 9];
+        expected.extend_from_slice(b"OK 0\0");
+        expected.extend_from_slice(&[b'Z', 0, 0, 0, 5, b'T']);
+        assert_eq!(packets, vec![expected]);
+        assert_eq!(connection.session().transaction_state, TransactionState::Active);
     }
 }

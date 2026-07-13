@@ -28,12 +28,12 @@ use mysql_protocol::{
         conn::{ClientConn, SessionAttr},
         stmt::Stmt,
     },
-    column::{decode_column, ColumnInfo},
+    column::{try_decode_column, ColumnInfo},
     err::ProtocolError,
     mysql_const::*,
     row::{decode_with_name, RowData, RowDataBinary, RowDataText, RowDataTyp, RowPartData},
     server::codec::{make_eof_packet, CommonPacket, PacketSend},
-    util::{length_encode_int, BufMutExt},
+    util::{try_length_encode_int, BufMutExt},
 };
 use pisa_error::error::{Error, ErrorKind};
 use rayon::prelude::*;
@@ -45,7 +45,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Decoder, Encoder};
 
 use super::util::{filter_avg_column, get_avg_change};
-use crate::{frontend::mysql::ReqContext, transaction_fsm::check_get_conn};
+use crate::{backend_conn::check_get_conn, frontend::mysql::ReqContext};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecuteError {
@@ -150,7 +150,7 @@ where
             return Ok(());
         }
 
-        let (cols, ..) = length_encode_int(&header[4..]);
+        let (cols, ..) = try_length_encode_int(&header[4..]).map_err(ErrorKind::Protocol)?;
 
         let mut buf = BytesMut::with_capacity(1 << 16);
 
@@ -219,8 +219,11 @@ where
         };
 
         while let Some(chunk) = stream.next().await {
-            let mut chunk =
-                chunk.into_iter().collect::<Result<Vec<_>, _>>().map_err(ErrorKind::from)?;
+            let mut chunk = chunk
+                .into_iter()
+                .flatten()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ErrorKind::from)?;
 
             let ro = &req.rewrite_outputs;
 
@@ -514,10 +517,12 @@ where
                     if let Some(data) = data {
                         data.map_err(ErrorKind::Protocol)?
                     } else {
-                        unreachable!()
+                        return Err(missing_shard_column_packet(
+                            "missing selected shard column packet",
+                        ));
                     }
                 } else {
-                    unreachable!()
+                    return Err(missing_shard_column_packet("missing shard column packet batch"));
                 }
             } else {
                 // find index from chunk
@@ -526,11 +531,11 @@ where
                     idx = Some(data.0);
                     data.1
                 } else {
-                    unreachable!()
+                    return Err(missing_shard_column_packet("missing initial shard column packet"));
                 }
             };
 
-            let column_info = decode_column(&data[4..]);
+            let column_info = try_decode_column(&data[4..]).map_err(ErrorKind::Protocol)?;
             ori_columns.push(column_info.clone());
 
             if let Some(change) = avg_change {
@@ -745,6 +750,13 @@ where
     let _ = data_remain.split_to(row_part_data.part_encode_length + row_part_data.part_data_length);
     data.extend_from_slice(&data_remain);
     ori_data.extend_from_slice(&data);
+}
+
+fn missing_shard_column_packet(method: &str) -> Error {
+    Error::new(ErrorKind::Protocol(ProtocolError::InvalidPacket {
+        method: method.to_string(),
+        data: vec![],
+    }))
 }
 
 fn required_row_part_data(

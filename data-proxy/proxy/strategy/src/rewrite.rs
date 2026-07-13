@@ -14,9 +14,25 @@
 
 use mysql_parser::ast::SqlStmt;
 
+#[derive(Debug, Clone)]
+pub enum DialectAst {
+    MySql(SqlStmt),
+    Unsupported { dialect: gateway_core::ProtocolKind, sql: String },
+}
+
+impl DialectAst {
+    pub fn mysql(ast: SqlStmt) -> Self {
+        Self::MySql(ast)
+    }
+
+    pub fn unsupported(dialect: gateway_core::ProtocolKind, sql: impl Into<String>) -> Self {
+        Self::Unsupported { dialect, sql: sql.into() }
+    }
+}
+
 pub struct ShardingRewriteInput {
     pub raw_sql: String,
-    pub ast: SqlStmt,
+    pub ast: DialectAst,
     pub default_db: Option<String>,
 }
 

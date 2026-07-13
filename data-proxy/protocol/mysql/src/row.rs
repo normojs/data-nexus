@@ -14,13 +14,11 @@
 
 use std::{default::Default, str::FromStr, sync::Arc};
 
-use bytes::Buf;
-
 use crate::{
     column::ColumnInfo,
-    err::DecodeRowError,
+    err::{DecodeRowError, ProtocolError},
     mysql_const::*,
-    util::{length_encode_int, BufExt},
+    util::{try_length_encode_int, BufExt},
     value::{self, Value},
 };
 
@@ -106,17 +104,23 @@ impl<T: AsRef<[u8]>> RowData<T> for RowDataText<T> {
         let name_idx = self.common.get_idx(name)?;
         let mut idx: usize = 0;
         for _ in 0..name_idx {
-            let (length, _, pos) = length_encode_int(&self.buf.as_ref()[idx..]);
+            let (length, _, pos) = try_length_encode_int(row_slice(self.buf.as_ref(), idx)?)?;
             idx += (length + pos) as usize;
         }
 
-        let (length, is_null, pos) = length_encode_int(&self.buf.as_ref()[idx..]);
+        let (length, is_null, pos) = try_length_encode_int(row_slice(self.buf.as_ref(), idx)?)?;
         if is_null || length == 0 {
             return Ok(None);
         }
 
+        let start = idx + pos as usize;
+        let end = idx + (pos + length) as usize;
+        if end > self.buf.as_ref().len() {
+            return Err(row_packet_error("text row value length exceeds packet").into());
+        }
+
         return Ok(Some(RowPartData {
-            data: self.buf.as_ref()[idx + pos as usize..idx + (pos + length) as usize].into(),
+            data: self.buf.as_ref()[start..end].into(),
             start_idx: idx,
             part_encode_length: pos as usize,
             part_data_length: length as usize,
@@ -176,11 +180,12 @@ impl<T: AsRef<[u8]>> RowData<T> for RowDataBinary<T> {
         // NULL Bitmap length: (column-count + 7 + 2) / 8
         let null_map_length = (column_length + 7 + 2) >> 3;
 
-        // Eat packet header
-        //buf.as_ref().get_u8();
-
         let mut null_map = vec![0; null_map_length];
-        buf.as_ref().copy_to_slice(&mut null_map);
+        let buf_ref = buf.as_ref();
+        if buf_ref.len() > 1 {
+            let null_map_end = (1 + null_map_length).min(buf_ref.len());
+            null_map[..null_map_end - 1].copy_from_slice(&buf_ref[1..null_map_end]);
+        }
         self.null_map = null_map;
 
         self.start_pos = 1 + null_map_length;
@@ -216,7 +221,8 @@ impl<T: AsRef<[u8]>> RowData<T> for RowDataBinary<T> {
                 | ColumnType::MYSQL_TYPE_BIT
                 | ColumnType::MYSQL_TYPE_DECIMAL
                 | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
-                    let (length, is_null, pos) = length_encode_int(&self.buf.as_ref()[start_pos..]);
+                    let (length, is_null, pos) =
+                        try_length_encode_int(row_slice(self.buf.as_ref(), start_pos)?)?;
                     (length, is_null, pos)
                 }
 
@@ -235,12 +241,14 @@ impl<T: AsRef<[u8]>> RowData<T> for RowDataBinary<T> {
                 ColumnType::MYSQL_TYPE_DATE
                 | ColumnType::MYSQL_TYPE_DATETIME
                 | ColumnType::MYSQL_TYPE_TIMESTAMP => {
-                    let (length, _, pos) = length_encode_int(&self.buf.as_ref()[self.start_pos..]);
+                    let (length, _, pos) =
+                        try_length_encode_int(row_slice(self.buf.as_ref(), start_pos)?)?;
                     (length, false, pos)
                 }
 
                 ColumnType::MYSQL_TYPE_TIME => {
-                    let (length, _, pos) = length_encode_int(&self.buf.as_ref()[self.start_pos..]);
+                    let (length, _, pos) =
+                        try_length_encode_int(row_slice(self.buf.as_ref(), start_pos)?)?;
                     (length, false, pos)
                 }
 
@@ -262,8 +270,12 @@ impl<T: AsRef<[u8]>> RowData<T> for RowDataBinary<T> {
                 }
 
                 // Need to add packet header and null_map to returnd data
-                let raw_data = &self.buf.as_ref()
-                    [start_pos + pos as usize..(start_pos + pos as usize + length as usize)];
+                let start = start_pos + pos as usize;
+                let end = start + length as usize;
+                if end > self.buf.as_ref().len() {
+                    return Err(row_packet_error("binary row value length exceeds packet").into());
+                }
+                let raw_data = &self.buf.as_ref()[start..end];
                 return Ok(Some(RowPartData {
                     data: raw_data.into(),
                     start_idx: start_pos,
@@ -275,6 +287,14 @@ impl<T: AsRef<[u8]>> RowData<T> for RowDataBinary<T> {
 
         Ok(None)
     }
+}
+
+fn row_slice(data: &[u8], start: usize) -> std::result::Result<&[u8], ProtocolError> {
+    data.get(start..).ok_or_else(|| row_packet_error("row cursor exceeds packet"))
+}
+
+fn row_packet_error(method: &str) -> ProtocolError {
+    ProtocolError::InvalidPacket { method: method.to_string(), data: vec![] }
 }
 
 // Box has default 'static bound, use `'e` lifetime relax bound.
@@ -310,8 +330,22 @@ mod test {
     use super::RowDataBinary;
     use crate::{
         column::{Column, ColumnInfo},
+        mysql_const::ColumnType,
         row::{RowData, RowDataText},
     };
+
+    fn column_info(column_name: &str, column_type: ColumnType) -> ColumnInfo {
+        ColumnInfo {
+            schema: None,
+            table_name: None,
+            column_name: column_name.to_string(),
+            charset: 0,
+            column_length: 0,
+            column_type,
+            column_flag: 0,
+            decimals: 0,
+        }
+    }
 
     fn get_test_column_data() -> Vec<u8> {
         vec![
@@ -478,6 +512,29 @@ mod test {
         let res = row.decode_with_name::<NaiveDateTime>("time");
         let d = NaiveDate::from_ymd(2003, 12, 31);
         let dt = d.and_hms_micro(01, 02, 03, 123123);
+        assert_eq!(res.unwrap().unwrap(), dt);
+    }
+
+    #[test]
+    fn test_decode_binary_row_datetime_after_fixed_column() {
+        let columns: Arc<[ColumnInfo]> = vec![
+            column_info("id", ColumnType::MYSQL_TYPE_LONG),
+            column_info("deleted_at", ColumnType::MYSQL_TYPE_DATETIME),
+        ]
+        .into_boxed_slice()
+        .into();
+        let row_buf = &[
+            0x00, // binary row header
+            0x00, // null bitmap
+            0x2a, 0x00, 0x00, 0x00, // id
+            0x07, 0xe6, 0x07, 0x08, 0x1f, 0x07, 0x10, 0x10, // deleted_at
+        ][..];
+
+        let mut row = RowDataBinary::test_new(columns, row_buf);
+        let res = row.decode_with_name::<NaiveDateTime>("deleted_at");
+
+        let d = NaiveDate::from_ymd(2022, 8, 31);
+        let dt = d.and_hms(7, 16, 16);
         assert_eq!(res.unwrap().unwrap(), dt);
     }
 

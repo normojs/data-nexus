@@ -14,19 +14,17 @@
 
 use std::sync::Arc;
 
-use conn_pool::{Pool, PoolConn};
+use conn_pool::PoolConn;
 use endpoint::endpoint::Endpoint;
 use indexmap::IndexMap;
 use mysql_parser::ast::SqlStmt;
-use mysql_protocol::{
-    client::conn::{ClientConn, SessionAttr},
-    server::auth::ServerHandshakeCodec,
-    session::Session,
-};
+use mysql_protocol::client::conn::ClientConn;
 use pisa_error::error::{Error, ErrorKind};
 use strategy::{
-    rewrite::{ShardingRewriteInput, ShardingRewriter},
-    route::{BoxError, Route, RouteInput, RouteInputTyp, RouteStrategy},
+    rewrite::{DialectAst, ShardingRewriteInput, ShardingRewriter},
+    route::{
+        route_plan_single_endpoint, BoxError, Route, RouteInput, RouteInputTyp, RouteStrategy,
+    },
     sharding_rewrite::{
         DataSource, DataSourceShardingIdx, ShardingColumn, ShardingIdx, ShardingRewriteOutput,
         ShardingRewriteResult,
@@ -71,28 +69,6 @@ impl Default for TransEventName {
     }
 }
 
-pub async fn check_get_conn(
-    pool: Pool<ClientConn>,
-    endpoint: &str,
-    attrs: &[SessionAttr],
-) -> Result<PoolConn<ClientConn>, Error> {
-    match pool.get_conn_with_endpoint_session(endpoint, attrs).await {
-        Ok(client_conn) => {
-            if !client_conn.is_ready().await {
-                return pool
-                    .rebuild_conn_with_session(endpoint, attrs)
-                    .await
-                    .map_err(|e| Error::new(ErrorKind::Protocol(e)));
-            }
-            Ok(client_conn)
-        }
-        Err(err) => {
-            debug!("check_get_conn err {:?}", err);
-            Err(Error::new(ErrorKind::Protocol(err)))
-        }
-    }
-}
-
 use strategy::sharding_rewrite::ShardingRewrite;
 pub fn query_rewrite(
     rewriter: &mut ShardingRewrite,
@@ -102,8 +78,11 @@ pub fn query_rewrite(
     can_rewrite: bool,
 ) -> Result<ShardingRewriteOutput, BoxError> {
     if can_rewrite {
-        let outputs =
-            rewriter.rewrite(ShardingRewriteInput { raw_sql: raw_sql.clone(), ast, default_db })?;
+        let outputs = rewriter.rewrite(ShardingRewriteInput {
+            raw_sql: raw_sql.clone(),
+            ast: DialectAst::mysql(ast),
+            default_db,
+        })?;
 
         if !outputs.results.is_empty() {
             return Ok(outputs);
@@ -139,13 +118,13 @@ pub fn route(
         _ => RouteInput::None,
     };
 
-    let dispatch_res = strategy.dispatch(&input).map_err(route_runtime_error)?;
+    let route_plan = strategy.dispatch(&input).map_err(route_runtime_error)?;
     debug!(
         "route_strategy rw + sharding to {:?} for input typ: {:?}, sql: {:?}",
-        dispatch_res, input_typ, raw_sql
+        route_plan, input_typ, raw_sql
     );
 
-    dispatch_res.0.ok_or_else(|| missing_route_endpoint(input_typ, raw_sql))
+    route_plan_single_endpoint(route_plan).map_err(route_runtime_error)
 }
 
 pub fn route_sharding(
@@ -184,17 +163,17 @@ pub fn route_sharding(
                     _ => RouteInput::None,
                 };
 
-                let dispatch_res = strategy.dispatch(&input).map_err(route_runtime_error)?;
+                let route_plan = strategy.dispatch(&input).map_err(route_runtime_error)?;
                 debug!(
                     "route_strategy rw + sharding to {:?} for input typ: {:?}, sql: {:?}",
-                    dispatch_res, input_typ, raw_sql
+                    route_plan, input_typ, raw_sql
                 );
                 // reassign data_source, type should is DataSource::Endpoint
                 o.ds_idx.ds = DataSource::Endpoint(
-                    dispatch_res.0.ok_or_else(|| missing_route_endpoint(input_typ, raw_sql))?,
+                    route_plan_single_endpoint(route_plan).map_err(route_runtime_error)?,
                 );
             }
-            _ => unreachable!(),
+            DataSource::None => return Err(missing_rewrite_data_source(input_typ, raw_sql)),
         }
     }
     Ok(())
@@ -204,12 +183,13 @@ fn route_runtime_error(error: BoxError) -> Error {
     Error::new(ErrorKind::Runtime(error))
 }
 
-fn missing_route_endpoint(input_typ: RouteInputTyp, raw_sql: &str) -> Error {
+fn missing_rewrite_data_source(input_typ: RouteInputTyp, raw_sql: &str) -> Error {
     Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        format!("route dispatch returned no endpoint for {:?}: {}", input_typ, raw_sql),
+        format!("sharding rewrite returned no data source for {:?}: {}", input_typ, raw_sql),
     ))))
 }
+
 pub struct TransEvent {
     name: TransEventName,
     src_state: TransState,
@@ -363,27 +343,17 @@ pub struct TransFsm {
     pub events: Vec<TransEvent>,
     pub current_state: TransState,
     pub current_event: TransEventName,
-    pub pool: Pool<ClientConn>,
     pub client_conn: Option<PoolConn<ClientConn>>,
-    pub endpoint: Option<Endpoint>,
     pub shard_cache_conn: Vec<PoolConn<ClientConn>>,
-    pub db: Option<String>,
-    pub charset: String,
-    pub autocommit: Option<String>,
 }
 
 impl TransFsm {
-    pub fn new(pool: Pool<ClientConn>) -> TransFsm {
+    pub fn new() -> TransFsm {
         TransFsm {
             events: init_trans_events(),
             current_state: TransState::TransDummyState,
             current_event: TransEventName::DummyEvent,
-            pool,
             client_conn: None,
-            endpoint: None,
-            db: None,
-            charset: String::from("utf8mb4"),
-            autocommit: None,
             shard_cache_conn: vec![],
         }
     }
@@ -413,60 +383,17 @@ impl TransFsm {
         self.trigger(TransEventName::QueryEvent);
     }
 
-    // Set current db.
-    pub fn set_db(&mut self, db: Option<String>) {
-        self.db = db
-    }
-
-    // Set current charset
-    pub fn set_charset(&mut self, name: String) {
-        self.charset = name;
-    }
-
-    // Set current autocommit
-    pub fn set_autocommit(&mut self, status: String) {
-        self.autocommit = Some(status)
-    }
-
-    pub async fn get_conn_with_endpoint(
-        &mut self,
-        endpoint: Endpoint,
-        attrs: &[SessionAttr],
-    ) -> Result<PoolConn<ClientConn>, Error> {
-        let conn = self.client_conn.take();
-        match conn {
-            Some(client_conn) => Ok(client_conn),
-            None => {
-                let factory =
-                    ClientConn::with_opts(endpoint.user, endpoint.password, endpoint.addr.clone());
-                self.pool.set_factory(&endpoint.addr, factory);
-                match self.pool.get_conn_with_endpoint_session(&endpoint.addr, attrs).await {
-                    Ok(client_conn) => Ok(client_conn),
-                    Err(err) => Err(Error::new(ErrorKind::Protocol(err))),
-                }
-            }
-        }
-    }
-
-    pub async fn get_conn(
-        &mut self,
-        _attrs: &[SessionAttr],
-    ) -> Result<PoolConn<ClientConn>, Error> {
-        let conn = self.client_conn.take();
-        conn.ok_or_else(|| {
+    pub fn take_conn(&mut self) -> Result<PoolConn<ClientConn>, Error> {
+        self.client_conn.take().ok_or_else(|| {
             Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "transaction FSM has no bound backend connection",
             ))))
         })
-        //let addr = self.endpoint.as_ref().unwrap().addr.as_ref();
-        //match conn {
-        //    Some(client_conn) => Ok(client_conn),
-        //    None => match self.pool.get_conn_with_endpoint_session(addr, attrs).await {
-        //        Ok(client_conn) => Ok(client_conn),
-        //        Err(err) => Err(Error::new(ErrorKind::Protocol(err))),
-        //    },
-        //}
+    }
+
+    pub fn take_conn_if_bound(&mut self) -> Option<PoolConn<ClientConn>> {
+        self.client_conn.take()
     }
 
     pub fn put_conn(&mut self, conn: PoolConn<ClientConn>) {
@@ -480,31 +407,6 @@ impl TransFsm {
     pub fn put_shard_conns(&mut self, conns: Vec<PoolConn<ClientConn>>) {
         self.shard_cache_conn = conns;
     }
-
-    #[inline]
-    pub fn build_conn_attrs(&self) -> Vec<SessionAttr> {
-        vec![
-            SessionAttr::DB(self.db.clone()),
-            SessionAttr::Charset(self.charset.clone()),
-            SessionAttr::Autocommit(self.autocommit.clone()),
-        ]
-    }
-}
-
-#[inline]
-pub fn build_conn_attrs(sess: &ServerHandshakeCodec) -> Result<Vec<SessionAttr>, Error> {
-    let charset = sess.get_charset().ok_or_else(|| {
-        Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "mysql session charset is missing",
-        ))))
-    })?;
-
-    Ok(vec![
-        SessionAttr::DB(sess.get_db()),
-        SessionAttr::Charset(charset),
-        SessionAttr::Autocommit(sess.get_autocommit()),
-    ])
 }
 
 #[cfg(test)]
@@ -513,7 +415,7 @@ mod test {
 
     #[test]
     fn test_trigger() {
-        let mut tsm = TransFsm::new(Pool::new(1));
+        let mut tsm = TransFsm::new();
         tsm.current_state = TransState::TransUseState;
         let _ = tsm.trigger(TransEventName::QueryEvent);
         assert_eq!(tsm.current_state, TransState::TransUseState);

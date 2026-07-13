@@ -16,8 +16,11 @@ pub mod build_phase;
 pub mod circuit_break;
 pub mod concurrency_control;
 pub mod config;
+pub mod context;
 pub mod err;
 pub mod layer;
+
+pub use context::{PluginContext, PluginDecision};
 
 #[cfg(test)]
 mod tests;

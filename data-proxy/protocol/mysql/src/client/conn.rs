@@ -178,7 +178,12 @@ impl ClientConn {
 
         let res = match common_codec.next().await {
             Some(Ok(data)) => {
-                if is_ok_header(data.0[4]) {
+                if data.0.len() <= 4 {
+                    Err(ProtocolError::InvalidPacket {
+                        method: "send_use_db.response".to_string(),
+                        data: data.0.to_vec(),
+                    })
+                } else if is_ok_header(data.0[4]) {
                     let auth_info =
                         common_codec.codec_mut().auth_info.as_mut().ok_or_else(|| {
                             ProtocolError::ClientState("common codec missing auth info".to_string())
@@ -192,7 +197,9 @@ impl ClientConn {
 
             Some(Err(e)) => Err(e),
 
-            _ => unreachable!(),
+            None => Err(ProtocolError::ClientState(
+                "connection closed while waiting for use database response".to_string(),
+            )),
         };
 
         self.framed = Some(Box::new(ClientCodec::Common(common_codec)));
@@ -254,7 +261,7 @@ impl ClientConn {
         }
 
         let _ = header.split_to(4);
-        let (cols, ..) = header.get_lenc_int();
+        let (cols, ..) = header.try_get_lenc_int()?;
 
         let mut col_buf = vec![];
         for _ in 0..cols {
@@ -271,7 +278,7 @@ impl ClientConn {
         // read eof
         let _ = stream.next().await;
 
-        let col_info = col_buf.as_slice().decode_columns();
+        let col_info = col_buf.as_slice().try_decode_columns()?;
 
         let arc_col_info: Arc<[ColumnInfo]> = col_info.into_boxed_slice().into();
 

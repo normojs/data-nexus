@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use endpoint::endpoint::Endpoint;
+use gateway_core::RoutePlan;
 use indexmap::IndexMap;
 use loadbalance::balance::LoadBalance;
 
@@ -21,8 +21,8 @@ use super::{
     ReadWriteEndpoint,
 };
 use crate::{
-    config::{self, NodeGroup, TargetRole},
-    route::{BoxError, RouteBalance},
+    config::{self, NodeGroup},
+    route::{endpoint_to_route_target, BoxError, RouteBalance},
     Route, RouteInput,
 };
 
@@ -53,12 +53,14 @@ pub struct ReadWriteSplittingStatic {
 
 impl Route for ReadWriteSplittingStatic {
     type Error = BoxError;
-    fn dispatch(
-        &mut self,
-        input: &RouteInput,
-    ) -> Result<(Option<Endpoint>, TargetRole), Self::Error> {
+    fn dispatch(&mut self, input: &RouteInput) -> Result<RoutePlan, Self::Error> {
         let b = self.rules_match.get(input);
-        Ok((b.0.next(), b.1))
+        Ok(b.0
+            .next()
+            .map(|endpoint| RoutePlan::Single { target: endpoint_to_route_target(endpoint, b.1) })
+            .unwrap_or_else(|| RoutePlan::Reject {
+                reason: "read/write splitting selected no endpoint".into(),
+            }))
     }
 }
 
@@ -73,6 +75,13 @@ mod test {
         readwritesplitting::{static_rw::ReadWriteSplittingStaticBuilder, ReadWriteEndpoint},
         route::{Route, RouteInput},
     };
+
+    fn selected_addr(plan: gateway_core::RoutePlan) -> String {
+        match plan {
+            gateway_core::RoutePlan::Single { target } => target.endpoint.address,
+            other => panic!("expected single target, got {:?}", other),
+        }
+    }
 
     #[test]
     fn test_route() {
@@ -132,22 +141,22 @@ mod test {
         );
         let input = RouteInput::Statement("insert");
         let res = rws.dispatch(&input).unwrap();
-        assert_eq!(res.0.unwrap().addr, "127.0.0.2");
+        assert_eq!(selected_addr(res), "127.0.0.2");
 
         let input = RouteInput::Statement("set");
         let res = rws.dispatch(&input).unwrap();
-        assert_eq!(res.0.unwrap().addr, "127.0.0.2");
+        assert_eq!(selected_addr(res), "127.0.0.2");
 
         let input = RouteInput::None;
         let res = rws.dispatch(&input).unwrap();
-        assert_eq!(res.0.unwrap().addr, "127.0.0.2");
+        assert_eq!(selected_addr(res), "127.0.0.2");
 
         let input = RouteInput::Statement("select 1");
         let res = rws.dispatch(&input).unwrap();
-        assert_eq!(res.0.unwrap().addr, "127.0.0.1");
+        assert_eq!(selected_addr(res), "127.0.0.1");
 
         let input = RouteInput::Transaction("begin");
         let res = rws.dispatch(&input).unwrap();
-        assert_eq!(res.0.unwrap().addr, "127.0.0.2");
+        assert_eq!(selected_addr(res), "127.0.0.2");
     }
 }

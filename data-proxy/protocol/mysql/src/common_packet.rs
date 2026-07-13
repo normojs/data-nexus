@@ -17,10 +17,11 @@ use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 
 use crate::{
+    err::ProtocolError,
     mysql_const::{
         CLIENT_PROTOCOL_41, CLIENT_SESSION_TRACK, CLIENT_TRANSACTIONS, SERVER_SESSION_STATE_CHANGED,
     },
-    util::{length_encoded_string, BufExt, BufMutExt},
+    util::{try_length_encoded_string, BufExt, BufMutExt},
 };
 
 #[derive(Debug, FromPrimitive)]
@@ -47,45 +48,68 @@ pub enum SessionState {
 
 impl SessionState {
     pub fn decode(data: &mut BytesMut) -> SessionState {
-        let mut payload = data.split_off(1);
-        let (num, ..) = payload.get_lenc_int();
+        Self::try_decode(data).expect("session state packet should be valid")
+    }
 
-        let mut payload = payload.split_to(num as usize);
+    pub fn try_decode_all(data: &mut BytesMut) -> Result<Vec<SessionState>, ProtocolError> {
+        let (num, ..) = data.try_get_lenc_int()?;
+        ensure_packet_len("session_state_changes.payload", data, num as usize)?;
 
-        match FromPrimitive::from_u8(data[0]) {
+        let mut payload = data.split_to(num as usize);
+        let mut states = Vec::new();
+        while !payload.is_empty() {
+            states.push(SessionState::try_decode(&mut payload)?);
+        }
+
+        Ok(states)
+    }
+
+    pub fn try_decode(data: &mut BytesMut) -> Result<SessionState, ProtocolError> {
+        if data.is_empty() {
+            return Err(invalid_packet("session_state.decode", data));
+        }
+
+        let original = data.clone();
+        let state_type = data.get_u8();
+        let (num, ..) = data.try_get_lenc_int()?;
+        ensure_packet_len("session_state.payload", data, num as usize)?;
+
+        let mut payload = data.split_to(num as usize);
+
+        match FromPrimitive::from_u8(state_type) {
             Some(SessionStateType::SystemVariables) => {
                 let mut pairs = Vec::new();
                 while !payload.is_empty() {
-                    let (name, _) = length_encoded_string(&mut payload);
-                    let (value, _) = length_encoded_string(&mut payload);
+                    let (name, _) = try_length_encoded_string(&mut payload)?;
+                    let (value, _) = try_length_encoded_string(&mut payload)?;
                     pairs.push((name, value))
                 }
 
-                SessionState::SystemVariables(pairs)
+                Ok(SessionState::SystemVariables(pairs))
             }
             Some(SessionStateType::Schema) => {
-                let (schema, _) = length_encoded_string(&mut payload);
-                SessionState::Schema(schema)
+                let (schema, _) = try_length_encoded_string(&mut payload)?;
+                Ok(SessionState::Schema(schema))
             }
             Some(SessionStateType::StateChange) => {
-                let (is_tracked, _) = length_encoded_string(&mut payload);
-                SessionState::StateChange(is_tracked == b"1")
+                let (is_tracked, _) = try_length_encoded_string(&mut payload)?;
+                Ok(SessionState::StateChange(is_tracked == b"1"))
             }
             Some(SessionStateType::Gtids) => {
-                let (gtids, _) = length_encoded_string(&mut payload);
-                SessionState::Gtids(gtids)
+                let (gtids, _) = try_length_encoded_string(&mut payload)?;
+                Ok(SessionState::Gtids(gtids))
             }
             Some(SessionStateType::TransactionCharacteristics) => {
-                let (char, _) = length_encoded_string(&mut payload);
-                SessionState::TransactionCharacteristics(char)
+                let (char, _) = try_length_encoded_string(&mut payload)?;
+                Ok(SessionState::TransactionCharacteristics(char))
             }
             Some(SessionStateType::TransactionState) => {
-                let (state, _) = length_encoded_string(&mut payload);
-                SessionState::TransactionState(state)
+                let (state, _) = try_length_encoded_string(&mut payload)?;
+                Ok(SessionState::TransactionState(state))
             }
             None => {
-                data.unsplit(payload);
-                SessionState::Unknown(data.to_vec())
+                let consumed_len = original.len() - data.len();
+                Ok(SessionState::Unknown(original[..consumed_len].to_vec()))
             }
         }
     }
@@ -98,7 +122,7 @@ pub struct ResultOkInfo {
     status: Option<u16>,
     warnings: Option<u16>,
     info: Option<Vec<u8>>,
-    state_changes: Option<SessionState>,
+    state_changes: Option<Vec<SessionState>>,
 }
 
 impl ResultOkInfo {
@@ -114,33 +138,38 @@ impl ResultOkInfo {
     }
 
     pub fn decode(capability: u32, data: &mut BytesMut) -> ResultOkInfo {
+        Self::try_decode(capability, data).expect("ok packet should be valid")
+    }
+
+    pub fn try_decode(capability: u32, data: &mut BytesMut) -> Result<ResultOkInfo, ProtocolError> {
         let mut ok_info = ResultOkInfo::new();
 
-        let (affect_rows, ..) = data.get_lenc_int();
+        let (affect_rows, ..) = data.try_get_lenc_int()?;
         ok_info.affected_rows = affect_rows;
 
-        let (last_inert_id, ..) = data.get_lenc_int();
+        let (last_inert_id, ..) = data.try_get_lenc_int()?;
         ok_info.last_insert_id = last_inert_id;
 
         if capability & CLIENT_PROTOCOL_41 > 0 {
+            ensure_packet_len("ok_packet.status_warnings", data, 4)?;
             ok_info.status = Some(data.get_u16_le());
             ok_info.warnings = Some(data.get_u16_le());
         } else if capability & CLIENT_TRANSACTIONS > 0 {
+            ensure_packet_len("ok_packet.status", data, 2)?;
             ok_info.status = Some(data.get_u16_le());
         }
 
         if data.is_empty() {
-            return ok_info;
+            return Ok(ok_info);
         }
 
         if capability & CLIENT_SESSION_TRACK > 0 {
-            let (info, _) = length_encoded_string(data);
+            let (info, _) = try_length_encoded_string(data)?;
             ok_info.info = Some(info);
 
             if let Some(status) = ok_info.status {
                 if status & SERVER_SESSION_STATE_CHANGED > 0 {
-                    let _ = data.get_lenc_int();
-                    ok_info.state_changes = Some(SessionState::decode(data))
+                    ok_info.state_changes = Some(SessionState::try_decode_all(data)?)
                 }
             }
         } else {
@@ -148,7 +177,7 @@ impl ResultOkInfo {
             ok_info.info = Some(payload.to_vec())
         }
 
-        ok_info
+        Ok(ok_info)
     }
 
     pub fn encode(&self, capability: u32) -> Box<[u8]> {
@@ -180,6 +209,17 @@ impl ResultOkInfo {
     }
 }
 
+fn ensure_packet_len(method: &str, data: &BytesMut, needed: usize) -> Result<(), ProtocolError> {
+    if data.len() < needed {
+        return Err(invalid_packet(method, data));
+    }
+    Ok(())
+}
+
+fn invalid_packet(method: &str, data: &BytesMut) -> ProtocolError {
+    ProtocolError::InvalidPacket { method: method.to_string(), data: data.to_vec() }
+}
+
 #[cfg(test)]
 mod test {
     use bytes::BytesMut;
@@ -206,11 +246,22 @@ mod test {
         .await
         .unwrap();
 
-        let auth_info = driver.framed.as_ref().unwrap();
+        let auth_info = driver.framed.as_ref().unwrap().auth_info().unwrap();
         let info = ResultOkInfo::decode(auth_info.capability, &mut packet);
 
-        if let Some(SessionState::Schema(schema)) = info.state_changes {
-            assert_eq!(b"test"[..], schema)
+        let state_changes = info.state_changes.unwrap();
+        assert_eq!(state_changes.len(), 2);
+
+        if let SessionState::Schema(schema) = &state_changes[0] {
+            assert_eq!(b"test"[..], schema[..])
+        } else {
+            panic!("expected schema state change")
+        }
+
+        if let SessionState::StateChange(is_tracked) = state_changes[1] {
+            assert!(is_tracked)
+        } else {
+            panic!("expected state-change tracker flag")
         }
     }
 
@@ -234,12 +285,23 @@ mod test {
         .await
         .unwrap();
 
-        let auth_info = driver.framed.as_ref().unwrap();
+        let auth_info = driver.framed.as_ref().unwrap().auth_info().unwrap();
         let info = ResultOkInfo::decode(auth_info.capability, &mut packet);
 
-        if let Some(SessionState::SystemVariables(vars)) = info.state_changes {
+        let state_changes = info.state_changes.unwrap();
+        assert_eq!(state_changes.len(), 2);
+
+        if let SessionState::SystemVariables(vars) = &state_changes[0] {
             assert_eq!(b"autocommit"[..], vars[0].0);
             assert_eq!(b"OFF"[..], vars[0].1);
+        } else {
+            panic!("expected system variables state change")
+        }
+
+        if let SessionState::StateChange(is_tracked) = state_changes[1] {
+            assert!(is_tracked)
+        } else {
+            panic!("expected state-change tracker flag")
         }
     }
 
@@ -257,7 +319,7 @@ mod test {
         .await
         .unwrap();
 
-        let auth_info = driver.framed.as_ref().unwrap();
+        let auth_info = driver.framed.as_ref().unwrap().auth_info().unwrap();
         let info = ResultOkInfo::decode(auth_info.capability, &mut packet);
         assert_eq!(info.state_changes.is_none(), true);
     }
@@ -271,7 +333,7 @@ mod test {
         )
         .await
         .unwrap();
-        let auth_info = driver.framed.as_ref().unwrap();
+        let auth_info = driver.framed.as_ref().unwrap().auth_info().unwrap();
         let ok_info = ResultOkInfo {
             affected_rows: 256,
             last_insert_id: 0,

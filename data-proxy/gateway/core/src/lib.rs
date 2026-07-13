@@ -10,12 +10,13 @@ mod model;
 mod transport;
 
 pub use config::{
-    AuthPolicyConfig, AuthPolicyUserConfig, EndpointConfig, EndpointRole, GatewayConfig,
-    ListenerConfig, PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,
+    AuthPolicyConfig, AuthPolicyUserConfig, ConfigSectionDiff, EndpointConfig, EndpointRole,
+    GatewayConfig, GatewayConfigDiff, ListenerConfig, PluginPolicyConfig, RoutePolicyConfig,
+    ServiceConfig,
 };
 pub use error::{GatewayError, GatewayResult};
 pub use model::{
-    Column, GatewayCommand, GatewayResponse, GatewayValue, ProtocolKind, SessionState,
-    TransactionState,
+    Column, GatewayCommand, GatewayResponse, GatewayValue, ProtocolKind, RoutePlan, RouteTarget,
+    SessionState, TransactionState,
 };
-pub use transport::{BackendConnector, FrontendProtocolAdapter};
+pub use transport::{BackendConnector, DialectParser, FrontendProtocolAdapter};
