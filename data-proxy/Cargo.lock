@@ -1700,7 +1700,6 @@ dependencies = [
  "proxy",
  "serde",
  "serde_json",
- "server",
  "tokio",
  "tower",
  "tracing",

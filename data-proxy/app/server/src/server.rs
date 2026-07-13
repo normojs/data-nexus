@@ -16,7 +16,7 @@ use std::{error::Error, fmt};
 
 use config::config::{GatewayConfigDocument, PisaProxyConfig};
 use proxy::{
-    factory::{Proxy, ProxyFactory, ShutdownHandle},
+    factory::{PoolSnapshotter, Proxy, ProxyFactory, ShutdownHandle},
     proxy::ProxyConfig,
 };
 // use runtime_mysql::mysql;
@@ -35,6 +35,7 @@ pub struct GatewayProxyInstance {
     pub name: String,
     pub proxy: Box<dyn Proxy + Send>,
     pub shutdown_handle: ShutdownHandle,
+    pub pool_snapshotter: Option<PoolSnapshotter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +83,7 @@ impl GatewayFactory {
     pub fn try_build_proxies(&self) -> Result<Vec<GatewayProxyInstance>, GatewayFactoryError> {
         match &self.config {
             GatewayFactoryConfig::Legacy { proxy_config, pisa_config } => {
-                let runtime = runtime_gateway::gateway::GatewayRuntime {
+                let mut runtime = runtime_gateway::gateway::GatewayRuntime {
                     proxy_config: proxy_config.clone(),
                     node_group: pisa_config.node_group.clone(),
                     nodes: pisa_config.get_nodes().to_vec(),
@@ -91,11 +92,13 @@ impl GatewayFactory {
                     ..Default::default()
                 };
                 let shutdown_handle = runtime.shutdown_handle();
+                let pool_snapshotter = Some(runtime.pool_snapshotter());
 
                 Ok(vec![GatewayProxyInstance {
                     name: proxy_config.name.clone(),
                     proxy: Box::new(runtime),
                     shutdown_handle,
+                    pool_snapshotter,
                 }])
             }
             GatewayFactoryConfig::Native(config) => {
@@ -117,11 +120,13 @@ impl GatewayFactory {
                             config.version.clone().unwrap_or_else(|| "2".into());
 
                         let shutdown_handle = gateway_runtime.shutdown_handle();
+                        let pool_snapshotter = Some(gateway_runtime.pool_snapshotter());
 
                         Ok(GatewayProxyInstance {
                             name: listener.name.clone(),
                             proxy: Box::new(gateway_runtime),
                             shutdown_handle,
+                            pool_snapshotter,
                         })
                     })
                     .collect::<Result<Vec<_>, gateway_core::GatewayError>>()
@@ -193,6 +198,12 @@ mod tests {
         assert_eq!(proxies.len(), 1);
         assert_eq!(proxies[0].name, "orders-mysql");
         assert!(!proxies[0].shutdown_handle.is_shutdown_requested());
+
+        let pool_snapshot = proxies[0].pool_snapshotter.as_ref().unwrap()();
+        assert_eq!(pool_snapshot.capacity, 64);
+        assert_eq!(pool_snapshot.endpoints.len(), 2);
+        assert_eq!(pool_snapshot.endpoints[0].endpoint, "127.0.0.1:3306");
+        assert_eq!(pool_snapshot.endpoints[1].endpoint, "127.0.0.1:3307");
     }
 
     #[test]

@@ -68,11 +68,14 @@ fn main() {
             std::process::exit(-1);
         }
     };
-    let runtime_state = AdminRuntimeState::new(
-        proxy_instances
-            .iter()
-            .map(|instance| (instance.name.clone(), instance.shutdown_handle.clone())),
-    );
+    let runtime_state =
+        AdminRuntimeState::new_with_pool_snapshotters(proxy_instances.iter().map(|instance| {
+            (
+                instance.name.clone(),
+                instance.shutdown_handle.clone(),
+                instance.pool_snapshotter.clone(),
+            )
+        }));
     let http_server = PisaHttpServerFactory::new_gateway_with_runtime_state(
         config,
         MetricsManager::new(),

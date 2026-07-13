@@ -26,7 +26,7 @@ use parking_lot::Mutex;
 use pisa_error::error::{Error, ErrorKind};
 use plugin::build_phase::PluginPhase;
 use proxy::{
-    factory::{ShutdownHandle, StartSource},
+    factory::{PoolEndpointSnapshot, PoolSnapshot, PoolSnapshotter, ShutdownHandle, StartSource},
     listener::Listener,
     proxy::{Proxy, ProxyConfig, UniSQLNode},
 };
@@ -54,6 +54,7 @@ pub struct GatewayRuntime {
     pub pisa_version: String,
     pub core_plan: Option<CoreGatewayRuntimePlan>,
     pub shutdown_handle: ShutdownHandle,
+    pub pool: Option<Pool<ClientConn>>,
 }
 
 impl GatewayRuntime {
@@ -80,8 +81,9 @@ impl GatewayRuntime {
         })?;
         let proxy_config = legacy_proxy_config_from_core_plan(listener_plan)?;
         let nodes = legacy_nodes_from_core_plan(listener_plan)?;
+        let pool = Some(Pool::<ClientConn>::new(proxy_config.pool_size as usize));
 
-        Ok(Self { proxy_config, nodes, core_plan: Some(core_plan), ..Default::default() })
+        Ok(Self { proxy_config, nodes, core_plan: Some(core_plan), pool, ..Default::default() })
     }
 
     pub fn set_core_config(&mut self, config: &GatewayConfig) -> GatewayResult<()> {
@@ -209,6 +211,16 @@ impl GatewayRuntime {
 
         Some(ShardingRewrite::new(config, endpoints, self.node_group.clone(), has_rw))
     }
+
+    pub fn pool_snapshotter(&mut self) -> PoolSnapshotter {
+        let pool = self
+            .pool
+            .get_or_insert_with(|| Pool::<ClientConn>::new(self.proxy_config.pool_size as usize))
+            .clone();
+        let configured_endpoints = configured_pool_endpoints(&self.nodes);
+
+        Arc::new(move || build_pool_snapshot(&pool, &configured_endpoints))
+    }
 }
 
 fn runtime_configuration_error(message: impl Into<String>) -> Error {
@@ -292,6 +304,36 @@ fn protocol_name(protocol: &ProtocolKind) -> &'static str {
     }
 }
 
+fn configured_pool_endpoints(nodes: &[UniSQLNode]) -> Vec<String> {
+    let mut endpoints =
+        nodes.iter().map(|node| Endpoint::from(node.clone()).addr).collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints
+}
+
+fn build_pool_snapshot(pool: &Pool<ClientConn>, configured_endpoints: &[String]) -> PoolSnapshot {
+    let mut endpoints = configured_endpoints.to_vec();
+    endpoints.extend(pool.factory_endpoints());
+    endpoints.extend(pool.pooled_endpoints());
+    endpoints.sort();
+    endpoints.dedup();
+
+    PoolSnapshot {
+        capacity: pool.capacity(),
+        endpoints: endpoints
+            .into_iter()
+            .map(|endpoint| PoolEndpointSnapshot {
+                configured: configured_endpoints.contains(&endpoint),
+                factory_registered: pool.has_factory(&endpoint),
+                idle_connections: pool.len(&endpoint),
+                capacity: pool.capacity(),
+                endpoint,
+            })
+            .collect(),
+    }
+}
+
 #[async_trait::async_trait]
 impl proxy::factory::Proxy for GatewayRuntime {
     // TODO：优雅退出
@@ -314,7 +356,10 @@ impl proxy::factory::Proxy for GatewayRuntime {
 
         let listener = proxy.build_listener().map_err(ErrorKind::Io)?;
 
-        let pool = Pool::<ClientConn>::new(self.proxy_config.pool_size as usize);
+        let pool = self
+            .pool
+            .get_or_insert_with(|| Pool::<ClientConn>::new(self.proxy_config.pool_size as usize))
+            .clone();
 
         let ast_cache = Arc::new(Mutex::new(ParserAstCache::new()));
 
@@ -558,5 +603,20 @@ mod tests {
 
         assert!(start_source.shutdown_handle.is_shutdown_requested());
         assert!(start_source.thread_handles.is_empty());
+    }
+
+    #[test]
+    fn pool_snapshot_reports_configured_endpoints_before_connections() {
+        let mut runtime = GatewayRuntime::from_core_config(&mysql_config()).unwrap();
+        let snapshotter = runtime.pool_snapshotter();
+
+        let snapshot = snapshotter();
+
+        assert_eq!(snapshot.capacity, 64);
+        assert_eq!(snapshot.endpoints.len(), 1);
+        assert_eq!(snapshot.endpoints[0].endpoint, "127.0.0.1:3306");
+        assert!(snapshot.endpoints[0].configured);
+        assert!(!snapshot.endpoints[0].factory_registered);
+        assert_eq!(snapshot.endpoints[0].idle_connections, 0);
     }
 }

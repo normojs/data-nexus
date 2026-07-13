@@ -14,6 +14,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
@@ -28,7 +29,7 @@ use axum::{
 use config::config::{GatewayConfigDocument, PisaProxyConfig};
 use pisa_error::error::*;
 use pisa_metrics::metrics::MetricsManager;
-use proxy::factory::ShutdownHandle;
+use proxy::factory::{PoolSnapshot, PoolSnapshotter, ShutdownHandle};
 use serde::Serialize;
 use tracing::info;
 use ver::version::get_version;
@@ -112,16 +113,47 @@ pub async fn new_http_server(mut s: Box<dyn HttpServer + Send>) {
     s.start().await.unwrap();
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct AdminRuntimeState {
     listener_shutdown_handles: HashMap<String, ShutdownHandle>,
+    listener_pool_snapshotters: HashMap<String, PoolSnapshotter>,
+}
+
+impl fmt::Debug for AdminRuntimeState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdminRuntimeState")
+            .field("listener_shutdown_handles", &self.listener_shutdown_handles)
+            .field("listener_pool_snapshotter_count", &self.listener_pool_snapshotters.len())
+            .finish()
+    }
 }
 
 impl AdminRuntimeState {
     pub fn new(
         listener_shutdown_handles: impl IntoIterator<Item = (String, ShutdownHandle)>,
     ) -> Self {
-        Self { listener_shutdown_handles: listener_shutdown_handles.into_iter().collect() }
+        Self::new_with_pool_snapshotters(
+            listener_shutdown_handles
+                .into_iter()
+                .map(|(name, shutdown_handle)| (name, shutdown_handle, None)),
+        )
+    }
+
+    pub fn new_with_pool_snapshotters(
+        listener_runtimes: impl IntoIterator<Item = (String, ShutdownHandle, Option<PoolSnapshotter>)>,
+    ) -> Self {
+        let mut listener_shutdown_handles = HashMap::new();
+        let mut listener_pool_snapshotters = HashMap::new();
+
+        for (name, shutdown_handle, pool_snapshotter) in listener_runtimes {
+            listener_shutdown_handles.insert(name.clone(), shutdown_handle);
+            if let Some(pool_snapshotter) = pool_snapshotter {
+                listener_pool_snapshotters.insert(name, pool_snapshotter);
+            }
+        }
+
+        Self { listener_shutdown_handles, listener_pool_snapshotters }
     }
 
     fn stop_listener(&self, name: &str) -> Option<ListenerRuntimeStatus> {
@@ -132,12 +164,32 @@ impl AdminRuntimeState {
             shutdown_requested: shutdown_handle.is_shutdown_requested(),
         })
     }
+
+    fn pool_statuses(&self) -> Vec<ListenerPoolRuntimeStatus> {
+        let mut statuses = self
+            .listener_pool_snapshotters
+            .iter()
+            .map(|(name, snapshotter)| ListenerPoolRuntimeStatus {
+                name: name.clone(),
+                snapshot: snapshotter(),
+            })
+            .collect::<Vec<_>>();
+        statuses.sort_by(|left, right| left.name.cmp(&right.name));
+        statuses
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct ListenerRuntimeStatus {
     name: String,
     shutdown_requested: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ListenerPoolRuntimeStatus {
+    name: String,
+    #[serde(flatten)]
+    snapshot: PoolSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +215,7 @@ impl AxumServer {
             .route("/admin/listeners/:name/stop", post(Self::admin_stop_listener))
             .route("/admin/services", get(Self::admin_services))
             .route("/admin/endpoints", get(Self::admin_endpoints))
+            .route("/admin/pools", get(Self::admin_pools))
             .with_state(state)
     }
 
@@ -209,6 +262,13 @@ impl AxumServer {
         match &state.gateway_config {
             Some(config) => json_response(&config.gateway.endpoints),
             None => gateway_config_not_available(),
+        }
+    }
+
+    async fn admin_pools(State(state): State<Self>) -> Response<Body> {
+        match &state.runtime_state {
+            Some(runtime_state) => json_response(&runtime_state.pool_statuses()),
+            None => admin_runtime_not_found("admin runtime state is not available"),
         }
     }
 
@@ -276,8 +336,11 @@ impl HttpServer for AxumServer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::http::{Method, Request};
     use hyper::body::to_bytes;
+    use proxy::factory::PoolEndpointSnapshot;
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -308,8 +371,8 @@ mod tests {
         server
     }
 
-    async fn get_json(path: &str) -> (StatusCode, Value) {
-        let response = gateway_server()
+    async fn get_json_from(server: AxumServer, path: &str) -> (StatusCode, Value) {
+        let response = server
             .routes()
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
@@ -318,6 +381,10 @@ mod tests {
         let body = to_bytes(response.into_body()).await.unwrap();
         let value = serde_json::from_slice(&body).unwrap();
         (status, value)
+    }
+
+    async fn get_json(path: &str) -> (StatusCode, Value) {
+        get_json_from(gateway_server(), path).await
     }
 
     async fn post_json(server: AxumServer, path: &str) -> (StatusCode, Value) {
@@ -382,6 +449,33 @@ mod tests {
         assert_eq!(value["name"], "orders-mysql");
         assert_eq!(value["shutdown_requested"], true);
         assert!(shutdown_handle.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn admin_pools_returns_runtime_pool_snapshots() {
+        let shutdown_handle = ShutdownHandle::new();
+        let pool_snapshotter: PoolSnapshotter = Arc::new(|| PoolSnapshot {
+            capacity: 64,
+            endpoints: vec![PoolEndpointSnapshot {
+                endpoint: "127.0.0.1:3306".to_string(),
+                configured: true,
+                factory_registered: true,
+                idle_connections: 1,
+                capacity: 64,
+            }],
+        });
+        let server =
+            gateway_server_with_runtime_state(AdminRuntimeState::new_with_pool_snapshotters(vec![
+                ("orders-mysql".to_string(), shutdown_handle, Some(pool_snapshotter)),
+            ]));
+
+        let (status, value) = get_json_from(server, "/admin/pools").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value[0]["name"], "orders-mysql");
+        assert_eq!(value[0]["capacity"], 64);
+        assert_eq!(value[0]["endpoints"][0]["endpoint"], "127.0.0.1:3306");
+        assert_eq!(value[0]["endpoints"][0]["idle_connections"], 1);
     }
 
     #[tokio::test]

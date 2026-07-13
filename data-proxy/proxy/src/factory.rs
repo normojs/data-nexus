@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use pisa_error::error::Error;
+use serde::Serialize;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -69,6 +72,23 @@ impl Default for StartSource {
         Self::new(ShutdownHandle::default())
     }
 }
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct PoolSnapshot {
+    pub capacity: usize,
+    pub endpoints: Vec<PoolEndpointSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct PoolEndpointSnapshot {
+    pub endpoint: String,
+    pub configured: bool,
+    pub factory_registered: bool,
+    pub idle_connections: usize,
+    pub capacity: usize,
+}
+
+pub type PoolSnapshotter = Arc<dyn Fn() -> PoolSnapshot + Send + Sync>;
 
 #[cfg(test)]
 mod tests {

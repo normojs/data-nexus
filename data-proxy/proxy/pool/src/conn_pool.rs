@@ -21,7 +21,6 @@ use std::{
 use async_trait::async_trait;
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
-use log::error;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info};
 
@@ -209,6 +208,22 @@ where
             Some(inner) => inner.inner.len(),
             None => 0,
         }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.size
+    }
+
+    pub fn factory_endpoints(&self) -> Vec<String> {
+        self.factory.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    pub fn pooled_endpoints(&self) -> Vec<String> {
+        self.pool.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    pub fn has_factory(&self, endpoint: &str) -> bool {
+        self.factory.contains_key(endpoint)
     }
 }
 
