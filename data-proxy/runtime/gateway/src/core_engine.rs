@@ -19,7 +19,10 @@ use gateway_core::{
     GatewayResponse, GatewayResult, ListenerConfig, ProtocolKind, ServiceConfig, SessionState,
 };
 
-use crate::{backend::mysql::MySqlBackendConnector, frontend::mysql::MySqlFrontendProtocol};
+use crate::{
+    backend::{mysql::MySqlBackendConnector, postgresql::PostgreSqlBackendConnector},
+    frontend::mysql::MySqlFrontendProtocol,
+};
 
 /// Protocol-neutral execution path for one frontend connection.
 ///
@@ -219,9 +222,9 @@ fn build_backend_connector(
         ProtocolKind::MySql => {
             Ok(Arc::new(MySqlBackendConnector::<(), ()>::with_endpoints(endpoints.to_vec())))
         }
-        ProtocolKind::PostgreSql => Err(GatewayError::Unsupported(
-            "postgresql backend connector is not implemented yet".into(),
-        )),
+        ProtocolKind::PostgreSql => {
+            Ok(Arc::new(PostgreSqlBackendConnector::with_endpoints(endpoints.to_vec())))
+        }
     }
 }
 
@@ -379,20 +382,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_postgresql_backend_for_now() {
+    fn builds_postgresql_backend_connector_from_runtime_plan() {
         let mut config = mysql_config();
         config.services[0].backend_protocol = ProtocolKind::PostgreSql;
         config.endpoints[0].protocol = ProtocolKind::PostgreSql;
         let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
 
-        let error = match plan.build_connection("mysql-listener") {
-            Ok(_) => panic!("postgresql backend should be rejected"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            error,
-            GatewayError::Unsupported("postgresql backend connector is not implemented yet".into())
-        );
+        let connection = plan.build_connection("mysql-listener").unwrap();
+        assert_eq!(connection.backend_protocol(), ProtocolKind::PostgreSql);
+        assert_eq!(connection.frontend_protocol(), ProtocolKind::MySql);
     }
 }
