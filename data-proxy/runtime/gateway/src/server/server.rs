@@ -71,7 +71,20 @@ impl<T, C> MySqlBackendConnector<T, C> {
         Self { endpoints, _phat: PhantomData }
     }
 
-    fn endpoint(&self) -> GatewayResult<&EndpointConfig> {
+    fn endpoint(&self, session: &SessionState) -> GatewayResult<&EndpointConfig> {
+        if let Some(endpoint_name) = session.backend_endpoint.as_deref() {
+            return self
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.name == endpoint_name)
+                .ok_or_else(|| {
+                    GatewayError::Configuration(format!(
+                        "mysql backend connector has no configured endpoint '{}'",
+                        endpoint_name
+                    ))
+                });
+        }
+
         self.endpoints.first().ok_or_else(|| {
             GatewayError::Configuration(
                 "mysql backend connector has no configured endpoints".into(),
@@ -84,7 +97,7 @@ impl<T, C> MySqlBackendConnector<T, C> {
         sql: &str,
         session: &mut SessionState,
     ) -> GatewayResult<GatewayResponse> {
-        let endpoint = self.endpoint()?;
+        let endpoint = self.endpoint(session)?;
         let mut conn = ClientConn::with_opts(
             endpoint.username.clone(),
             endpoint.password.clone(),

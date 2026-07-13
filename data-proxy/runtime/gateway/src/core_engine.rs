@@ -14,10 +14,13 @@
 
 use std::sync::Arc;
 
+use endpoint::endpoint::Endpoint;
 use gateway_core::{
     BackendConnector, EndpointConfig, FrontendProtocolAdapter, GatewayConfig, GatewayError,
     GatewayResponse, GatewayResult, ListenerConfig, ProtocolKind, ServiceConfig, SessionState,
 };
+use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
+use parking_lot::Mutex;
 
 use crate::{
     backend::{mysql::MySqlBackendConnector, postgresql::PostgreSqlBackendConnector},
@@ -96,10 +99,18 @@ pub async fn handle_gateway_frame(
 }
 
 /// Resolved v2 gateway topology ready to create protocol-neutral connections.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CoreGatewayRuntimePlan {
     listeners: Vec<CoreGatewayListenerPlan>,
 }
+
+impl PartialEq for CoreGatewayRuntimePlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.listeners == other.listeners
+    }
+}
+
+impl Eq for CoreGatewayRuntimePlan {}
 
 impl CoreGatewayRuntimePlan {
     pub fn from_config(config: &GatewayConfig) -> GatewayResult<Self> {
@@ -131,12 +142,25 @@ impl CoreGatewayRuntimePlan {
 }
 
 /// A listener with its selected service and backend endpoints.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CoreGatewayListenerPlan {
     listener: ListenerConfig,
     service: ServiceConfig,
     endpoints: Vec<EndpointConfig>,
+    route_policy_kind: Option<String>,
+    simple_balancer: Option<Arc<Mutex<BalanceType>>>,
 }
+
+impl PartialEq for CoreGatewayListenerPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.listener == other.listener
+            && self.service == other.service
+            && self.endpoints == other.endpoints
+            && self.route_policy_kind == other.route_policy_kind
+    }
+}
+
+impl Eq for CoreGatewayListenerPlan {}
 
 impl CoreGatewayListenerPlan {
     fn from_config(config: &GatewayConfig, listener: &ListenerConfig) -> GatewayResult<Self> {
@@ -168,7 +192,31 @@ impl CoreGatewayListenerPlan {
             })
             .collect::<GatewayResult<Vec<_>>>()?;
 
-        Ok(Self { listener: listener.clone(), service: service.clone(), endpoints })
+        let route_policy_kind = match &service.route_policy {
+            Some(route_policy_name) => {
+                let route_policy = config
+                    .route_policies
+                    .iter()
+                    .find(|route_policy| route_policy.name == *route_policy_name)
+                    .ok_or_else(|| {
+                        GatewayError::Configuration(format!(
+                            "service '{}' references missing route policy '{}'",
+                            service.name, route_policy_name
+                        ))
+                    })?;
+                Some(route_policy.kind.clone())
+            }
+            None => None,
+        };
+        let simple_balancer = build_simple_balancer(route_policy_kind.as_deref(), &endpoints);
+
+        Ok(Self {
+            listener: listener.clone(),
+            service: service.clone(),
+            endpoints,
+            route_policy_kind,
+            simple_balancer,
+        })
     }
 
     pub fn listener(&self) -> &ListenerConfig {
@@ -183,17 +231,88 @@ impl CoreGatewayListenerPlan {
         &self.endpoints
     }
 
+    pub fn route_policy_kind(&self) -> Option<&str> {
+        self.route_policy_kind.as_deref()
+    }
+
     pub fn default_database(&self) -> Option<&str> {
         self.endpoints.iter().find_map(|endpoint| endpoint.database.as_deref())
     }
 
     pub fn build_connection(&self) -> GatewayResult<CoreGatewayConnection> {
-        let database = self.default_database().map(ToOwned::to_owned);
+        let endpoint = self.select_endpoint()?;
+        let database = endpoint.database.clone();
         let frontend = build_frontend_protocol(&self.listener, database.clone())?;
-        let backend = build_backend_connector(&self.service, &self.endpoints)?;
-        let session = SessionState { database, ..SessionState::default() };
+        let backend = build_backend_connector(&self.service, &[endpoint.clone()])?;
+        let session = SessionState {
+            database,
+            backend_endpoint: Some(endpoint.name),
+            ..SessionState::default()
+        };
 
         Ok(CoreGatewayConnection::new(frontend, backend, session))
+    }
+
+    pub fn select_endpoint(&self) -> GatewayResult<EndpointConfig> {
+        if let Some(balancer) = &self.simple_balancer {
+            let selected = balancer.lock().next();
+            if let Some(selected) = selected {
+                if let Some(endpoint) =
+                    self.endpoints.iter().find(|endpoint| endpoint.name == selected.name)
+                {
+                    return Ok(endpoint.clone());
+                }
+
+                return Err(GatewayError::Configuration(format!(
+                    "route policy selected missing endpoint '{}'",
+                    selected.name
+                )));
+            }
+        }
+
+        self.endpoints.first().cloned().ok_or_else(|| {
+            GatewayError::Configuration(format!("service '{}' has no endpoints", self.service.name))
+        })
+    }
+}
+
+fn build_simple_balancer(
+    route_policy_kind: Option<&str>,
+    endpoints: &[EndpointConfig],
+) -> Option<Arc<Mutex<BalanceType>>> {
+    let algorithm = simple_load_balance_algorithm(route_policy_kind?)?;
+    let mut builder = Balance {};
+    let mut balancer = builder.build_balance(algorithm);
+    for endpoint in endpoints {
+        balancer.add(load_balance_endpoint(endpoint));
+    }
+    Some(Arc::new(Mutex::new(balancer)))
+}
+
+fn simple_load_balance_algorithm(kind: &str) -> Option<AlgorithmName> {
+    match kind.to_ascii_lowercase().as_str() {
+        "simple_load_balance" | "random" => Some(AlgorithmName::Random),
+        "round_robin" | "round-robin" | "roundrobin" => Some(AlgorithmName::RoundRobin),
+        _ => None,
+    }
+}
+
+fn load_balance_endpoint(endpoint: &EndpointConfig) -> Endpoint {
+    Endpoint {
+        node_type: endpoint_protocol_name(&endpoint.protocol).to_owned(),
+        weight: endpoint.weight as i64,
+        name: endpoint.name.clone(),
+        db: endpoint.database.clone().unwrap_or_default(),
+        user: endpoint.username.clone(),
+        password: endpoint.password.clone(),
+        addr: endpoint.address.clone(),
+    }
+}
+
+fn endpoint_protocol_name(protocol: &ProtocolKind) -> &'static str {
+    match protocol {
+        ProtocolKind::MySql => "mysql",
+        ProtocolKind::PostgreSql => "postgresql",
     }
 }
 
@@ -314,6 +433,26 @@ mod tests {
         }
     }
 
+    fn round_robin_config() -> GatewayConfig {
+        let mut config = mysql_config();
+        config.services[0].route_policy = Some("orders-balance".into());
+        config.services[0].endpoints.push("orders-replica".into());
+        config.endpoints.push(EndpointConfig {
+            name: "orders-replica".into(),
+            protocol: ProtocolKind::MySql,
+            address: "127.0.0.1:3307".into(),
+            database: Some("orders_replica_db".into()),
+            username: "root".into(),
+            password: "backend-secret".into(),
+            weight: 1,
+        });
+        config.route_policies = vec![gateway_core::RoutePolicyConfig {
+            name: "orders-balance".into(),
+            kind: "round_robin".into(),
+        }];
+        config
+    }
+
     fn postgresql_config() -> GatewayConfig {
         let mut config = mysql_config();
         config.listeners[0].name = "postgresql-listener".into();
@@ -431,6 +570,7 @@ mod tests {
         assert_eq!(listener.service().name, "orders");
         assert_eq!(listener.endpoints()[0].name, "orders-primary");
         assert_eq!(listener.endpoints()[0].username, "root");
+        assert_eq!(listener.route_policy_kind(), None);
         assert_eq!(listener.default_database(), Some("orders_db"));
     }
 
@@ -444,6 +584,7 @@ mod tests {
         assert_eq!(connection.frontend_protocol(), ProtocolKind::MySql);
         assert_eq!(connection.backend_protocol(), ProtocolKind::MySql);
         assert_eq!(connection.session().database, Some("orders_db".into()));
+        assert_eq!(connection.session().backend_endpoint, Some("orders-primary".into()));
     }
 
     #[test]
@@ -456,6 +597,7 @@ mod tests {
         assert_eq!(connection.frontend_protocol(), ProtocolKind::PostgreSql);
         assert_eq!(connection.backend_protocol(), ProtocolKind::PostgreSql);
         assert_eq!(connection.session().database, Some("orders_db".into()));
+        assert_eq!(connection.session().backend_endpoint, Some("orders-primary".into()));
     }
 
     #[test]
@@ -468,5 +610,40 @@ mod tests {
         let connection = plan.build_connection("mysql-listener").unwrap();
         assert_eq!(connection.backend_protocol(), ProtocolKind::PostgreSql);
         assert_eq!(connection.frontend_protocol(), ProtocolKind::MySql);
+    }
+
+    #[test]
+    fn route_policy_selects_backend_endpoint_for_mysql_sessions() {
+        let config = round_robin_config();
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+
+        let first = plan.build_connection("mysql-listener").unwrap();
+        let second = plan.build_connection("mysql-listener").unwrap();
+
+        assert_eq!(first.session().backend_endpoint, Some("orders-primary".into()));
+        assert_eq!(first.session().database, Some("orders_db".into()));
+        assert_eq!(second.session().backend_endpoint, Some("orders-replica".into()));
+        assert_eq!(second.session().database, Some("orders_replica_db".into()));
+    }
+
+    #[test]
+    fn route_policy_selects_backend_endpoint_for_postgresql_sessions() {
+        let mut config = round_robin_config();
+        config.listeners[0].name = "postgresql-listener".into();
+        config.listeners[0].listen_addr = "127.0.0.1:5433".into();
+        config.listeners[0].protocol = ProtocolKind::PostgreSql;
+        config.services[0].backend_protocol = ProtocolKind::PostgreSql;
+        for endpoint in &mut config.endpoints {
+            endpoint.protocol = ProtocolKind::PostgreSql;
+        }
+        config.endpoints[0].address = "127.0.0.1:5432".into();
+        config.endpoints[1].address = "127.0.0.1:5434".into();
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+
+        let first = plan.build_connection("postgresql-listener").unwrap();
+        let second = plan.build_connection("postgresql-listener").unwrap();
+
+        assert_eq!(first.session().backend_endpoint, Some("orders-primary".into()));
+        assert_eq!(second.session().backend_endpoint, Some("orders-replica".into()));
     }
 }

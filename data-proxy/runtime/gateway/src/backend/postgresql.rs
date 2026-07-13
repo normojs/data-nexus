@@ -48,7 +48,22 @@ impl PostgreSqlBackendConnector {
         self.endpoints.lock().clone()
     }
 
-    fn select_endpoint(&self) -> GatewayResult<EndpointConfig> {
+    fn select_endpoint(&self, session: &SessionState) -> GatewayResult<EndpointConfig> {
+        if let Some(endpoint_name) = session.backend_endpoint.as_deref() {
+            return self
+                .endpoints
+                .lock()
+                .iter()
+                .find(|endpoint| endpoint.name == endpoint_name)
+                .cloned()
+                .ok_or_else(|| {
+                    GatewayError::Configuration(format!(
+                        "postgresql backend connector has no configured endpoint '{}'",
+                        endpoint_name
+                    ))
+                });
+        }
+
         self.endpoints.lock().first().cloned().ok_or_else(|| {
             GatewayError::Configuration(
                 "postgresql backend connector has no configured endpoints".into(),
@@ -113,7 +128,7 @@ impl BackendConnector for PostgreSqlBackendConnector {
                 Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
             }
             GatewayCommand::Query { sql } => {
-                let endpoint = self.select_endpoint()?;
+                let endpoint = self.select_endpoint(session)?;
                 self.execute_simple_query(endpoint, &sql, session).await
             }
             command => Err(GatewayError::Unsupported(format!(

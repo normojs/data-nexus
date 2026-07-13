@@ -27,6 +27,8 @@ pub struct SessionState {
     pub database: Option<String>,
     pub charset: Option<String>,
     pub autocommit: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_endpoint: Option<String>,
     #[serde(default)]
     pub transaction_state: TransactionState,
 }

@@ -343,13 +343,19 @@ async fn run_postgresql_core_session(
             return;
         }
     };
-    let metric_labels = GatewayMetricLabels::from_plan(&core_plan, &listener_name);
-    let metrics_collector = MySQLServerMetricsCollector;
-
     let mut session = handshake.session;
     if session.database.is_none() {
         session.database = connection.session().database.clone();
     }
+    if session.backend_endpoint.is_none() {
+        session.backend_endpoint = connection.session().backend_endpoint.clone();
+    }
+    let metric_labels = GatewayMetricLabels::from_plan(
+        &core_plan,
+        &listener_name,
+        session.backend_endpoint.as_deref(),
+    );
+    let metrics_collector = MySQLServerMetricsCollector;
     *connection.session_mut() = session.clone();
 
     let _session_registration = session_registry.register(SessionEntrySnapshot {
@@ -470,7 +476,11 @@ struct GatewayMetricLabels {
 }
 
 impl GatewayMetricLabels {
-    fn from_plan(core_plan: &CoreGatewayRuntimePlan, listener_name: &str) -> Self {
+    fn from_plan(
+        core_plan: &CoreGatewayRuntimePlan,
+        listener_name: &str,
+        backend_endpoint: Option<&str>,
+    ) -> Self {
         if let Some(plan) = core_plan.listener(listener_name) {
             return Self {
                 listener: plan.listener().name.clone(),
@@ -479,7 +489,13 @@ impl GatewayMetricLabels {
                 backend_protocol: protocol_name(&plan.service().backend_protocol).to_owned(),
                 endpoint: plan
                     .endpoints()
-                    .first()
+                    .iter()
+                    .find(|endpoint| {
+                        backend_endpoint
+                            .map(|backend_endpoint| endpoint.name == backend_endpoint)
+                            .unwrap_or(false)
+                    })
+                    .or_else(|| plan.endpoints().first())
                     .map(|endpoint| endpoint.address.clone())
                     .unwrap_or_default(),
             };
@@ -532,11 +548,20 @@ fn legacy_proxy_config_from_core_plan(
             ProtocolKind::PostgreSql => "14.0".into(),
         },
         simple_loadbalance: Some(proxy::proxy::ProxySimpleLoadBalance {
-            balance_type: AlgorithmName::Random,
+            balance_type: simple_load_balance_algorithm_name(plan.route_policy_kind()),
             nodes: plan.endpoints().iter().map(|endpoint| endpoint.name.clone()).collect(),
         }),
         ..ProxyConfig::default()
     })
+}
+
+fn simple_load_balance_algorithm_name(kind: Option<&str>) -> AlgorithmName {
+    match kind.map(|kind| kind.to_ascii_lowercase()) {
+        Some(kind) if kind == "round_robin" || kind == "round-robin" || kind == "roundrobin" => {
+            AlgorithmName::RoundRobin
+        }
+        _ => AlgorithmName::Random,
+    }
 }
 
 fn legacy_nodes_from_core_plan(plan: &CoreGatewayListenerPlan) -> GatewayResult<Vec<UniSQLNode>> {
@@ -946,6 +971,23 @@ mod tests {
     }
 
     #[test]
+    fn derives_legacy_simple_load_balance_algorithm_from_route_policy() {
+        let mut config = mysql_config();
+        config.services[0].route_policy = Some("orders-balance".into());
+        config.route_policies = vec![gateway_core::RoutePolicyConfig {
+            name: "orders-balance".into(),
+            kind: "round_robin".into(),
+        }];
+
+        let runtime = GatewayRuntime::from_core_config(&config).unwrap();
+
+        assert!(matches!(
+            runtime.proxy_config.simple_loadbalance.as_ref().unwrap().balance_type,
+            AlgorithmName::RoundRobin
+        ));
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn derives_postgresql_runtime_fields_from_v2_config() {
         let runtime = GatewayRuntime::from_core_config_for_listener(
@@ -986,7 +1028,7 @@ mod tests {
     fn metric_labels_include_service_protocols_and_endpoint() {
         let core_plan = CoreGatewayRuntimePlan::from_config(&postgresql_config()).unwrap();
 
-        let labels = GatewayMetricLabels::from_plan(&core_plan, "postgresql-listener");
+        let labels = GatewayMetricLabels::from_plan(&core_plan, "postgresql-listener", None);
 
         assert_eq!(
             labels,
