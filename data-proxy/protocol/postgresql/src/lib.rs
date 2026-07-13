@@ -11,6 +11,7 @@ pub const MAX_STARTUP_PACKET_LEN: usize = 1024 * 1024;
 pub enum ProtocolError {
     InvalidLength { expected: Option<usize>, actual: usize },
     InvalidProtocolVersion(i32),
+    UnsupportedFrontendMessage(u8),
     InvalidUtf8(String),
     MissingTerminator,
     MalformedStartupParameters,
@@ -27,6 +28,9 @@ impl fmt::Display for ProtocolError {
             }
             Self::InvalidProtocolVersion(version) => {
                 write!(f, "unsupported postgresql protocol version {}", version)
+            }
+            Self::UnsupportedFrontendMessage(tag) => {
+                write!(f, "unsupported postgresql frontend message '{}'", *tag as char)
             }
             Self::InvalidUtf8(error) => write!(f, "invalid postgresql startup utf8: {}", error),
             Self::MissingTerminator => {
@@ -60,6 +64,13 @@ impl StartupMessage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontendMessage {
+    Query(String),
+    Terminate,
+    Sync,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionStatus {
     Idle,
@@ -74,6 +85,42 @@ impl TransactionStatus {
             Self::InTransaction => b'T',
             Self::Failed => b'E',
         }
+    }
+}
+
+pub fn decode_frontend_message(frame: &[u8]) -> Result<FrontendMessage, ProtocolError> {
+    if frame.len() < 5 {
+        return Err(ProtocolError::InvalidLength { expected: None, actual: frame.len() });
+    }
+
+    let declared_len = BigEndian::read_i32(&frame[1..5]);
+    if declared_len < 4 {
+        return Err(ProtocolError::InvalidLength {
+            expected: None,
+            actual: declared_len.max(0) as usize,
+        });
+    }
+
+    let expected_len = declared_len as usize + 1;
+    if expected_len != frame.len() {
+        return Err(ProtocolError::InvalidLength {
+            expected: Some(expected_len),
+            actual: frame.len(),
+        });
+    }
+
+    let body = &frame[5..];
+    match frame[0] {
+        b'Q' => Ok(FrontendMessage::Query(decode_single_cstring(body)?)),
+        b'X' => {
+            require_empty_body(body)?;
+            Ok(FrontendMessage::Terminate)
+        }
+        b'S' => {
+            require_empty_body(body)?;
+            Ok(FrontendMessage::Sync)
+        }
+        tag => Err(ProtocolError::UnsupportedFrontendMessage(tag)),
     }
 }
 
@@ -146,6 +193,21 @@ pub fn encode_ssl_request() -> Vec<u8> {
     encode_untagged_packet(&SSL_REQUEST_CODE.to_be_bytes())
 }
 
+pub fn encode_query_message(sql: &str) -> Vec<u8> {
+    let mut body = Vec::with_capacity(sql.len() + 1);
+    body.extend_from_slice(sql.as_bytes());
+    body.push(0);
+    encode_message(b'Q', &body)
+}
+
+pub fn encode_terminate_message() -> Vec<u8> {
+    encode_message(b'X', &[])
+}
+
+pub fn encode_sync_message() -> Vec<u8> {
+    encode_message(b'S', &[])
+}
+
 pub fn encode_cancel_request(process_id: i32, secret_key: i32) -> Vec<u8> {
     let mut body = Vec::with_capacity(12);
     body.extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
@@ -214,6 +276,14 @@ fn decode_startup_parameters(payload: &[u8]) -> Result<BTreeMap<String, String>,
     Err(ProtocolError::MissingTerminator)
 }
 
+fn decode_single_cstring(payload: &[u8]) -> Result<String, ProtocolError> {
+    let end = find_null(payload, 0).ok_or(ProtocolError::MissingTerminator)?;
+    if end + 1 != payload.len() {
+        return Err(ProtocolError::MalformedStartupParameters);
+    }
+    decode_utf8(&payload[..end])
+}
+
 fn decode_utf8(bytes: &[u8]) -> Result<String, ProtocolError> {
     std::str::from_utf8(bytes)
         .map(str::to_owned)
@@ -222,6 +292,14 @@ fn decode_utf8(bytes: &[u8]) -> Result<String, ProtocolError> {
 
 fn find_null(payload: &[u8], offset: usize) -> Option<usize> {
     payload[offset..].iter().position(|byte| *byte == 0).map(|relative| offset + relative)
+}
+
+fn require_empty_body(body: &[u8]) -> Result<(), ProtocolError> {
+    if body.is_empty() {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidLength { expected: Some(5), actual: body.len() + 5 })
+    }
 }
 
 fn encode_untagged_packet(body: &[u8]) -> Vec<u8> {
@@ -307,5 +385,26 @@ mod tests {
             vec![b'K', 0, 0, 0, 12, 0, 0, 0, 7, 0, 0, 0, 11]
         );
         assert_eq!(encode_ready_for_query(TransactionStatus::Idle), vec![b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    #[test]
+    fn decodes_frontend_query_terminate_and_sync() {
+        assert_eq!(
+            decode_frontend_message(&encode_query_message("select 1")),
+            Ok(FrontendMessage::Query("select 1".into()))
+        );
+        assert_eq!(
+            decode_frontend_message(&encode_terminate_message()),
+            Ok(FrontendMessage::Terminate)
+        );
+        assert_eq!(decode_frontend_message(&encode_sync_message()), Ok(FrontendMessage::Sync));
+    }
+
+    #[test]
+    fn rejects_unsupported_frontend_message() {
+        assert_eq!(
+            decode_frontend_message(&[b'P', 0, 0, 0, 4]),
+            Err(ProtocolError::UnsupportedFrontendMessage(b'P'))
+        );
     }
 }

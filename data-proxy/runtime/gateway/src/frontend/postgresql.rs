@@ -1,8 +1,11 @@
-use gateway_core::{GatewayError, GatewayResult, ProtocolKind, SessionState};
+use gateway_core::{
+    FrontendProtocolAdapter, GatewayCommand, GatewayError, GatewayResponse, GatewayResult,
+    ProtocolKind, SessionState, TransactionState,
+};
 use postgresql_protocol::{
-    decode_startup_packet, encode_authentication_ok, encode_backend_key_data,
-    encode_parameter_status, encode_ready_for_query, StartupMessage, StartupPacket,
-    TransactionStatus, MAX_STARTUP_PACKET_LEN,
+    decode_frontend_message, decode_startup_packet, encode_authentication_ok,
+    encode_backend_key_data, encode_parameter_status, encode_ready_for_query, FrontendMessage,
+    StartupMessage, StartupPacket, TransactionStatus, MAX_STARTUP_PACKET_LEN,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -62,6 +65,32 @@ impl PostgreSqlFrontendProtocol {
                 }
             }
         }
+    }
+}
+
+impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
+    fn protocol(&self) -> ProtocolKind {
+        ProtocolKind::PostgreSql
+    }
+
+    fn decode(
+        &mut self,
+        frame: &[u8],
+        session: &mut SessionState,
+    ) -> GatewayResult<Vec<GatewayCommand>> {
+        match decode_frontend_message(frame).map_err(postgresql_protocol_error)? {
+            FrontendMessage::Query(sql) => Ok(vec![decode_query_command(sql, session)]),
+            FrontendMessage::Terminate => Ok(vec![GatewayCommand::Quit]),
+            FrontendMessage::Sync => Ok(vec![]),
+        }
+    }
+
+    fn encode(
+        &mut self,
+        _response: GatewayResponse,
+        _session: &SessionState,
+    ) -> GatewayResult<Vec<Vec<u8>>> {
+        Err(GatewayError::Unsupported("postgresql response encoding is not implemented yet".into()))
     }
 }
 
@@ -134,6 +163,24 @@ fn session_from_startup(startup: &StartupMessage) -> SessionState {
     }
 }
 
+fn decode_query_command(sql: String, session: &mut SessionState) -> GatewayCommand {
+    match sql.trim().to_ascii_lowercase().as_str() {
+        "begin" | "start transaction" => {
+            session.transaction_state = TransactionState::Active;
+            GatewayCommand::Begin
+        }
+        "commit" => {
+            session.transaction_state = TransactionState::Idle;
+            GatewayCommand::Commit
+        }
+        "rollback" => {
+            session.transaction_state = TransactionState::Idle;
+            GatewayCommand::Rollback
+        }
+        _ => GatewayCommand::Query { sql },
+    }
+}
+
 fn postgresql_protocol_error(error: postgresql_protocol::ProtocolError) -> GatewayError {
     GatewayError::Protocol(error.to_string())
 }
@@ -144,7 +191,11 @@ fn postgresql_io_error(context: &str, error: std::io::Error) -> GatewayError {
 
 #[cfg(test)]
 mod tests {
-    use postgresql_protocol::{encode_ssl_request, encode_startup_message};
+    use gateway_core::FrontendProtocolAdapter;
+    use postgresql_protocol::{
+        encode_query_message, encode_ssl_request, encode_startup_message, encode_sync_message,
+        encode_terminate_message,
+    };
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -194,6 +245,41 @@ mod tests {
         assert_eq!(handshake.session.user, Some("app".into()));
         assert_eq!(handshake.session.database, None);
         assert!(response.ends_with(&encode_ready_for_query(TransactionStatus::Idle)));
+    }
+
+    #[test]
+    fn decodes_simple_query_and_transaction_shortcuts() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let mut session = SessionState::default();
+
+        assert_eq!(
+            protocol.decode(&encode_query_message("select 1"), &mut session),
+            Ok(vec![GatewayCommand::Query { sql: "select 1".into() }])
+        );
+
+        assert_eq!(
+            protocol.decode(&encode_query_message("begin"), &mut session),
+            Ok(vec![GatewayCommand::Begin])
+        );
+        assert_eq!(session.transaction_state, TransactionState::Active);
+
+        assert_eq!(
+            protocol.decode(&encode_query_message("commit"), &mut session),
+            Ok(vec![GatewayCommand::Commit])
+        );
+        assert_eq!(session.transaction_state, TransactionState::Idle);
+    }
+
+    #[test]
+    fn decodes_terminate_and_sync() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let mut session = SessionState::default();
+
+        assert_eq!(
+            protocol.decode(&encode_terminate_message(), &mut session),
+            Ok(vec![GatewayCommand::Quit])
+        );
+        assert_eq!(protocol.decode(&encode_sync_message(), &mut session), Ok(vec![]));
     }
 
     async fn read_until_ready_for_query(
