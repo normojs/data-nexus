@@ -21,7 +21,7 @@ use gateway_core::{
 
 use crate::{
     backend::{mysql::MySqlBackendConnector, postgresql::PostgreSqlBackendConnector},
-    frontend::mysql::MySqlFrontendProtocol,
+    frontend::{mysql::MySqlFrontendProtocol, postgresql::PostgreSqlFrontendProtocol},
 };
 
 /// Protocol-neutral execution path for one frontend connection.
@@ -208,9 +208,7 @@ fn build_frontend_protocol(
             database.unwrap_or_default(),
             "8.0".into(),
         ))),
-        ProtocolKind::PostgreSql => Err(GatewayError::Unsupported(
-            "postgresql frontend adapter is not implemented yet".into(),
-        )),
+        ProtocolKind::PostgreSql => Ok(Box::new(PostgreSqlFrontendProtocol::new("14.0".into()))),
     }
 }
 
@@ -230,12 +228,37 @@ fn build_backend_connector(
 
 #[cfg(test)]
 mod tests {
+    use gateway_core::{Column as GatewayColumn, GatewayCommand, GatewayValue};
     use mysql_protocol::{
         mysql_const::{COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT},
         server::codec::ok_packet,
     };
+    use postgresql_protocol::encode_query_message;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct StaticBackendConnector {
+        protocol: ProtocolKind,
+        expected_command: GatewayCommand,
+        response: GatewayResponse,
+    }
+
+    #[async_trait::async_trait]
+    impl BackendConnector for StaticBackendConnector {
+        fn protocol(&self) -> ProtocolKind {
+            self.protocol.clone()
+        }
+
+        async fn execute(
+            &self,
+            command: GatewayCommand,
+            _session: &mut SessionState,
+        ) -> GatewayResult<GatewayResponse> {
+            assert_eq!(command, self.expected_command);
+            Ok(self.response.clone())
+        }
+    }
 
     fn mysql_connection() -> CoreGatewayConnection {
         CoreGatewayConnection::new(
@@ -246,6 +269,18 @@ mod tests {
                 "8.0".into(),
             )),
             Arc::new(MySqlBackendConnector::<(), ()>::new()),
+            SessionState::default(),
+        )
+    }
+
+    fn postgresql_connection(response: GatewayResponse) -> CoreGatewayConnection {
+        CoreGatewayConnection::new(
+            Box::new(PostgreSqlFrontendProtocol::new("14.0".into())),
+            Arc::new(StaticBackendConnector {
+                protocol: ProtocolKind::PostgreSql,
+                expected_command: GatewayCommand::Query { sql: "select 1".into() },
+                response,
+            }),
             SessionState::default(),
         )
     }
@@ -277,6 +312,18 @@ mod tests {
             }],
             ..GatewayConfig::default()
         }
+    }
+
+    fn postgresql_config() -> GatewayConfig {
+        let mut config = mysql_config();
+        config.listeners[0].name = "postgresql-listener".into();
+        config.listeners[0].listen_addr = "127.0.0.1:5433".into();
+        config.listeners[0].protocol = ProtocolKind::PostgreSql;
+        config.services[0].backend_protocol = ProtocolKind::PostgreSql;
+        config.endpoints[0].protocol = ProtocolKind::PostgreSql;
+        config.endpoints[0].address = "127.0.0.1:5432".into();
+        config.endpoints[0].username = "postgres".into();
+        config
     }
 
     #[tokio::test]
@@ -337,6 +384,41 @@ mod tests {
             .contains("mysql backend connector has no configured endpoints"));
     }
 
+    #[tokio::test]
+    async fn handles_postgresql_simple_query_through_core_traits() {
+        let mut connection = postgresql_connection(GatewayResponse::ResultSet {
+            columns: vec![GatewayColumn { name: "one".into(), data_type: "int".into() }],
+            rows: vec![vec![GatewayValue::Integer(1)]],
+        });
+
+        let packets = connection.handle_frame(&encode_query_message("select 1")).await.unwrap();
+
+        assert_eq!(connection.frontend_protocol(), ProtocolKind::PostgreSql);
+        assert_eq!(connection.backend_protocol(), ProtocolKind::PostgreSql);
+        assert_eq!(packets.len(), 4);
+        assert_eq!(packets[0].first(), Some(&b'T'));
+        assert_eq!(packets[1].first(), Some(&b'D'));
+        assert_eq!(packets[2].first(), Some(&b'C'));
+        assert_eq!(packets[3].first(), Some(&b'Z'));
+    }
+
+    #[tokio::test]
+    async fn encodes_backend_error_for_postgresql_query_without_endpoint() {
+        let mut connection = CoreGatewayConnection::new(
+            Box::new(PostgreSqlFrontendProtocol::new("14.0".into())),
+            Arc::new(PostgreSqlBackendConnector::new()),
+            SessionState::default(),
+        );
+
+        let packets = connection.handle_frame(&encode_query_message("select 1")).await.unwrap();
+
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].first(), Some(&b'E'));
+        assert!(String::from_utf8_lossy(&packets[0])
+            .contains("postgresql backend connector has no configured endpoints"));
+        assert_eq!(packets[1].first(), Some(&b'Z'));
+    }
+
     #[test]
     fn resolves_v2_config_into_runtime_plan() {
         let config = mysql_config();
@@ -365,20 +447,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_postgresql_frontend_for_now() {
-        let mut config = mysql_config();
-        config.listeners[0].protocol = ProtocolKind::PostgreSql;
+    fn builds_postgresql_core_connection_from_runtime_plan() {
+        let config = postgresql_config();
         let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
 
-        let error = match plan.build_connection("mysql-listener") {
-            Ok(_) => panic!("postgresql frontend should be rejected"),
-            Err(error) => error,
-        };
+        let connection = plan.build_connection("postgresql-listener").unwrap();
 
-        assert_eq!(
-            error,
-            GatewayError::Unsupported("postgresql frontend adapter is not implemented yet".into())
-        );
+        assert_eq!(connection.frontend_protocol(), ProtocolKind::PostgreSql);
+        assert_eq!(connection.backend_protocol(), ProtocolKind::PostgreSql);
+        assert_eq!(connection.session().database, Some("orders_db".into()));
     }
 
     #[test]
