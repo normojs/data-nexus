@@ -627,7 +627,7 @@ where
             let addr = ep.addr.clone();
             let user = ep.user.clone();
             let password = ep.password.clone();
-            let mut pool = pool.clone();
+            let pool = pool.clone();
             let attrs = attrs.clone();
 
             let f = tokio::spawn(async move {

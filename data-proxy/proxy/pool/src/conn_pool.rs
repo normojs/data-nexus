@@ -127,7 +127,7 @@ where
         }
     }
 
-    pub fn set_factory(&mut self, endpoint: &str, factory: T) {
+    pub fn set_factory(&self, endpoint: &str, factory: T) {
         if self.factory.get(endpoint).is_none() {
             self.factory.insert(endpoint.to_string(), factory);
         }
@@ -364,7 +364,7 @@ mod tests {
     }
 
     fn test_pool() -> Pool<TestConn> {
-        let mut pool = Pool::new(4);
+        let pool = Pool::new(4);
         pool.set_factory("127.0.0.1:3306", TestConn { endpoint: "127.0.0.1:3306".to_string() });
         pool
     }

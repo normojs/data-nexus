@@ -46,7 +46,6 @@
 
 ## Phase 2：PostgreSQL 同协议中转
 
-- [ ] 支持 PostgreSQL 后端连接池。
 - [ ] 支持 PostgreSQL simple query 基础链路。
 - [ ] 支持 PostgreSQL session 状态同步。
 - [ ] 支持 MySQL listener 和 PostgreSQL listener 同时存在。
