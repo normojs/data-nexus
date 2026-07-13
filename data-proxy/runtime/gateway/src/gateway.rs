@@ -30,8 +30,9 @@ use pisa_error::error::{Error, ErrorKind};
 use plugin::build_phase::PluginPhase;
 use proxy::{
     factory::{
-        PoolEndpointSnapshot, PoolSnapshot, PoolSnapshotter, SessionEntrySnapshot, SessionSnapshot,
-        SessionSnapshotter, ShutdownHandle, StartSource,
+        PoolEndpointRefresh, PoolEndpointSnapshot, PoolRefresh, PoolRefresher, PoolSnapshot,
+        PoolSnapshotter, SessionEntrySnapshot, SessionSnapshot, SessionSnapshotter, ShutdownHandle,
+        StartSource,
     },
     listener::Listener,
     proxy::{Proxy, ProxyConfig, UniSQLNode},
@@ -229,6 +230,16 @@ impl GatewayRuntime {
         Arc::new(move || build_pool_snapshot(&pool, &configured_endpoints))
     }
 
+    pub fn pool_refresher(&mut self) -> PoolRefresher {
+        let pool = self
+            .pool
+            .get_or_insert_with(|| Pool::<ClientConn>::new(self.proxy_config.pool_size as usize))
+            .clone();
+        let configured_endpoints = configured_pool_endpoints(&self.nodes);
+
+        Arc::new(move || refresh_pool(&pool, &configured_endpoints))
+    }
+
     pub fn session_snapshotter(&mut self) -> SessionSnapshotter {
         let registry = self.sessions.get_or_insert_with(SessionRegistry::default).clone();
 
@@ -326,11 +337,7 @@ fn configured_pool_endpoints(nodes: &[UniSQLNode]) -> Vec<String> {
 }
 
 fn build_pool_snapshot(pool: &Pool<ClientConn>, configured_endpoints: &[String]) -> PoolSnapshot {
-    let mut endpoints = configured_endpoints.to_vec();
-    endpoints.extend(pool.factory_endpoints());
-    endpoints.extend(pool.pooled_endpoints());
-    endpoints.sort();
-    endpoints.dedup();
+    let endpoints = known_pool_endpoints(pool, configured_endpoints);
 
     PoolSnapshot {
         capacity: pool.capacity(),
@@ -345,6 +352,36 @@ fn build_pool_snapshot(pool: &Pool<ClientConn>, configured_endpoints: &[String])
             })
             .collect(),
     }
+}
+
+fn refresh_pool(pool: &Pool<ClientConn>, configured_endpoints: &[String]) -> PoolRefresh {
+    let endpoints = known_pool_endpoints(pool, configured_endpoints);
+
+    PoolRefresh {
+        endpoints: endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let idle_connections_closed = pool.refresh_endpoint(&endpoint);
+                PoolEndpointRefresh {
+                    configured: configured_endpoints.contains(&endpoint),
+                    factory_registered: pool.has_factory(&endpoint),
+                    remaining_idle_connections: pool.len(&endpoint),
+                    capacity: pool.capacity(),
+                    endpoint,
+                    idle_connections_closed,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn known_pool_endpoints(pool: &Pool<ClientConn>, configured_endpoints: &[String]) -> Vec<String> {
+    let mut endpoints = configured_endpoints.to_vec();
+    endpoints.extend(pool.factory_endpoints());
+    endpoints.extend(pool.pooled_endpoints());
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints
 }
 
 #[derive(Clone, Default)]

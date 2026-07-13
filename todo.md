@@ -102,10 +102,6 @@
 - [ ] 减少主链路中的 `unwrap()`，把请求级错误转换成客户端协议错误包。
 - [x] 配置错误在启动阶段 fail fast，并输出明确错误信息。
 
-## Admin API
-
-- [ ] 支持刷新 endpoint pool。
-
 ## 验收标准
 
 - [x] 不保留 v1 MySQL example config 的运行兼容（项目尚未发布）。

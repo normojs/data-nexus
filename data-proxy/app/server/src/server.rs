@@ -16,7 +16,9 @@ use std::{error::Error, fmt};
 
 use config::config::{GatewayConfigDocument, PisaProxyConfig};
 use proxy::{
-    factory::{PoolSnapshotter, Proxy, ProxyFactory, SessionSnapshotter, ShutdownHandle},
+    factory::{
+        PoolRefresher, PoolSnapshotter, Proxy, ProxyFactory, SessionSnapshotter, ShutdownHandle,
+    },
     proxy::ProxyConfig,
 };
 // use runtime_mysql::mysql;
@@ -36,6 +38,7 @@ pub struct GatewayProxyInstance {
     pub proxy: Box<dyn Proxy + Send>,
     pub shutdown_handle: ShutdownHandle,
     pub pool_snapshotter: Option<PoolSnapshotter>,
+    pub pool_refresher: Option<PoolRefresher>,
     pub session_snapshotter: Option<SessionSnapshotter>,
 }
 
@@ -130,6 +133,7 @@ impl GatewayFactory {
                 };
                 let shutdown_handle = runtime.shutdown_handle();
                 let pool_snapshotter = Some(runtime.pool_snapshotter());
+                let pool_refresher = Some(runtime.pool_refresher());
                 let session_snapshotter = Some(runtime.session_snapshotter());
 
                 Ok(vec![GatewayProxyInstance {
@@ -137,6 +141,7 @@ impl GatewayFactory {
                     proxy: Box::new(runtime),
                     shutdown_handle,
                     pool_snapshotter,
+                    pool_refresher,
                     session_snapshotter,
                 }])
             }
@@ -168,6 +173,7 @@ impl GatewayFactory {
 
         let shutdown_handle = gateway_runtime.shutdown_handle();
         let pool_snapshotter = Some(gateway_runtime.pool_snapshotter());
+        let pool_refresher = Some(gateway_runtime.pool_refresher());
         let session_snapshotter = Some(gateway_runtime.session_snapshotter());
 
         Ok(GatewayProxyInstance {
@@ -175,6 +181,7 @@ impl GatewayFactory {
             proxy: Box::new(gateway_runtime),
             shutdown_handle,
             pool_snapshotter,
+            pool_refresher,
             session_snapshotter,
         })
     }
@@ -248,6 +255,11 @@ mod tests {
         assert_eq!(pool_snapshot.endpoints.len(), 2);
         assert_eq!(pool_snapshot.endpoints[0].endpoint, "127.0.0.1:3306");
         assert_eq!(pool_snapshot.endpoints[1].endpoint, "127.0.0.1:3307");
+
+        let pool_refresh = proxies[0].pool_refresher.as_ref().unwrap()();
+        assert_eq!(pool_refresh.endpoints.len(), 2);
+        assert_eq!(pool_refresh.endpoints[0].endpoint, "127.0.0.1:3306");
+        assert_eq!(pool_refresh.endpoints[0].idle_connections_closed, 0);
 
         let session_snapshot = proxies[0].session_snapshotter.as_ref().unwrap()();
         assert!(session_snapshot.sessions.is_empty());

@@ -91,6 +91,23 @@ pub struct PoolEndpointSnapshot {
 pub type PoolSnapshotter = Arc<dyn Fn() -> PoolSnapshot + Send + Sync>;
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct PoolRefresh {
+    pub endpoints: Vec<PoolEndpointRefresh>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct PoolEndpointRefresh {
+    pub endpoint: String,
+    pub configured: bool,
+    pub factory_registered: bool,
+    pub idle_connections_closed: usize,
+    pub remaining_idle_connections: usize,
+    pub capacity: usize,
+}
+
+pub type PoolRefresher = Arc<dyn Fn() -> PoolRefresh + Send + Sync>;
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct SessionSnapshot {
     pub sessions: Vec<SessionEntrySnapshot>,
 }

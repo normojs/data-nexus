@@ -32,7 +32,8 @@ use gateway_core::{ListenerConfig, RoutePolicyConfig};
 use pisa_error::error::*;
 use pisa_metrics::metrics::MetricsManager;
 use proxy::factory::{
-    PoolSnapshot, PoolSnapshotter, SessionEntrySnapshot, SessionSnapshotter, ShutdownHandle,
+    PoolRefresh, PoolRefresher, PoolSnapshot, PoolSnapshotter, SessionEntrySnapshot,
+    SessionSnapshotter, ShutdownHandle,
 };
 use serde::Serialize;
 use server::server::{start_gateway_server, GatewayFactory};
@@ -175,6 +176,7 @@ pub struct AdminRuntimeState {
 struct AdminRuntimeStateInner {
     listener_shutdown_handles: HashMap<String, ShutdownHandle>,
     listener_pool_snapshotters: HashMap<String, PoolSnapshotter>,
+    listener_pool_refreshers: HashMap<String, PoolRefresher>,
     listener_session_snapshotters: HashMap<String, SessionSnapshotter>,
 }
 
@@ -194,6 +196,7 @@ impl fmt::Debug for AdminRuntimeState {
             .debug_struct("AdminRuntimeState")
             .field("listener_shutdown_handles", &inner.listener_shutdown_handles)
             .field("listener_pool_snapshotter_count", &inner.listener_pool_snapshotters.len())
+            .field("listener_pool_refresher_count", &inner.listener_pool_refreshers.len())
             .field("listener_session_snapshotter_count", &inner.listener_session_snapshotters.len())
             .finish()
     }
@@ -225,12 +228,35 @@ impl AdminRuntimeState {
             Item = (String, ShutdownHandle, Option<PoolSnapshotter>, Option<SessionSnapshotter>),
         >,
     ) -> Self {
+        Self::new_with_runtime_controls(listener_runtimes.into_iter().map(
+            |(name, shutdown_handle, pool_snapshotter, session_snapshotter)| {
+                (name, shutdown_handle, pool_snapshotter, None, session_snapshotter)
+            },
+        ))
+    }
+
+    pub fn new_with_runtime_controls(
+        listener_runtimes: impl IntoIterator<
+            Item = (
+                String,
+                ShutdownHandle,
+                Option<PoolSnapshotter>,
+                Option<PoolRefresher>,
+                Option<SessionSnapshotter>,
+            ),
+        >,
+    ) -> Self {
         let mut inner = AdminRuntimeStateInner::default();
 
-        for (name, shutdown_handle, pool_snapshotter, session_snapshotter) in listener_runtimes {
+        for (name, shutdown_handle, pool_snapshotter, pool_refresher, session_snapshotter) in
+            listener_runtimes
+        {
             inner.listener_shutdown_handles.insert(name.clone(), shutdown_handle);
             if let Some(pool_snapshotter) = pool_snapshotter {
                 inner.listener_pool_snapshotters.insert(name.clone(), pool_snapshotter);
+            }
+            if let Some(pool_refresher) = pool_refresher {
+                inner.listener_pool_refreshers.insert(name.clone(), pool_refresher);
             }
             if let Some(session_snapshotter) = session_snapshotter {
                 inner.listener_session_snapshotters.insert(name, session_snapshotter);
@@ -245,6 +271,7 @@ impl AdminRuntimeState {
         name: String,
         shutdown_handle: ShutdownHandle,
         pool_snapshotter: Option<PoolSnapshotter>,
+        pool_refresher: Option<PoolRefresher>,
         session_snapshotter: Option<SessionSnapshotter>,
     ) -> Result<(), String> {
         let mut inner =
@@ -257,6 +284,9 @@ impl AdminRuntimeState {
         inner.listener_shutdown_handles.insert(name.clone(), shutdown_handle);
         if let Some(pool_snapshotter) = pool_snapshotter {
             inner.listener_pool_snapshotters.insert(name.clone(), pool_snapshotter);
+        }
+        if let Some(pool_refresher) = pool_refresher {
+            inner.listener_pool_refreshers.insert(name.clone(), pool_refresher);
         }
         if let Some(session_snapshotter) = session_snapshotter {
             inner.listener_session_snapshotters.insert(name, session_snapshotter);
@@ -297,6 +327,35 @@ impl AdminRuntimeState {
         statuses
     }
 
+    fn refresh_pool(&self, name: &str) -> Option<ListenerPoolRefreshStatus> {
+        let refresher = self.inner.read().ok()?.listener_pool_refreshers.get(name)?.clone();
+
+        Some(ListenerPoolRefreshStatus { name: name.to_owned(), refresh: refresher() })
+    }
+
+    fn refresh_pools(&self) -> Vec<ListenerPoolRefreshStatus> {
+        let refreshers = self
+            .inner
+            .read()
+            .map(|inner| {
+                inner
+                    .listener_pool_refreshers
+                    .iter()
+                    .map(|(name, refresher)| (name.clone(), refresher.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut statuses = refreshers
+            .iter()
+            .map(|(name, refresher)| ListenerPoolRefreshStatus {
+                name: name.clone(),
+                refresh: refresher(),
+            })
+            .collect::<Vec<_>>();
+        statuses.sort_by(|left, right| left.name.cmp(&right.name));
+        statuses
+    }
+
     fn session_statuses(&self) -> Vec<SessionEntrySnapshot> {
         let snapshotters = self
             .inner
@@ -323,6 +382,13 @@ struct ListenerPoolRuntimeStatus {
     name: String,
     #[serde(flatten)]
     snapshot: PoolSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct ListenerPoolRefreshStatus {
+    name: String,
+    #[serde(flatten)]
+    refresh: PoolRefresh,
 }
 
 #[derive(Debug, Serialize)]
@@ -484,6 +550,8 @@ impl AxumServer {
             .route("/admin/services", get(Self::admin_services))
             .route("/admin/endpoints", get(Self::admin_endpoints))
             .route("/admin/pools", get(Self::admin_pools))
+            .route("/admin/pools/refresh", post(Self::admin_refresh_pools))
+            .route("/admin/pools/:name/refresh", post(Self::admin_refresh_pool))
             .route("/admin/sessions", get(Self::admin_sessions))
             .route("/admin/reload", post(Self::admin_reload))
             .with_state(state)
@@ -601,6 +669,7 @@ impl AxumServer {
                 listener_runtime.name.clone(),
                 listener_runtime.shutdown_handle.clone(),
                 listener_runtime.pool_snapshotter.clone(),
+                listener_runtime.pool_refresher.clone(),
                 listener_runtime.session_snapshotter.clone(),
             ) {
                 return admin_json_error(
@@ -699,6 +768,26 @@ impl AxumServer {
     async fn admin_pools(State(state): State<Self>) -> Response<Body> {
         match &state.runtime_state {
             Some(runtime_state) => json_response(&runtime_state.pool_statuses()),
+            None => admin_runtime_not_found("admin runtime state is not available"),
+        }
+    }
+
+    async fn admin_refresh_pool(
+        Path(name): Path<String>,
+        State(state): State<Self>,
+    ) -> Response<Body> {
+        match &state.runtime_state {
+            Some(runtime_state) => match runtime_state.refresh_pool(&name) {
+                Some(status) => json_response(&status),
+                None => admin_runtime_not_found("listener pool refresher is not available"),
+            },
+            None => admin_runtime_not_found("admin runtime state is not available"),
+        }
+    }
+
+    async fn admin_refresh_pools(State(state): State<Self>) -> Response<Body> {
+        match &state.runtime_state {
+            Some(runtime_state) => json_response(&runtime_state.refresh_pools()),
             None => admin_runtime_not_found("admin runtime state is not available"),
         }
     }
@@ -854,7 +943,10 @@ mod tests {
 
     use axum::http::{Method, Request};
     use hyper::body::to_bytes;
-    use proxy::factory::{PoolEndpointSnapshot, SessionEntrySnapshot, SessionSnapshot};
+    use proxy::factory::{
+        PoolEndpointRefresh, PoolEndpointSnapshot, PoolRefresh, PoolRefresher,
+        SessionEntrySnapshot, SessionSnapshot,
+    };
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -1143,6 +1235,33 @@ mod tests {
         assert_eq!(value[0]["capacity"], 64);
         assert_eq!(value[0]["endpoints"][0]["endpoint"], "127.0.0.1:3306");
         assert_eq!(value[0]["endpoints"][0]["idle_connections"], 1);
+    }
+
+    #[tokio::test]
+    async fn admin_refresh_pool_returns_runtime_refresh_status() {
+        let shutdown_handle = ShutdownHandle::new();
+        let pool_refresher: PoolRefresher = Arc::new(|| PoolRefresh {
+            endpoints: vec![PoolEndpointRefresh {
+                endpoint: "127.0.0.1:3306".to_string(),
+                configured: true,
+                factory_registered: true,
+                idle_connections_closed: 2,
+                remaining_idle_connections: 0,
+                capacity: 64,
+            }],
+        });
+        let server =
+            gateway_server_with_runtime_state(AdminRuntimeState::new_with_runtime_controls(vec![
+                ("orders-mysql".to_string(), shutdown_handle, None, Some(pool_refresher), None),
+            ]));
+
+        let (status, value) = post_json(server, "/admin/pools/orders-mysql/refresh").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["name"], "orders-mysql");
+        assert_eq!(value["endpoints"][0]["endpoint"], "127.0.0.1:3306");
+        assert_eq!(value["endpoints"][0]["idle_connections_closed"], 2);
+        assert_eq!(value["endpoints"][0]["remaining_idle_connections"], 0);
     }
 
     #[tokio::test]

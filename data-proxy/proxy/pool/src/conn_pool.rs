@@ -15,7 +15,10 @@
 use std::{
     fmt::Debug,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use async_trait::async_trait;
@@ -60,11 +63,12 @@ pub trait ConnAttrMut {
 #[derive(Debug)]
 pub struct PoolInner<T: ConnLike + ConnAttr + ConnAttrMut> {
     pub inner: ArrayQueue<T>,
+    generation: AtomicU64,
 }
 
 impl<T: ConnLike + ConnAttr + ConnAttrMut> PoolInner<T> {
     fn new(size: usize) -> PoolInner<T> {
-        PoolInner { inner: ArrayQueue::new(size) }
+        PoolInner { inner: ArrayQueue::new(size), generation: AtomicU64::new(0) }
     }
 
     fn get_conn(&self) -> Option<T> {
@@ -76,6 +80,19 @@ impl<T: ConnLike + ConnAttr + ConnAttrMut> PoolInner<T> {
             let _ = self.inner.push(conn);
         }
     }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn refresh(&self) -> usize {
+        let mut cleared = 0;
+        while self.inner.pop().is_some() {
+            cleared += 1;
+        }
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        cleared
+    }
 }
 
 #[derive(Debug)]
@@ -85,6 +102,7 @@ where
 {
     pub pool: Arc<DashMap<String, PoolInner<T>>>,
     pub conn: Option<T>,
+    generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -116,8 +134,9 @@ where
     }
 
     pub async fn rebuild_conn(&self, endpoint: &str) -> Result<PoolConn<T>, T::Error> {
+        let generation = self.ensure_pool_inner(endpoint);
         let conn = self.factory.get(endpoint).as_ref().unwrap().build_conn().await?;
-        Ok(PoolConn { pool: Arc::clone(&self.pool), conn: Some(conn) })
+        Ok(PoolConn { pool: Arc::clone(&self.pool), conn: Some(conn), generation })
     }
 
     pub async fn rebuild_conn_with_session(
@@ -125,9 +144,10 @@ where
         endpoint: &str,
         attrs: &[<T as ConnAttrMut>::Item],
     ) -> Result<PoolConn<T>, T::Error> {
+        let generation = self.ensure_pool_inner(endpoint);
         let mut conn = self.factory.get(endpoint).as_ref().unwrap().build_conn().await?;
         self.reinit_session(&mut conn, attrs).await;
-        Ok(PoolConn { pool: Arc::clone(&self.pool), conn: Some(conn) })
+        Ok(PoolConn { pool: Arc::clone(&self.pool), conn: Some(conn), generation })
     }
 
     pub async fn get_conn_with_endpoint_session(
@@ -135,14 +155,22 @@ where
         endpoint: &str,
         attrs: &[<T as ConnAttrMut>::Item],
     ) -> Result<PoolConn<T>, T::Error> {
-        let mut conn = self.get_conn_with_endpoint(endpoint).await?;
+        let (mut conn, generation) = self.get_conn_with_endpoint_with_generation(endpoint).await?;
         self.reinit_session(&mut conn, attrs).await;
 
-        Ok(PoolConn { pool: Arc::clone(&self.pool), conn: Some(conn) })
+        Ok(PoolConn { pool: Arc::clone(&self.pool), conn: Some(conn), generation })
     }
 
     // Get connection by endpoint attribute
     pub async fn get_conn_with_endpoint(&self, endpoint: &str) -> Result<T, T::Error> {
+        self.get_conn_with_endpoint_with_generation(endpoint).await.map(|(conn, _generation)| conn)
+    }
+
+    async fn get_conn_with_endpoint_with_generation(
+        &self,
+        endpoint: &str,
+    ) -> Result<(T, u64), T::Error> {
+        let generation = self.ensure_pool_inner(endpoint);
         let conn = self.pool.get(endpoint);
         let conn = match conn {
             Some(val) => val.get_conn(),
@@ -158,7 +186,7 @@ where
 
                 let try_conn = self.factory.get(endpoint).as_ref().unwrap().build_conn().await;
                 match try_conn {
-                    Ok(conn) => return Ok(conn),
+                    Ok(conn) => return Ok((conn, generation)),
                     Err(_) => None,
                 }
             }
@@ -166,7 +194,7 @@ where
 
         if let Some(mut conn) = conn {
             if let Ok(_) = conn.ping().await {
-                return Ok(conn);
+                return Ok((conn, generation));
             }
         }
 
@@ -178,7 +206,7 @@ where
             match try_conn {
                 Ok(conn) => {
                     info!("Retry successful");
-                    return Ok(conn);
+                    return Ok((conn, generation));
                 }
                 Err(err) => {
                     // error!("Retry failed: {}", Err(err.into()));
@@ -210,6 +238,13 @@ where
         }
     }
 
+    pub fn refresh_endpoint(&self, endpoint: &str) -> usize {
+        match self.pool.get(endpoint) {
+            Some(inner) => inner.refresh(),
+            None => 0,
+        }
+    }
+
     pub fn capacity(&self) -> usize {
         self.size
     }
@@ -224,6 +259,13 @@ where
 
     pub fn has_factory(&self, endpoint: &str) -> bool {
         self.factory.contains_key(endpoint)
+    }
+
+    fn ensure_pool_inner(&self, endpoint: &str) -> u64 {
+        if !self.pool.contains_key(endpoint) {
+            self.pool.insert(endpoint.to_string(), PoolInner::new(self.size));
+        }
+        self.pool.get(endpoint).map(|inner| inner.generation()).unwrap_or_default()
     }
 }
 
@@ -256,7 +298,99 @@ where
             debug!("put conn {:?}", &self.conn);
             let conn = self.conn.take().unwrap();
             let endpoint = conn.get_endpoint();
-            self.pool.get_mut(&endpoint).unwrap().put_conn(conn);
+            match self.pool.get_mut(&endpoint) {
+                Some(inner) if inner.generation() == self.generation => inner.put_conn(conn),
+                Some(_) => debug!("discard stale pooled connection for endpoint {}", endpoint),
+                None => debug!("discard pooled connection for missing endpoint {}", endpoint),
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct TestConn {
+        endpoint: String,
+    }
+
+    #[async_trait]
+    impl ConnLike for TestConn {
+        type Error = ();
+
+        async fn build_conn(&self) -> Result<Self, Self::Error> {
+            Ok(self.clone())
+        }
+
+        async fn ping(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl ConnAttr for TestConn {
+        fn get_host(&self) -> String {
+            "127.0.0.1".to_string()
+        }
+
+        fn get_port(&self) -> u16 {
+            3306
+        }
+
+        fn get_user(&self) -> String {
+            "root".to_string()
+        }
+
+        fn get_endpoint(&self) -> String {
+            self.endpoint.clone()
+        }
+
+        fn get_db(&self) -> Option<String> {
+            None
+        }
+
+        fn get_charset(&self) -> Option<String> {
+            None
+        }
+
+        fn get_autocommit(&self) -> Option<String> {
+            None
+        }
+    }
+
+    impl ConnAttrMut for TestConn {
+        type Item = ();
+    }
+
+    fn test_pool() -> Pool<TestConn> {
+        let mut pool = Pool::new(4);
+        pool.set_factory("127.0.0.1:3306", TestConn { endpoint: "127.0.0.1:3306".to_string() });
+        pool
+    }
+
+    #[tokio::test]
+    async fn refresh_endpoint_clears_idle_connections() {
+        let pool = test_pool();
+        let conn = pool.get_conn_with_endpoint_session("127.0.0.1:3306", &[]).await.unwrap();
+        drop(conn);
+
+        assert_eq!(pool.len("127.0.0.1:3306"), 1);
+
+        let cleared = pool.refresh_endpoint("127.0.0.1:3306");
+
+        assert_eq!(cleared, 1);
+        assert_eq!(pool.len("127.0.0.1:3306"), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_endpoint_discards_checked_out_connections_on_return() {
+        let pool = test_pool();
+        let conn = pool.get_conn_with_endpoint_session("127.0.0.1:3306", &[]).await.unwrap();
+
+        assert_eq!(pool.refresh_endpoint("127.0.0.1:3306"), 0);
+        drop(conn);
+
+        assert_eq!(pool.len("127.0.0.1:3306"), 0);
     }
 }
