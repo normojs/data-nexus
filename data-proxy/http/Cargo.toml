@@ -10,6 +10,7 @@ config = { path = "../app/config" }
 once_cell = "1.10.0"
 pisa_error = { path = "../error", package = "error" }
 pisa_metrics = { path = "../app/metrics", package = "metrics" }
+proxy = { path = "../proxy" }
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = { version = "1.0.113", features = [] }
 server = { path = "../app/server" }

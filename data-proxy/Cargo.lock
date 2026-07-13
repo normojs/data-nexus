@@ -1697,6 +1697,7 @@ dependencies = [
  "hyper",
  "metrics",
  "once_cell",
+ "proxy",
  "serde",
  "serde_json",
  "server",

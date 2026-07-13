@@ -26,7 +26,9 @@ use tracing::{error, info, log::debug, Level};
 extern crate tokio;
 
 use config::config::PisaProxyConfigBuilder;
-use http::http::{new_http_server, HttpFactory, HttpServerKind, PisaHttpServerFactory};
+use http::http::{
+    new_http_server, AdminRuntimeState, HttpFactory, HttpServerKind, PisaHttpServerFactory,
+};
 use pisa_metrics::metrics::MetricsManager;
 
 use crate::node::NodeInstance;
@@ -58,10 +60,7 @@ fn main() {
     // 2、启动
     // 3、停止
     // 4、重启
-    let http_server = PisaHttpServerFactory::new_gateway(config.clone(), MetricsManager::new())
-        .build_http_server(HttpServerKind::Axum);
-
-    let factory = GatewayFactory::from_gateway_config(config);
+    let factory = GatewayFactory::from_gateway_config(config.clone());
     let proxy_instances = match factory.try_build_proxies() {
         Ok(instances) => instances,
         Err(error) => {
@@ -69,6 +68,17 @@ fn main() {
             std::process::exit(-1);
         }
     };
+    let runtime_state = AdminRuntimeState::new(
+        proxy_instances
+            .iter()
+            .map(|instance| (instance.name.clone(), instance.shutdown_handle.clone())),
+    );
+    let http_server = PisaHttpServerFactory::new_gateway_with_runtime_state(
+        config,
+        MetricsManager::new(),
+        runtime_state,
+    )
+    .build_http_server(HttpServerKind::Axum);
 
     let mut servers = Vec::with_capacity(proxy_instances.len() + 1);
 

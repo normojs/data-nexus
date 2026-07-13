@@ -24,7 +24,7 @@ pub enum ProxyKind {
     PostgreSQL,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ShutdownHandle {
     token: CancellationToken,
 }
