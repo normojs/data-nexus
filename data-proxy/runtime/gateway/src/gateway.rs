@@ -15,6 +15,7 @@
 use std::{
     collections::BTreeMap,
     sync::{atomic::AtomicU32, Arc},
+    time::Instant,
 };
 
 use common::ast_cache::ParserAstCache;
@@ -125,6 +126,12 @@ impl GatewayRuntime {
         self.core_listener_plan()
             .map(|plan| protocol_name(&plan.listener().protocol).to_owned())
             .unwrap_or_else(|| self.proxy_config.node_type.clone())
+    }
+
+    fn service_name(&self) -> String {
+        self.core_listener_plan()
+            .map(|plan| plan.service().name.clone())
+            .unwrap_or_else(|| self.proxy_config.name.clone())
     }
 
     #[allow(deprecated)]
@@ -336,6 +343,8 @@ async fn run_postgresql_core_session(
             return;
         }
     };
+    let metric_labels = GatewayMetricLabels::from_plan(&core_plan, &listener_name);
+    let metrics_collector = MySQLServerMetricsCollector;
 
     let mut session = handshake.session;
     if session.database.is_none() {
@@ -361,14 +370,36 @@ async fn run_postgresql_core_session(
             }
         };
         let terminate = frame.first() == Some(&b'X');
+        let collect_query_metrics = frame.first() == Some(&b'Q');
+        let started_at = Instant::now();
+
+        if collect_query_metrics {
+            let labels = metric_labels.values("QUERY");
+            metrics_collector.set_sql_under_processing_inc(&labels);
+        }
 
         let packets = match connection.handle_frame(&frame).await {
             Ok(packets) => packets,
             Err(error) => {
+                if collect_query_metrics {
+                    let labels = metric_labels.values("QUERY");
+                    metrics_collector.set_sql_under_processing_dec(&labels);
+                    metrics_collector.set_sql_processed_total(&labels);
+                    metrics_collector
+                        .set_sql_processed_duration(&labels, started_at.elapsed().as_secs_f64());
+                }
                 error!("postgresql core frame handling error {:?}", error);
                 break;
             }
         };
+
+        if collect_query_metrics {
+            let labels = metric_labels.values("QUERY");
+            metrics_collector.set_sql_under_processing_dec(&labels);
+            metrics_collector.set_sql_processed_total(&labels);
+            metrics_collector
+                .set_sql_processed_duration(&labels, started_at.elapsed().as_secs_f64());
+        }
 
         for packet in packets {
             if let Err(error) = stream.write_all(&packet).await {
@@ -427,6 +458,52 @@ where
     })?;
 
     Ok(Some(frame))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayMetricLabels {
+    listener: String,
+    service: String,
+    frontend_protocol: String,
+    backend_protocol: String,
+    endpoint: String,
+}
+
+impl GatewayMetricLabels {
+    fn from_plan(core_plan: &CoreGatewayRuntimePlan, listener_name: &str) -> Self {
+        if let Some(plan) = core_plan.listener(listener_name) {
+            return Self {
+                listener: plan.listener().name.clone(),
+                service: plan.service().name.clone(),
+                frontend_protocol: protocol_name(&plan.listener().protocol).to_owned(),
+                backend_protocol: protocol_name(&plan.service().backend_protocol).to_owned(),
+                endpoint: plan
+                    .endpoints()
+                    .first()
+                    .map(|endpoint| endpoint.address.clone())
+                    .unwrap_or_default(),
+            };
+        }
+
+        Self {
+            listener: listener_name.to_owned(),
+            service: listener_name.to_owned(),
+            frontend_protocol: protocol_name(&ProtocolKind::PostgreSql).to_owned(),
+            backend_protocol: protocol_name(&ProtocolKind::PostgreSql).to_owned(),
+            endpoint: String::new(),
+        }
+    }
+
+    fn values<'a>(&'a self, command_type: &'a str) -> [&'a str; 6] {
+        [
+            self.listener.as_str(),
+            self.service.as_str(),
+            self.frontend_protocol.as_str(),
+            self.backend_protocol.as_str(),
+            command_type,
+            self.endpoint.as_str(),
+        ]
+    }
 }
 
 #[allow(deprecated)]
@@ -691,6 +768,8 @@ impl proxy::factory::Proxy for GatewayRuntime {
             let session_registry = session_registry.clone();
             let peer_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
             let frontend_protocol = self.frontend_protocol_name();
+            let backend_protocol = self.backend_protocol_name();
+            let service = self.service_name();
             let database = optional_database(&self.proxy_config.db);
             let rewriter = rewriter.clone();
 
@@ -709,7 +788,7 @@ impl proxy::factory::Proxy for GatewayRuntime {
                     id: 0,
                     listener: session_listener,
                     peer_addr,
-                    frontend_protocol,
+                    frontend_protocol: frontend_protocol.clone(),
                     database,
                 });
 
@@ -731,6 +810,9 @@ impl proxy::factory::Proxy for GatewayRuntime {
                     concurrency_control_rule_idx: None,
                     framed,
                     name: proxy_name,
+                    service,
+                    frontend_protocol,
+                    backend_protocol,
                     // mysql_parser: Arc::new(()),
                     parser,
                     rewriter,
@@ -898,6 +980,35 @@ mod tests {
 
         assert_eq!(listener.node_type, "mysql");
         assert_eq!(listener.backend_type, "mysql");
+    }
+
+    #[test]
+    fn metric_labels_include_service_protocols_and_endpoint() {
+        let core_plan = CoreGatewayRuntimePlan::from_config(&postgresql_config()).unwrap();
+
+        let labels = GatewayMetricLabels::from_plan(&core_plan, "postgresql-listener");
+
+        assert_eq!(
+            labels,
+            GatewayMetricLabels {
+                listener: "postgresql-listener".into(),
+                service: "analytics".into(),
+                frontend_protocol: "postgresql".into(),
+                backend_protocol: "postgresql".into(),
+                endpoint: "127.0.0.1:5432".into(),
+            }
+        );
+        assert_eq!(
+            labels.values("QUERY"),
+            [
+                "postgresql-listener",
+                "analytics",
+                "postgresql",
+                "postgresql",
+                "QUERY",
+                "127.0.0.1:5432",
+            ]
+        );
     }
 
     #[test]

@@ -306,6 +306,9 @@ fn gateway_value_to_text(value: &GatewayValue) -> Option<Vec<u8>> {
 /// The Context arg required to handle the command.
 pub struct ReqContext<T, C> {
     pub name: String,
+    pub service: String,
+    pub frontend_protocol: String,
+    pub backend_protocol: String,
     pub fsm: TransFsm,
     pub route_strategy: Arc<Mutex<RouteStrategy>>,
     pub pool: Pool<ClientConn>,
