@@ -10,6 +10,8 @@ use postgresql_protocol::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+const DEFAULT_CLIENT_ENCODING: &str = "UTF8";
+
 #[derive(Clone, Debug)]
 pub struct PostgreSqlFrontendProtocol {
     server_version: String,
@@ -53,15 +55,16 @@ impl PostgreSqlFrontendProtocol {
                     ))
                 }
                 StartupPacket::Startup(startup) => {
+                    let session = session_from_startup(&startup);
                     write_handshake_response(
                         &mut stream,
                         &self.server_version,
                         self.process_id,
                         self.secret_key,
+                        session.charset.as_deref().unwrap_or(DEFAULT_CLIENT_ENCODING),
                     )
                     .await?;
 
-                    let session = session_from_startup(&startup);
                     return Ok(PostgreSqlHandshake { stream, startup, session });
                 }
             }
@@ -149,6 +152,7 @@ async fn write_handshake_response<S>(
     server_version: &str,
     process_id: i32,
     secret_key: i32,
+    client_encoding: &str,
 ) -> GatewayResult<()>
 where
     S: AsyncWrite + Unpin,
@@ -157,7 +161,7 @@ where
     response.extend_from_slice(&encode_authentication_ok());
     response.extend_from_slice(&encode_parameter_status("server_version", server_version));
     response.extend_from_slice(&encode_parameter_status("server_encoding", "UTF8"));
-    response.extend_from_slice(&encode_parameter_status("client_encoding", "UTF8"));
+    response.extend_from_slice(&encode_parameter_status("client_encoding", client_encoding));
     response.extend_from_slice(&encode_parameter_status("DateStyle", "ISO, MDY"));
     response.extend_from_slice(&encode_parameter_status("integer_datetimes", "on"));
     response.extend_from_slice(&encode_backend_key_data(process_id, secret_key));
@@ -175,11 +179,19 @@ fn session_from_startup(startup: &StartupMessage) -> SessionState {
     SessionState {
         user: startup.get("user").map(ToOwned::to_owned),
         database: startup.get("database").map(ToOwned::to_owned),
+        charset: startup
+            .get("client_encoding")
+            .map(ToOwned::to_owned)
+            .or_else(|| Some(DEFAULT_CLIENT_ENCODING.to_owned())),
         ..SessionState::default()
     }
 }
 
 fn decode_query_command(sql: String, session: &mut SessionState) -> GatewayCommand {
+    if let Some(client_encoding) = client_encoding_from_set_query(&sql) {
+        session.charset = Some(client_encoding);
+    }
+
     match sql.trim().to_ascii_lowercase().as_str() {
         "begin" | "start transaction" => {
             session.transaction_state = TransactionState::Active;
@@ -195,6 +207,62 @@ fn decode_query_command(sql: String, session: &mut SessionState) -> GatewayComma
         }
         _ => GatewayCommand::Query { sql },
     }
+}
+
+fn client_encoding_from_set_query(sql: &str) -> Option<String> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let value = strip_ascii_prefix(sql, "set client_encoding")
+        .or_else(|| strip_ascii_prefix(sql, "set names"))?;
+
+    parse_set_value(value)
+}
+
+fn parse_set_value(value: &str) -> Option<String> {
+    let mut value = value.trim();
+    if let Some(rest) = strip_keyword(value, "to") {
+        value = rest.trim();
+    } else if let Some(rest) = value.strip_prefix('=') {
+        value = rest.trim();
+    }
+
+    let value = value.trim_end_matches(';').trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if value.starts_with('\'') {
+        return unquote(value, '\'').map(|value| value.replace("''", "'"));
+    }
+    if value.starts_with('"') {
+        return unquote(value, '"').map(|value| value.replace("\"\"", "\""));
+    }
+
+    value.split_whitespace().next().map(|value| value.trim_matches(';').to_owned())
+}
+
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+
+    let rest = &value[prefix.len()..];
+    if rest.chars().next().map_or(true, char::is_whitespace) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn strip_keyword<'a>(value: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = strip_ascii_prefix(value, keyword)?;
+    Some(rest)
+}
+
+fn unquote(value: &str, quote: char) -> Option<&str> {
+    let value = value.strip_prefix(quote)?;
+    let end = value.find(quote)?;
+    Some(&value[..end])
 }
 
 fn encode_resultset(
@@ -311,7 +379,11 @@ mod tests {
         let server_task = tokio::spawn(async move { protocol.handshake(server).await });
 
         client
-            .write_all(&encode_startup_message(&[("user", "app"), ("database", "orders")]))
+            .write_all(&encode_startup_message(&[
+                ("user", "app"),
+                ("database", "orders"),
+                ("client_encoding", "LATIN1"),
+            ]))
             .await
             .unwrap();
 
@@ -321,7 +393,11 @@ mod tests {
         let handshake = server_task.await.unwrap().unwrap();
         assert_eq!(handshake.session.user, Some("app".into()));
         assert_eq!(handshake.session.database, Some("orders".into()));
+        assert_eq!(handshake.session.charset, Some("LATIN1".into()));
         assert!(response.starts_with(&encode_authentication_ok()));
+        assert!(response
+            .windows(encode_parameter_status("client_encoding", "LATIN1").len())
+            .any(|window| window == encode_parameter_status("client_encoding", "LATIN1")));
         assert!(response
             .windows(encode_backend_key_data(17, 23).len())
             .any(|window| window == encode_backend_key_data(17, 23)));
@@ -347,6 +423,7 @@ mod tests {
         let handshake = server_task.await.unwrap().unwrap();
         assert_eq!(handshake.session.user, Some("app".into()));
         assert_eq!(handshake.session.database, None);
+        assert_eq!(handshake.session.charset, Some("UTF8".into()));
         assert!(response.ends_with(&encode_ready_for_query(TransactionStatus::Idle)));
     }
 
@@ -371,6 +448,26 @@ mod tests {
             Ok(vec![GatewayCommand::Commit])
         );
         assert_eq!(session.transaction_state, TransactionState::Idle);
+    }
+
+    #[test]
+    fn decodes_client_encoding_session_updates() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let mut session = SessionState::default();
+
+        assert_eq!(
+            protocol
+                .decode(&encode_query_message("SET client_encoding TO 'LATIN1';"), &mut session),
+            Ok(vec![GatewayCommand::Query { sql: "SET client_encoding TO 'LATIN1';".into() }])
+        );
+        assert_eq!(session.charset, Some("LATIN1".into()));
+
+        assert_eq!(
+            protocol.decode(&encode_query_message("set names utf8"), &mut session),
+            Ok(vec![GatewayCommand::Query { sql: "set names utf8".into() }])
+        );
+        assert_eq!(session.charset, Some("utf8".into()));
+        assert_eq!(client_encoding_from_set_query("SET client_encoding TO 'UTF8"), None);
     }
 
     #[test]

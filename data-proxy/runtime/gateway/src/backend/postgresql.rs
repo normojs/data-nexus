@@ -63,7 +63,8 @@ impl PostgreSqlBackendConnector {
         session: &SessionState,
     ) -> GatewayResult<GatewayResponse> {
         let pool_key = self.ensure_pool_factory_for_session(&endpoint, session)?;
-        let conn = self.pool.get_conn_with_endpoint_session(&pool_key, &[]).await?;
+        let session_attrs = postgresql_session_attrs(session);
+        let conn = self.pool.get_conn_with_endpoint_session(&pool_key, &session_attrs).await?;
         let messages = conn.simple_query(sql).await?;
         simple_query_messages_to_gateway_response(messages)
     }
@@ -127,6 +128,7 @@ struct PostgreSqlBackendConnection {
     endpoint: EndpointConfig,
     pool_key: String,
     database: String,
+    client_encoding: Option<String>,
     client: Option<Client>,
 }
 
@@ -136,6 +138,7 @@ impl Clone for PostgreSqlBackendConnection {
             endpoint: self.endpoint.clone(),
             pool_key: self.pool_key.clone(),
             database: self.database.clone(),
+            client_encoding: self.client_encoding.clone(),
             client: None,
         }
     }
@@ -155,6 +158,7 @@ impl Default for PostgreSqlBackendConnection {
             },
             pool_key: String::new(),
             database: String::new(),
+            client_encoding: None,
             client: None,
         }
     }
@@ -163,11 +167,22 @@ impl Default for PostgreSqlBackendConnection {
 impl PostgreSqlBackendConnection {
     fn factory(endpoint: EndpointConfig, database: String) -> Self {
         let pool_key = postgresql_pool_key(&endpoint, &database);
-        Self { endpoint, pool_key, database, client: None }
+        Self { endpoint, pool_key, database, client_encoding: None, client: None }
     }
 
     async fn simple_query(&self, sql: &str) -> GatewayResult<Vec<SimpleQueryMessage>> {
         self.client()?.simple_query(sql).await.map_err(postgresql_backend_error)
+    }
+
+    async fn set_client_encoding(&mut self, client_encoding: String) -> GatewayResult<()> {
+        if self.client_encoding.as_deref() == Some(client_encoding.as_str()) {
+            return Ok(());
+        }
+
+        let sql = postgresql_client_encoding_statement(&client_encoding);
+        self.simple_query(&sql).await?;
+        self.client_encoding = Some(client_encoding);
+        Ok(())
     }
 
     fn client(&self) -> GatewayResult<&Client> {
@@ -184,6 +199,7 @@ impl fmt::Debug for PostgreSqlBackendConnection {
             .field("endpoint", &self.endpoint)
             .field("pool_key", &self.pool_key)
             .field("database", &self.database)
+            .field("client_encoding", &self.client_encoding)
             .field("connected", &self.client.is_some())
             .finish()
     }
@@ -199,6 +215,7 @@ impl ConnLike for PostgreSqlBackendConnection {
             endpoint: self.endpoint.clone(),
             pool_key: self.pool_key.clone(),
             database: self.database.clone(),
+            client_encoding: None,
             client: Some(client),
         })
     }
@@ -230,7 +247,7 @@ impl ConnAttr for PostgreSqlBackendConnection {
     }
 
     fn get_charset(&self) -> Option<String> {
-        None
+        self.client_encoding.clone()
     }
 
     fn get_autocommit(&self) -> Option<String> {
@@ -240,7 +257,27 @@ impl ConnAttr for PostgreSqlBackendConnection {
 
 #[async_trait]
 impl ConnAttrMut for PostgreSqlBackendConnection {
-    type Item = ();
+    type Item = PostgreSqlSessionAttr;
+
+    async fn init(&mut self, session: &[Self::Item]) {
+        for attr in session {
+            match attr {
+                PostgreSqlSessionAttr::ClientEncoding(client_encoding) => {
+                    if let Err(error) = self.set_client_encoding(client_encoding.clone()).await {
+                        error!(
+                            "postgresql backend failed to sync client_encoding '{}': {}",
+                            client_encoding, error
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PostgreSqlSessionAttr {
+    ClientEncoding(String),
 }
 
 async fn connect_endpoint(endpoint: &EndpointConfig, database: &str) -> GatewayResult<Client> {
@@ -284,6 +321,22 @@ fn effective_database(endpoint: &EndpointConfig, session: &SessionState) -> Gate
 
 fn postgresql_pool_key(endpoint: &EndpointConfig, database: &str) -> String {
     format!("{}|{}", endpoint.address, database)
+}
+
+fn postgresql_session_attrs(session: &SessionState) -> Vec<PostgreSqlSessionAttr> {
+    session
+        .charset
+        .as_ref()
+        .map(|client_encoding| vec![PostgreSqlSessionAttr::ClientEncoding(client_encoding.clone())])
+        .unwrap_or_default()
+}
+
+fn postgresql_client_encoding_statement(client_encoding: &str) -> String {
+    if client_encoding.eq_ignore_ascii_case("default") {
+        "SET client_encoding TO DEFAULT".into()
+    } else {
+        format!("SET client_encoding TO '{}'", client_encoding.replace('\'', "''"))
+    }
 }
 
 fn simple_query_messages_to_gateway_response(
@@ -393,6 +446,30 @@ mod tests {
         assert_eq!(pool_key, postgresql_pool_key(&endpoint, "reporting"));
         assert!(connector.pool.has_factory(&postgresql_pool_key(&endpoint, "analytics")));
         assert!(connector.pool.has_factory(&pool_key));
+    }
+
+    #[test]
+    fn builds_session_attrs_from_client_encoding() {
+        let session = SessionState { charset: Some("LATIN1".into()), ..Default::default() };
+
+        assert_eq!(
+            postgresql_session_attrs(&session),
+            vec![PostgreSqlSessionAttr::ClientEncoding("LATIN1".into())]
+        );
+        assert!(postgresql_session_attrs(&SessionState::default()).is_empty());
+    }
+
+    #[test]
+    fn builds_client_encoding_statement() {
+        assert_eq!(postgresql_client_encoding_statement("UTF8"), "SET client_encoding TO 'UTF8'");
+        assert_eq!(
+            postgresql_client_encoding_statement("O'HARE"),
+            "SET client_encoding TO 'O''HARE'"
+        );
+        assert_eq!(
+            postgresql_client_encoding_statement("DEFAULT"),
+            "SET client_encoding TO DEFAULT"
+        );
     }
 
     #[tokio::test]
