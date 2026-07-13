@@ -19,29 +19,33 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use common::ast_cache::ParserAstCache;
 use conn_pool::Pool;
 use futures::{SinkExt, StreamExt};
 use gateway_core::{
-    FrontendProtocolAdapter, GatewayCommand, GatewayError, GatewayResponse, GatewayResult,
-    ProtocolKind, SessionState, TransactionState,
+    Column as GatewayColumn, FrontendProtocolAdapter, GatewayCommand, GatewayError,
+    GatewayResponse, GatewayResult, GatewayValue, ProtocolKind, SessionState, TransactionState,
 };
 use mysql_parser::parser::Parser;
 use mysql_protocol::{
     client::conn::ClientConn,
+    column::ColumnInfo,
     err::ProtocolError,
     mysql_const::{
-        ComType, COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE, COM_STMT_EXECUTE,
-        COM_STMT_PREPARE,
+        ColumnType, ComType, COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE,
+        COM_STMT_EXECUTE, COM_STMT_PREPARE,
     },
     server::{
         auth::{handshake, ServerHandshakeCodec},
-        codec::{make_err_packet, ok_packet, CommonPacket, PacketCodec, PacketSend},
+        codec::{
+            make_eof_packet, make_err_packet, ok_packet, CommonPacket, PacketCodec, PacketSend,
+        },
         err::MySQLError,
         stream::LocalStream,
     },
     session::Session,
+    util::BufMutExt,
 };
 use parking_lot::Mutex;
 use pisa_error::error::{Error, ErrorKind};
@@ -146,18 +150,17 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
         &mut self,
         response: GatewayResponse,
         _session: &SessionState,
-    ) -> GatewayResult<Vec<u8>> {
+    ) -> GatewayResult<Vec<Vec<u8>>> {
         match response {
             GatewayResponse::Ok { .. } | GatewayResponse::Pong | GatewayResponse::Bye => {
-                Ok(ok_packet()[4..].to_vec())
+                Ok(vec![ok_packet()[4..].to_vec()])
             }
             GatewayResponse::Error { code, message } => {
                 let code = code.parse::<u16>().unwrap_or(1105);
-                Ok(make_err_packet(MySQLError::new(code, b"HY000".to_vec(), message))[4..].to_vec())
+                Ok(vec![make_err_packet(MySQLError::new(code, b"HY000".to_vec(), message))[4..]
+                    .to_vec()])
             }
-            GatewayResponse::ResultSet { .. } => Err(GatewayError::Unsupported(
-                "mysql resultset encoding is still handled by the legacy packet stream".into(),
-            )),
+            GatewayResponse::ResultSet { columns, rows } => encode_text_resultset(columns, rows),
             GatewayResponse::Prepared { .. } => Err(GatewayError::Unsupported(
                 "mysql prepared response encoding is still handled by the legacy packet stream"
                     .into(),
@@ -204,6 +207,100 @@ fn decode_statement_id(payload: &[u8]) -> GatewayResult<String> {
     }
 
     Ok(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]).to_string())
+}
+
+fn encode_text_resultset(
+    columns: Vec<GatewayColumn>,
+    rows: Vec<Vec<GatewayValue>>,
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut packets = Vec::with_capacity(columns.len() + rows.len() + 3);
+
+    let mut column_count = Vec::new();
+    column_count.put_lenc_int(columns.len() as u64, true);
+    packets.push(column_count);
+
+    for column in &columns {
+        let mut packet = Vec::new();
+        gateway_column_to_mysql_column(column).encode(&mut packet);
+        packets.push(packet);
+    }
+
+    packets.push(make_eof_packet()[4..].to_vec());
+
+    for row in rows {
+        packets.push(encode_text_row(&row, columns.len())?);
+    }
+
+    packets.push(make_eof_packet()[4..].to_vec());
+    Ok(packets)
+}
+
+fn gateway_column_to_mysql_column(column: &GatewayColumn) -> ColumnInfo {
+    ColumnInfo {
+        schema: None,
+        table_name: None,
+        column_name: column.name.clone(),
+        charset: 33,
+        column_length: 1024,
+        column_type: mysql_column_type(&column.data_type),
+        column_flag: 0,
+        decimals: 0,
+    }
+}
+
+fn mysql_column_type(data_type: &str) -> ColumnType {
+    match data_type.to_ascii_lowercase().as_str() {
+        "tiny" | "int1" | "bool" | "boolean" => ColumnType::MYSQL_TYPE_TINY,
+        "short" | "int2" | "smallint" => ColumnType::MYSQL_TYPE_SHORT,
+        "long" | "int" | "int4" | "integer" => ColumnType::MYSQL_TYPE_LONG,
+        "longlong" | "int8" | "bigint" => ColumnType::MYSQL_TYPE_LONGLONG,
+        "float" | "float4" => ColumnType::MYSQL_TYPE_FLOAT,
+        "double" | "float8" => ColumnType::MYSQL_TYPE_DOUBLE,
+        "decimal" | "numeric" | "new_decimal" => ColumnType::MYSQL_TYPE_NEWDECIMAL,
+        "date" => ColumnType::MYSQL_TYPE_DATE,
+        "time" => ColumnType::MYSQL_TYPE_TIME,
+        "datetime" => ColumnType::MYSQL_TYPE_DATETIME,
+        "timestamp" | "timestamptz" => ColumnType::MYSQL_TYPE_TIMESTAMP,
+        "blob" | "bytea" | "bytes" | "binary" | "varbinary" => ColumnType::MYSQL_TYPE_BLOB,
+        _ => ColumnType::MYSQL_TYPE_VAR_STRING,
+    }
+}
+
+fn encode_text_row(row: &[GatewayValue], column_count: usize) -> GatewayResult<Vec<u8>> {
+    if row.len() != column_count {
+        return Err(GatewayError::Protocol(format!(
+            "mysql resultset row has {} values for {} columns",
+            row.len(),
+            column_count
+        )));
+    }
+
+    let mut packet = Vec::new();
+    for value in row {
+        match gateway_value_to_text(value) {
+            Some(value) => {
+                packet.put_lenc_int(value.len() as u64, true);
+                packet.extend_from_slice(&value);
+            }
+            None => packet.put_u8(0xfb),
+        }
+    }
+
+    Ok(packet)
+}
+
+fn gateway_value_to_text(value: &GatewayValue) -> Option<Vec<u8>> {
+    match value {
+        GatewayValue::Null => None,
+        GatewayValue::Boolean(value) => Some(if *value { b"1".to_vec() } else { b"0".to_vec() }),
+        GatewayValue::Integer(value) => Some(value.to_string().into_bytes()),
+        GatewayValue::UnsignedInteger(value) => Some(value.to_string().into_bytes()),
+        GatewayValue::Float(value) => Some(value.to_string().into_bytes()),
+        GatewayValue::Decimal(value) | GatewayValue::String(value) => {
+            Some(value.as_bytes().to_vec())
+        }
+        GatewayValue::Bytes(value) => Some(value.clone()),
+    }
 }
 
 /// The Context arg required to handle the command.
@@ -458,13 +555,44 @@ mod tests {
         let mut adapter = adapter();
         let session = SessionState::default();
 
-        assert_eq!(adapter.encode(GatewayResponse::Pong, &session), Ok(ok_packet()[4..].to_vec()));
+        assert_eq!(
+            adapter.encode(GatewayResponse::Pong, &session),
+            Ok(vec![ok_packet()[4..].to_vec()])
+        );
 
         let error = adapter.encode(
             GatewayResponse::Error { code: "1047".into(), message: "nope".into() },
             &session,
         );
 
-        assert!(matches!(error, Ok(packet) if packet.first() == Some(&0xff)));
+        assert!(matches!(error, Ok(packets) if packets[0].first() == Some(&0xff)));
+    }
+
+    #[test]
+    fn encodes_resultset_as_mysql_text_protocol_payloads() {
+        let mut adapter = adapter();
+        let session = SessionState::default();
+
+        let packets = adapter
+            .encode(
+                GatewayResponse::ResultSet {
+                    columns: vec![
+                        GatewayColumn { name: "id".into(), data_type: "int".into() },
+                        GatewayColumn { name: "name".into(), data_type: "varchar".into() },
+                    ],
+                    rows: vec![
+                        vec![GatewayValue::Integer(42), GatewayValue::String("Ada".into())],
+                        vec![GatewayValue::Integer(43), GatewayValue::Null],
+                    ],
+                },
+                &session,
+            )
+            .unwrap();
+
+        assert_eq!(packets[0], vec![2]);
+        assert_eq!(packets[3], make_eof_packet()[4..].to_vec());
+        assert_eq!(packets[4], b"\x0242\x03Ada".to_vec());
+        assert_eq!(packets[5], b"\x0243\xfb".to_vec());
+        assert_eq!(packets[6], make_eof_packet()[4..].to_vec());
     }
 }

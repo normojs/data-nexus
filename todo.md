@@ -34,8 +34,8 @@
 
 - [x] 将 `runtime/gateway` 中的 MySQL 协议处理抽成 `MySqlFrontendProtocol`。
 - [x] 将 MySQL 后端连接和执行逻辑收口为 `MySqlBackendConnector`。
-- [ ] 让 `MySqlFrontendProtocol` 对接 `gateway_core::FrontendProtocolAdapter`。
-- [ ] 让 `MySqlBackendConnector` 对接 `gateway_core::BackendConnector`。
+- [x] 让 `MySqlFrontendProtocol` 对接 `gateway_core::FrontendProtocolAdapter`。
+- [x] 让 `MySqlBackendConnector` 对接 `gateway_core::BackendConnector`。
 - [x] 新增 `GatewayRuntime` 运行时入口（当前内部仍复用迁移中的 MySQL 主链路）。
 - [ ] 让 `GatewayRuntime` 只依赖 `GatewayCommand`、`GatewayResponse`、`SessionState` 等 core 类型。
 - [x] 让 `PisaProxyFactory` 演进为 `GatewayFactory`。
@@ -88,12 +88,12 @@
 - [x] 将 `PisaProxyFactory` 演进为 `GatewayFactory`，启动路径改为 `runtime_gateway::gateway::GatewayRuntime`。
 - [ ] 将 `GatewayFactory` 改为按 listener/service 构建 runtime。
 - [ ] 拆分 `ProxyConfig`，避免一个结构同时承载监听、认证、后端、路由、插件和云端配置。
-- [ ] 新增 `ListenerConfig`。
-- [ ] 新增 `ServiceConfig`。
-- [ ] 新增 `EndpointConfig`。
-- [ ] 新增 `RoutePolicyConfig`。
-- [ ] 新增 `AuthPolicyConfig`。
-- [ ] 新增 `PluginPolicyConfig`。
+- [x] 新增 `ListenerConfig`。
+- [x] 新增 `ServiceConfig`。
+- [x] 新增 `EndpointConfig`。
+- [x] 新增 `RoutePolicyConfig`。
+- [x] 新增 `AuthPolicyConfig`。
+- [x] 新增 `PluginPolicyConfig`。
 - [ ] 将 `UniSQLNode` 替换为更通用的 `EndpointConfig`。
 - [ ] 将 `node_type`、`backend_type` 字符串替换为 `ProtocolKind` enum。
 - [ ] 将事务 FSM 与 `mysql_protocol::client::conn::SessionAttr` 解耦。

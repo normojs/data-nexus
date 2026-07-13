@@ -28,6 +28,10 @@ pub struct EndpointConfig {
     pub protocol: ProtocolKind,
     pub address: String,
     pub database: Option<String>,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
     pub weight: u32,
 }
 
@@ -189,6 +193,8 @@ mod tests {
                 protocol: ProtocolKind::MySql,
                 address: "127.0.0.1:3306".into(),
                 database: Some("orders".into()),
+                username: "app".into(),
+                password: "secret".into(),
                 weight: 1,
             }],
             route_policies: vec![RoutePolicyConfig {
