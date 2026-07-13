@@ -87,6 +87,14 @@ impl PisaProxyConfigBuilder {
         GatewayConfigDocument::from_toml(&config_str)
     }
 
+    pub fn gateway_config_path(&self) -> Option<&str> {
+        if self._local && !self._config_path.is_empty() {
+            Some(self._config_path.as_str())
+        } else {
+            None
+        }
+    }
+
     pub fn collect_from_cmd(mut self) -> Self {
         let mut matches = Command::new("Pisa-Proxy")
             .subcommand(

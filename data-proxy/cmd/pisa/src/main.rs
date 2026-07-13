@@ -27,7 +27,8 @@ extern crate tokio;
 
 use config::config::PisaProxyConfigBuilder;
 use http::http::{
-    new_http_server, AdminRuntimeState, HttpFactory, HttpServerKind, PisaHttpServerFactory,
+    new_http_server, AdminRuntimeState, GatewayConfigSource, HttpFactory, HttpServerKind,
+    PisaHttpServerFactory,
 };
 use pisa_metrics::metrics::MetricsManager;
 
@@ -40,7 +41,10 @@ fn main() {
     // error!("uni-proxy error");
     // print!("xxxxx");
     // return;
-    let config = match PisaProxyConfigBuilder::new().collect_from_cmd().build_gateway() {
+    let config_builder = PisaProxyConfigBuilder::new().collect_from_cmd();
+    let gateway_config_source =
+        config_builder.gateway_config_path().map(|path| GatewayConfigSource::file(path.to_owned()));
+    let config = match config_builder.build_gateway() {
         Ok(config) => config,
         Err(error) => {
             eprintln!("{}", error);
@@ -77,12 +81,20 @@ fn main() {
                 instance.session_snapshotter.clone(),
             )
         }));
-    let http_server = PisaHttpServerFactory::new_gateway_with_runtime_state(
-        config,
-        MetricsManager::new(),
-        runtime_state,
-    )
-    .build_http_server(HttpServerKind::Axum);
+    let http_factory = match gateway_config_source {
+        Some(source) => PisaHttpServerFactory::new_gateway_with_runtime_state_and_config_source(
+            config,
+            MetricsManager::new(),
+            runtime_state,
+            source,
+        ),
+        None => PisaHttpServerFactory::new_gateway_with_runtime_state(
+            config,
+            MetricsManager::new(),
+            runtime_state,
+        ),
+    };
+    let http_server = http_factory.build_http_server(HttpServerKind::Axum);
 
     let mut servers = Vec::with_capacity(proxy_instances.len() + 1);
 

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
@@ -26,7 +26,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use config::config::{GatewayConfigDocument, PisaProxyConfig};
+use config::config::{GatewayConfigDocument, GatewayConfigLoadError, PisaProxyConfig};
 use pisa_error::error::*;
 use pisa_metrics::metrics::MetricsManager;
 use proxy::factory::{
@@ -54,6 +54,7 @@ pub enum HttpServerKind {
 pub struct PisaHttpServerFactory {
     pisa_config: PisaProxyConfig,
     gateway_config: Option<GatewayConfigDocument>,
+    gateway_config_source: Option<GatewayConfigSource>,
     runtime_state: Option<AdminRuntimeState>,
     metrics_manager: MetricsManager,
 }
@@ -62,6 +63,7 @@ impl PisaHttpServerFactory {
         PisaHttpServerFactory {
             pisa_config: pcfg,
             gateway_config: None,
+            gateway_config_source: None,
             runtime_state: None,
             metrics_manager: mgr,
         }
@@ -79,6 +81,7 @@ impl PisaHttpServerFactory {
         PisaHttpServerFactory {
             pisa_config,
             gateway_config: Some(gateway_config),
+            gateway_config_source: None,
             runtime_state: None,
             metrics_manager: mgr,
         }
@@ -93,6 +96,17 @@ impl PisaHttpServerFactory {
         factory.runtime_state = Some(runtime_state);
         factory
     }
+
+    pub fn new_gateway_with_runtime_state_and_config_source(
+        gateway_config: GatewayConfigDocument,
+        mgr: MetricsManager,
+        runtime_state: AdminRuntimeState,
+        gateway_config_source: GatewayConfigSource,
+    ) -> PisaHttpServerFactory {
+        let mut factory = Self::new_gateway_with_runtime_state(gateway_config, mgr, runtime_state);
+        factory.gateway_config_source = Some(gateway_config_source);
+        factory
+    }
 }
 
 impl HttpFactory for PisaHttpServerFactory {
@@ -102,6 +116,7 @@ impl HttpFactory for PisaHttpServerFactory {
                 let xx = AxumServer {
                     pisa_config: self.pisa_config.clone(),
                     gateway_config: self.gateway_config.clone(),
+                    gateway_config_source: self.gateway_config_source.clone(),
                     runtime_state: self.runtime_state.clone(),
                     metrics_manager: self.metrics_manager.clone(),
                 };
@@ -113,6 +128,33 @@ impl HttpFactory for PisaHttpServerFactory {
 
 pub async fn new_http_server(mut s: Box<dyn HttpServer + Send>) {
     s.start().await.unwrap();
+}
+
+#[derive(Clone, Debug)]
+pub enum GatewayConfigSource {
+    File { path: String },
+}
+
+impl GatewayConfigSource {
+    pub fn file(path: impl Into<String>) -> Self {
+        Self::File { path: path.into() }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::File { path } => path.clone(),
+        }
+    }
+
+    fn load(&self) -> Result<GatewayConfigDocument, GatewayConfigLoadError> {
+        match self {
+            Self::File { path } => {
+                let config_str =
+                    std::fs::read_to_string(path).map_err(GatewayConfigLoadError::Io)?;
+                GatewayConfigDocument::from_toml(&config_str)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -228,10 +270,130 @@ struct ListenerPoolRuntimeStatus {
     snapshot: PoolSnapshot,
 }
 
+#[derive(Debug, Serialize)]
+struct GatewayReloadResponse {
+    status: &'static str,
+    source: String,
+    applied: bool,
+    changed: bool,
+    diff: GatewayConfigDiff,
+}
+
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+struct GatewayConfigDiff {
+    admin_changed: bool,
+    version_changed: bool,
+    listeners: NamedSectionDiff,
+    services: NamedSectionDiff,
+    endpoints: NamedSectionDiff,
+    route_policies: NamedSectionDiff,
+    auth_policies: NamedSectionDiff,
+    plugin_policies: NamedSectionDiff,
+}
+
+impl GatewayConfigDiff {
+    fn between(current: &GatewayConfigDocument, next: &GatewayConfigDocument) -> Self {
+        Self {
+            admin_changed: serde_json::to_value(&current.admin).ok()
+                != serde_json::to_value(&next.admin).ok(),
+            version_changed: current.version != next.version,
+            listeners: diff_named_section(
+                &current.gateway.listeners,
+                &next.gateway.listeners,
+                |item| item.name.as_str(),
+            ),
+            services: diff_named_section(
+                &current.gateway.services,
+                &next.gateway.services,
+                |item| item.name.as_str(),
+            ),
+            endpoints: diff_named_section(
+                &current.gateway.endpoints,
+                &next.gateway.endpoints,
+                |item| item.name.as_str(),
+            ),
+            route_policies: diff_named_section(
+                &current.gateway.route_policies,
+                &next.gateway.route_policies,
+                |item| item.name.as_str(),
+            ),
+            auth_policies: diff_named_section(
+                &current.gateway.auth_policies,
+                &next.gateway.auth_policies,
+                |item| item.name.as_str(),
+            ),
+            plugin_policies: diff_named_section(
+                &current.gateway.plugin_policies,
+                &next.gateway.plugin_policies,
+                |item| item.name.as_str(),
+            ),
+        }
+    }
+
+    fn has_changes(&self) -> bool {
+        self.admin_changed
+            || self.version_changed
+            || self.listeners.has_changes()
+            || self.services.has_changes()
+            || self.endpoints.has_changes()
+            || self.route_policies.has_changes()
+            || self.auth_policies.has_changes()
+            || self.plugin_policies.has_changes()
+    }
+}
+
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+struct NamedSectionDiff {
+    added: Vec<String>,
+    removed: Vec<String>,
+    changed: Vec<String>,
+}
+
+impl NamedSectionDiff {
+    fn has_changes(&self) -> bool {
+        !self.added.is_empty() || !self.removed.is_empty() || !self.changed.is_empty()
+    }
+}
+
+fn diff_named_section<T>(current: &[T], next: &[T], name: impl Fn(&T) -> &str) -> NamedSectionDiff
+where
+    T: PartialEq,
+{
+    let current = current.iter().map(|item| (name(item), item)).collect::<BTreeMap<_, _>>();
+    let next = next.iter().map(|item| (name(item), item)).collect::<BTreeMap<_, _>>();
+
+    let added = next
+        .keys()
+        .filter(|name| !current.contains_key(*name))
+        .map(|name| (*name).to_owned())
+        .collect();
+    let removed = current
+        .keys()
+        .filter(|name| !next.contains_key(*name))
+        .map(|name| (*name).to_owned())
+        .collect();
+    let changed = current
+        .iter()
+        .filter_map(|(name, current_item)| match next.get(name) {
+            Some(next_item) if current_item != next_item => Some((*name).to_owned()),
+            _ => None,
+        })
+        .collect();
+
+    NamedSectionDiff { added, removed, changed }
+}
+
+#[derive(Debug, Serialize)]
+struct AdminErrorResponse {
+    error: &'static str,
+    message: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct AxumServer {
     pisa_config: PisaProxyConfig,
     gateway_config: Option<GatewayConfigDocument>,
+    gateway_config_source: Option<GatewayConfigSource>,
     runtime_state: Option<AdminRuntimeState>,
     metrics_manager: MetricsManager,
 }
@@ -253,6 +415,7 @@ impl AxumServer {
             .route("/admin/endpoints", get(Self::admin_endpoints))
             .route("/admin/pools", get(Self::admin_pools))
             .route("/admin/sessions", get(Self::admin_sessions))
+            .route("/admin/reload", post(Self::admin_reload))
             .with_state(state)
     }
 
@@ -316,6 +479,32 @@ impl AxumServer {
         }
     }
 
+    async fn admin_reload(State(state): State<Self>) -> Response<Body> {
+        let current_config = match &state.gateway_config {
+            Some(config) => config,
+            None => return gateway_config_not_available(),
+        };
+        let config_source = match &state.gateway_config_source {
+            Some(config_source) => config_source,
+            None => return admin_runtime_not_found("gateway config source is not available"),
+        };
+
+        let next_config = match config_source.load() {
+            Ok(config) => config,
+            Err(error) => return gateway_config_load_error(error),
+        };
+        let diff = GatewayConfigDiff::between(current_config, &next_config);
+        let changed = diff.has_changes();
+
+        json_response(&GatewayReloadResponse {
+            status: "validated",
+            source: config_source.description(),
+            applied: false,
+            changed,
+            diff,
+        })
+    }
+
     async fn admin_stop_listener(
         Path(name): Path<String>,
         State(state): State<Self>,
@@ -362,6 +551,30 @@ fn admin_runtime_not_found(message: &'static str) -> Response<Body> {
         .expect("static not found response is valid")
 }
 
+fn gateway_config_load_error(error: GatewayConfigLoadError) -> Response<Body> {
+    let status = match &error {
+        GatewayConfigLoadError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        GatewayConfigLoadError::Parse(_) | GatewayConfigLoadError::Validation(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        GatewayConfigLoadError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
+    };
+    let value =
+        AdminErrorResponse { error: "gateway config reload failed", message: error.to_string() };
+
+    match serde_json::to_vec(&value) {
+        Ok(body) => Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("static gateway config error response is valid"),
+        Err(error) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(error.to_string()))
+            .expect("static internal server error response is valid"),
+    }
+}
+
 #[async_trait::async_trait]
 impl HttpServer for AxumServer {
     async fn start(&mut self) -> Result<(), Error> {
@@ -380,7 +593,7 @@ impl HttpServer for AxumServer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fs, sync::Arc};
 
     use axum::http::{Method, Request};
     use hyper::body::to_bytes;
@@ -404,6 +617,7 @@ mod tests {
                 ..PisaProxyConfig::default()
             },
             gateway_config: Some(gateway_config),
+            gateway_config_source: None,
             runtime_state: None,
             metrics_manager: MetricsManager::new(),
         }
@@ -413,6 +627,26 @@ mod tests {
         let mut server = gateway_server();
         server.runtime_state = Some(runtime_state);
         server
+    }
+
+    fn gateway_server_with_config_source(path: String) -> AxumServer {
+        let mut server = gateway_server();
+        server.gateway_config_source = Some(GatewayConfigSource::file(path));
+        server
+    }
+
+    fn write_temp_gateway_config(contents: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "data-nexus-reload-test-{}-{}.toml",
+            std::process::id(),
+            unique_test_id()
+        ));
+        fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn unique_test_id() -> u128 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     }
 
     async fn get_json_from(server: AxumServer, path: &str) -> (StatusCode, Value) {
@@ -554,10 +788,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_reload_validates_current_config_and_reports_no_changes() {
+        let path = write_temp_gateway_config(include_str!("../../examples/gateway-config.toml"));
+        let server = gateway_server_with_config_source(path.clone());
+
+        let (status, value) = post_json(server, "/admin/reload").await;
+        let _ = fs::remove_file(path);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["status"], "validated");
+        assert_eq!(value["applied"], false);
+        assert_eq!(value["changed"], false);
+        assert_eq!(value["diff"]["endpoints"]["changed"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_reports_config_diff_without_applying_runtime_changes() {
+        let changed_config = include_str!("../../examples/gateway-config.toml")
+            .replace("address = \"127.0.0.1:3307\"", "address = \"127.0.0.1:3317\"");
+        let path = write_temp_gateway_config(&changed_config);
+        let server = gateway_server_with_config_source(path.clone());
+
+        let (status, value) = post_json(server, "/admin/reload").await;
+        let _ = fs::remove_file(path);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["status"], "validated");
+        assert_eq!(value["applied"], false);
+        assert_eq!(value["changed"], true);
+        assert_eq!(value["diff"]["endpoints"]["changed"][0], "orders-replica");
+    }
+
+    #[tokio::test]
     async fn topology_routes_report_missing_gateway_config_for_legacy_state() {
         let response = AxumServer {
             pisa_config: PisaProxyConfig::default(),
             gateway_config: None,
+            gateway_config_source: None,
             runtime_state: None,
             metrics_manager: MetricsManager::new(),
         }

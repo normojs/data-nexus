@@ -104,8 +104,6 @@
 
 ## Admin API
 
-- [ ] 新增 `POST /admin/reload`。
-- [ ] 热更新前实现 config diff。
 - [ ] 支持新增 listener。
 - [ ] 支持替换 route policy。
 - [ ] 支持刷新 endpoint pool。
