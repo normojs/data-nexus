@@ -24,11 +24,11 @@ use axum::{
     extract::{Json, Path, State},
     http::{header, StatusCode},
     response::Response,
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use config::config::{GatewayConfigDocument, GatewayConfigLoadError, PisaProxyConfig};
-use gateway_core::ListenerConfig;
+use gateway_core::{ListenerConfig, RoutePolicyConfig};
 use pisa_error::error::*;
 use pisa_metrics::metrics::MetricsManager;
 use proxy::factory::{
@@ -341,6 +341,13 @@ struct AdminAddListenerResponse {
     listen_addr: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AdminReplaceRoutePolicyResponse {
+    status: &'static str,
+    name: String,
+    kind: String,
+}
+
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
 struct GatewayConfigDiff {
     admin_changed: bool,
@@ -473,6 +480,7 @@ impl AxumServer {
             .route("/admin/config", get(Self::admin_config))
             .route("/admin/listeners", get(Self::admin_listeners).post(Self::admin_add_listener))
             .route("/admin/listeners/:name/stop", post(Self::admin_stop_listener))
+            .route("/admin/route-policies/:name", put(Self::admin_replace_route_policy))
             .route("/admin/services", get(Self::admin_services))
             .route("/admin/endpoints", get(Self::admin_endpoints))
             .route("/admin/pools", get(Self::admin_pools))
@@ -613,6 +621,79 @@ impl AxumServer {
             name: listener_name,
             listen_addr,
         })
+    }
+
+    async fn admin_replace_route_policy(
+        Path(name): Path<String>,
+        State(state): State<Self>,
+        Json(route_policy): Json<RoutePolicyConfig>,
+    ) -> Response<Body> {
+        let gateway_config = match &state.gateway_config {
+            Some(gateway_config) => gateway_config.clone(),
+            None => return gateway_config_not_available(),
+        };
+
+        if route_policy.name != name {
+            return admin_json_error(
+                StatusCode::BAD_REQUEST,
+                "gateway route policy replace failed",
+                format!(
+                    "route policy name '{}' does not match path parameter '{}'",
+                    route_policy.name, name
+                ),
+            );
+        }
+
+        let updated_kind = route_policy.kind.clone();
+        let route_policy_name = route_policy.name.clone();
+
+        let response = {
+            let mut current_config = match gateway_config.write() {
+                Ok(current_config) => current_config,
+                Err(_) => {
+                    return admin_json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "gateway route policy replace failed",
+                        "gateway config lock is poisoned".to_string(),
+                    )
+                }
+            };
+            let route_policy_idx = match current_config
+                .gateway
+                .route_policies
+                .iter()
+                .position(|policy| policy.name == name)
+            {
+                Some(index) => index,
+                None => {
+                    return admin_json_error(
+                        StatusCode::NOT_FOUND,
+                        "gateway route policy replace failed",
+                        format!("route policy '{}' is not defined", name),
+                    )
+                }
+            };
+
+            let mut next_config = current_config.clone();
+            next_config.gateway.route_policies[route_policy_idx] = route_policy;
+
+            if let Err(error) = next_config.gateway.validate() {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "gateway route policy replace failed",
+                    format!("invalid gateway configuration: {}", error),
+                );
+            }
+
+            *current_config = next_config;
+            AdminReplaceRoutePolicyResponse {
+                status: "updated",
+                name: route_policy_name,
+                kind: updated_kind,
+            }
+        };
+
+        json_response(&response)
     }
 
     async fn admin_pools(State(state): State<Self>) -> Response<Body> {
@@ -853,13 +934,18 @@ mod tests {
         (status, value)
     }
 
-    async fn post_json_body(server: AxumServer, path: &str, value: Value) -> (StatusCode, Value) {
+    async fn json_body_request(
+        server: AxumServer,
+        method: Method,
+        path: &str,
+        value: Value,
+    ) -> (StatusCode, Value) {
         let body = serde_json::to_vec(&value).unwrap();
         let response = server
             .routes()
             .oneshot(
                 Request::builder()
-                    .method(Method::POST)
+                    .method(method)
                     .uri(path)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
@@ -871,6 +957,14 @@ mod tests {
         let body = to_bytes(response.into_body()).await.unwrap();
         let value = serde_json::from_slice(&body).unwrap();
         (status, value)
+    }
+
+    async fn post_json_body(server: AxumServer, path: &str, value: Value) -> (StatusCode, Value) {
+        json_body_request(server, Method::POST, path, value).await
+    }
+
+    async fn put_json_body(server: AxumServer, path: &str, value: Value) -> (StatusCode, Value) {
+        json_body_request(server, Method::PUT, path, value).await
     }
 
     #[tokio::test]
@@ -978,6 +1072,50 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(value["error"], "gateway listener add failed");
         assert!(value["message"].as_str().unwrap().contains("duplicate listener"));
+    }
+
+    #[tokio::test]
+    async fn admin_replace_route_policy_updates_shared_config() {
+        let server = gateway_server();
+
+        let (status, value) = put_json_body(
+            server.clone(),
+            "/admin/route-policies/orders-balance",
+            json!({
+                "name": "orders-balance",
+                "kind": "round_robin"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["status"], "updated");
+        assert_eq!(value["name"], "orders-balance");
+        assert_eq!(value["kind"], "round_robin");
+
+        let (status, config) = get_json_from(server, "/admin/config").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(config["route_policies"][0]["name"], "orders-balance");
+        assert_eq!(config["route_policies"][0]["kind"], "round_robin");
+    }
+
+    #[tokio::test]
+    async fn admin_replace_route_policy_rejects_missing_policy() {
+        let server = gateway_server();
+
+        let (status, value) = put_json_body(
+            server,
+            "/admin/route-policies/missing",
+            json!({
+                "name": "missing",
+                "kind": "round_robin"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(value["error"], "gateway route policy replace failed");
+        assert!(value["message"].as_str().unwrap().contains("not defined"));
     }
 
     #[tokio::test]
