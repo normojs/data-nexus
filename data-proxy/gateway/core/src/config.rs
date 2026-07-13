@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +81,8 @@ impl GatewayConfig {
         let services: HashSet<&str> = self.services.iter().map(|item| item.name.as_str()).collect();
         let endpoints: HashSet<&str> =
             self.endpoints.iter().map(|item| item.name.as_str()).collect();
+        let endpoint_protocols: HashMap<&str, &ProtocolKind> =
+            self.endpoints.iter().map(|item| (item.name.as_str(), &item.protocol)).collect();
         let routes: HashSet<&str> =
             self.route_policies.iter().map(|item| item.name.as_str()).collect();
         let auth: HashSet<&str> =
@@ -120,6 +122,13 @@ impl GatewayConfig {
                     return Err(GatewayError::Configuration(format!(
                         "service '{}' references missing endpoint '{}'",
                         service.name, endpoint
+                    )));
+                }
+                let endpoint_protocol = endpoint_protocols.get(endpoint.as_str()).unwrap();
+                if *endpoint_protocol != &service.backend_protocol {
+                    return Err(GatewayError::Configuration(format!(
+                        "service '{}' backend protocol {:?} does not match endpoint '{}' protocol {:?}",
+                        service.name, service.backend_protocol, endpoint, endpoint_protocol
                     )));
                 }
             }
@@ -225,6 +234,19 @@ mod tests {
             config.validate(),
             Err(GatewayError::Configuration(
                 "listener 'mysql-public' references missing service 'missing'".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_service_endpoint_protocol_mismatch() {
+        let mut config = config();
+        config.endpoints[0].protocol = ProtocolKind::PostgreSql;
+
+        assert_eq!(
+            config.validate(),
+            Err(GatewayError::Configuration(
+                "service 'orders' backend protocol MySql does not match endpoint 'orders-primary' protocol PostgreSql".into()
             ))
         );
     }

@@ -17,6 +17,7 @@ use std::sync::{atomic::AtomicU32, Arc};
 use common::ast_cache::ParserAstCache;
 use conn_pool::Pool;
 use endpoint::endpoint::Endpoint;
+use gateway_core::{GatewayConfig, GatewayError, GatewayResult};
 use indexmap::IndexMap;
 use loadbalance::balance::{Balance, LoadBalance};
 use mysql_parser::parser::Parser;
@@ -39,6 +40,7 @@ use tracing::{debug, error};
 
 use crate::{
     backend::mysql::MySqlBackendConnector,
+    core_engine::{CoreGatewayConnection, CoreGatewayRuntimePlan},
     frontend::mysql::{MySqlFrontendConnection, MySqlFrontendProtocol, ReqContext},
     server::{metrics::*, stmt_cache::StmtCache},
     transaction_fsm::*,
@@ -50,9 +52,36 @@ pub struct GatewayRuntime {
     pub node_group: Option<NodeGroup>,
     pub nodes: Vec<UniSQLNode>,
     pub pisa_version: String,
+    pub core_plan: Option<CoreGatewayRuntimePlan>,
 }
 
 impl GatewayRuntime {
+    pub fn from_core_config(config: &GatewayConfig) -> GatewayResult<Self> {
+        Ok(Self {
+            core_plan: Some(CoreGatewayRuntimePlan::from_config(config)?),
+            ..Default::default()
+        })
+    }
+
+    pub fn set_core_config(&mut self, config: &GatewayConfig) -> GatewayResult<()> {
+        self.core_plan = Some(CoreGatewayRuntimePlan::from_config(config)?);
+        Ok(())
+    }
+
+    pub fn core_plan(&self) -> Option<&CoreGatewayRuntimePlan> {
+        self.core_plan.as_ref()
+    }
+
+    pub fn build_core_connection(
+        &self,
+        listener_name: &str,
+    ) -> GatewayResult<CoreGatewayConnection> {
+        let plan = self.core_plan.as_ref().ok_or_else(|| {
+            GatewayError::Configuration("gateway runtime has no v2 core config".into())
+        })?;
+        plan.build_connection(listener_name)
+    }
+
     // 构建路由
     fn build_route(&self) -> Result<RouteStrategy, Error> {
         let length = self.nodes.len();
@@ -260,5 +289,69 @@ impl proxy::factory::Proxy for GatewayRuntime {
     async fn stop(&mut self) -> Result<(), Error> {
         // TODO：
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gateway_core::{
+        EndpointConfig, GatewayConfig, ListenerConfig, ProtocolKind, ServiceConfig,
+    };
+
+    use super::*;
+
+    fn mysql_config() -> GatewayConfig {
+        GatewayConfig {
+            listeners: vec![ListenerConfig {
+                name: "mysql-listener".into(),
+                listen_addr: "127.0.0.1:3307".into(),
+                protocol: ProtocolKind::MySql,
+                service: "orders".into(),
+                auth_policy: None,
+            }],
+            services: vec![ServiceConfig {
+                name: "orders".into(),
+                backend_protocol: ProtocolKind::MySql,
+                endpoints: vec!["orders-primary".into()],
+                route_policy: None,
+                plugin_policies: vec![],
+            }],
+            endpoints: vec![EndpointConfig {
+                name: "orders-primary".into(),
+                protocol: ProtocolKind::MySql,
+                address: "127.0.0.1:3306".into(),
+                database: Some("orders_db".into()),
+                username: "root".into(),
+                password: "backend-secret".into(),
+                weight: 1,
+            }],
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn builds_core_connection_from_v2_config() {
+        let runtime = GatewayRuntime::from_core_config(&mysql_config()).unwrap();
+
+        let connection = runtime.build_core_connection("mysql-listener").unwrap();
+
+        assert_eq!(connection.frontend_protocol(), ProtocolKind::MySql);
+        assert_eq!(connection.backend_protocol(), ProtocolKind::MySql);
+        assert_eq!(connection.session().database, Some("orders_db".into()));
+    }
+
+    #[test]
+    fn reports_missing_core_config() {
+        let runtime = GatewayRuntime::default();
+
+        let error = match runtime.build_core_connection("mysql-listener") {
+            Ok(_) => panic!("runtime should require v2 core config"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            GatewayError::Configuration("gateway runtime has no v2 core config".into())
+        );
     }
 }

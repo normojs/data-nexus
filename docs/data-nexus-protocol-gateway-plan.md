@@ -249,14 +249,14 @@ databases = ["test", "analytics"]
 问题：
 
 - `GatewayRuntime` 已替代 `SQLProxy`，MySQL 握手和命令循环已抽到 `frontend/mysql.rs`，MySQL 执行入口已收口为 `MySqlBackendConnector`。
-- 新的 MySQL frontend/backend 还没有对接 `gateway_core::FrontendProtocolAdapter` 和 `gateway_core::BackendConnector`。
+- MySQL frontend/backend 已对接 `gateway_core::FrontendProtocolAdapter` 和 `gateway_core::BackendConnector`，并新增 v2 config 到 core connection 的 runtime bridge。
 - `proxy_config.node_type` 只是字段，没有决定协议实现。
-- PostgreSQL crate 存在，但没有进入运行时主链路。
+- PostgreSQL crate 存在，但没有进入运行时主链路；v2 bridge 会先明确返回 unsupported。
 
 建议：
 
-- 继续把 `MySqlFrontendProtocol`、`MySqlBackendConnector` 接到 core trait。
-- 继续让 `GatewayRuntime` 由 listener 配置选择 frontend adapter，并只依赖 core 层命令、响应和 session 模型。
+- 继续把 legacy MySQL accept loop 迁到 v2 runtime bridge。
+- 继续让 `GatewayRuntime` 只依赖 core 层命令、响应和 session 模型。
 
 ### 2. `GatewayFactory` 还没有按 v2 拓扑构建 runtime
 

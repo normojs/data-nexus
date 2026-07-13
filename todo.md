@@ -39,8 +39,8 @@
 - [x] 新增 `GatewayRuntime` 运行时入口（当前内部仍复用迁移中的 MySQL 主链路）。
 - [ ] 让 `GatewayRuntime` 只依赖 `GatewayCommand`、`GatewayResponse`、`SessionState` 等 core 类型。
 - [x] 让 `PisaProxyFactory` 演进为 `GatewayFactory`。
-- [ ] 根据 `listener.protocol` 构建对应 frontend adapter。
-- [ ] 根据 `service.backend_protocol` 构建对应 backend connector。
+- [x] 根据 `listener.protocol` 构建对应 frontend adapter。
+- [x] 根据 `service.backend_protocol` 构建对应 backend connector。
 - [ ] 保持现有 MySQL 代理功能行为不变。
 - [x] 不保留旧 MySQL example config 的启动兼容，后续只支持 v2 Gateway 配置。
 - [ ] 补齐 runtime shutdown handle，避免 `stop()` 空实现。

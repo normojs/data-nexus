@@ -970,12 +970,8 @@ where
 #[async_trait]
 impl<T, C> BackendConnector for MySqlBackendConnector<T, C>
 where
-    T: AsyncRead + AsyncWrite + Unpin + Send + Sync,
-    C: Decoder<Item = BytesMut>
-        + Encoder<PacketSend<Box<[u8]>>, Error = ProtocolError>
-        + Send
-        + Sync
-        + CommonPacket,
+    T: Send + Sync,
+    C: Send + Sync,
 {
     fn protocol(&self) -> ProtocolKind {
         ProtocolKind::MySql
