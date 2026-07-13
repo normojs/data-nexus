@@ -46,7 +46,6 @@
 
 ## Phase 2：PostgreSQL 同协议中转
 
-- [ ] 实现 PostgreSQL response encode。
 - [ ] 实现 PostgreSQL backend connector。
 - [ ] 支持 PostgreSQL 后端连接池。
 - [ ] 支持 PostgreSQL simple query 基础链路。

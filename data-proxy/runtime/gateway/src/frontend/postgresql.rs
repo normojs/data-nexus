@@ -1,11 +1,12 @@
 use gateway_core::{
-    FrontendProtocolAdapter, GatewayCommand, GatewayError, GatewayResponse, GatewayResult,
-    ProtocolKind, SessionState, TransactionState,
+    Column as GatewayColumn, FrontendProtocolAdapter, GatewayCommand, GatewayError,
+    GatewayResponse, GatewayResult, GatewayValue, ProtocolKind, SessionState, TransactionState,
 };
 use postgresql_protocol::{
     decode_frontend_message, decode_startup_packet, encode_authentication_ok,
-    encode_backend_key_data, encode_parameter_status, encode_ready_for_query, FrontendMessage,
-    StartupMessage, StartupPacket, TransactionStatus, MAX_STARTUP_PACKET_LEN,
+    encode_backend_key_data, encode_command_complete, encode_data_row, encode_error_response,
+    encode_parameter_status, encode_ready_for_query, encode_row_description, FieldDescription,
+    FrontendMessage, StartupMessage, StartupPacket, TransactionStatus, MAX_STARTUP_PACKET_LEN,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -87,10 +88,25 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
 
     fn encode(
         &mut self,
-        _response: GatewayResponse,
-        _session: &SessionState,
+        response: GatewayResponse,
+        session: &SessionState,
     ) -> GatewayResult<Vec<Vec<u8>>> {
-        Err(GatewayError::Unsupported("postgresql response encoding is not implemented yet".into()))
+        let ready = encode_ready_for_query(transaction_status(session));
+        match response {
+            GatewayResponse::Ok { affected_rows, .. } => {
+                Ok(vec![encode_command_complete(&format!("OK {}", affected_rows)), ready])
+            }
+            GatewayResponse::Pong => Ok(vec![encode_command_complete("SELECT 1"), ready]),
+            GatewayResponse::Bye => Ok(vec![]),
+            GatewayResponse::Error { code, message } => Ok(vec![
+                encode_error_response("ERROR", postgresql_sqlstate(&code), &message),
+                ready,
+            ]),
+            GatewayResponse::ResultSet { columns, rows } => encode_resultset(columns, rows, ready),
+            GatewayResponse::Prepared { .. } => Err(GatewayError::Unsupported(
+                "postgresql prepared response encoding is not implemented yet".into(),
+            )),
+        }
     }
 }
 
@@ -178,6 +194,93 @@ fn decode_query_command(sql: String, session: &mut SessionState) -> GatewayComma
             GatewayCommand::Rollback
         }
         _ => GatewayCommand::Query { sql },
+    }
+}
+
+fn encode_resultset(
+    columns: Vec<GatewayColumn>,
+    rows: Vec<Vec<GatewayValue>>,
+    ready: Vec<u8>,
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let fields = columns.iter().map(gateway_column_to_postgresql_field).collect::<Vec<_>>();
+    let mut messages = Vec::with_capacity(rows.len() + 3);
+    messages.push(encode_row_description(&fields).map_err(postgresql_protocol_error)?);
+
+    for row in &rows {
+        if row.len() != columns.len() {
+            return Err(GatewayError::Protocol(format!(
+                "postgresql resultset row has {} values for {} columns",
+                row.len(),
+                columns.len()
+            )));
+        }
+
+        let values = row.iter().map(gateway_value_to_text).collect::<Vec<_>>();
+        messages.push(encode_data_row(&values).map_err(postgresql_protocol_error)?);
+    }
+
+    messages.push(encode_command_complete(&format!("SELECT {}", rows.len())));
+    messages.push(ready);
+    Ok(messages)
+}
+
+fn gateway_column_to_postgresql_field(column: &GatewayColumn) -> FieldDescription {
+    let (type_oid, type_size) = postgresql_type_info(&column.data_type);
+    FieldDescription {
+        name: column.name.clone(),
+        type_oid,
+        type_size,
+        type_modifier: -1,
+        format_code: 0,
+    }
+}
+
+fn postgresql_type_info(data_type: &str) -> (i32, i16) {
+    match data_type.to_ascii_lowercase().as_str() {
+        "bool" | "boolean" => (16, 1),
+        "int2" | "smallint" => (21, 2),
+        "int" | "int4" | "integer" => (23, 4),
+        "int8" | "bigint" => (20, 8),
+        "float4" | "real" => (700, 4),
+        "float8" | "double" | "double precision" => (701, 8),
+        "numeric" | "decimal" => (1700, -1),
+        "date" => (1082, 4),
+        "time" => (1083, 8),
+        "timestamp" => (1114, 8),
+        "timestamptz" => (1184, 8),
+        "bytea" | "bytes" | "binary" | "varbinary" => (17, -1),
+        "varchar" | "char" | "bpchar" => (1043, -1),
+        _ => (25, -1),
+    }
+}
+
+fn gateway_value_to_text(value: &GatewayValue) -> Option<Vec<u8>> {
+    match value {
+        GatewayValue::Null => None,
+        GatewayValue::Boolean(value) => Some(if *value { b"t".to_vec() } else { b"f".to_vec() }),
+        GatewayValue::Integer(value) => Some(value.to_string().into_bytes()),
+        GatewayValue::UnsignedInteger(value) => Some(value.to_string().into_bytes()),
+        GatewayValue::Float(value) => Some(value.to_string().into_bytes()),
+        GatewayValue::Decimal(value) | GatewayValue::String(value) => {
+            Some(value.as_bytes().to_vec())
+        }
+        GatewayValue::Bytes(value) => Some(value.clone()),
+    }
+}
+
+fn transaction_status(session: &SessionState) -> TransactionStatus {
+    match session.transaction_state {
+        TransactionState::Idle => TransactionStatus::Idle,
+        TransactionState::Active => TransactionStatus::InTransaction,
+        TransactionState::Failed => TransactionStatus::Failed,
+    }
+}
+
+fn postgresql_sqlstate(code: &str) -> &str {
+    if code.len() == 5 && code.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        code
+    } else {
+        "XX000"
     }
 }
 
@@ -280,6 +383,84 @@ mod tests {
             Ok(vec![GatewayCommand::Quit])
         );
         assert_eq!(protocol.decode(&encode_sync_message(), &mut session), Ok(vec![]));
+    }
+
+    #[test]
+    fn encodes_ok_error_and_bye_responses() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState::default();
+
+        assert_eq!(
+            protocol
+                .encode(GatewayResponse::Ok { affected_rows: 3, last_insert_id: None }, &session),
+            Ok(vec![
+                encode_command_complete("OK 3"),
+                encode_ready_for_query(TransactionStatus::Idle)
+            ])
+        );
+
+        let error = protocol
+            .encode(
+                GatewayResponse::Error { code: "23505".into(), message: "duplicate".into() },
+                &session,
+            )
+            .unwrap();
+        assert_eq!(error.len(), 2);
+        assert_eq!(error[0][0], b'E');
+        assert!(error[0].windows(b"C23505\0".len()).any(|window| window == b"C23505\0"));
+        assert_eq!(error[1], encode_ready_for_query(TransactionStatus::Idle));
+
+        assert_eq!(protocol.encode(GatewayResponse::Bye, &session), Ok(vec![]));
+    }
+
+    #[test]
+    fn encodes_resultset_response() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState::default();
+
+        let packets = protocol
+            .encode(
+                GatewayResponse::ResultSet {
+                    columns: vec![
+                        GatewayColumn { name: "id".into(), data_type: "int".into() },
+                        GatewayColumn { name: "name".into(), data_type: "text".into() },
+                    ],
+                    rows: vec![
+                        vec![GatewayValue::Integer(42), GatewayValue::String("Ada".into())],
+                        vec![GatewayValue::Integer(43), GatewayValue::Null],
+                    ],
+                },
+                &session,
+            )
+            .unwrap();
+
+        assert_eq!(packets.len(), 5);
+        assert_eq!(packets[0][0], b'T');
+        assert_eq!(
+            packets[1],
+            encode_data_row(&[Some(b"42".to_vec()), Some(b"Ada".to_vec())]).unwrap()
+        );
+        assert_eq!(packets[2], encode_data_row(&[Some(b"43".to_vec()), None]).unwrap());
+        assert_eq!(packets[3], encode_command_complete("SELECT 2"));
+        assert_eq!(packets[4], encode_ready_for_query(TransactionStatus::Idle));
+    }
+
+    #[test]
+    fn rejects_resultset_rows_with_wrong_width() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState::default();
+
+        let result = protocol.encode(
+            GatewayResponse::ResultSet {
+                columns: vec![GatewayColumn { name: "id".into(), data_type: "int".into() }],
+                rows: vec![vec![]],
+            },
+            &session,
+        );
+
+        assert!(
+            matches!(result, Err(GatewayError::Protocol(message)) if message.contains("row has 0 values"))
+        );
     }
 
     async fn read_until_ready_for_query(
