@@ -93,7 +93,7 @@ pub async fn handle_gateway_frame(
             }
         };
 
-        packets.push(frontend.encode(response, session)?);
+        packets.extend(frontend.encode(response, session)?);
     }
 
     Ok(packets)

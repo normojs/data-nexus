@@ -25,7 +25,7 @@ pub trait FrontendProtocolAdapter: Send {
         &mut self,
         response: GatewayResponse,
         session: &SessionState,
-    ) -> GatewayResult<Vec<u8>>;
+    ) -> GatewayResult<Vec<Vec<u8>>>;
 }
 
 /// Executes neutral gateway messages against one backend database protocol.

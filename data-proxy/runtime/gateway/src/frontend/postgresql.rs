@@ -161,8 +161,8 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
         &mut self,
         response: GatewayResponse,
         session: &SessionState,
-    ) -> GatewayResult<Vec<u8>> {
-        match response {
+    ) -> GatewayResult<Vec<Vec<u8>>> {
+        let frame = match response {
             GatewayResponse::Ok { affected_rows, .. } => {
                 let mut out = encode_command_complete(&format!("OK {}", affected_rows));
                 out.extend_from_slice(&encode_ready_for_query(session));
@@ -192,7 +192,9 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             GatewayResponse::Prepared { .. } => Err(GatewayError::Unsupported(
                 "postgresql prepared response encoding is not implemented yet".into(),
             )),
-        }
+        }?;
+
+        Ok(if frame.is_empty() { Vec::new() } else { vec![frame] })
     }
 }
 
@@ -670,7 +672,7 @@ mod tests {
 
         let mut expected = message(b'C', b"OK 3\0");
         expected.extend_from_slice(&message(b'Z', b"I"));
-        assert_eq!(encoded, Ok(expected));
+        assert_eq!(encoded, Ok(vec![expected]));
     }
 
     #[test]
@@ -685,7 +687,7 @@ mod tests {
 
         let mut expected = message(b'E', b"SERROR\0CXX000\0Mboom\0\0");
         expected.extend_from_slice(&message(b'Z', b"I"));
-        assert_eq!(encoded, Ok(expected));
+        assert_eq!(encoded, Ok(vec![expected]));
     }
 
     #[test]
@@ -698,7 +700,7 @@ mod tests {
 
         let mut expected = message(b'C', b"PONG\0");
         expected.extend_from_slice(&message(b'Z', b"T"));
-        assert_eq!(encoded, Ok(expected));
+        assert_eq!(encoded, Ok(vec![expected]));
     }
 
     #[test]
@@ -766,7 +768,7 @@ mod tests {
         expected.extend_from_slice(&message(b'D', &second_row));
         expected.extend_from_slice(&message(b'C', b"SELECT 2\0"));
         expected.extend_from_slice(&message(b'Z', b"I"));
-        assert_eq!(encoded, Ok(expected));
+        assert_eq!(encoded, Ok(vec![expected]));
     }
 
     fn push_test_column(payload: &mut Vec<u8>, name: &str, type_oid: i32, type_size: i16) {
