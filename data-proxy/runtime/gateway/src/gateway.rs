@@ -21,7 +21,9 @@ use std::{
 use common::ast_cache::ParserAstCache;
 use conn_pool::Pool;
 use endpoint::endpoint::Endpoint;
-use gateway_core::{EndpointConfig, GatewayConfig, GatewayError, GatewayResult, ProtocolKind};
+use gateway_core::{
+    EndpointConfig, EndpointRole, GatewayConfig, GatewayError, GatewayResult, ProtocolKind,
+};
 use indexmap::IndexMap;
 use loadbalance::balance::{AlgorithmName, Balance, LoadBalance};
 use mysql_parser::parser::Parser;
@@ -39,7 +41,10 @@ use proxy::{
     proxy::{Proxy, ProxyConfig, UniSQLNode},
 };
 use strategy::{
-    config::{NodeGroup, TargetRole},
+    config::{
+        GenericRule, NodeGroup, ReadWriteSplitting, ReadWriteSplittingRule,
+        ReadWriteSplittingStatic, TargetRole,
+    },
     readwritesplitting::ReadWriteEndpoint,
     route::RouteStrategy,
     sharding_rewrite::{ShardingRewrite, ShardingRewriteOutput},
@@ -536,6 +541,12 @@ fn legacy_proxy_config_from_core_plan(
         )));
     }
 
+    let read_write_splitting = if is_read_write_splitting_policy(plan.route_policy_kind()) {
+        Some(default_read_write_splitting())
+    } else {
+        None
+    };
+
     Ok(ProxyConfig {
         name: plan.listener().name.clone(),
         node_type: protocol_name(&plan.listener().protocol).into(),
@@ -551,8 +562,35 @@ fn legacy_proxy_config_from_core_plan(
             balance_type: simple_load_balance_algorithm_name(plan.route_policy_kind()),
             nodes: plan.endpoints().iter().map(|endpoint| endpoint.name.clone()).collect(),
         }),
+        read_write_splitting,
         ..ProxyConfig::default()
     })
+}
+
+fn default_read_write_splitting() -> ReadWriteSplitting {
+    ReadWriteSplitting {
+        statics: Some(ReadWriteSplittingStatic {
+            default_target: TargetRole::ReadWrite,
+            rules: vec![ReadWriteSplittingRule::Generic(GenericRule {
+                name: "generic-read-write".into(),
+                rule_type: "generic".into(),
+                algorithm_name: AlgorithmName::Random,
+                node_group_name: vec![],
+            })],
+        }),
+        dynamic: None,
+    }
+}
+
+fn is_read_write_splitting_policy(kind: Option<&str>) -> bool {
+    matches!(kind.map(normalize_policy_kind).as_deref(), Some("readwritesplitting"))
+}
+
+fn normalize_policy_kind(kind: &str) -> String {
+    kind.chars()
+        .filter(|char| *char != '_' && *char != '-')
+        .flat_map(|char| char.to_lowercase())
+        .collect()
 }
 
 fn simple_load_balance_algorithm_name(kind: Option<&str>) -> AlgorithmName {
@@ -581,8 +619,15 @@ fn legacy_node_from_endpoint(endpoint: &EndpointConfig) -> GatewayResult<UniSQLN
         host,
         port,
         weight: endpoint.weight as i64,
-        role: TargetRole::ReadWrite,
+        role: target_role_from_endpoint_role(&endpoint.role),
     })
+}
+
+fn target_role_from_endpoint_role(role: &EndpointRole) -> TargetRole {
+    match role {
+        EndpointRole::Read => TargetRole::Read,
+        EndpointRole::ReadWrite => TargetRole::ReadWrite,
+    }
 }
 
 fn parse_endpoint_address(address: &str) -> GatewayResult<(String, u32)> {
@@ -877,7 +922,7 @@ mod tests {
     use std::time::Duration;
 
     use gateway_core::{
-        EndpointConfig, GatewayConfig, ListenerConfig, ProtocolKind, ServiceConfig,
+        EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig, ProtocolKind, ServiceConfig,
     };
     use proxy::factory::Proxy as _;
 
@@ -904,6 +949,7 @@ mod tests {
                 protocol: ProtocolKind::MySql,
                 address: "127.0.0.1:3306".into(),
                 database: Some("orders_db".into()),
+                role: EndpointRole::ReadWrite,
                 username: "root".into(),
                 password: "backend-secret".into(),
                 weight: 1,
@@ -933,6 +979,7 @@ mod tests {
                 protocol: ProtocolKind::PostgreSql,
                 address: "127.0.0.1:5432".into(),
                 database: Some("analytics_db".into()),
+                role: EndpointRole::ReadWrite,
                 username: "postgres".into(),
                 password: "backend-secret".into(),
                 weight: 1,
@@ -985,6 +1032,62 @@ mod tests {
             runtime.proxy_config.simple_loadbalance.as_ref().unwrap().balance_type,
             AlgorithmName::RoundRobin
         ));
+    }
+
+    #[test]
+    fn derives_legacy_read_write_splitting_from_v2_route_policy() {
+        let mut config = mysql_config();
+        config.services[0].route_policy = Some("orders-read-write".into());
+        config.services[0].endpoints.push("orders-replica".into());
+        config.endpoints.push(EndpointConfig {
+            name: "orders-replica".into(),
+            protocol: ProtocolKind::MySql,
+            address: "127.0.0.1:3307".into(),
+            database: Some("orders_db".into()),
+            role: EndpointRole::Read,
+            username: "root".into(),
+            password: "backend-secret".into(),
+            weight: 1,
+        });
+        config.route_policies = vec![gateway_core::RoutePolicyConfig {
+            name: "orders-read-write".into(),
+            kind: "read_write_splitting".into(),
+        }];
+
+        let runtime = GatewayRuntime::from_core_config(&config).unwrap();
+        let read_write_splitting = runtime.proxy_config.read_write_splitting.as_ref().unwrap();
+        let statics = read_write_splitting.statics.as_ref().unwrap();
+
+        assert_eq!(statics.default_target, TargetRole::ReadWrite);
+        assert!(matches!(
+            statics.rules.first(),
+            Some(ReadWriteSplittingRule::Generic(rule))
+                if matches!(&rule.algorithm_name, AlgorithmName::Random)
+        ));
+        assert!(runtime.build_route().is_ok());
+    }
+
+    #[test]
+    fn derives_legacy_endpoint_roles_from_v2_config() {
+        let mut config = mysql_config();
+        config.services[0].endpoints.push("orders-replica".into());
+        config.endpoints.push(EndpointConfig {
+            name: "orders-replica".into(),
+            protocol: ProtocolKind::MySql,
+            address: "127.0.0.1:3307".into(),
+            database: Some("orders_db".into()),
+            role: EndpointRole::Read,
+            username: "root".into(),
+            password: "backend-secret".into(),
+            weight: 1,
+        });
+
+        let runtime = GatewayRuntime::from_core_config(&config).unwrap();
+
+        let primary = runtime.nodes.iter().find(|node| node.name == "orders-primary").unwrap();
+        let replica = runtime.nodes.iter().find(|node| node.name == "orders-replica").unwrap();
+        assert_eq!(primary.role, TargetRole::ReadWrite);
+        assert_eq!(replica.role, TargetRole::Read);
     }
 
     #[test]

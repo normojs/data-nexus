@@ -29,10 +29,25 @@ pub struct EndpointConfig {
     pub address: String,
     pub database: Option<String>,
     #[serde(default)]
+    pub role: EndpointRole,
+    #[serde(default)]
     pub username: String,
     #[serde(default)]
     pub password: String,
     pub weight: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointRole {
+    Read,
+    ReadWrite,
+}
+
+impl Default for EndpointRole {
+    fn default() -> Self {
+        Self::ReadWrite
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +217,7 @@ mod tests {
                 protocol: ProtocolKind::MySql,
                 address: "127.0.0.1:3306".into(),
                 database: Some("orders".into()),
+                role: EndpointRole::ReadWrite,
                 username: "app".into(),
                 password: "secret".into(),
                 weight: 1,

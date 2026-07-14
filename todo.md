@@ -54,7 +54,7 @@
 ## Phase 3：治理能力协议无关化
 
 - [x] 将 simple load balance 改为协议无关。
-- [ ] 将读写分离 route policy 改为协议无关。
+- [x] 将读写分离 route policy 改为协议无关。
 - [ ] 将并发控制插件改为基于 `PluginContext`。
 - [ ] 将熔断插件改为基于 `PluginContext`。
 - [ ] 定义 `PluginDecision`，支持 continue、reject、rewrite。

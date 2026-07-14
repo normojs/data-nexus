@@ -232,7 +232,7 @@ pub async fn start_gateway_server(mut s: Box<dyn proxy::factory::Proxy + Send>) 
 #[cfg(test)]
 mod tests {
     use config::config::GatewayConfigDocument;
-    use gateway_core::{EndpointConfig, ListenerConfig, ProtocolKind, ServiceConfig};
+    use gateway_core::{EndpointConfig, EndpointRole, ListenerConfig, ProtocolKind, ServiceConfig};
 
     use super::*;
 
@@ -262,6 +262,7 @@ mod tests {
             protocol: ProtocolKind::PostgreSql,
             address: "127.0.0.1:5432".into(),
             database: Some("analytics".into()),
+            role: EndpointRole::ReadWrite,
             username: "postgres".into(),
             password: "secret".into(),
             weight: 1,

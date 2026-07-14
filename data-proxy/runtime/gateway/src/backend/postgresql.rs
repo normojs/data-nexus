@@ -3,8 +3,9 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool};
 use gateway_core::{
-    BackendConnector, Column as GatewayColumn, EndpointConfig, GatewayCommand, GatewayError,
-    GatewayResponse, GatewayResult, GatewayValue, ProtocolKind, SessionState, TransactionState,
+    BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, GatewayCommand,
+    GatewayError, GatewayResponse, GatewayResult, GatewayValue, ProtocolKind, SessionState,
+    TransactionState,
 };
 use parking_lot::Mutex;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
@@ -167,6 +168,7 @@ impl Default for PostgreSqlBackendConnection {
                 protocol: ProtocolKind::PostgreSql,
                 address: String::new(),
                 database: None,
+                role: EndpointRole::ReadWrite,
                 username: String::new(),
                 password: String::new(),
                 weight: 0,
@@ -433,6 +435,7 @@ mod tests {
             protocol: ProtocolKind::PostgreSql,
             address: "127.0.0.1:5432".into(),
             database: Some("analytics".into()),
+            role: EndpointRole::ReadWrite,
             username: "postgres".into(),
             password: "secret".into(),
             weight: 1,

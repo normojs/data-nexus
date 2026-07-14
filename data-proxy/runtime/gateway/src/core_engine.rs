@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
-    BackendConnector, EndpointConfig, FrontendProtocolAdapter, GatewayConfig, GatewayError,
-    GatewayResponse, GatewayResult, ListenerConfig, ProtocolKind, ServiceConfig, SessionState,
+    BackendConnector, EndpointConfig, EndpointRole, FrontendProtocolAdapter, GatewayCommand,
+    GatewayConfig, GatewayError, GatewayResponse, GatewayResult, ListenerConfig, ProtocolKind,
+    ServiceConfig, SessionState, TransactionState,
 };
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use parking_lot::Mutex;
@@ -37,6 +38,7 @@ pub struct CoreGatewayConnection {
     frontend: Box<dyn FrontendProtocolAdapter>,
     backend: Arc<dyn BackendConnector>,
     session: SessionState,
+    route_policy: Option<CoreRoutePolicy>,
 }
 
 impl CoreGatewayConnection {
@@ -45,7 +47,16 @@ impl CoreGatewayConnection {
         backend: Arc<dyn BackendConnector>,
         session: SessionState,
     ) -> Self {
-        Self { frontend, backend, session }
+        Self { frontend, backend, session, route_policy: None }
+    }
+
+    fn with_route_policy(
+        frontend: Box<dyn FrontendProtocolAdapter>,
+        backend: Arc<dyn BackendConnector>,
+        session: SessionState,
+        route_policy: CoreRoutePolicy,
+    ) -> Self {
+        Self { frontend, backend, session, route_policy: Some(route_policy) }
     }
 
     pub fn frontend_protocol(&self) -> ProtocolKind {
@@ -65,13 +76,26 @@ impl CoreGatewayConnection {
     }
 
     pub async fn handle_frame(&mut self, frame: &[u8]) -> GatewayResult<Vec<Vec<u8>>> {
-        handle_gateway_frame(
-            self.frontend.as_mut(),
-            self.backend.as_ref(),
-            &mut self.session,
-            frame,
-        )
-        .await
+        let commands = self.frontend.decode(frame, &mut self.session)?;
+        let mut packets = Vec::with_capacity(commands.len());
+
+        for command in commands {
+            if let Some(route_policy) = &self.route_policy {
+                route_policy.route_command(&command, &mut self.session)?;
+            }
+
+            let response = match self.backend.execute(command, &mut self.session).await {
+                Ok(response) => response,
+                Err(error) => GatewayResponse::Error {
+                    code: "gateway_error".into(),
+                    message: error.to_string(),
+                },
+            };
+
+            packets.extend(self.frontend.encode(response, &mut self.session)?);
+        }
+
+        Ok(packets)
     }
 }
 
@@ -148,7 +172,7 @@ pub struct CoreGatewayListenerPlan {
     service: ServiceConfig,
     endpoints: Vec<EndpointConfig>,
     route_policy_kind: Option<String>,
-    simple_balancer: Option<Arc<Mutex<BalanceType>>>,
+    route_policy: CoreRoutePolicy,
 }
 
 impl PartialEq for CoreGatewayListenerPlan {
@@ -208,14 +232,14 @@ impl CoreGatewayListenerPlan {
             }
             None => None,
         };
-        let simple_balancer = build_simple_balancer(route_policy_kind.as_deref(), &endpoints);
+        let route_policy = CoreRoutePolicy::build(route_policy_kind.as_deref(), endpoints.clone())?;
 
         Ok(Self {
             listener: listener.clone(),
             service: service.clone(),
             endpoints,
             route_policy_kind,
-            simple_balancer,
+            route_policy,
         })
     }
 
@@ -240,53 +264,185 @@ impl CoreGatewayListenerPlan {
     }
 
     pub fn build_connection(&self) -> GatewayResult<CoreGatewayConnection> {
-        let endpoint = self.select_endpoint()?;
+        let endpoint = self.route_policy.select_initial_endpoint()?;
         let database = endpoint.database.clone();
         let frontend = build_frontend_protocol(&self.listener, database.clone())?;
-        let backend = build_backend_connector(&self.service, &[endpoint.clone()])?;
+        let backend = build_backend_connector(&self.service, &self.endpoints)?;
         let session = SessionState {
             database,
             backend_endpoint: Some(endpoint.name),
             ..SessionState::default()
         };
 
-        Ok(CoreGatewayConnection::new(frontend, backend, session))
+        Ok(CoreGatewayConnection::with_route_policy(
+            frontend,
+            backend,
+            session,
+            self.route_policy.clone(),
+        ))
     }
 
     pub fn select_endpoint(&self) -> GatewayResult<EndpointConfig> {
-        if let Some(balancer) = &self.simple_balancer {
-            let selected = balancer.lock().next();
-            if let Some(selected) = selected {
-                if let Some(endpoint) =
-                    self.endpoints.iter().find(|endpoint| endpoint.name == selected.name)
-                {
-                    return Ok(endpoint.clone());
-                }
+        self.route_policy.select_initial_endpoint()
+    }
+}
 
-                return Err(GatewayError::Configuration(format!(
-                    "route policy selected missing endpoint '{}'",
-                    selected.name
-                )));
-            }
+#[derive(Debug, Clone)]
+struct CoreRoutePolicy {
+    endpoints: Vec<EndpointConfig>,
+    kind: CoreRoutePolicyKind,
+}
+
+#[derive(Debug, Clone)]
+enum CoreRoutePolicyKind {
+    First,
+    Simple {
+        balancer: Arc<Mutex<BalanceType>>,
+    },
+    ReadWrite {
+        read_balancer: Arc<Mutex<BalanceType>>,
+        readwrite_balancer: Arc<Mutex<BalanceType>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteTargetRole {
+    Read,
+    ReadWrite,
+}
+
+impl CoreRoutePolicy {
+    fn build(
+        route_policy_kind: Option<&str>,
+        endpoints: Vec<EndpointConfig>,
+    ) -> GatewayResult<Self> {
+        let kind = if is_read_write_splitting_policy(route_policy_kind) {
+            CoreRoutePolicyKind::build_read_write(&endpoints)?
+        } else if let Some(algorithm) = route_policy_kind.and_then(simple_load_balance_algorithm) {
+            CoreRoutePolicyKind::Simple { balancer: build_balancer(algorithm, &endpoints) }
+        } else {
+            CoreRoutePolicyKind::First
+        };
+
+        Ok(Self { endpoints, kind })
+    }
+
+    fn select_initial_endpoint(&self) -> GatewayResult<EndpointConfig> {
+        self.select_for_role(RouteTargetRole::ReadWrite)
+    }
+
+    fn route_command(
+        &self,
+        command: &GatewayCommand,
+        session: &mut SessionState,
+    ) -> GatewayResult<()> {
+        if matches!(self.kind, CoreRoutePolicyKind::First | CoreRoutePolicyKind::Simple { .. })
+            && session.backend_endpoint.is_some()
+        {
+            return Ok(());
         }
 
-        self.endpoints.first().cloned().ok_or_else(|| {
-            GatewayError::Configuration(format!("service '{}' has no endpoints", self.service.name))
+        let endpoint = self.select_for_role(command_target_role(command, session))?;
+        session.backend_endpoint = Some(endpoint.name);
+        if session.database.is_none() {
+            session.database = endpoint.database;
+        }
+        Ok(())
+    }
+
+    fn select_for_role(&self, target_role: RouteTargetRole) -> GatewayResult<EndpointConfig> {
+        match &self.kind {
+            CoreRoutePolicyKind::First => self.first_endpoint(),
+            CoreRoutePolicyKind::Simple { balancer } => self.select_from_balancer(balancer),
+            CoreRoutePolicyKind::ReadWrite { read_balancer, readwrite_balancer } => {
+                let balancer = match target_role {
+                    RouteTargetRole::Read => read_balancer,
+                    RouteTargetRole::ReadWrite => readwrite_balancer,
+                };
+                self.select_from_balancer(balancer)
+            }
+        }
+    }
+
+    fn first_endpoint(&self) -> GatewayResult<EndpointConfig> {
+        self.endpoints
+            .first()
+            .cloned()
+            .ok_or_else(|| GatewayError::Configuration("service has no endpoints".into()))
+    }
+
+    fn select_from_balancer(
+        &self,
+        balancer: &Arc<Mutex<BalanceType>>,
+    ) -> GatewayResult<EndpointConfig> {
+        let selected = balancer.lock().next();
+        if let Some(selected) = selected {
+            if let Some(endpoint) =
+                self.endpoints.iter().find(|endpoint| endpoint.name == selected.name)
+            {
+                return Ok(endpoint.clone());
+            }
+
+            return Err(GatewayError::Configuration(format!(
+                "route policy selected missing endpoint '{}'",
+                selected.name
+            )));
+        }
+
+        self.first_endpoint()
+    }
+}
+
+impl CoreRoutePolicyKind {
+    fn build_read_write(endpoints: &[EndpointConfig]) -> GatewayResult<Self> {
+        let read_endpoints = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.role == EndpointRole::Read)
+            .cloned()
+            .collect::<Vec<_>>();
+        let readwrite_endpoints = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.role == EndpointRole::ReadWrite)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if readwrite_endpoints.is_empty() {
+            return Err(GatewayError::Configuration(
+                "read_write_splitting route policy requires at least one readwrite endpoint".into(),
+            ));
+        }
+
+        let read_targets =
+            if read_endpoints.is_empty() { &readwrite_endpoints } else { &read_endpoints };
+
+        Ok(CoreRoutePolicyKind::ReadWrite {
+            read_balancer: build_balancer(AlgorithmName::Random, read_targets),
+            readwrite_balancer: build_balancer(AlgorithmName::Random, &readwrite_endpoints),
         })
     }
 }
 
-fn build_simple_balancer(
-    route_policy_kind: Option<&str>,
+fn build_balancer(
+    algorithm: AlgorithmName,
     endpoints: &[EndpointConfig],
-) -> Option<Arc<Mutex<BalanceType>>> {
-    let algorithm = simple_load_balance_algorithm(route_policy_kind?)?;
+) -> Arc<Mutex<BalanceType>> {
     let mut builder = Balance {};
     let mut balancer = builder.build_balance(algorithm);
     for endpoint in endpoints {
         balancer.add(load_balance_endpoint(endpoint));
     }
-    Some(Arc::new(Mutex::new(balancer)))
+    Arc::new(Mutex::new(balancer))
+}
+
+fn is_read_write_splitting_policy(route_policy_kind: Option<&str>) -> bool {
+    matches!(route_policy_kind.map(normalize_policy_kind).as_deref(), Some("readwritesplitting"))
+}
+
+fn normalize_policy_kind(kind: &str) -> String {
+    kind.chars()
+        .filter(|char| *char != '_' && *char != '-')
+        .flat_map(|char| char.to_lowercase())
+        .collect()
 }
 
 fn simple_load_balance_algorithm(kind: &str) -> Option<AlgorithmName> {
@@ -295,6 +451,27 @@ fn simple_load_balance_algorithm(kind: &str) -> Option<AlgorithmName> {
         "round_robin" | "round-robin" | "roundrobin" => Some(AlgorithmName::RoundRobin),
         _ => None,
     }
+}
+
+fn command_target_role(command: &GatewayCommand, session: &SessionState) -> RouteTargetRole {
+    if session.transaction_state == TransactionState::Active {
+        return RouteTargetRole::ReadWrite;
+    }
+
+    match command {
+        GatewayCommand::Query { sql } if is_read_only_sql(sql) => RouteTargetRole::Read,
+        _ => RouteTargetRole::ReadWrite,
+    }
+}
+
+fn is_read_only_sql(sql: &str) -> bool {
+    let sql = sql.trim_start();
+    let upper = sql.to_ascii_uppercase();
+    let first_token = upper.split_whitespace().next().unwrap_or_default().trim_end_matches(';');
+
+    matches!(first_token, "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "WITH" | "VALUES")
+        && !upper.contains(" FOR UPDATE")
+        && !upper.contains(" FOR SHARE")
 }
 
 fn load_balance_endpoint(endpoint: &EndpointConfig) -> Endpoint {
@@ -425,6 +602,7 @@ mod tests {
                 protocol: ProtocolKind::MySql,
                 address: "127.0.0.1:3306".into(),
                 database: Some("orders_db".into()),
+                role: EndpointRole::ReadWrite,
                 username: "root".into(),
                 password: "backend-secret".into(),
                 weight: 1,
@@ -442,6 +620,7 @@ mod tests {
             protocol: ProtocolKind::MySql,
             address: "127.0.0.1:3307".into(),
             database: Some("orders_replica_db".into()),
+            role: EndpointRole::ReadWrite,
             username: "root".into(),
             password: "backend-secret".into(),
             weight: 1,
@@ -449,6 +628,27 @@ mod tests {
         config.route_policies = vec![gateway_core::RoutePolicyConfig {
             name: "orders-balance".into(),
             kind: "round_robin".into(),
+        }];
+        config
+    }
+
+    fn read_write_config() -> GatewayConfig {
+        let mut config = mysql_config();
+        config.services[0].route_policy = Some("orders-read-write".into());
+        config.services[0].endpoints.push("orders-replica".into());
+        config.endpoints.push(EndpointConfig {
+            name: "orders-replica".into(),
+            protocol: ProtocolKind::MySql,
+            address: "127.0.0.1:3307".into(),
+            database: Some("orders_db".into()),
+            role: EndpointRole::Read,
+            username: "root".into(),
+            password: "backend-secret".into(),
+            weight: 1,
+        });
+        config.route_policies = vec![gateway_core::RoutePolicyConfig {
+            name: "orders-read-write".into(),
+            kind: "read_write_splitting".into(),
         }];
         config
     }
@@ -645,5 +845,113 @@ mod tests {
 
         assert_eq!(first.session().backend_endpoint, Some("orders-primary".into()));
         assert_eq!(second.session().backend_endpoint, Some("orders-replica".into()));
+    }
+
+    #[test]
+    fn read_write_route_policy_routes_mysql_gateway_commands_by_role() {
+        let config = read_write_config();
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+        let listener = plan.listener("mysql-listener").unwrap();
+        let mut session = SessionState {
+            database: Some("orders_db".into()),
+            backend_endpoint: Some("orders-primary".into()),
+            ..SessionState::default()
+        };
+
+        listener
+            .route_policy
+            .route_command(
+                &GatewayCommand::Query { sql: "select * from orders".into() },
+                &mut session,
+            )
+            .unwrap();
+        assert_eq!(session.backend_endpoint, Some("orders-replica".into()));
+
+        listener
+            .route_policy
+            .route_command(
+                &GatewayCommand::Query { sql: "insert into orders values (1)".into() },
+                &mut session,
+            )
+            .unwrap();
+        assert_eq!(session.backend_endpoint, Some("orders-primary".into()));
+    }
+
+    #[test]
+    fn read_write_route_policy_routes_postgresql_gateway_commands_by_role() {
+        let mut config = read_write_config();
+        config.listeners[0].name = "postgresql-listener".into();
+        config.listeners[0].listen_addr = "127.0.0.1:5433".into();
+        config.listeners[0].protocol = ProtocolKind::PostgreSql;
+        config.services[0].backend_protocol = ProtocolKind::PostgreSql;
+        for endpoint in &mut config.endpoints {
+            endpoint.protocol = ProtocolKind::PostgreSql;
+        }
+        config.endpoints[0].address = "127.0.0.1:5432".into();
+        config.endpoints[1].address = "127.0.0.1:5434".into();
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+        let listener = plan.listener("postgresql-listener").unwrap();
+        let mut session = SessionState {
+            database: Some("orders_db".into()),
+            backend_endpoint: Some("orders-primary".into()),
+            ..SessionState::default()
+        };
+
+        listener
+            .route_policy
+            .route_command(
+                &GatewayCommand::Query { sql: "select * from orders".into() },
+                &mut session,
+            )
+            .unwrap();
+
+        assert_eq!(session.backend_endpoint, Some("orders-replica".into()));
+    }
+
+    #[test]
+    fn read_write_route_policy_keeps_transactions_on_readwrite_endpoint() {
+        let config = read_write_config();
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+        let listener = plan.listener("mysql-listener").unwrap();
+        let mut session = SessionState {
+            database: Some("orders_db".into()),
+            backend_endpoint: Some("orders-primary".into()),
+            transaction_state: TransactionState::Active,
+            ..SessionState::default()
+        };
+
+        listener
+            .route_policy
+            .route_command(
+                &GatewayCommand::Query { sql: "select * from orders".into() },
+                &mut session,
+            )
+            .unwrap();
+
+        assert_eq!(session.backend_endpoint, Some("orders-primary".into()));
+    }
+
+    #[test]
+    fn read_write_route_policy_falls_back_to_readwrite_when_no_read_endpoint_exists() {
+        let mut config = read_write_config();
+        config.endpoints.retain(|endpoint| endpoint.role == EndpointRole::ReadWrite);
+        config.services[0].endpoints = vec!["orders-primary".into()];
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+        let listener = plan.listener("mysql-listener").unwrap();
+        let mut session = SessionState {
+            database: Some("orders_db".into()),
+            backend_endpoint: Some("orders-primary".into()),
+            ..SessionState::default()
+        };
+
+        listener
+            .route_policy
+            .route_command(
+                &GatewayCommand::Query { sql: "select * from orders".into() },
+                &mut session,
+            )
+            .unwrap();
+
+        assert_eq!(session.backend_endpoint, Some("orders-primary".into()));
     }
 }
