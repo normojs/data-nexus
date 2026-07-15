@@ -70,10 +70,10 @@ M3  受控跨协议（可选）
 
 ### M0.2 会话与连接
 
-- [ ] 连接池按 `EndpointConfig` 建池，不经 `UniSQLNode` 转换（可先 bridge，再删）
-- [ ] session：user / database / charset(或 client_encoding) / autocommit / transaction 在 frontend 与 core `SessionState` 间双向同步
-- [ ] 事务：同连接绑定（事务中禁止切 endpoint），BEGIN/COMMIT/ROLLBACK 走 `GatewayCommand`
-- [ ] `TransFsm` 去掉对 `mysql_protocol::SessionAttr` 的直接依赖（FSM 只看 `SessionState` + 连接租约）
+- [x] MySQL/PG backend 连接池按 `EndpointConfig` 建池（core 路径；runtime 仍可能 bridge UniSQLNode）
+- [x] session：core accept 路径同步 user/database/charset/autocommit；transaction 走 `SessionState`
+- [x] 事务：BEGIN 延迟到首条语句；同一 `PoolConn` lease 贯穿事务；COMMIT/ROLLBACK 释放
+- [ ] `TransFsm` 去掉对 `mysql_protocol::SessionAttr` 的直接依赖（legacy 路径仍用；core 路径已不依赖）
 
 ### M0.3 配置与示例
 

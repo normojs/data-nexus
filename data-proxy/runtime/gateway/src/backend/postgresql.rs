@@ -1,7 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
-use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool};
+use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool, PoolConn};
 use gateway_core::{
     BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, GatewayCommand,
     GatewayError, GatewayResponse, GatewayResult, GatewayValue, ProtocolKind, SessionState,
@@ -17,6 +17,7 @@ const DEFAULT_POSTGRESQL_POOL_SIZE: usize = 16;
 pub struct PostgreSqlBackendConnector {
     endpoints: Arc<Mutex<Vec<EndpointConfig>>>,
     pool: Pool<PostgreSqlBackendConnection>,
+    txn_lease: Arc<Mutex<Option<PoolConn<PostgreSqlBackendConnection>>>>,
 }
 
 impl Default for PostgreSqlBackendConnector {
@@ -42,11 +43,19 @@ impl PostgreSqlBackendConnector {
             }
         }
 
-        Self { endpoints: Arc::new(Mutex::new(endpoints)), pool }
+        Self {
+            endpoints: Arc::new(Mutex::new(endpoints)),
+            pool,
+            txn_lease: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn endpoints(&self) -> Vec<EndpointConfig> {
         self.endpoints.lock().clone()
+    }
+
+    pub fn has_transaction_lease(&self) -> bool {
+        self.txn_lease.lock().is_some()
     }
 
     fn select_endpoint(&self, session: &SessionState) -> GatewayResult<EndpointConfig> {
@@ -72,17 +81,82 @@ impl PostgreSqlBackendConnector {
         })
     }
 
+    async fn acquire_conn(
+        &self,
+        endpoint: &EndpointConfig,
+        session: &SessionState,
+    ) -> GatewayResult<PoolConn<PostgreSqlBackendConnection>> {
+        let pool_key = self.ensure_pool_factory_for_session(endpoint, session)?;
+        let session_attrs = postgresql_session_attrs(session);
+        self.pool.get_conn_with_endpoint_session(&pool_key, &session_attrs).await
+    }
+
+    async fn execute_on_conn(
+        conn: &PoolConn<PostgreSqlBackendConnection>,
+        sql: &str,
+    ) -> GatewayResult<GatewayResponse> {
+        let messages = conn.simple_query(sql).await?;
+        simple_query_messages_to_gateway_response(messages)
+    }
+
+    async fn take_or_acquire_lease(
+        &self,
+        endpoint: &EndpointConfig,
+        session: &SessionState,
+    ) -> GatewayResult<PoolConn<PostgreSqlBackendConnection>> {
+        if let Some(conn) = self.txn_lease.lock().take() {
+            return Ok(conn);
+        }
+        self.acquire_conn(endpoint, session).await
+    }
+
+    fn store_lease(&self, conn: PoolConn<PostgreSqlBackendConnection>) {
+        *self.txn_lease.lock() = Some(conn);
+    }
+
     async fn execute_simple_query(
         &self,
         endpoint: EndpointConfig,
         sql: &str,
         session: &SessionState,
     ) -> GatewayResult<GatewayResponse> {
-        let pool_key = self.ensure_pool_factory_for_session(&endpoint, session)?;
-        let session_attrs = postgresql_session_attrs(session);
-        let conn = self.pool.get_conn_with_endpoint_session(&pool_key, &session_attrs).await?;
-        let messages = conn.simple_query(sql).await?;
-        simple_query_messages_to_gateway_response(messages)
+        if session.transaction_state == TransactionState::Active {
+            let need_begin = self.txn_lease.lock().is_none();
+            let conn = self.take_or_acquire_lease(&endpoint, session).await?;
+            if need_begin {
+                let begin = Self::execute_on_conn(&conn, "BEGIN").await?;
+                if !matches!(begin, GatewayResponse::Ok { .. }) {
+                    self.store_lease(conn);
+                    return Ok(begin);
+                }
+            }
+            let response = Self::execute_on_conn(&conn, sql).await;
+            self.store_lease(conn);
+            return response;
+        }
+
+        let conn = self.acquire_conn(&endpoint, session).await?;
+        Self::execute_on_conn(&conn, sql).await
+    }
+
+    async fn finish_transaction(&self, sql: &str) -> GatewayResult<GatewayResponse> {
+        let Some(conn) = self.txn_lease.lock().take() else {
+            return Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None });
+        };
+        let response = Self::execute_on_conn(&conn, sql).await;
+        drop(conn);
+        match response {
+            Ok(response @ GatewayResponse::Ok { .. })
+            | Ok(response @ GatewayResponse::ResultSet { .. }) => Ok(response),
+            Ok(GatewayResponse::Error { code, message }) => {
+                Err(GatewayError::Backend(format!("postgresql {}: {}", code, message)))
+            }
+            Ok(other) => Err(GatewayError::Backend(format!(
+                "postgresql control statement unexpected response {:?}",
+                other
+            ))),
+            Err(error) => Err(error),
+        }
     }
 
     fn ensure_pool_factory_for_session(
@@ -115,18 +189,28 @@ impl BackendConnector for PostgreSqlBackendConnector {
     ) -> GatewayResult<GatewayResponse> {
         match command {
             GatewayCommand::Ping => Ok(GatewayResponse::Pong),
-            GatewayCommand::Quit => Ok(GatewayResponse::Bye),
+            GatewayCommand::Quit => {
+                *self.txn_lease.lock() = None;
+                Ok(GatewayResponse::Bye)
+            }
             GatewayCommand::UseDatabase { database } => {
                 session.database = Some(database);
                 Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
             }
             GatewayCommand::Begin => {
+                // Defer backend BEGIN until the first statement leases a connection.
                 session.transaction_state = TransactionState::Active;
                 Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
             }
-            GatewayCommand::Commit | GatewayCommand::Rollback => {
+            GatewayCommand::Commit => {
+                let response = self.finish_transaction("COMMIT").await?;
                 session.transaction_state = TransactionState::Idle;
-                Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
+                Ok(response)
+            }
+            GatewayCommand::Rollback => {
+                let response = self.finish_transaction("ROLLBACK").await?;
+                session.transaction_state = TransactionState::Idle;
+                Ok(response)
             }
             GatewayCommand::Query { sql } => {
                 let endpoint = self.select_endpoint(session)?;

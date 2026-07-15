@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::BytesMut;
-use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool};
+use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool, PoolConn};
 use futures::StreamExt;
 use gateway_core::{
     BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, GatewayCommand,
@@ -26,6 +26,8 @@ const DEFAULT_MYSQL_POOL_SIZE: usize = 16;
 pub struct MySqlBackendConnector {
     endpoints: Arc<Mutex<Vec<EndpointConfig>>>,
     pool: Pool<MySqlBackendConnection>,
+    // Held across BEGIN..COMMIT/ROLLBACK so all statements share one backend conn.
+    txn_lease: Arc<Mutex<Option<PoolConn<MySqlBackendConnection>>>>,
 }
 
 impl Default for MySqlBackendConnector {
@@ -50,11 +52,19 @@ impl MySqlBackendConnector {
             register_endpoint_factory(&pool, endpoint, database);
         }
 
-        Self { endpoints: Arc::new(Mutex::new(endpoints)), pool }
+        Self {
+            endpoints: Arc::new(Mutex::new(endpoints)),
+            pool,
+            txn_lease: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn endpoints(&self) -> Vec<EndpointConfig> {
         self.endpoints.lock().clone()
+    }
+
+    pub fn has_transaction_lease(&self) -> bool {
+        self.txn_lease.lock().is_some()
     }
 
     fn select_endpoint(&self, session: &SessionState) -> GatewayResult<EndpointConfig> {
@@ -80,26 +90,76 @@ impl MySqlBackendConnector {
         })
     }
 
+    async fn acquire_conn(
+        &self,
+        endpoint: &EndpointConfig,
+        session: &SessionState,
+    ) -> GatewayResult<PoolConn<MySqlBackendConnection>> {
+        let pool_key = self.ensure_pool_factory_for_session(endpoint, session)?;
+        let session_attrs = mysql_session_attrs(session);
+        self.pool.get_conn_with_endpoint_session(&pool_key, &session_attrs).await
+    }
+
+    async fn execute_on_conn(
+        conn: &mut PoolConn<MySqlBackendConnection>,
+        sql: &str,
+    ) -> GatewayResult<GatewayResponse> {
+        conn.simple_query(sql).await
+    }
+
+    async fn take_or_acquire_lease(
+        &self,
+        endpoint: &EndpointConfig,
+        session: &SessionState,
+    ) -> GatewayResult<PoolConn<MySqlBackendConnection>> {
+        if let Some(conn) = self.txn_lease.lock().take() {
+            return Ok(conn);
+        }
+        self.acquire_conn(endpoint, session).await
+    }
+
+    fn store_lease(&self, conn: PoolConn<MySqlBackendConnection>) {
+        *self.txn_lease.lock() = Some(conn);
+    }
+
     async fn execute_simple_query(
         &self,
         endpoint: EndpointConfig,
         sql: &str,
         session: &SessionState,
     ) -> GatewayResult<GatewayResponse> {
-        let pool_key = self.ensure_pool_factory_for_session(&endpoint, session)?;
-        let session_attrs = mysql_session_attrs(session);
-        let mut conn =
-            self.pool.get_conn_with_endpoint_session(&pool_key, &session_attrs).await?;
-        conn.simple_query(sql).await
+        if session.transaction_state == TransactionState::Active {
+            let need_begin = self.txn_lease.lock().is_none();
+            let mut conn = self.take_or_acquire_lease(&endpoint, session).await?;
+            if need_begin {
+                let begin = Self::execute_on_conn(&mut conn, "BEGIN").await?;
+                if !matches!(begin, GatewayResponse::Ok { .. }) {
+                    self.store_lease(conn);
+                    return Ok(begin);
+                }
+            }
+            let response = Self::execute_on_conn(&mut conn, sql).await;
+            self.store_lease(conn);
+            return response;
+        }
+
+        let mut conn = self.acquire_conn(&endpoint, session).await?;
+        Self::execute_on_conn(&mut conn, sql).await
     }
 
-    async fn execute_control_sql(
+    async fn finish_transaction(
         &self,
-        endpoint: EndpointConfig,
-        sql: &str,
         session: &SessionState,
+        sql: &str,
     ) -> GatewayResult<GatewayResponse> {
-        match self.execute_simple_query(endpoint, sql, session).await {
+        let Some(mut conn) = self.txn_lease.lock().take() else {
+            // No backend work was done inside the transaction.
+            return Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None });
+        };
+        let _ = session;
+        let response = Self::execute_on_conn(&mut conn, sql).await;
+        drop(conn);
+        match response {
             Ok(response @ GatewayResponse::Ok { .. }) => Ok(response),
             Ok(GatewayResponse::Error { code, message }) => {
                 Err(GatewayError::Backend(format!("mysql {}: {}", code, message)))
@@ -109,6 +169,44 @@ impl MySqlBackendConnector {
                 other
             ))),
             Err(error) => Err(error),
+        }
+    }
+
+    async fn execute_control_sql(
+        &self,
+        endpoint: EndpointConfig,
+        sql: &str,
+        session: &SessionState,
+        keep_lease: bool,
+        release_lease: bool,
+    ) -> GatewayResult<GatewayResponse> {
+        let use_lease = keep_lease || self.txn_lease.lock().is_some();
+        let response = if use_lease {
+            let mut conn = self.take_or_acquire_lease(&endpoint, session).await?;
+            let response = Self::execute_on_conn(&mut conn, sql).await;
+            if release_lease {
+                drop(conn);
+            } else {
+                self.store_lease(conn);
+            }
+            response?
+        } else {
+            self.execute_simple_query(endpoint, sql, session).await?
+        };
+
+        if release_lease {
+            *self.txn_lease.lock() = None;
+        }
+
+        match response {
+            response @ GatewayResponse::Ok { .. } => Ok(response),
+            GatewayResponse::Error { code, message } => {
+                Err(GatewayError::Backend(format!("mysql {}: {}", code, message)))
+            }
+            other => Err(GatewayError::Backend(format!(
+                "mysql control statement expected OK response, got {:?}",
+                other
+            ))),
         }
     }
 
@@ -142,42 +240,43 @@ impl BackendConnector for MySqlBackendConnector {
     ) -> GatewayResult<GatewayResponse> {
         match command {
             GatewayCommand::Ping => Ok(GatewayResponse::Pong),
-            GatewayCommand::Quit => Ok(GatewayResponse::Bye),
-            // Control commands update session first (same as PostgreSQL connector).
-            // When endpoints exist, also push the statement to the selected backend.
+            GatewayCommand::Quit => {
+                *self.txn_lease.lock() = None;
+                Ok(GatewayResponse::Bye)
+            }
             GatewayCommand::UseDatabase { database } => {
-                if let Ok(endpoint) = self.select_endpoint(session) {
-                    let _ = self
-                        .execute_control_sql(
-                            endpoint,
-                            &format!("USE `{}`", database.replace('`', "``")),
-                            session,
-                        )
-                        .await?;
+                // Prefer deferred USE via session attrs when leasing a connection.
+                // If a txn lease is already held, apply immediately on that conn.
+                if self.txn_lease.lock().is_some() {
+                    if let Ok(endpoint) = self.select_endpoint(session) {
+                        let _ = self
+                            .execute_control_sql(
+                                endpoint,
+                                &format!("USE `{}`", database.replace('`', "``")),
+                                session,
+                                true,
+                                false,
+                            )
+                            .await?;
+                    }
                 }
                 session.database = Some(database);
                 Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
             }
             GatewayCommand::Begin => {
-                if let Ok(endpoint) = self.select_endpoint(session) {
-                    let _ = self.execute_control_sql(endpoint, "BEGIN", session).await?;
-                }
+                // Defer backend BEGIN until the first statement leases a connection.
                 session.transaction_state = TransactionState::Active;
                 Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
             }
             GatewayCommand::Commit => {
-                if let Ok(endpoint) = self.select_endpoint(session) {
-                    let _ = self.execute_control_sql(endpoint, "COMMIT", session).await?;
-                }
+                let response = self.finish_transaction(session, "COMMIT").await?;
                 session.transaction_state = TransactionState::Idle;
-                Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
+                Ok(response)
             }
             GatewayCommand::Rollback => {
-                if let Ok(endpoint) = self.select_endpoint(session) {
-                    let _ = self.execute_control_sql(endpoint, "ROLLBACK", session).await?;
-                }
+                let response = self.finish_transaction(session, "ROLLBACK").await?;
                 session.transaction_state = TransactionState::Idle;
-                Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
+                Ok(response)
             }
             GatewayCommand::Query { sql } => {
                 let endpoint = self.select_endpoint(session)?;
@@ -740,6 +839,20 @@ mod tests {
             connector.execute(GatewayCommand::Quit, &mut session).await,
             Ok(GatewayResponse::Bye)
         );
+    }
+
+    #[tokio::test]
+    async fn begin_without_reachable_backend_still_marks_transaction_active() {
+        // No live MySQL: control path without endpoint still updates session.
+        let connector = MySqlBackendConnector::new();
+        let mut session = SessionState::default();
+
+        assert_eq!(
+            connector.execute(GatewayCommand::Begin, &mut session).await,
+            Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
+        );
+        assert_eq!(session.transaction_state, TransactionState::Active);
+        assert!(!connector.has_transaction_lease());
     }
 
     #[tokio::test]
