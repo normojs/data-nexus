@@ -32,11 +32,11 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 
 ### 关键缺口（阻塞可交付）
 
-1. **`GatewayRuntime` 字段仍含 legacy**：v2 已不再派生填充；`proxy_config`/`nodes` 仅 legacy 启动使用
+1. **`GatewayRuntime` 字段仍含 legacy**：`proxy_config`/`nodes` 默认空；public 字段尚未删除
 2. **事务 FSM 仍绑定 MySQL `SessionAttr`**（legacy 路径）
 3. **插件仍吃 `String`**：并发控制 / 熔断未挂 `PluginContext`
 4. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选
-5. **GatewayFactory Legacy 分支**、public API 仍暴露 `ProxyConfig` 字段
+5. **`Listener.backend_type` / `node_type` 字符串**仍在 proxy listener 结构中
 
 ---
 
@@ -104,13 +104,13 @@ M3  受控跨协议（可选）
 - [x] core accept 路径从 `core_plan` 构建 listener（不再用派生 ProxyConfig 驱动 accept）
 - [x] 删除 `legacy_proxy_config_from_core_plan` / `legacy_nodes_from_core_plan`；v2 构造不再填充 `ProxyConfig`/`nodes`
 - [x] `GatewayRuntime` 增加 `listener_name` / `pool_size` / `core_plan`；pool snapshot 从 core endpoints 取地址
-- [ ] `GatewayFactory` 去掉 `Legacy` 分支（仍保留编译兼容，非 v2 主路径）
+- [x] `GatewayFactory` 仅接受 v2 `GatewayConfigDocument`；移除 `Legacy` 分支与 `GatewayFactory::new`
 
 ### M1.2 配置类型收敛
 
-- [ ] 运行时不再读写 `ProxyConfig` / `UniSQLNode`（ShardingSphere 路径若仍需要，独立 crate，不污染 gateway）
-- [ ] `node_type` / `backend_type` 字符串从 gateway 主路径彻底移除
-- [ ] 旧 example-config（v1）标记废弃或移出默认文档；文档只写 v2
+- [x] Factory/启动路径不再读写 `ProxyConfig` / `UniSQLNode`（runtime 字段仍为 legacy 预留，默认空）
+- [ ] `node_type` / `backend_type` 字符串从 gateway 主路径彻底移除（`Listener` 结构仍带字段）
+- [x] 旧 example-config（v1）标记废弃；文档/示例只写 v2
 
 ### M1.3 错误模型
 

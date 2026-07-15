@@ -14,23 +14,14 @@
 
 use std::{error::Error, fmt};
 
-use config::config::{GatewayConfigDocument, PisaProxyConfig};
-use proxy::{
-    factory::{
-        PoolRefresher, PoolSnapshotter, Proxy, ProxyFactory, SessionSnapshotter, ShutdownHandle,
-    },
-    proxy::ProxyConfig,
+use config::config::GatewayConfigDocument;
+use proxy::factory::{
+    PoolRefresher, PoolSnapshotter, Proxy, ProxyFactory, SessionSnapshotter, ShutdownHandle,
 };
-// use runtime_mysql::mysql;
 
-#[derive(Clone)]
-enum GatewayFactoryConfig {
-    Legacy { proxy_config: ProxyConfig, pisa_config: PisaProxyConfig },
-    Native(GatewayConfigDocument),
-}
-
+/// Builds gateway runtimes from native v2 `GatewayConfigDocument` only.
 pub struct GatewayFactory {
-    config: GatewayFactoryConfig,
+    config: GatewayConfigDocument,
 }
 
 pub struct GatewayProxyInstance {
@@ -68,12 +59,8 @@ impl From<gateway_core::GatewayError> for GatewayFactoryError {
 }
 
 impl GatewayFactory {
-    pub fn new(proxy_config: ProxyConfig, pisa_config: PisaProxyConfig) -> Self {
-        Self { config: GatewayFactoryConfig::Legacy { proxy_config, pisa_config } }
-    }
-
     pub fn from_gateway_config(config: GatewayConfigDocument) -> Self {
-        Self { config: GatewayFactoryConfig::Native(config) }
+        Self { config }
     }
 
     pub fn try_build_proxy(&self) -> Result<Box<dyn Proxy + Send>, GatewayFactoryError> {
@@ -88,76 +75,30 @@ impl GatewayFactory {
         &self,
         listener_name: &str,
     ) -> Result<GatewayProxyInstance, GatewayFactoryError> {
-        match &self.config {
-            GatewayFactoryConfig::Legacy { proxy_config, .. } => {
-                if proxy_config.name != listener_name {
-                    return Err(GatewayFactoryError::new(format!(
-                        "listener '{}' is not defined",
-                        listener_name
-                    )));
-                }
+        let listener = self
+            .config
+            .gateway
+            .listeners
+            .iter()
+            .find(|listener| listener.name == listener_name)
+            .ok_or_else(|| {
+                GatewayFactoryError::new(format!("listener '{}' is not defined", listener_name))
+            })?;
 
-                self.try_build_proxies()?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| GatewayFactoryError::new("gateway config has no listeners"))
-            }
-            GatewayFactoryConfig::Native(config) => {
-                let listener = config
-                    .gateway
-                    .listeners
-                    .iter()
-                    .find(|listener| listener.name == listener_name)
-                    .ok_or_else(|| {
-                        GatewayFactoryError::new(format!(
-                            "listener '{}' is not defined",
-                            listener_name
-                        ))
-                    })?;
-
-                Self::build_native_proxy_instance(config, &listener.name)
-            }
-        }
+        Self::build_native_proxy_instance(&self.config, &listener.name)
     }
 
     pub fn try_build_proxies(&self) -> Result<Vec<GatewayProxyInstance>, GatewayFactoryError> {
-        match &self.config {
-            GatewayFactoryConfig::Legacy { proxy_config, pisa_config } => {
-                let mut runtime = runtime_gateway::gateway::GatewayRuntime {
-                    proxy_config: proxy_config.clone(),
-                    node_group: pisa_config.node_group.clone(),
-                    nodes: pisa_config.get_nodes().to_vec(),
-                    pisa_version: pisa_config.get_version().to_string(),
-                    core_plan: None,
-                    ..Default::default()
-                };
-                let shutdown_handle = runtime.shutdown_handle();
-                let pool_snapshotter = Some(runtime.pool_snapshotter());
-                let pool_refresher = Some(runtime.pool_refresher());
-                let session_snapshotter = Some(runtime.session_snapshotter());
-
-                Ok(vec![GatewayProxyInstance {
-                    name: proxy_config.name.clone(),
-                    proxy: Box::new(runtime),
-                    shutdown_handle,
-                    pool_snapshotter,
-                    pool_refresher,
-                    session_snapshotter,
-                }])
-            }
-            GatewayFactoryConfig::Native(config) => {
-                if config.gateway.listeners.is_empty() {
-                    return Err(GatewayFactoryError::new("gateway config has no listeners"));
-                }
-
-                config
-                    .gateway
-                    .listeners
-                    .iter()
-                    .map(|listener| Self::build_native_proxy_instance(config, &listener.name))
-                    .collect()
-            }
+        if self.config.gateway.listeners.is_empty() {
+            return Err(GatewayFactoryError::new("gateway config has no listeners"));
         }
+
+        self.config
+            .gateway
+            .listeners
+            .iter()
+            .map(|listener| Self::build_native_proxy_instance(&self.config, &listener.name))
+            .collect()
     }
 
     fn build_native_proxy_instance(
@@ -189,30 +130,12 @@ impl GatewayFactory {
 
 impl ProxyFactory for GatewayFactory {
     fn build_proxy(&self) -> Box<dyn Proxy + Send> {
-        return self.try_build_proxy().unwrap_or_else(|error| {
+        self.try_build_proxy().unwrap_or_else(|error| {
             panic!("failed to build gateway proxy: {}", error);
-        });
-
-        // 以下废弃
-        // match kind {
-        //
-        //     ProxyKind::ShardingSphereProxy => {
-        //         Box::new(runtime_shardingsphereproxy::shardingsphereproxy::ShardingSphereProxy {
-        //             proxy_config: config,
-        //             shardingsphereproxy_nodes: self.pisa_config.get_shardingsphere_proxy().to_vec(),
-        //             // shardingsphereproxy_nodes: self.pisa_config.clone().get_shardingsphere_proxy(),
-        //             // shardingsphereproxy_nodes: self.pisa_config.get_shardingsphere_proxy(),
-        //             // pisa_version: self.pisa_config.clone().get_version(),
-        //             // pisa_version: self.pisa_config.get_version(),
-        //             pisa_version: self.pisa_config.get_version().to_string(),
-        //             // shardingsphereproxy_nodes: self.pisa_config.shardingsphere_proxy.as_ref().unwrap().node.as_ref().unwrap().to_vec(),
-        //             // pisa_version: self.pisa_config.version.as_ref().unwrap().to_string(),
-        //         })
-        //     },
-        //
-        // }
+        })
     }
 }
+
 /// 启动代理服务器
 pub async fn start_gateway_server(mut s: Box<dyn proxy::factory::Proxy + Send>) {
     match s.start().await {
@@ -319,5 +242,15 @@ mod tests {
         };
 
         assert_eq!(error, GatewayFactoryError::new("gateway config has no listeners"));
+    }
+
+    #[test]
+    fn rejects_unknown_listener_name() {
+        let factory = GatewayFactory::from_gateway_config(gateway_config());
+        let error = match factory.try_build_proxy_for_listener("missing") {
+            Ok(_) => panic!("missing listener should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error, GatewayFactoryError::new("listener 'missing' is not defined"));
     }
 }

@@ -1,3 +1,8 @@
+# DEPRECATED: v1 PisaProxyConfig schema.
+# Native Data Nexus gateway only accepts v2 configs, for example:
+#   cargo run -p pisa -- --config examples/gateway-config.toml
+#   cargo run -p pisa -- --config examples/dual-listener-gateway-config.toml
+# This file remains for historical reference / unit tests of the old loader only.
 # run --package pisa-proxy --bin proxy -- daemon -c examples/example-config.toml
 
 version = '0.0.1'
