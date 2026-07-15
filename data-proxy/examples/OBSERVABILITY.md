@@ -61,10 +61,30 @@ If the exporter fails to initialize, the process logs an error and continues wit
 
 ## Admin UI
 
-Self-contained status page (no separate frontend package required):
+### Embedded (zero dependency)
 
 ```text
 GET http://127.0.0.1:8082/admin
 ```
 
 Loads live JSON from `/admin/listeners|services|endpoints|pools|sessions` and can trigger `POST /admin/reload`.
+
+### Nuxt console (`data-ui`)
+
+```bash
+cd data-ui
+pnpm install
+NUXT_PUBLIC_ADMIN_API_BASE=http://127.0.0.1:8082 pnpm dev
+```
+
+Open `http://localhost:3000`. The UI calls the Admin API over HTTP.
+
+### CORS
+
+Admin routes allow browser origins by default (`Access-Control-Allow-Origin: *`).
+
+Restrict:
+
+```bash
+export DATA_NEXUS_ADMIN_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+```

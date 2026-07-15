@@ -22,11 +22,12 @@ use std::{
 use axum::{
     body::Body,
     extract::{Json, Path, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     response::Response,
     routing::{get, post, put},
     Router,
 };
+use tower_http::cors::{Any, CorsLayer};
 use config::config::{GatewayConfigDocument, GatewayConfigLoadError, PisaProxyConfig};
 use gateway_core::{ListenerConfig, RoutePolicyConfig};
 use pisa_error::error::*;
@@ -41,6 +42,49 @@ use tracing::info;
 use ver::version::get_version;
 
 mod admin_ui;
+
+/// CORS for Admin API / metrics so independent UIs can call the gateway.
+///
+/// - Default: allow any origin (local/dev friendly)
+/// - `DATA_NEXUS_ADMIN_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000`
+fn admin_cors_layer() -> CorsLayer {
+    let methods = [
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::OPTIONS,
+    ];
+    match std::env::var("DATA_NEXUS_ADMIN_CORS_ORIGINS") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let origins: Vec<HeaderValue> = raw
+                .split(',')
+                .filter_map(|s| {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        HeaderValue::from_str(s).ok()
+                    }
+                })
+                .collect();
+            if origins.is_empty() {
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(methods)
+                    .allow_headers(Any)
+            } else {
+                CorsLayer::new()
+                    .allow_origin(origins)
+                    .allow_methods(methods)
+                    .allow_headers(Any)
+            }
+        }
+        _ => CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(methods)
+            .allow_headers(Any),
+    }
+}
 
 #[async_trait::async_trait]
 pub trait HttpServer {
@@ -538,6 +582,9 @@ pub struct AxumServer {
 impl AxumServer {
     fn routes(&self) -> Router<(), Body> {
         let state = self.clone();
+        // Allow browser-based admin UIs (e.g. data-ui Nuxt) on another origin.
+        // Origins can be restricted via DATA_NEXUS_ADMIN_CORS_ORIGINS (comma-separated).
+        let cors = admin_cors_layer();
 
         Router::new()
             .route("/", get(Self::version))
@@ -558,6 +605,7 @@ impl AxumServer {
             .route("/admin/pools/:name/refresh", post(Self::admin_refresh_pool))
             .route("/admin/sessions", get(Self::admin_sessions))
             .route("/admin/reload", post(Self::admin_reload))
+            .layer(cors)
             .with_state(state)
     }
 
@@ -1180,6 +1228,52 @@ mod tests {
         assert!(html.contains("Data Nexus Admin"));
         assert!(html.contains("/admin/listeners"));
         assert!(html.contains("/admin/reload"));
+    }
+
+    #[tokio::test]
+    async fn admin_api_allows_cors_preflight() {
+        let app = gateway_server().routes();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/admin/listeners")
+                    .header(header::ORIGIN, "http://localhost:3000")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status() == StatusCode::OK
+                || response.status() == StatusCode::NO_CONTENT
+                || response.status() == StatusCode::BAD_REQUEST,
+            "unexpected status {}",
+            response.status()
+        );
+        // With allow any origin, CORS headers should be present on preflight or GET.
+        let get_response = gateway_server()
+            .routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/listeners")
+                    .header(header::ORIGIN, "http://localhost:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let acao = get_response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            acao == "*" || acao == "http://localhost:3000",
+            "missing/invalid ACAO: {acao}"
+        );
     }
 
     #[tokio::test]

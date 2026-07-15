@@ -15,14 +15,14 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 
 ### 已完成
 
-- M0–M5：同/跨协议 E2E、方言、tracing、Admin UI、可选 OTel
-- PostgreSQL AST dialect：`sqlparser` + structured + heuristic 三级回退
-- 文档：`data-proxy/examples/OBSERVABILITY.md`
+- M0–M6：同/跨协议 E2E、方言 AST、tracing、嵌入式 Admin、可选 OTel
+- `data-ui` Nuxt 管理台消费 Admin API + CORS
+- 文档：`data-proxy/examples/OBSERVABILITY.md`、`data-ui/README.md`
 
 ### 开放缺口（可选）
 
-1. 独立 `data-ui` Nuxt 应用深化（Admin HTML 页已可用）
-2. OTel metrics/logs 导出（当前仅 traces）
+1. OTel metrics/logs 导出（当前仅 traces）
+2. data-ui 路由拆分 / 认证 / 生产部署打包
 
 ---
 
@@ -32,6 +32,7 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 M0–M4  核心网关 + 跨协议 + 方言/可观测   ✓
 M5     Admin UI + 可选 OTel              ✓
 M6     PostgreSQL AST dialect            ✓
+M7     data-ui Nuxt + Admin CORS         ✓
 ```
 
 ---
@@ -43,29 +44,19 @@ M6     PostgreSQL AST dialect            ✓
 | 同协议双 listener | `./data-proxy/examples/smoke-dual-listener.sh` |
 | MySQL → PG | `./data-proxy/examples/smoke-cross-protocol.sh` |
 | PG → MySQL | `./data-proxy/examples/smoke-cross-protocol-pg-to-mysql.sh` |
-| Admin UI | 启动后打开 `http://127.0.0.1:8082/admin` |
+| 嵌入式 Admin | `http://127.0.0.1:8082/admin` |
+| Nuxt Admin | `cd data-ui && pnpm dev`（`NUXT_PUBLIC_ADMIN_API_BASE`） |
 | OTel | `cargo build -p data-proxy --features otel` + `OTEL_EXPORTER_OTLP_ENDPOINT` |
 
 ---
 
-## M5：Admin UI + OTel（完成）
+## M7：data-ui + CORS（完成）
 
-- [x] `GET /admin` 自包含 dashboard（listeners/services/endpoints/pools/sessions + reload）
-- [x] 单测：dashboard 返回 HTML
-- [x] 可选 feature `otel`（默认关闭，不拖累默认构建）
-- [x] 运行时需 `OTEL_EXPORTER_OTLP_ENDPOINT` 才激活 OTLP
-- [x] OBSERVABILITY.md 更新
-
----
-
-## M6：PostgreSQL AST dialect（完成）
-
-- [x] `sqlparser` + `PostgreSqlDialect` 解析 `Statement` / `Query` / `SetExpr`
-- [x] 识别 SELECT/VALUES/TABLE/UNION、FOR UPDATE 锁、INSERT/UPDATE/DELETE/COPY/DDL
-- [x] WITH … INSERT/UPDATE/DELETE 判定为写
-- [x] 失败回退：structured classifier → heuristic
-- [x] `runtime_dialect_parser(PostgreSql)` 默认挂 AST 实现
-- [x] 单测覆盖 AST / structured / fallback
+- [x] Nuxt 管理台：listeners/services/endpoints/pools/sessions + reload
+- [x] `composables/useAdminApi.ts` + 可配置 API base
+- [x] Admin API CORS（默认 any；`DATA_NEXUS_ADMIN_CORS_ORIGINS` 可收紧）
+- [x] CORS 单测
+- [x] README / OBSERVABILITY 文档
 
 ---
 
@@ -75,7 +66,8 @@ M6     PostgreSQL AST dialect            ✓
 gateway/core     协议无关类型
 runtime/gateway  编排 + dialect + spans
 cmd/pisa         进程入口、日志 / 可选 OTel
-http             Admin API + /admin HTML
+http             Admin API + /admin HTML + CORS
+data-ui          Nuxt 管理台（消费 Admin API）
 ```
 
 ---
