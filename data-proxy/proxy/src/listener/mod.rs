@@ -17,34 +17,33 @@ use std::io::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::info;
 
-/// Listener
+/// TCP listener bootstrap for one gateway frontend.
+///
+/// `protocol` is informational (logging only). Routing and backend selection
+/// use gateway_core ProtocolKind / RoutePlan, not this string field.
 pub struct Listener {
     pub name: String,
     pub listen_addr: String,
-    pub node_type: String,
-    #[deprecated(note = "使用node中的node_type确定后端数据库类型")]
-    pub backend_type: String,
+    /// Frontend protocol label for logs (e.g. "mysql", "postgresql").
+    pub protocol: String,
     pub server_version: String,
 }
 
 impl Listener {
     pub fn build_listener(&mut self) -> Result<TcpListener, Error> {
         info!(
-            "{:?} proxy {:?} is listening on: {:?} with server version: {:?}",
-            self.node_type.clone(),
-            self.name.clone(),
-            self.listen_addr.clone(),
-            self.server_version.clone()
+            "gateway listener {:?} protocol={:?} addr={:?} server_version={:?}",
+            self.name, self.protocol, self.listen_addr, self.server_version
         );
         let listener = {
-            let std_listenner = match std::net::TcpListener::bind(self.listen_addr.clone()) {
+            let std_listener = match std::net::TcpListener::bind(self.listen_addr.clone()) {
                 Err(err) => return Err(err),
                 Ok(listener) => listener,
             };
-            if let Err(err) = std_listenner.set_nonblocking(true) {
+            if let Err(err) = std_listener.set_nonblocking(true) {
                 return Err(err);
             }
-            TcpListener::from_std(std_listenner).expect("listener must be valid")
+            TcpListener::from_std(std_listener).expect("listener must be valid")
         };
         Ok(listener)
     }
@@ -55,8 +54,12 @@ impl Listener {
             Err(err) => return Err(err),
         };
 
-        // TODO: need refactor this log
-        info!("uni-proxy client_ip: {:?} - backend_type: {:?}", addr.ip(), self.backend_type);
+        info!(
+            "gateway listener {:?} accepted client_ip={:?} protocol={:?}",
+            self.name,
+            addr.ip(),
+            self.protocol
+        );
 
         socket.set_nodelay(true)?;
         Ok(socket)

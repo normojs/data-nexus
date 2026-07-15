@@ -142,12 +142,9 @@ impl GatewayRuntime {
         let plan = self
             .core_listener_plan()
             .expect("core listener plan must exist for native gateway runtime");
-        let protocol = protocol_name(&plan.listener().protocol).to_owned();
         Listener {
             name: plan.listener().name.clone(),
-            node_type: protocol.clone(),
-            // Kept for Listener struct compatibility; not used for routing decisions.
-            backend_type: protocol_name(&plan.service().backend_protocol).to_owned(),
+            protocol: protocol_name(&plan.listener().protocol).to_owned(),
             listen_addr: plan.listener().listen_addr.clone(),
             server_version: match plan.listener().protocol {
                 ProtocolKind::MySql => "8.0".into(),
@@ -201,8 +198,7 @@ impl GatewayRuntime {
         let mut proxy = Proxy {
             listener: Listener {
                 name: listener_name.clone(),
-                node_type: protocol_label.clone(),
-                backend_type: protocol_name(&listener_plan.service().backend_protocol).to_owned(),
+                protocol: protocol_label.clone(),
                 listen_addr,
                 server_version: server_version.clone(),
             },
@@ -825,8 +821,7 @@ mod tests {
 
         assert_eq!(listener.name, "mysql-listener");
         assert_eq!(listener.listen_addr, "127.0.0.1:3307");
-        assert_eq!(listener.node_type, "mysql");
-        assert_eq!(listener.backend_type, "mysql");
+        assert_eq!(listener.protocol, "mysql");
         assert_eq!(listener.server_version, "8.0");
     }
 

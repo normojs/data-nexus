@@ -25,6 +25,7 @@ use gateway_core::{
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use parking_lot::Mutex;
 use plugin::build_phase::PluginPhase;
+use tracing::info;
 
 use crate::{
     backend::{mysql::MySqlBackendConnector, postgresql::PostgreSqlBackendConnector},
@@ -159,6 +160,21 @@ impl CoreGatewayConnection {
                         concurrency_rule_idx = idx;
                     }
                     Ok(PluginDecision::Reject { code, message }) => {
+                        info!(
+                            target: "data_nexus::audit",
+                            listener = %self.listener_name,
+                            service = %self.service_name,
+                            frontend_protocol = %protocol_metric_name(&self.frontend.protocol()),
+                            backend_protocol = %protocol_metric_name(&self.backend.protocol()),
+                            command_type = %command_type,
+                            endpoint = %label_owned[5],
+                            user = ?self.session.user,
+                            database = ?self.session.database,
+                            decision = "reject",
+                            code = %code,
+                            message = %message,
+                            "gateway command rejected by plugin"
+                        );
                         let response = GatewayResponse::Error { code, message };
                         packets.extend(self.frontend.encode(response, &mut self.session)?);
                         finish_command_metrics(&self.metrics, &labels, started_at);
@@ -185,6 +201,30 @@ impl CoreGatewayConnection {
                     message: error.to_string(),
                 },
             };
+
+            let outcome = match &response {
+                GatewayResponse::Error { code, .. } => format!("error:{code}"),
+                GatewayResponse::ResultSet { .. } => "resultset".to_owned(),
+                GatewayResponse::Ok { .. } => "ok".to_owned(),
+                GatewayResponse::Pong => "pong".to_owned(),
+                GatewayResponse::Bye => "bye".to_owned(),
+                GatewayResponse::Prepared { .. } => "prepared".to_owned(),
+            };
+            info!(
+                target: "data_nexus::audit",
+                listener = %self.listener_name,
+                service = %self.service_name,
+                frontend_protocol = %protocol_metric_name(&self.frontend.protocol()),
+                backend_protocol = %protocol_metric_name(&self.backend.protocol()),
+                command_type = %command_type,
+                endpoint = %label_owned[5],
+                user = ?self.session.user,
+                database = ?self.session.database,
+                decision = "execute",
+                outcome = %outcome,
+                latency_ms = started_at.elapsed().as_millis() as u64,
+                "gateway command audited"
+            );
 
             if let (Some(plugins), Some(idx)) = (self.plugins.as_mut(), concurrency_rule_idx) {
                 plugins.release_concurrency(idx);

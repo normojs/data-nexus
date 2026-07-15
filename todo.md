@@ -36,13 +36,13 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] core 层命令 metrics（accept 循环不再重复统计）
 - [x] 优雅关闭：accept 停止后 drain 在途 session
 - [x] Admin reload apply：错误配置保留旧配置，合法 diff 更新共享配置
+- [x] Listener 字段收敛为 `protocol`；core audit 日志
 
 ### 关键缺口（阻塞可交付）
 
-1. **`Listener.backend_type` / `node_type`** 仍在 proxy listener 结构（兼容字段，不决定协议）
-2. **事务 FSM 仍绑定 MySQL `SessionAttr`**（legacy command service 路径；core 路径已不依赖）
-3. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选（需 Docker）
-4. **legacy `RouteStrategy::dispatch`** 仍返回 `Endpoint`（仅 legacy 路径）
+1. **事务 FSM 仍绑定 MySQL `SessionAttr`**（legacy command service 路径；core 路径已不依赖）
+2. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选（需 Docker）
+3. **legacy `RouteStrategy::dispatch`** 仍返回 `Endpoint`（仅 legacy 路径）
 
 ---
 
@@ -116,7 +116,7 @@ M3  受控跨协议（可选）
 
 - [x] Factory/启动路径不再读写 `ProxyConfig` / `UniSQLNode`
 - [x] 删除 `start_legacy_mysql` 与 `GatewayRuntime::{proxy_config,nodes,node_group}` 公共字段
-- [ ] `Listener.node_type` / `backend_type` 字段仍存在（仅日志/兼容，不决定路由）
+- [x] `Listener` 去掉 `backend_type`/`node_type`，改为单一 `protocol` 日志字段
 - [x] 旧 example-config（v1）标记废弃；文档/示例只写 v2
 
 ### M1.3 错误模型
@@ -163,7 +163,8 @@ M3  受控跨协议（可选）
 ### M2.4 可观测与 Admin
 
 - [x] metrics 统一挂 core `handle_frame`（每命令：listener/service/frontend/backend/type/endpoint + latency）
-- [ ] trace / audit 挂 core 层
+- [x] audit 日志挂 core 层（`data_nexus::audit`：命令/拒绝/结果/延迟）
+- [ ] structured trace（OpenTelemetry 等，后续）
 - [x] Admin 查询 API 已接 runtime snapshot（listeners/services/endpoints/pools/sessions；骨架+单测）
 - [x] `POST /admin/reload`：validate + diff；有变更时 apply 共享配置，并 best-effort 协调 listener stop/start + pool refresh
 - [x] 优雅关闭：`stop()` 停止 accept；`start()` 退出循环后 await 在途 session 任务
