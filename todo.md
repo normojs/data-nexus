@@ -32,13 +32,14 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] `RoutePlan` / `EndpointRef` 进入 gateway_core；core 路由输出 RoutePlan
 - [x] `PluginContext` / `PluginDecision`；core 执行前插件评估
 - [x] v2 `plugin_policies` → PluginPhase 自动装载
+- [x] `DialectParser` 驱动 core 读写路由
 
 ### 关键缺口（阻塞可交付）
 
 1. **`Listener.backend_type` / `node_type`** 仍在 proxy listener 结构（兼容字段，不决定协议）
-2. **事务 FSM 仍绑定 MySQL `SessionAttr`**（legacy command service 路径）
-3. **插件仍吃 `String`**：并发控制 / 熔断未挂 `PluginContext`
-4. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选
+2. **事务 FSM 仍绑定 MySQL `SessionAttr`**（legacy command service 路径；core 路径已不依赖）
+3. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选（需 Docker）
+4. **legacy `RouteStrategy::dispatch`** 仍返回 `Endpoint`（仅 legacy 路径）
 
 ---
 
@@ -151,9 +152,10 @@ M3  受控跨协议（可选）
 
 ### M2.3 Parser / Dialect
 
-- [ ] 抽出 `DialectParser` trait
-- [ ] MySQL / PostgreSQL parser 按 dialect 挂载
-- [ ] 读路由、审计、rewrite 只依赖 dialect 抽象，不直接 import mysql_parser
+- [x] 抽出 `DialectParser` trait + `HeuristicDialectParser`（`gateway_core::dialect`）
+- [x] MySQL / PostgreSQL 默认 dialect 挂载到 core 读写路由
+- [x] core 读路由不再内联 SQL 启发式，改走 `DialectParser::is_read_only`
+- [ ] 完整 AST parser 按 dialect 挂载（mysql_parser 等，后续）
 
 ### M2.4 可观测与 Admin
 

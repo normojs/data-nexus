@@ -5,6 +5,7 @@
 //! connectors meet at these types instead.
 
 mod config;
+mod dialect;
 mod error;
 mod model;
 mod plugin;
@@ -15,6 +16,7 @@ pub use config::{
     AuthPolicyConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
     PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,
 };
+pub use dialect::{default_dialect_parser, DialectParser, HeuristicDialectParser};
 pub use error::{GatewayError, GatewayResult};
 pub use model::{
     Column, GatewayCommand, GatewayResponse, GatewayValue, ProtocolKind, SessionState,

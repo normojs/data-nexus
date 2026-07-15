@@ -16,10 +16,11 @@ use std::sync::Arc;
 
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
-    BackendConnector, CommandSummary, EndpointConfig, EndpointRef, EndpointRole,
-    FrontendProtocolAdapter, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse,
-    GatewayResult, ListenerConfig, PluginContext, PluginDecision, ProtocolKind, RoutePlan,
-    ServiceConfig, SessionState, TransactionState,
+    default_dialect_parser, BackendConnector, CommandSummary, DialectParser, EndpointConfig,
+    EndpointRef, EndpointRole, FrontendProtocolAdapter, GatewayCommand, GatewayConfig,
+    GatewayError, GatewayResponse, GatewayResult, HeuristicDialectParser, ListenerConfig,
+    PluginContext, PluginDecision, ProtocolKind, RoutePlan, ServiceConfig, SessionState,
+    TransactionState,
 };
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use parking_lot::Mutex;
@@ -295,7 +296,11 @@ impl CoreGatewayListenerPlan {
             }
             None => None,
         };
-        let route_policy = CoreRoutePolicy::build(route_policy_kind.as_deref(), endpoints.clone())?;
+        let route_policy = CoreRoutePolicy::build(
+            route_policy_kind.as_deref(),
+            endpoints.clone(),
+            &service.backend_protocol,
+        )?;
         let plugin_config = build_plugin_config(config, &service.plugin_policies)?;
 
         Ok(Self {
@@ -427,6 +432,7 @@ fn build_plugin_config(
 struct CoreRoutePolicy {
     endpoints: Vec<EndpointConfig>,
     kind: CoreRoutePolicyKind,
+    dialect: HeuristicDialectParser,
 }
 
 #[derive(Debug, Clone)]
@@ -451,6 +457,7 @@ impl CoreRoutePolicy {
     fn build(
         route_policy_kind: Option<&str>,
         endpoints: Vec<EndpointConfig>,
+        backend_protocol: &ProtocolKind,
     ) -> GatewayResult<Self> {
         let kind = if is_read_write_splitting_policy(route_policy_kind) {
             CoreRoutePolicyKind::build_read_write(&endpoints)?
@@ -460,7 +467,11 @@ impl CoreRoutePolicy {
             CoreRoutePolicyKind::First
         };
 
-        Ok(Self { endpoints, kind })
+        Ok(Self {
+            endpoints,
+            kind,
+            dialect: default_dialect_parser(backend_protocol),
+        })
     }
 
     fn select_initial_endpoint(&self) -> GatewayResult<EndpointConfig> {
@@ -496,7 +507,7 @@ impl CoreRoutePolicy {
             }
         }
 
-        self.plan_for_role(command_target_role(command, session))
+        self.plan_for_role(command_target_role(command, session, &self.dialect))
     }
 
     fn plan_for_role(&self, target_role: RouteTargetRole) -> GatewayResult<RoutePlan> {
@@ -626,25 +637,19 @@ fn simple_load_balance_algorithm(kind: &str) -> Option<AlgorithmName> {
     }
 }
 
-fn command_target_role(command: &GatewayCommand, session: &SessionState) -> RouteTargetRole {
+fn command_target_role(
+    command: &GatewayCommand,
+    session: &SessionState,
+    dialect: &dyn DialectParser,
+) -> RouteTargetRole {
     if session.transaction_state == TransactionState::Active {
         return RouteTargetRole::ReadWrite;
     }
 
     match command {
-        GatewayCommand::Query { sql } if is_read_only_sql(sql) => RouteTargetRole::Read,
+        GatewayCommand::Query { sql } if dialect.is_read_only(sql) => RouteTargetRole::Read,
         _ => RouteTargetRole::ReadWrite,
     }
-}
-
-fn is_read_only_sql(sql: &str) -> bool {
-    let sql = sql.trim_start();
-    let upper = sql.to_ascii_uppercase();
-    let first_token = upper.split_whitespace().next().unwrap_or_default().trim_end_matches(';');
-
-    matches!(first_token, "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "WITH" | "VALUES")
-        && !upper.contains(" FOR UPDATE")
-        && !upper.contains(" FOR SHARE")
 }
 
 fn load_balance_endpoint(endpoint: &EndpointConfig) -> Endpoint {
