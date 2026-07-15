@@ -235,6 +235,7 @@ pub struct CoreGatewayListenerPlan {
     endpoints: Vec<EndpointConfig>,
     route_policy_kind: Option<String>,
     route_policy: CoreRoutePolicy,
+    plugin_config: Option<plugin::config::Plugin>,
 }
 
 impl PartialEq for CoreGatewayListenerPlan {
@@ -295,6 +296,7 @@ impl CoreGatewayListenerPlan {
             None => None,
         };
         let route_policy = CoreRoutePolicy::build(route_policy_kind.as_deref(), endpoints.clone())?;
+        let plugin_config = build_plugin_config(config, &service.plugin_policies)?;
 
         Ok(Self {
             listener: listener.clone(),
@@ -302,6 +304,7 @@ impl CoreGatewayListenerPlan {
             endpoints,
             route_policy_kind,
             route_policy,
+            plugin_config,
         })
     }
 
@@ -336,18 +339,88 @@ impl CoreGatewayListenerPlan {
             ..SessionState::default()
         };
 
-        Ok(CoreGatewayConnection::with_route_policy(
+        let mut connection = CoreGatewayConnection::with_route_policy(
             frontend,
             backend,
             session,
             self.service.name.clone(),
             self.route_policy.clone(),
-        ))
+        );
+        if let Some(plugin_config) = &self.plugin_config {
+            connection = connection.with_plugins(PluginPhase::new(plugin_config.clone()));
+        }
+        Ok(connection)
     }
 
     pub fn select_endpoint(&self) -> GatewayResult<EndpointConfig> {
         self.route_policy.select_initial_endpoint()
     }
+
+    pub fn has_plugins(&self) -> bool {
+        self.plugin_config.is_some()
+    }
+}
+
+fn build_plugin_config(
+    config: &GatewayConfig,
+    policy_names: &[String],
+) -> GatewayResult<Option<plugin::config::Plugin>> {
+    if policy_names.is_empty() {
+        return Ok(None);
+    }
+
+    let mut concurrency_control = Vec::new();
+    let mut circuit_break = Vec::new();
+
+    for name in policy_names {
+        let policy = config.plugin_policies.iter().find(|policy| policy.name == *name).ok_or_else(
+            || {
+                GatewayError::Configuration(format!(
+                    "service references missing plugin policy '{}'",
+                    name
+                ))
+            },
+        )?;
+
+        let kind = normalize_policy_kind(&policy.kind);
+        match kind.as_str() {
+            "circuitbreak" | "audit" => {
+                if policy.regex.is_empty() {
+                    // Policy declared without rules: no-op, skip.
+                    continue;
+                }
+                circuit_break.push(plugin::config::CircuitBreak {
+                    regex: policy.regex.clone(),
+                    case_insensitive: policy.case_insensitive,
+                });
+            }
+            "concurrencycontrol" => {
+                if policy.regex.is_empty() {
+                    continue;
+                }
+                concurrency_control.push(plugin::config::ConcurrencyControl {
+                    regex: policy.regex.clone(),
+                    max_concurrency: policy.max_concurrency.unwrap_or(1),
+                    duration: std::time::Duration::from_secs(policy.duration_secs.unwrap_or(60)),
+                });
+            }
+            other => {
+                return Err(GatewayError::Configuration(format!(
+                    "unsupported plugin policy kind '{}' for policy '{}'",
+                    other, policy.name
+                )));
+            }
+        }
+    }
+
+    if concurrency_control.is_empty() && circuit_break.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(plugin::config::Plugin {
+        concurrency_control: (!concurrency_control.is_empty()).then_some(concurrency_control),
+        circuit_break: (!circuit_break.is_empty()).then_some(circuit_break),
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -1156,5 +1229,44 @@ mod tests {
             err,
             GatewayError::Configuration(message) if message.contains("no healthy")
         ));
+    }
+
+    #[test]
+    fn loads_circuit_break_plugin_from_v2_plugin_policies() {
+        let mut config = mysql_config();
+        config.services[0].plugin_policies = vec!["deny-drop".into()];
+        config.plugin_policies = vec![gateway_core::PluginPolicyConfig {
+            name: "deny-drop".into(),
+            kind: "circuit_break".into(),
+            regex: vec![r"(?i)drop\s+table".into()],
+            case_insensitive: true,
+            max_concurrency: None,
+            duration_secs: None,
+        }];
+
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+        let listener = plan.listener("mysql-listener").unwrap();
+        assert!(listener.has_plugins());
+
+        let connection = plan.build_connection("mysql-listener").unwrap();
+        // plugins field is private; building connection with policies is enough for load path.
+        let _ = connection;
+    }
+
+    #[test]
+    fn ignores_plugin_policy_without_regex_rules() {
+        let mut config = mysql_config();
+        config.services[0].plugin_policies = vec!["empty-audit".into()];
+        config.plugin_policies = vec![gateway_core::PluginPolicyConfig {
+            name: "empty-audit".into(),
+            kind: "audit".into(),
+            regex: vec![],
+            case_insensitive: false,
+            max_concurrency: None,
+            duration_secs: None,
+        }];
+
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+        assert!(!plan.listener("mysql-listener").unwrap().has_plugins());
     }
 }

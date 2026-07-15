@@ -31,6 +31,7 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] 协议名 canonical + 别名解析；v2 示例 / dual-listener / compose 本地后端
 - [x] `RoutePlan` / `EndpointRef` 进入 gateway_core；core 路由输出 RoutePlan
 - [x] `PluginContext` / `PluginDecision`；core 执行前插件评估
+- [x] v2 `plugin_policies` → PluginPhase 自动装载
 
 ### 关键缺口（阻塞可交付）
 
@@ -146,7 +147,7 @@ M3  受控跨协议（可选）
 - [x] 定义 `PluginDecision`：`Continue` / `Reject` / `Rewrite { sql }`
 - [x] `PluginPhase::evaluate(PluginContext)`：熔断/并发基于上下文 match_text（SQL）
 - [x] 插件挂在 Core `handle_frame`：route → plugin → execute → encode（MySQL/PG 共用）
-- [ ] 从 v2 `plugin_policies` 配置自动装载 PluginPhase（当前需 `with_plugins`）
+- [x] 从 v2 `plugin_policies` 自动装载 PluginPhase（`circuit_break`/`audit`/`concurrency_control` + regex 规则）
 
 ### M2.3 Parser / Dialect
 

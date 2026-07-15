@@ -51,4 +51,6 @@ kind = "static"
 
 [[plugin_policies]]
 name = "analytics-audit"
-kind = "audit"
+kind = "circuit_break"
+regex = ["(?i)\\bdrop\\s+table\\b", "(?i)\\btruncate\\b"]
+case_insensitive = true

@@ -63,10 +63,25 @@ pub struct AuthPolicyConfig {
     pub kind: String,
 }
 
+/// Named governance policy referenced by `ServiceConfig.plugin_policies`.
+///
+/// Supported kinds:
+/// - `circuit_break` / `audit`: reject SQL matching any `regex`
+/// - `concurrency_control`: limit concurrent matching SQL with `max_concurrency` / `duration_secs`
+/// - unknown kinds are ignored at runtime with a configuration error when rules are required
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginPolicyConfig {
     pub name: String,
     pub kind: String,
+    #[serde(default)]
+    pub regex: Vec<String>,
+    #[serde(default)]
+    pub case_insensitive: bool,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    /// Active window for concurrency control, seconds. Default 60 when kind is concurrency_control.
+    #[serde(default)]
+    pub duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +285,10 @@ mod tests {
             plugin_policies: vec![PluginPolicyConfig {
                 name: "audit".into(),
                 kind: "audit".into(),
+                regex: vec![],
+                case_insensitive: false,
+                max_concurrency: None,
+                duration_secs: None,
             }],
         }
     }
