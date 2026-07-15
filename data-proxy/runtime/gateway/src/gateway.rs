@@ -138,11 +138,13 @@ impl GatewayRuntime {
             .unwrap_or_default()
     }
 
-    fn build_listener_config(&self) -> Listener {
-        let plan = self
-            .core_listener_plan()
-            .expect("core listener plan must exist for native gateway runtime");
-        Listener {
+    fn build_listener_config(&self) -> Result<Listener, Error> {
+        let plan = self.core_listener_plan().ok_or_else(|| {
+            runtime_configuration_error(
+                "core listener plan must exist for native gateway runtime",
+            )
+        })?;
+        Ok(Listener {
             name: plan.listener().name.clone(),
             protocol: protocol_name(&plan.listener().protocol).to_owned(),
             listen_addr: plan.listener().listen_addr.clone(),
@@ -150,7 +152,7 @@ impl GatewayRuntime {
                 ProtocolKind::MySql => "8.0".into(),
                 ProtocolKind::PostgreSql => "14.0".into(),
             },
-        }
+        })
     }
 
     pub fn pool_snapshotter(&mut self) -> PoolSnapshotter {
@@ -817,7 +819,7 @@ mod tests {
     #[test]
     fn builds_listener_from_core_plan() {
         let runtime = GatewayRuntime::from_core_config(&mysql_config()).unwrap();
-        let listener = runtime.build_listener_config();
+        let listener = runtime.build_listener_config().unwrap();
 
         assert_eq!(listener.name, "mysql-listener");
         assert_eq!(listener.listen_addr, "127.0.0.1:3307");

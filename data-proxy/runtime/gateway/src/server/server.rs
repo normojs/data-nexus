@@ -92,7 +92,7 @@ where
             return Self::fsm_get_new_conn(req, raw_sql, input_typ).await;
         }
 
-        let endpoint = route(input_typ, raw_sql, req.route_strategy.clone());
+        let endpoint = route(input_typ, raw_sql, req.route_strategy.clone())?;
         req.fsm.get_conn_with_endpoint(endpoint).await
     }
 
@@ -101,7 +101,7 @@ where
         raw_sql: &str,
         input_typ: RouteInputTyp,
     ) -> Result<PoolConn<ClientConn>, Error> {
-        let endpoint = route(input_typ, raw_sql, req.route_strategy.clone());
+        let endpoint = route(input_typ, raw_sql, req.route_strategy.clone())?;
         let factory =
             ClientConn::with_opts(endpoint.user, endpoint.password, endpoint.addr.clone());
         req.pool.set_factory(&endpoint.addr, factory);
@@ -120,7 +120,7 @@ where
         client_conn: &mut PoolConn<ClientConn>,
         payload: &[u8],
     ) -> Result<(), Error> {
-        let db = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let db = std::str::from_utf8(payload).map_err(|e| Error::new(ErrorKind::Protocol(mysql_protocol::err::ProtocolError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))))?.trim_matches(char::from(0));
 
         req.fsm.set_db(Some(db.to_string()));
 
@@ -154,7 +154,7 @@ where
         let sess = req.framed.codec_mut().get_session();
 
         apply_handshake_to_fsm(&mut req.fsm, sess);
-        let raw_sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let raw_sql = std::str::from_utf8(payload).map_err(|e| Error::new(ErrorKind::Protocol(mysql_protocol::err::ProtocolError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))))?.trim_matches(char::from(0));
         let (_, input_typ, rewrite_outputs) = Self::query_rewrite(req, raw_sql)?;
         req.rewrite_outputs = rewrite_outputs;
 
@@ -175,7 +175,7 @@ where
             return res;
         }
 
-        route_sharding(input_typ, raw_sql, req.route_strategy.clone(), &mut req.rewrite_outputs);
+        route_sharding(input_typ, raw_sql, req.route_strategy.clone(), &mut req.rewrite_outputs)?;
         let sharding_column = req.rewrite_outputs.results[0].ds_idx.column.clone();
         debug!(
             "prepare rewrite outputs {:?} {:?} {:?}",
@@ -308,7 +308,7 @@ where
         let sess = req.framed.codec_mut().get_session();
 
         apply_handshake_to_fsm(&mut req.fsm, sess);
-        let raw_sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let raw_sql = std::str::from_utf8(payload).map_err(|e| Error::new(ErrorKind::Protocol(mysql_protocol::err::ProtocolError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))))?.trim_matches(char::from(0));
         let (is_get_conn, input_typ, rewrite_outputs) = Self::query_rewrite(req, raw_sql)?;
         req.rewrite_outputs = rewrite_outputs;
 
@@ -320,7 +320,7 @@ where
             return res;
         }
 
-        route_sharding(input_typ, raw_sql, req.route_strategy.clone(), &mut req.rewrite_outputs);
+        route_sharding(input_typ, raw_sql, req.route_strategy.clone(), &mut req.rewrite_outputs)?;
         Executor::shard_query_executor(
             req,
             req.fsm.session_db().map(|s| s.to_owned()),
@@ -367,11 +367,11 @@ where
     ) -> Result<PoolConn<ClientConn>, Error> {
         let sess = req.framed.codec_mut().get_session();
         apply_handshake_to_fsm(&mut req.fsm, sess);
-        let sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let sql = std::str::from_utf8(payload).map_err(|e| Error::new(ErrorKind::Protocol(mysql_protocol::err::ProtocolError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))))?.trim_matches(char::from(0));
         let (is_get_conn, input_typ, _rewrite_outputs) = Self::query_rewrite(req, sql)?;
 
         if is_get_conn {
-            let endpoint = route(input_typ, sql, req.route_strategy.clone());
+            let endpoint = route(input_typ, sql, req.route_strategy.clone())?;
             let factory =
                 ClientConn::with_opts(endpoint.user, endpoint.password, endpoint.addr.clone());
             req.pool.set_factory(&endpoint.addr, factory);
@@ -719,7 +719,7 @@ where
 {
     async fn init_db(cx: &mut ReqContext<T, C>, payload: &[u8]) -> Result<RespContext, Error> {
         let now = Instant::now();
-        let db = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let db = std::str::from_utf8(payload).map_err(|e| Error::new(ErrorKind::Protocol(mysql_protocol::err::ProtocolError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))))?.trim_matches(char::from(0));
         cx.framed.codec_mut().get_session().set_db(db.to_string());
 
         if cx.rewriter.is_some() {
@@ -790,7 +790,7 @@ where
             return Ok(RespContext { ep: None, duration: now.elapsed() });
         }
 
-        let sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
+        let sql = std::str::from_utf8(payload).map_err(|e| Error::new(ErrorKind::Protocol(mysql_protocol::err::ProtocolError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))))?.trim_matches(char::from(0));
 
         let mut client_conn =
             Self::fsm_trigger(cx, TransEventName::PrepareEvent, RouteInputTyp::Statement, sql)

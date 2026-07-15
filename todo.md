@@ -39,6 +39,7 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] Listener 字段收敛为 `protocol`；core audit 日志
 - [x] TransFsm 与 SessionAttr 解耦（池边界内部转换）
 - [x] legacy RouteStrategy 输出 DispatchPlan（对齐 RoutePlan）
+- [x] ShardingPlanner 解耦入口 stub；legacy route 主路径 Result 化
 
 ### 关键缺口（阻塞可交付）
 
@@ -122,7 +123,7 @@ M3  受控跨协议（可选）
 ### M1.3 错误模型
 
 - [x] 无 core_plan 时 `start()` fail fast（明确错误，不再走 legacy）
-- [ ] 减少 `runtime/gateway`、`core_engine`、frontend/backend adapter 中的 `unwrap()`
+- [x] 减少主路径 `unwrap`/`expect`（legacy route/route_sharding 与 Listener 构建改为 Result；测试除外）
 - [x] 配置错误：启动失败；协议/SQL 错误：session 级（core 路径）
 
 ### M1.4 验收
@@ -143,7 +144,7 @@ M3  受控跨协议（可选）
 - [x] Core 路由 `plan_command` 返回 `RoutePlan`；`handle_frame` 经 `apply_route_plan` 写入 session
 - [x] 读写分离、simple LB 基于 `GatewayCommand` + `SessionState` 决策（core 路径）
 - [x] legacy `RouteStrategy::dispatch` 返回 `DispatchPlan`（可转 core `RoutePlan`，保留 Endpoint 凭证）
-- [ ] sharding rewrite 与 MySQL parser 解耦入口（可先 stub Reject）
+- [x] sharding rewrite 解耦入口：`ShardingPlanner` + `UnsupportedShardingPlanner` stub（Reject）
 
 ### M2.2 插件
 

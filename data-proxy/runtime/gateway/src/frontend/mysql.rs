@@ -395,9 +395,10 @@ where
 
                     cx.framed.codec_mut().reset_seq();
 
-                    if let Some(idx) = &cx.concurrency_control_rule_idx {
-                        cx.plugin.as_mut().unwrap().concurrency_control.add_permits(*idx);
-                        cx.concurrency_control_rule_idx = None;
+                    if let Some(idx) = cx.concurrency_control_rule_idx.take() {
+                        if let Some(plugin) = cx.plugin.as_mut() {
+                            plugin.concurrency_control.add_permits(idx);
+                        }
                     }
 
                     if self.is_quit {

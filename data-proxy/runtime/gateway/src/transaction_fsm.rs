@@ -147,7 +147,7 @@ pub fn route(
     input_typ: RouteInputTyp,
     raw_sql: &str,
     strategy: Arc<parking_lot::Mutex<RouteStrategy>>,
-) -> Endpoint {
+) -> Result<Endpoint, Error> {
     let mut strategy = strategy.lock();
     let input = match input_typ {
         RouteInputTyp::Statement => RouteInput::Statement(raw_sql),
@@ -155,15 +155,23 @@ pub fn route(
         _ => RouteInput::None,
     };
 
-    let dispatch_res = strategy.dispatch(&input).unwrap();
+    let dispatch_res = strategy.dispatch(&input).map_err(|e| {
+        Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("route dispatch failed: {e}"),
+        ))))
+    })?;
     debug!(
         "route_strategy rw + sharding to {:?} for input typ: {:?}, sql: {:?}",
         dispatch_res, input_typ, raw_sql
     );
 
-    dispatch_res
-        .endpoint()
-        .expect("route strategy must produce a Single endpoint for legacy path")
+    dispatch_res.endpoint().ok_or_else(|| {
+        Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "route strategy produced no endpoint",
+        ))))
+    })
 }
 
 pub fn route_sharding(
@@ -171,7 +179,7 @@ pub fn route_sharding(
     raw_sql: &str,
     strategy: Arc<parking_lot::Mutex<RouteStrategy>>,
     rewrite_outputs: &mut ShardingRewriteOutput,
-) {
+) -> Result<(), Error> {
     let mut strategy = strategy.lock();
     for o in rewrite_outputs.results.iter_mut() {
         match &o.ds_idx.ds {
@@ -183,7 +191,6 @@ pub fn route_sharding(
                     _ => RouteInput::None,
                 };
 
-                //let dispatch_res = strategy.dispatch(&input).unwrap();
                 debug!(
                     "route_strategy sharding only to {:?} for input typ: {:?}, sql: {:?}",
                     ep, input_typ, raw_sql
@@ -202,21 +209,34 @@ pub fn route_sharding(
                     _ => RouteInput::None,
                 };
 
-                let dispatch_res = strategy.dispatch(&input).unwrap();
+                let dispatch_res = strategy.dispatch(&input).map_err(|e| {
+                    Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("sharding route dispatch failed: {e}"),
+                    ))))
+                })?;
                 debug!(
                     "route_strategy rw + sharding to {:?} for input typ: {:?}, sql: {:?}",
                     dispatch_res, input_typ, raw_sql
                 );
                 // reassign data_source, type should is DataSource::Endpoint
-                o.ds_idx.ds = DataSource::Endpoint(
-                    dispatch_res
-                        .endpoint()
-                        .expect("route strategy must produce a Single endpoint for sharding"),
-                );
+                let endpoint = dispatch_res.endpoint().ok_or_else(|| {
+                    Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "sharding route strategy produced no endpoint",
+                    ))))
+                })?;
+                o.ds_idx.ds = DataSource::Endpoint(endpoint);
             }
-            _ => unreachable!(),
+            _ => {
+                return Err(Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported sharding data source kind",
+                )))));
+            }
         }
     }
+    Ok(())
 }
 pub struct TransEvent {
     name: TransEventName,

@@ -10,6 +10,7 @@ mod error;
 mod model;
 mod plugin;
 mod route;
+mod sharding;
 mod transport;
 
 pub use config::{
@@ -24,4 +25,5 @@ pub use model::{
 };
 pub use plugin::{CommandSummary, PluginContext, PluginDecision};
 pub use route::{EndpointRef, RoutePlan, ShardTarget};
+pub use sharding::{ShardingPlanner, UnsupportedShardingPlanner};
 pub use transport::{BackendConnector, FrontendProtocolAdapter};
