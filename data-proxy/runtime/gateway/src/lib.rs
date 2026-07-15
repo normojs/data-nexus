@@ -17,5 +17,11 @@ pub mod core_engine;
 pub mod dialect;
 pub mod frontend;
 pub mod gateway;
+#[cfg(feature = "otel")]
+pub mod otel_metrics;
+#[cfg(not(feature = "otel"))]
+pub mod otel_metrics {
+    include!("otel_metrics_stub.rs");
+}
 pub mod server;
 pub mod transaction_fsm;

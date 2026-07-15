@@ -1,0 +1,19 @@
+# Example stack: gateway admin UI behind nginx.
+# From repo root:
+#   docker compose -f data-ui/deploy/docker-compose.ui.yml up --build
+services:
+  data-ui:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        NUXT_PUBLIC_ADMIN_API_BASE: ${NUXT_PUBLIC_ADMIN_API_BASE:-http://host.docker.internal:8082}
+        NUXT_PUBLIC_ADMIN_PASSWORD: ${NUXT_PUBLIC_ADMIN_PASSWORD:-}
+        NUXT_PUBLIC_OIDC_ISSUER: ${NUXT_PUBLIC_OIDC_ISSUER:-}
+        NUXT_PUBLIC_OIDC_CLIENT_ID: ${NUXT_PUBLIC_OIDC_CLIENT_ID:-}
+        NUXT_PUBLIC_OIDC_REDIRECT_URI: ${NUXT_PUBLIC_OIDC_REDIRECT_URI:-http://localhost:8080/auth/callback}
+        NUXT_PUBLIC_OIDC_SCOPES: ${NUXT_PUBLIC_OIDC_SCOPES:-openid profile email}
+    ports:
+      - "8080:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

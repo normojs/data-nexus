@@ -1,6 +1,6 @@
 export default defineNuxtRouteMiddleware((to) => {
-  // Login page is always public.
-  if (to.path === '/login') return
+  // Public routes.
+  if (to.path === '/login' || to.path.startsWith('/auth/')) return
 
   const { authRequired, authenticated, hydrateFromStorage } = useAdminAuth()
   hydrateFromStorage()

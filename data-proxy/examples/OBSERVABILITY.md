@@ -51,14 +51,42 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
 
 | Item | Detail |
 |------|--------|
-| Feature flag | `otel` on crate `data-proxy` |
+| Feature flag | `otel` on crate `data-proxy` (enables `runtime_gateway/otel`) |
 | Runtime gate | `OTEL_EXPORTER_OTLP_ENDPOINT` must be set (non-empty) |
 | Protocol | OTLP gRPC (tonic), default collector port `4317` |
 | Service name | `data-nexus` |
-| Traces | always on when endpoint set; spans `gateway.handle_frame`, `gateway.command` |
+| Traces | spans `gateway.handle_frame`, `gateway.command` |
 | Metrics | default on; disable with `DATA_NEXUS_OTEL_METRICS=0` |
 | Logs | default on (tracing → OTLP logs); disable with `DATA_NEXUS_OTEL_LOGS=0` |
-| Sample metric | `data_nexus.otel.up` counter (emitted once at startup) |
+
+### Trace sampling
+
+| Variable | Values | Default |
+|----------|--------|---------|
+| `OTEL_TRACES_SAMPLER` or `DATA_NEXUS_OTEL_TRACES_SAMPLER` | `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off`, `parentbased_traceidratio` | `parentbased_traceidratio` |
+| `OTEL_TRACES_SAMPLER_ARG` or `DATA_NEXUS_OTEL_TRACES_SAMPLER_ARG` | ratio `0.0`–`1.0` for `*traceidratio` | `1.0` |
+
+Example (sample 10% of root traces, respect parent decision):
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+OTEL_TRACES_SAMPLER=parentbased_traceidratio \
+OTEL_TRACES_SAMPLER_ARG=0.1 \
+./target/debug/proxy daemon -c examples/dual-listener-gateway-config.toml
+```
+
+### Business metrics (command path)
+
+When `otel` is built and metrics are enabled:
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `data_nexus.otel.up` | counter | (startup) |
+| `data_nexus.gateway.commands` | counter | listener, service, frontend_protocol, backend_protocol, command_type, endpoint, outcome |
+| `data_nexus.gateway.command_duration_ms` | histogram | same |
+| `data_nexus.gateway.errors` | counter | same (outcome starts with `error` or `translation_reject`) |
+
+Prometheus text metrics on `/metrics` remain available regardless of OTel.
 
 If the exporter fails to initialize, the process logs an error and continues with fmt-only logging.
 
@@ -82,9 +110,13 @@ NUXT_PUBLIC_ADMIN_PASSWORD=secret \
 pnpm dev
 ```
 
-Open `http://localhost:3000`. Routes: `/`, `/topology`, `/sessions`, `/settings`, `/login`.
+Open `http://localhost:3000`. Routes: `/`, `/topology`, `/sessions`, `/settings`, `/login`, `/auth/callback`.
 
-`NUXT_PUBLIC_ADMIN_PASSWORD` enables a browser login gate (optional; empty disables auth).
+Auth options:
+
+- Password: `NUXT_PUBLIC_ADMIN_PASSWORD`
+- SSO (OIDC PKCE): `NUXT_PUBLIC_OIDC_ISSUER` + `NUXT_PUBLIC_OIDC_CLIENT_ID`
+- Production: `pnpm generate` or `docker build -f data-ui/Dockerfile`
 
 ### CORS
 

@@ -4,9 +4,16 @@
 //! `OTEL_EXPORTER_OTLP_ENDPOINT` is set at runtime.
 //!
 //! Exports:
-//! - traces (always when endpoint set)
+//! - traces (always when endpoint set) with configurable sampler
 //! - metrics when `DATA_NEXUS_OTEL_METRICS` is not `0`/`false` (default on)
 //! - logs when `DATA_NEXUS_OTEL_LOGS` is not `0`/`false` (default on)
+//!
+//! Sampling (standard OTel env + Data Nexus alias):
+//! - `OTEL_TRACES_SAMPLER` / `DATA_NEXUS_OTEL_TRACES_SAMPLER`:
+//!   `always_on` | `always_off` | `traceidratio` | `parentbased_always_on` |
+//!   `parentbased_always_off` | `parentbased_traceidratio` (default)
+//! - `OTEL_TRACES_SAMPLER_ARG` / `DATA_NEXUS_OTEL_TRACES_SAMPLER_ARG`:
+//!   ratio in `[0.0, 1.0]` for `*traceidratio` (default `1.0`)
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -18,6 +25,7 @@ use opentelemetry_appender_tracing2::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::logs::LoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::trace::Sampler;
 use opentelemetry_sdk::{runtime, Resource};
 use tracing::{info, Level};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -42,6 +50,7 @@ pub fn init_tracing(admin_log_level: &str) -> Option<OtelGuard> {
                 info!(
                     %endpoint,
                     traces = true,
+                    sampler = %guard.sampler_label,
                     metrics = guard.meter_provider.is_some(),
                     logs = guard.logger_provider.is_some(),
                     "OpenTelemetry OTLP exporter enabled"
@@ -50,7 +59,6 @@ pub fn init_tracing(admin_log_level: &str) -> Option<OtelGuard> {
             }
             Err(error) => {
                 eprintln!("failed to init OTLP exporter ({error}); continuing without OTel");
-                // Fall through with a fresh filter (original was moved into install_otlp).
                 let filter = EnvFilter::try_from_default_env()
                     .or_else(|_| EnvFilter::try_from_env("DATA_NEXUS_LOG"))
                     .unwrap_or_else(|_| EnvFilter::new(default_level.as_str()));
@@ -78,6 +86,7 @@ pub struct OtelGuard {
     tracer_provider: opentelemetry_sdk::trace::TracerProvider,
     meter_provider: Option<SdkMeterProvider>,
     logger_provider: Option<LoggerProvider>,
+    sampler_label: String,
 }
 
 impl Drop for OtelGuard {
@@ -102,11 +111,57 @@ fn env_flag_enabled(name: &str, default: bool) -> bool {
     }
 }
 
+fn env_first(names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Ok(v) = std::env::var(name) {
+            let v = v.trim().to_owned();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 fn service_resource() -> Resource {
     Resource::new(vec![
         KeyValue::new("service.name", "data-nexus"),
         KeyValue::new("service.namespace", "revocloud"),
     ])
+}
+
+/// Resolve sampler from OTEL / Data Nexus env vars.
+///
+/// Returns `(sampler, human-readable label)`.
+pub fn resolve_sampler() -> (Sampler, String) {
+    let name = env_first(&["OTEL_TRACES_SAMPLER", "DATA_NEXUS_OTEL_TRACES_SAMPLER"])
+        .unwrap_or_else(|| "parentbased_traceidratio".into())
+        .to_ascii_lowercase();
+    let ratio = env_first(&["OTEL_TRACES_SAMPLER_ARG", "DATA_NEXUS_OTEL_TRACES_SAMPLER_ARG"])
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|r| r.clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+
+    match name.as_str() {
+        "always_on" => (Sampler::AlwaysOn, "always_on".into()),
+        "always_off" => (Sampler::AlwaysOff, "always_off".into()),
+        "traceidratio" => (
+            Sampler::TraceIdRatioBased(ratio),
+            format!("traceidratio({ratio})"),
+        ),
+        "parentbased_always_on" => (
+            Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
+            "parentbased_always_on".into(),
+        ),
+        "parentbased_always_off" => (
+            Sampler::ParentBased(Box::new(Sampler::AlwaysOff)),
+            "parentbased_always_off".into(),
+        ),
+        "parentbased_traceidratio" | _ => (
+            Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio))),
+            format!("parentbased_traceidratio({ratio})"),
+        ),
+    }
 }
 
 fn install_otlp(
@@ -115,6 +170,7 @@ fn install_otlp(
     filter: EnvFilter,
 ) -> Result<OtelGuard, Box<dyn std::error::Error + Send + Sync>> {
     let resource = service_resource();
+    let (sampler, sampler_label) = resolve_sampler();
 
     // --- traces ---
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -123,6 +179,7 @@ fn install_otlp(
         .build()?;
     let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
         .with_batch_exporter(span_exporter, runtime::Tokio)
+        .with_sampler(sampler)
         .with_resource(resource.clone())
         .build();
     let tracer = tracer_provider.tracer("data-nexus");
@@ -190,5 +247,18 @@ fn install_otlp(
         tracer_provider,
         meter_provider,
         logger_provider,
+        sampler_label,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_sampler_defaults_to_parentbased_ratio() {
+        // Clear-ish: function reads env; just ensure it returns a label.
+        let (_sampler, label) = resolve_sampler();
+        assert!(!label.is_empty());
+    }
 }

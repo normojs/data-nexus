@@ -7,7 +7,9 @@
     "dev": "nuxt dev --port 3000",
     "generate": "nuxt generate",
     "preview": "nuxt preview",
-    "postinstall": "nuxt prepare"
+    "postinstall": "nuxt prepare",
+    "docker:build": "docker build -t data-nexus-ui .",
+    "docker:run": "docker run --rm -p 8080:80 data-nexus-ui"
   },
   "dependencies": {
     "@nuxt/content": "3.5.1",

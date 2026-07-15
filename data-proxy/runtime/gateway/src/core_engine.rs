@@ -211,6 +211,16 @@ impl CoreGatewayConnection {
                         );
                         let response = GatewayResponse::Error { code, message };
                         packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        record_otel_command(
+                            &self.listener_name,
+                            &self.service_name,
+                            labels[2],
+                            labels[3],
+                            command_type,
+                            labels[5],
+                            "plugin_reject",
+                            started_at,
+                        );
                         finish_command_metrics(&self.metrics, &labels, started_at);
                         continue;
                     }
@@ -255,6 +265,16 @@ impl CoreGatewayConnection {
                         );
                         command_span.record("outcome", "translation_reject");
                         packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        record_otel_command(
+                            &self.listener_name,
+                            &self.service_name,
+                            labels[2],
+                            labels[3],
+                            command_type,
+                            labels[5],
+                            "translation_reject",
+                            started_at,
+                        );
                         finish_command_metrics(&self.metrics, &labels, started_at);
                         continue;
                     }
@@ -308,6 +328,16 @@ impl CoreGatewayConnection {
             }
 
             packets.extend(self.frontend.encode(response, &mut self.session)?);
+            record_otel_command(
+                &self.listener_name,
+                &self.service_name,
+                labels[2],
+                labels[3],
+                command_type,
+                labels[5],
+                &outcome,
+                started_at,
+            );
             finish_command_metrics(&self.metrics, &labels, started_at);
         }
 
@@ -323,6 +353,28 @@ fn finish_command_metrics(
     metrics.set_sql_under_processing_dec(labels);
     metrics.set_sql_processed_total(labels);
     metrics.set_sql_processed_duration(labels, started_at.elapsed().as_secs_f64());
+}
+
+fn record_otel_command(
+    listener: &str,
+    service: &str,
+    frontend_protocol: &str,
+    backend_protocol: &str,
+    command_type: &str,
+    endpoint: &str,
+    outcome: &str,
+    started_at: Instant,
+) {
+    crate::otel_metrics::record_command(
+        listener,
+        service,
+        frontend_protocol,
+        backend_protocol,
+        command_type,
+        endpoint,
+        outcome,
+        started_at.elapsed(),
+    );
 }
 
 fn protocol_metric_name(protocol: &ProtocolKind) -> &'static str {

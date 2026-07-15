@@ -1,6 +1,6 @@
 # Data UI
 
-Nuxt 3 admin console for **Data Nexus** gateway.
+Nuxt 3 admin console for **Data Nexus** gateway (static SPA).
 
 Consumes the gateway Admin HTTP API (default `http://127.0.0.1:8082`).
 
@@ -15,9 +15,13 @@ Consumes the gateway Admin HTTP API (default `http://127.0.0.1:8082`).
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `NUXT_PUBLIC_ADMIN_API_BASE` | `http://127.0.0.1:8082` | Gateway Admin API base URL |
-| `NUXT_PUBLIC_ADMIN_PASSWORD` | _(empty)_ | Optional UI password; empty disables login |
+| `NUXT_PUBLIC_ADMIN_PASSWORD` | _(empty)_ | Optional password gate |
+| `NUXT_PUBLIC_OIDC_ISSUER` | _(empty)_ | OIDC issuer URL (enables SSO) |
+| `NUXT_PUBLIC_OIDC_CLIENT_ID` | _(empty)_ | Public OIDC client id |
+| `NUXT_PUBLIC_OIDC_REDIRECT_URI` | `{origin}/auth/callback` | Redirect URI registered with IdP |
+| `NUXT_PUBLIC_OIDC_SCOPES` | `openid profile email` | OIDC scopes |
 
-Gateway CORS is enabled by default for browser UIs. Restrict with:
+Gateway CORS is enabled by default. Restrict with:
 
 ```bash
 export DATA_NEXUS_ADMIN_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
@@ -34,8 +38,13 @@ cargo run -p data-proxy --bin proxy -- daemon -c examples/dual-listener-gateway-
 cd ../data-ui
 pnpm install
 pnpm dev
-# with password gate:
+# password:
 # NUXT_PUBLIC_ADMIN_PASSWORD=secret pnpm dev
+# SSO (OIDC PKCE public client):
+# NUXT_PUBLIC_OIDC_ISSUER=https://idp.example.com \
+# NUXT_PUBLIC_OIDC_CLIENT_ID=data-nexus-admin \
+# NUXT_PUBLIC_OIDC_REDIRECT_URI=http://localhost:3000/auth/callback \
+# pnpm dev
 ```
 
 Open `http://localhost:3000`.
@@ -44,21 +53,47 @@ Open `http://localhost:3000`.
 
 | Path | Page |
 |------|------|
-| `/` | Overview (counts + quick links) |
+| `/` | Overview |
 | `/topology` | Listeners / services / endpoints / pools |
 | `/sessions` | Active sessions |
 | `/settings` | API base + config reload |
-| `/login` | Password gate (only when password set) |
+| `/login` | Password / SSO |
+| `/auth/callback` | OIDC PKCE callback |
 
-Auth session is stored in `localStorage` for 12 hours.
+Auth session is stored in `localStorage` (password: 12h; OIDC: token `expires_in` capped at 12h).
 
-## Features
+## Production packaging
 
-- Multi-page layout with nav
-- Optional password gate
-- Configurable API base URL (localStorage)
-- `POST /admin/reload`
-- Links to `/metrics` and embedded `/admin`
+### Static generate
+
+```bash
+NUXT_PUBLIC_ADMIN_API_BASE=https://gateway.example.com:8082 \
+pnpm generate
+# output: .output/public
+```
+
+### Docker (nginx)
+
+```bash
+docker build -t data-nexus-ui \
+  --build-arg NUXT_PUBLIC_ADMIN_API_BASE=http://host.docker.internal:8082 \
+  -f Dockerfile .
+
+docker run --rm -p 8080:80 data-nexus-ui
+# or
+docker compose -f deploy/docker-compose.ui.yml up --build
+```
+
+SPA routes are handled by `deploy/nginx.conf` (`try_files` → `index.html`).
+
+## Auth models
+
+1. **Open** — no password, no OIDC env → no login gate  
+2. **Password** — `NUXT_PUBLIC_ADMIN_PASSWORD`  
+3. **SSO** — OIDC authorization code + PKCE (`NUXT_PUBLIC_OIDC_ISSUER` + `CLIENT_ID`)  
+4. **Both** — login page offers password and SSO  
+
+IdP must allow the SPA redirect URI and public client (no client secret).
 
 ## Embedded alternative
 
