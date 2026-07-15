@@ -13,6 +13,7 @@ mod route;
 mod sharding;
 mod translation;
 mod transport;
+mod types;
 
 pub use config::{
     AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
@@ -28,7 +29,9 @@ pub use plugin::{CommandSummary, PluginContext, PluginDecision};
 pub use route::{EndpointRef, RoutePlan, ShardTarget};
 pub use sharding::{ShardingPlanner, UnsupportedShardingPlanner};
 pub use translation::{
-    check_translation_sql, default_allowed_statements, TranslationPolicyConfig,
+    check_translation_sql, default_allowed_statements, map_response_types,
+    prepare_cross_protocol_command, rewrite_sql_for_backend, TranslationPolicyConfig,
     TranslationStatementKind,
 };
 pub use transport::{BackendConnector, FrontendProtocolAdapter};
+pub use types::{map_column_type, parse_backend_type, CanonicalDataType};

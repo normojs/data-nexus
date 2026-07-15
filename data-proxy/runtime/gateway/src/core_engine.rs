@@ -16,11 +16,12 @@ use std::{sync::Arc, time::Instant};
 
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
-    default_dialect_parser, BackendConnector, CommandSummary, DialectParser, EndpointConfig,
-    EndpointRef, EndpointRole, FrontendProtocolAdapter, GatewayCommand, GatewayConfig,
-    GatewayError, GatewayResponse, GatewayResult, HeuristicDialectParser, ListenerConfig,
-    PluginContext, PluginDecision, ProtocolKind, RoutePlan, ServiceConfig, SessionState,
-    TransactionState,
+    default_dialect_parser, map_response_types, prepare_cross_protocol_command, BackendConnector,
+    CommandSummary, DialectParser, EndpointConfig, EndpointRef, EndpointRole,
+    FrontendProtocolAdapter, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse,
+    GatewayResult, HeuristicDialectParser, ListenerConfig, PluginContext, PluginDecision,
+    ProtocolKind, RoutePlan, ServiceConfig, SessionState, TransactionState,
+    TranslationPolicyConfig,
 };
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use parking_lot::Mutex;
@@ -46,6 +47,10 @@ pub struct CoreGatewayConnection {
     service_name: String,
     route_policy: Option<CoreRoutePolicy>,
     plugins: Option<PluginPhase>,
+    /// Present only for cross-protocol services with an enabled policy.
+    translation_policy: Option<TranslationPolicyConfig>,
+    /// Frontend dialect used for translation checks (SQL arrives as client dialect).
+    frontend_dialect: HeuristicDialectParser,
     metrics: MySQLServerMetricsCollector,
 }
 
@@ -55,6 +60,7 @@ impl CoreGatewayConnection {
         backend: Arc<dyn BackendConnector>,
         session: SessionState,
     ) -> Self {
+        let frontend_protocol = frontend.protocol();
         Self {
             frontend,
             backend,
@@ -63,6 +69,8 @@ impl CoreGatewayConnection {
             service_name: String::new(),
             route_policy: None,
             plugins: None,
+            translation_policy: None,
+            frontend_dialect: default_dialect_parser(&frontend_protocol),
             metrics: MySQLServerMetricsCollector,
         }
     }
@@ -74,7 +82,9 @@ impl CoreGatewayConnection {
         listener_name: String,
         service_name: String,
         route_policy: CoreRoutePolicy,
+        translation_policy: Option<TranslationPolicyConfig>,
     ) -> Self {
+        let frontend_protocol = frontend.protocol();
         Self {
             frontend,
             backend,
@@ -83,6 +93,8 @@ impl CoreGatewayConnection {
             service_name,
             route_policy: Some(route_policy),
             plugins: None,
+            translation_policy,
+            frontend_dialect: default_dialect_parser(&frontend_protocol),
             metrics: MySQLServerMetricsCollector,
         }
     }
@@ -194,8 +206,40 @@ impl CoreGatewayConnection {
                 }
             }
 
+            // Cross-protocol: validate subset, rewrite SQL, reject prepared stmts.
+            if let Some(policy) = &self.translation_policy {
+                match prepare_cross_protocol_command(policy, command, &self.frontend_dialect) {
+                    Ok(translated) => command = translated,
+                    Err(error) => {
+                        let response = GatewayResponse::Error {
+                            code: "translation_error".into(),
+                            message: error.to_string(),
+                        };
+                        info!(
+                            target: "data_nexus::audit",
+                            listener = %self.listener_name,
+                            service = %self.service_name,
+                            frontend_protocol = %protocol_metric_name(&self.frontend.protocol()),
+                            backend_protocol = %protocol_metric_name(&self.backend.protocol()),
+                            command_type = %command_type,
+                            endpoint = %label_owned[5],
+                            decision = "translation_reject",
+                            message = %error,
+                            "gateway command rejected by translation policy"
+                        );
+                        packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        finish_command_metrics(&self.metrics, &labels, started_at);
+                        continue;
+                    }
+                }
+            }
+
             let response = match self.backend.execute(command, &mut self.session).await {
-                Ok(response) => response,
+                Ok(response) => map_response_types(
+                    response,
+                    &self.backend.protocol(),
+                    &self.frontend.protocol(),
+                ),
                 Err(error) => GatewayResponse::Error {
                     code: "gateway_error".into(),
                     message: error.to_string(),
@@ -354,6 +398,8 @@ pub struct CoreGatewayListenerPlan {
     plugin_config: Option<plugin::config::Plugin>,
     /// Frontend static auth credential (username, password), if configured.
     auth_user: Option<(String, String)>,
+    /// Enabled cross-protocol translation policy, if any.
+    translation_policy: Option<TranslationPolicyConfig>,
 }
 
 impl PartialEq for CoreGatewayListenerPlan {
@@ -413,13 +459,16 @@ impl CoreGatewayListenerPlan {
             }
             None => None,
         };
+        // Route SQL classification uses frontend dialect (commands arrive as client SQL).
         let route_policy = CoreRoutePolicy::build(
             route_policy_kind.as_deref(),
             endpoints.clone(),
-            &service.backend_protocol,
+            &listener.protocol,
         )?;
         let plugin_config = build_plugin_config(config, &service.plugin_policies)?;
         let auth_user = resolve_auth_user(config, listener.auth_policy.as_deref())?;
+        let translation_policy =
+            resolve_translation_policy(config, listener, service)?;
 
         Ok(Self {
             listener: listener.clone(),
@@ -429,6 +478,7 @@ impl CoreGatewayListenerPlan {
             route_policy,
             plugin_config,
             auth_user,
+            translation_policy,
         })
     }
 
@@ -474,6 +524,7 @@ impl CoreGatewayListenerPlan {
             self.listener.name.clone(),
             self.service.name.clone(),
             self.route_policy.clone(),
+            self.translation_policy.clone(),
         );
         if let Some(plugin_config) = &self.plugin_config {
             connection = connection.with_plugins(PluginPhase::new(plugin_config.clone()));
@@ -488,6 +539,43 @@ impl CoreGatewayListenerPlan {
     pub fn has_plugins(&self) -> bool {
         self.plugin_config.is_some()
     }
+}
+
+fn resolve_translation_policy(
+    config: &GatewayConfig,
+    listener: &ListenerConfig,
+    service: &ServiceConfig,
+) -> GatewayResult<Option<TranslationPolicyConfig>> {
+    if listener.protocol == service.backend_protocol {
+        return Ok(None);
+    }
+    let policy_name = service.translation_policy.as_deref().ok_or_else(|| {
+        GatewayError::Configuration(format!(
+            "listener '{}' protocol '{}' does not match service '{}' backend protocol '{}' (set service.translation_policy)",
+            listener.name,
+            listener.protocol,
+            service.name,
+            service.backend_protocol
+        ))
+    })?;
+    let policy = config
+        .translation_policies
+        .iter()
+        .find(|policy| policy.name == policy_name)
+        .cloned()
+        .ok_or_else(|| {
+            GatewayError::Configuration(format!(
+                "service '{}' references missing translation policy '{}'",
+                service.name, policy_name
+            ))
+        })?;
+    if !policy.enabled {
+        return Err(GatewayError::Configuration(format!(
+            "translation policy '{}' is disabled",
+            policy.name
+        )));
+    }
+    Ok(Some(policy))
 }
 
 fn resolve_auth_user(
@@ -1419,5 +1507,104 @@ mod tests {
 
         let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
         assert!(!plan.listener("mysql-listener").unwrap().has_plugins());
+    }
+
+    fn cross_protocol_mysql_to_pg_config() -> GatewayConfig {
+        let mut config = mysql_config();
+        config.services[0].backend_protocol = ProtocolKind::PostgreSql;
+        config.services[0].translation_policy = Some("mysql-to-pg".into());
+        config.endpoints[0].protocol = ProtocolKind::PostgreSql;
+        config.endpoints[0].address = "127.0.0.1:5432".into();
+        config.endpoints[0].username = "postgres".into();
+        config.translation_policies = vec![TranslationPolicyConfig {
+            name: "mysql-to-pg".into(),
+            enabled: true,
+            frontend_protocol: ProtocolKind::MySql,
+            backend_protocol: ProtocolKind::PostgreSql,
+            allowed_statements: gateway_core::default_allowed_statements(),
+        }];
+        config
+    }
+
+    #[test]
+    fn builds_cross_protocol_connection_when_translation_enabled() {
+        let plan =
+            CoreGatewayRuntimePlan::from_config(&cross_protocol_mysql_to_pg_config()).unwrap();
+        let connection = plan.build_connection("mysql-listener").unwrap();
+        assert_eq!(connection.frontend_protocol(), ProtocolKind::MySql);
+        assert_eq!(connection.backend_protocol(), ProtocolKind::PostgreSql);
+        assert!(connection.translation_policy.is_some());
+    }
+
+    #[tokio::test]
+    async fn cross_protocol_rewrites_sql_and_maps_result_types() {
+        let mut connection = CoreGatewayConnection::new(
+            Box::new(MySqlFrontendProtocol::new(
+                "app".into(),
+                "secret".into(),
+                "test".into(),
+                "8.0".into(),
+            )),
+            Arc::new(StaticBackendConnector {
+                protocol: ProtocolKind::PostgreSql,
+                expected_command: GatewayCommand::Query {
+                    sql: "SELECT \"id\" FROM t LIMIT 2 OFFSET 1".into(),
+                },
+                response: GatewayResponse::ResultSet {
+                    columns: vec![GatewayColumn {
+                        name: "id".into(),
+                        data_type: "int4".into(),
+                    }],
+                    rows: vec![vec![GatewayValue::Integer(7)]],
+                },
+            }),
+            SessionState::default(),
+        );
+        connection.translation_policy = Some(TranslationPolicyConfig {
+            name: "mysql-to-pg".into(),
+            enabled: true,
+            frontend_protocol: ProtocolKind::MySql,
+            backend_protocol: ProtocolKind::PostgreSql,
+            allowed_statements: gateway_core::default_allowed_statements(),
+        });
+
+        let mut frame = vec![COM_QUERY];
+        frame.extend_from_slice(b"SELECT `id` FROM t LIMIT 1, 2");
+        let packets = connection.handle_frame(&frame).await.unwrap();
+        assert!(!packets.is_empty());
+        // MySQL resultset: column-count packet is first (lenenc integer).
+        assert_ne!(packets[0].first(), Some(&0xff));
+    }
+
+    #[tokio::test]
+    async fn cross_protocol_rejects_unsupported_sql() {
+        let mut connection = CoreGatewayConnection::new(
+            Box::new(MySqlFrontendProtocol::new(
+                "app".into(),
+                "secret".into(),
+                "test".into(),
+                "8.0".into(),
+            )),
+            Arc::new(StaticBackendConnector {
+                protocol: ProtocolKind::PostgreSql,
+                expected_command: GatewayCommand::Query {
+                    sql: "should not run".into(),
+                },
+                response: GatewayResponse::Pong,
+            }),
+            SessionState::default(),
+        );
+        connection.translation_policy = Some(TranslationPolicyConfig {
+            name: "mysql-to-pg".into(),
+            enabled: true,
+            frontend_protocol: ProtocolKind::MySql,
+            backend_protocol: ProtocolKind::PostgreSql,
+            allowed_statements: gateway_core::default_allowed_statements(),
+        });
+
+        let mut frame = vec![COM_QUERY];
+        frame.extend_from_slice(b"DROP TABLE users");
+        let packets = connection.handle_frame(&frame).await.unwrap();
+        assert_eq!(packets[0].first(), Some(&0xff));
     }
 }
