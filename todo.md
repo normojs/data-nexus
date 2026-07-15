@@ -35,6 +35,7 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] `DialectParser` 驱动 core 读写路由
 - [x] core 层命令 metrics（accept 循环不再重复统计）
 - [x] 优雅关闭：accept 停止后 drain 在途 session
+- [x] Admin reload apply：错误配置保留旧配置，合法 diff 更新共享配置
 
 ### 关键缺口（阻塞可交付）
 
@@ -164,14 +165,14 @@ M3  受控跨协议（可选）
 - [x] metrics 统一挂 core `handle_frame`（每命令：listener/service/frontend/backend/type/endpoint + latency）
 - [ ] trace / audit 挂 core 层
 - [x] Admin 查询 API 已接 runtime snapshot（listeners/services/endpoints/pools/sessions；骨架+单测）
-- [ ] `POST /admin/reload`：先 diff，再安全应用（当前仅 validate+diff，`applied=false`）
+- [x] `POST /admin/reload`：validate + diff；有变更时 apply 共享配置，并 best-effort 协调 listener stop/start + pool refresh
 - [x] 优雅关闭：`stop()` 停止 accept；`start()` 退出循环后 await 在途 session 任务
 
 ### M2.5 验收
 
 - [x] 同一套 concurrency / circuit-break 策略在 MySQL 与 PG service 上共用 PluginPhase（单元测试）
 - [x] Admin 可查看 listener / service / endpoint / pool / session（API 单测）
-- [ ] reload 后错误配置被拒绝且不影响旧配置（apply 路径未完成）
+- [x] reload 错误配置被拒绝且保留旧配置；合法 diff 会 apply（单测）
 
 ---
 

@@ -800,30 +800,117 @@ impl AxumServer {
     }
 
     async fn admin_reload(State(state): State<Self>) -> Response<Body> {
-        let current_config = match &state.gateway_config {
-            Some(config) => match gateway_config_snapshot(config) {
-                Ok(config) => config,
-                Err(response) => return response,
-            },
+        let shared_config = match &state.gateway_config {
+            Some(config) => config.clone(),
             None => return gateway_config_not_available(),
+        };
+        let current_config = match gateway_config_snapshot(&shared_config) {
+            Ok(config) => config,
+            Err(response) => return response,
         };
         let config_source = match &state.gateway_config_source {
             Some(config_source) => config_source,
             None => return admin_runtime_not_found("gateway config source is not available"),
         };
 
+        // Load+validate next config. On failure keep the previous in-memory config.
         let next_config = match config_source.load() {
             Ok(config) => config,
             Err(error) => return gateway_config_load_error(error),
         };
         let diff = GatewayConfigDiff::between(&current_config, &next_config);
         let changed = diff.has_changes();
+        if !changed {
+            return json_response(&GatewayReloadResponse {
+                status: "validated",
+                source: config_source.description(),
+                applied: false,
+                changed: false,
+                diff,
+            });
+        }
+
+        // Apply shared config first so topology APIs see the new document.
+        {
+            let mut current = match shared_config.write() {
+                Ok(current) => current,
+                Err(_) => {
+                    return admin_json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "gateway reload failed",
+                        "gateway config lock is poisoned".to_string(),
+                    )
+                }
+            };
+            *current = next_config.clone();
+        }
+
+        // Best-effort runtime reconcile for listener topology when controls exist.
+        if let Some(runtime_state) = &state.runtime_state {
+            for removed in &diff.listeners.removed {
+                let _ = runtime_state.stop_listener(removed);
+            }
+            for changed_listener in &diff.listeners.changed {
+                let _ = runtime_state.stop_listener(changed_listener);
+            }
+
+            for added in diff.listeners.added.iter().chain(diff.listeners.changed.iter()) {
+                match GatewayFactory::from_gateway_config(next_config.clone())
+                    .try_build_proxy_for_listener(added)
+                {
+                    Ok(listener_runtime) => {
+                        if let Err(_error) = runtime_state.register_listener(
+                            listener_runtime.name.clone(),
+                            listener_runtime.shutdown_handle.clone(),
+                            listener_runtime.pool_snapshotter.clone(),
+                            listener_runtime.pool_refresher.clone(),
+                            listener_runtime.session_snapshotter.clone(),
+                        ) {
+                            // Listener may still be registered after stop; replace registration.
+                            let _ = runtime_state.stop_listener(added);
+                            if let Err(error) = runtime_state.register_listener(
+                                listener_runtime.name.clone(),
+                                listener_runtime.shutdown_handle.clone(),
+                                listener_runtime.pool_snapshotter.clone(),
+                                listener_runtime.pool_refresher.clone(),
+                                listener_runtime.session_snapshotter.clone(),
+                            ) {
+                                return admin_json_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "gateway reload failed",
+                                    format!(
+                                        "config applied but failed to register listener '{}': {}",
+                                        added, error
+                                    ),
+                                );
+                            }
+                        }
+                        tokio::spawn(start_gateway_server(listener_runtime.proxy));
+                    }
+                    Err(error) => {
+                        return admin_json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "gateway reload failed",
+                            format!(
+                                "config applied but failed to build listener '{}': {}",
+                                added, error
+                            ),
+                        );
+                    }
+                }
+            }
+
+            // Endpoint/pool changes: refresh pools so idle conns pick up new topology.
+            if diff.endpoints.has_changes() {
+                let _ = runtime_state.refresh_pools();
+            }
+        }
 
         json_response(&GatewayReloadResponse {
-            status: "validated",
+            status: "applied",
             source: config_source.description(),
-            applied: false,
-            changed,
+            applied: true,
+            changed: true,
             diff,
         })
     }
@@ -1311,20 +1398,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_reload_reports_config_diff_without_applying_runtime_changes() {
+    async fn admin_reload_applies_shared_config_when_diff_exists() {
         let changed_config = include_str!("../../examples/gateway-config.toml")
             .replace("address = \"127.0.0.1:3307\"", "address = \"127.0.0.1:3317\"");
         let path = write_temp_gateway_config(&changed_config);
         let server = gateway_server_with_config_source(path.clone());
 
-        let (status, value) = post_json(server, "/admin/reload").await;
-        let _ = fs::remove_file(path);
+        let (status, value) = post_json(server.clone(), "/admin/reload").await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(value["status"], "validated");
-        assert_eq!(value["applied"], false);
+        assert_eq!(value["status"], "applied");
+        assert_eq!(value["applied"], true);
         assert_eq!(value["changed"], true);
         assert_eq!(value["diff"]["endpoints"]["changed"][0], "orders-replica");
+
+        let (status, endpoints) = get_json_from(server, "/admin/endpoints").await;
+        let _ = fs::remove_file(path);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(endpoints[1]["address"], "127.0.0.1:3317");
+    }
+
+    #[tokio::test]
+    async fn admin_reload_rejects_invalid_config_and_keeps_previous() {
+        let path = write_temp_gateway_config(
+            r#"
+version = "2"
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+[[listeners]]
+name = "broken"
+listen_addr = "0.0.0.0:1"
+protocol = "mysql"
+service = "missing-service"
+"#,
+        );
+        let server = gateway_server_with_config_source(path.clone());
+
+        let (status, value) = post_json(server.clone(), "/admin/reload").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(value["message"].as_str().unwrap().contains("invalid gateway configuration"));
+
+        let (status, listeners) = get_json_from(server, "/admin/listeners").await;
+        let _ = fs::remove_file(path);
+        assert_eq!(status, StatusCode::OK);
+        // Previous valid example config remains.
+        assert_eq!(listeners[0]["name"], "orders-mysql");
     }
 
     #[tokio::test]
