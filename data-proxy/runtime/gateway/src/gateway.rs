@@ -269,6 +269,25 @@ impl GatewayRuntime {
             start_source.thread_handles.push(join_handle);
         }
 
+        // Graceful shutdown: stop accepting, then wait for in-flight sessions.
+        let session_handles = std::mem::take(&mut start_source.thread_handles);
+        let outstanding = session_handles.len();
+        if outstanding > 0 {
+            debug!(
+                "gateway '{}' waiting for {} in-flight session(s) after accept loop exit",
+                listener_name, outstanding
+            );
+        }
+        for handle in session_handles {
+            if let Err(error) = handle.await {
+                error!(
+                    "gateway '{}' session task stopped with error: {}",
+                    listener_name, error
+                );
+            }
+        }
+        debug!("gateway '{}' session drain complete", listener_name);
+
         Ok(start_source)
     }
 }
@@ -681,13 +700,7 @@ impl Drop for SessionRegistration {
 
 #[async_trait::async_trait]
 impl proxy::factory::Proxy for GatewayRuntime {
-    // TODO：优雅退出
-    // 1、关闭监听
-    // 2、等待处理连接的线程结束
-    // thread_handld:ThreadHandld<()>;
-
-    // 3、退出循环
-
+    /// Run the accept loop until shutdown is requested, then drain sessions.
     async fn start(&mut self) -> Result<StartSource, Error> {
         if self.core_plan.is_none() {
             return Err(runtime_configuration_error(
@@ -697,7 +710,8 @@ impl proxy::factory::Proxy for GatewayRuntime {
         self.start_core_listener().await
     }
 
-    // stop proxy server
+    /// Request graceful shutdown: stop accepting new connections.
+    /// In-flight sessions are drained by `start()` after the accept loop exits.
     async fn stop(&mut self) -> Result<(), Error> {
         self.shutdown_handle.shutdown();
         Ok(())
