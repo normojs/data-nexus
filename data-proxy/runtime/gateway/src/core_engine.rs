@@ -16,12 +16,14 @@ use std::sync::Arc;
 
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
-    BackendConnector, EndpointConfig, EndpointRef, EndpointRole, FrontendProtocolAdapter,
-    GatewayCommand, GatewayConfig, GatewayError, GatewayResponse, GatewayResult, ListenerConfig,
-    ProtocolKind, RoutePlan, ServiceConfig, SessionState, TransactionState,
+    BackendConnector, CommandSummary, EndpointConfig, EndpointRef, EndpointRole,
+    FrontendProtocolAdapter, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse,
+    GatewayResult, ListenerConfig, PluginContext, PluginDecision, ProtocolKind, RoutePlan,
+    ServiceConfig, SessionState, TransactionState,
 };
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use parking_lot::Mutex;
+use plugin::build_phase::PluginPhase;
 
 use crate::{
     backend::{mysql::MySqlBackendConnector, postgresql::PostgreSqlBackendConnector},
@@ -32,13 +34,14 @@ use crate::{
 ///
 /// Wire-specific code still owns socket framing and handshake. Once a frontend
 /// frame is available, this bridge keeps the request path on gateway_core
-/// contracts: decode command, execute against a backend connector, then encode
-/// the response.
+/// contracts: decode command, route, plugin evaluate, execute, then encode.
 pub struct CoreGatewayConnection {
     frontend: Box<dyn FrontendProtocolAdapter>,
     backend: Arc<dyn BackendConnector>,
     session: SessionState,
+    service_name: String,
     route_policy: Option<CoreRoutePolicy>,
+    plugins: Option<PluginPhase>,
 }
 
 impl CoreGatewayConnection {
@@ -47,16 +50,36 @@ impl CoreGatewayConnection {
         backend: Arc<dyn BackendConnector>,
         session: SessionState,
     ) -> Self {
-        Self { frontend, backend, session, route_policy: None }
+        Self {
+            frontend,
+            backend,
+            session,
+            service_name: String::new(),
+            route_policy: None,
+            plugins: None,
+        }
     }
 
     fn with_route_policy(
         frontend: Box<dyn FrontendProtocolAdapter>,
         backend: Arc<dyn BackendConnector>,
         session: SessionState,
+        service_name: String,
         route_policy: CoreRoutePolicy,
     ) -> Self {
-        Self { frontend, backend, session, route_policy: Some(route_policy) }
+        Self {
+            frontend,
+            backend,
+            session,
+            service_name,
+            route_policy: Some(route_policy),
+            plugins: None,
+        }
+    }
+
+    pub fn with_plugins(mut self, plugins: PluginPhase) -> Self {
+        self.plugins = Some(plugins);
+        self
     }
 
     pub fn frontend_protocol(&self) -> ProtocolKind {
@@ -79,10 +102,44 @@ impl CoreGatewayConnection {
         let commands = self.frontend.decode(frame, &mut self.session)?;
         let mut packets = Vec::with_capacity(commands.len());
 
-        for command in commands {
-            if let Some(route_policy) = &self.route_policy {
+        for mut command in commands {
+            let route_plan = if let Some(route_policy) = &self.route_policy {
                 let plan = route_policy.plan_command(&command, &self.session)?;
                 apply_route_plan(&plan, &mut self.session)?;
+                Some(plan)
+            } else {
+                None
+            };
+
+            let mut concurrency_rule_idx = None;
+            if let Some(plugins) = self.plugins.as_mut() {
+                let ctx = PluginContext {
+                    service: self.service_name.clone(),
+                    client_protocol: self.frontend.protocol(),
+                    user: self.session.user.clone(),
+                    database: self.session.database.clone(),
+                    command: CommandSummary::from_command(&command),
+                    route_plan: route_plan.clone(),
+                };
+                match plugins.evaluate(&ctx).map_err(|error| {
+                    GatewayError::Configuration(format!("plugin evaluate failed: {}", error))
+                })? {
+                    PluginDecision::Continue { concurrency_rule_idx: idx } => {
+                        concurrency_rule_idx = idx;
+                    }
+                    PluginDecision::Reject { code, message } => {
+                        let response = GatewayResponse::Error { code, message };
+                        packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        continue;
+                    }
+                    PluginDecision::Rewrite { sql } => {
+                        if let Some(rewritten) =
+                            CommandSummary::from_command(&command).rewritten_sql(sql)
+                        {
+                            command = rewritten;
+                        }
+                    }
+                }
             }
 
             let response = match self.backend.execute(command, &mut self.session).await {
@@ -92,6 +149,10 @@ impl CoreGatewayConnection {
                     message: error.to_string(),
                 },
             };
+
+            if let (Some(plugins), Some(idx)) = (self.plugins.as_mut(), concurrency_rule_idx) {
+                plugins.release_concurrency(idx);
+            }
 
             packets.extend(self.frontend.encode(response, &mut self.session)?);
         }
@@ -279,6 +340,7 @@ impl CoreGatewayListenerPlan {
             frontend,
             backend,
             session,
+            self.service.name.clone(),
             self.route_policy.clone(),
         ))
     }
@@ -605,6 +667,43 @@ mod tests {
             Arc::new(MySqlBackendConnector::new()),
             SessionState::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn plugin_reject_returns_protocol_error_without_backend_execute() {
+        use plugin::{
+            build_phase::PluginPhase,
+            config::{CircuitBreak, Plugin},
+        };
+
+        let plugins = PluginPhase::new(Plugin {
+            concurrency_control: None,
+            circuit_break: Some(vec![CircuitBreak {
+                regex: vec![r"(?i)drop\s+table".into()],
+                case_insensitive: true,
+            }]),
+        });
+        let mut connection = CoreGatewayConnection::new(
+            Box::new(MySqlFrontendProtocol::new(
+                "app".into(),
+                "secret".into(),
+                "test".into(),
+                "8.0".into(),
+            )),
+            Arc::new(StaticBackendConnector {
+                protocol: ProtocolKind::MySql,
+                expected_command: GatewayCommand::Query { sql: "should not run".into() },
+                response: GatewayResponse::Pong,
+            }),
+            SessionState::default(),
+        )
+        .with_plugins(plugins);
+
+        let mut frame = vec![COM_QUERY];
+        frame.extend_from_slice(b"drop table users");
+        let packets = connection.handle_frame(&frame).await.unwrap();
+        assert!(!packets.is_empty());
+        assert_eq!(packets[0].first(), Some(&0xff));
     }
 
     fn postgresql_connection(response: GatewayResponse) -> CoreGatewayConnection {
