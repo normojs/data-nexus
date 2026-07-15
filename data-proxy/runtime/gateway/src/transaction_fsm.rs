@@ -74,13 +74,16 @@ impl Default for TransEventName {
 pub async fn check_get_conn(
     pool: Pool<ClientConn>,
     endpoint: &str,
-    attrs: &[SessionAttr],
+    db: Option<String>,
+    charset: String,
+    autocommit: Option<String>,
 ) -> Result<PoolConn<ClientConn>, Error> {
-    match pool.get_conn_with_endpoint_session(endpoint, attrs).await {
+    let attrs = mysql_pool_attrs(db, charset, autocommit);
+    match pool.get_conn_with_endpoint_session(endpoint, &attrs).await {
         Ok(client_conn) => {
             if !client_conn.is_ready().await {
                 return pool
-                    .rebuild_conn_with_session(endpoint, attrs)
+                    .rebuild_conn_with_session(endpoint, &attrs)
                     .await
                     .map_err(|e| Error::new(ErrorKind::Protocol(e)));
             }
@@ -91,6 +94,19 @@ pub async fn check_get_conn(
             Err(Error::new(ErrorKind::Protocol(err)))
         }
     }
+}
+
+/// Convert generic session fields into MySQL pool session attrs at the pool boundary only.
+fn mysql_pool_attrs(
+    db: Option<String>,
+    charset: String,
+    autocommit: Option<String>,
+) -> Vec<SessionAttr> {
+    vec![
+        SessionAttr::DB(db),
+        SessionAttr::Charset(charset),
+        SessionAttr::Autocommit(autocommit),
+    ]
 }
 
 use strategy::sharding_rewrite::ShardingRewrite;
@@ -414,10 +430,11 @@ impl TransFsm {
         self.autocommit = Some(status)
     }
 
+    /// Borrow a backend connection for `endpoint`, applying current FSM session fields.
+    /// MySQL SessionAttr conversion stays private inside this method.
     pub async fn get_conn_with_endpoint(
         &mut self,
         endpoint: Endpoint,
-        attrs: &[SessionAttr],
     ) -> Result<PoolConn<ClientConn>, Error> {
         let conn = self.client_conn.take();
         match conn {
@@ -426,7 +443,9 @@ impl TransFsm {
                 let factory =
                     ClientConn::with_opts(endpoint.user, endpoint.password, endpoint.addr.clone());
                 self.pool.set_factory(&endpoint.addr, factory);
-                match self.pool.get_conn_with_endpoint_session(&endpoint.addr, attrs).await {
+                let attrs =
+                    mysql_pool_attrs(self.db.clone(), self.charset.clone(), self.autocommit.clone());
+                match self.pool.get_conn_with_endpoint_session(&endpoint.addr, &attrs).await {
                     Ok(client_conn) => Ok(client_conn),
                     Err(err) => Err(Error::new(ErrorKind::Protocol(err))),
                 }
@@ -434,20 +453,14 @@ impl TransFsm {
         }
     }
 
-    pub async fn get_conn(
-        &mut self,
-        _attrs: &[SessionAttr],
-    ) -> Result<PoolConn<ClientConn>, Error> {
+    pub async fn get_conn(&mut self) -> Result<PoolConn<ClientConn>, Error> {
         let conn = self.client_conn.take();
-        Ok(conn.unwrap())
-        //let addr = self.endpoint.as_ref().unwrap().addr.as_ref();
-        //match conn {
-        //    Some(client_conn) => Ok(client_conn),
-        //    None => match self.pool.get_conn_with_endpoint_session(addr, attrs).await {
-        //        Ok(client_conn) => Ok(client_conn),
-        //        Err(err) => Err(Error::new(ErrorKind::Protocol(err))),
-        //    },
-        //}
+        conn.ok_or_else(|| {
+            Error::new(ErrorKind::Runtime(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "transaction fsm has no bound backend connection",
+            ))))
+        })
     }
 
     pub fn put_conn(&mut self, conn: PoolConn<ClientConn>) {
@@ -462,23 +475,32 @@ impl TransFsm {
         self.shard_cache_conn = conns;
     }
 
-    #[inline]
-    pub fn build_conn_attrs(&self) -> Vec<SessionAttr> {
-        vec![
-            SessionAttr::DB(self.db.clone()),
-            SessionAttr::Charset(self.charset.clone()),
-            SessionAttr::Autocommit(self.autocommit.clone()),
-        ]
+    /// Sync generic session fields from the MySQL frontend handshake codec.
+    pub fn apply_handshake_session(&mut self, sess: &ServerHandshakeCodec) {
+        self.db = sess.get_db();
+        if let Some(charset) = sess.get_charset() {
+            self.charset = charset;
+        }
+        self.autocommit = sess.get_autocommit();
+    }
+
+    pub fn session_db(&self) -> Option<&str> {
+        self.db.as_deref()
+    }
+
+    pub fn session_charset(&self) -> &str {
+        self.charset.as_str()
+    }
+
+    pub fn session_autocommit(&self) -> Option<&str> {
+        self.autocommit.as_deref()
     }
 }
 
+/// Apply handshake session into a TransFsm without exposing MySQL SessionAttr to callers.
 #[inline]
-pub fn build_conn_attrs(sess: &ServerHandshakeCodec) -> Vec<SessionAttr> {
-    vec![
-        SessionAttr::DB(sess.get_db()),
-        SessionAttr::Charset(sess.get_charset().unwrap()),
-        SessionAttr::Autocommit(sess.get_autocommit()),
-    ]
+pub fn apply_handshake_to_fsm(fsm: &mut TransFsm, sess: &ServerHandshakeCodec) {
+    fsm.apply_handshake_session(sess);
 }
 
 #[cfg(test)]

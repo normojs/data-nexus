@@ -37,12 +37,12 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] 优雅关闭：accept 停止后 drain 在途 session
 - [x] Admin reload apply：错误配置保留旧配置，合法 diff 更新共享配置
 - [x] Listener 字段收敛为 `protocol`；core audit 日志
+- [x] TransFsm 与 SessionAttr 解耦（池边界内部转换）
 
 ### 关键缺口（阻塞可交付）
 
-1. **事务 FSM 仍绑定 MySQL `SessionAttr`**（legacy command service 路径；core 路径已不依赖）
-2. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选（需 Docker）
-3. **legacy `RouteStrategy::dispatch`** 仍返回 `Endpoint`（仅 legacy 路径）
+1. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选（需 Docker）
+2. **legacy `RouteStrategy::dispatch`** 仍返回 `Endpoint`（仅 legacy 路径）
 
 ---
 
@@ -80,7 +80,7 @@ M3  受控跨协议（可选）
 - [x] MySQL/PG backend 连接池按 `EndpointConfig` 建池（core 路径；runtime 仍可能 bridge UniSQLNode）
 - [x] session：core accept 路径同步 user/database/charset/autocommit；transaction 走 `SessionState`
 - [x] 事务：BEGIN 延迟到首条语句；同一 `PoolConn` lease 贯穿事务；COMMIT/ROLLBACK 释放
-- [ ] `TransFsm` 去掉对 `mysql_protocol::SessionAttr` 的直接依赖（legacy 路径仍用；core 路径已不依赖）
+- [x] `TransFsm` 公共 API 去掉 `SessionAttr`；仅在池边界内部转换为 MySQL attrs
 
 ### M0.3 配置与示例
 

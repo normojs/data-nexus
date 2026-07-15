@@ -24,7 +24,7 @@ use mysql_parser::ast::*;
 use mysql_protocol::{
     client::{
         codec::ResultsetStream,
-        conn::{ClientConn, SessionAttr},
+        conn::ClientConn,
         stmt::Stmt,
     },
     column::{decode_column, Column, ColumnInfo},
@@ -50,7 +50,7 @@ use super::{
 use crate::{
     frontend::mysql::{MySqlCommandService, ReqContext, RespContext},
     transaction_fsm::{
-        build_conn_attrs, check_get_conn, query_rewrite, route, route_sharding, TransEventName,
+        apply_handshake_to_fsm, check_get_conn, query_rewrite, route, route_sharding, TransEventName,
     },
 };
 
@@ -86,27 +86,33 @@ where
         raw_sql: &str,
     ) -> Result<PoolConn<ClientConn>, Error> {
         let sess = req.framed.codec_mut().get_session();
-        let attrs = build_conn_attrs(sess);
+        apply_handshake_to_fsm(&mut req.fsm, sess);
         let is_get_conn = req.fsm.trigger(state_name);
         if is_get_conn {
-            return Self::fsm_get_new_conn(req, raw_sql, input_typ, &attrs).await;
+            return Self::fsm_get_new_conn(req, raw_sql, input_typ).await;
         }
 
         let endpoint = route(input_typ, raw_sql, req.route_strategy.clone());
-        req.fsm.get_conn_with_endpoint(endpoint, &attrs).await
+        req.fsm.get_conn_with_endpoint(endpoint).await
     }
 
     async fn fsm_get_new_conn(
         req: &mut ReqContext<T, C>,
         raw_sql: &str,
         input_typ: RouteInputTyp,
-        attrs: &[SessionAttr],
     ) -> Result<PoolConn<ClientConn>, Error> {
         let endpoint = route(input_typ, raw_sql, req.route_strategy.clone());
         let factory =
             ClientConn::with_opts(endpoint.user, endpoint.password, endpoint.addr.clone());
         req.pool.set_factory(&endpoint.addr, factory);
-        check_get_conn(req.pool.clone(), &endpoint.addr, attrs).await
+        check_get_conn(
+            req.pool.clone(),
+            &endpoint.addr,
+            req.fsm.session_db().map(|s| s.to_owned()),
+            req.fsm.session_charset().to_owned(),
+            req.fsm.session_autocommit().map(|s| s.to_owned()),
+        )
+        .await
     }
 
     async fn init_db_inner<'b>(
@@ -146,7 +152,8 @@ where
         req.stmt_id.fetch_add(1, Ordering::Relaxed);
         let stmt_id = req.stmt_id.load(Ordering::Relaxed);
         let sess = req.framed.codec_mut().get_session();
-        let attrs = build_conn_attrs(sess);
+
+        apply_handshake_to_fsm(&mut req.fsm, sess);
         let raw_sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
         let (_, input_typ, rewrite_outputs) = Self::query_rewrite(req, raw_sql)?;
         req.rewrite_outputs = rewrite_outputs;
@@ -178,7 +185,14 @@ where
         );
 
         let (mut stmts, shard_conns) =
-            Executor::shard_prepare_executor(req, attrs, is_get_conn).await?;
+            Executor::shard_prepare_executor(
+            req,
+            req.fsm.session_db().map(|s| s.to_owned()),
+            req.fsm.session_charset().to_owned(),
+            req.fsm.session_autocommit().map(|s| s.to_owned()),
+            is_get_conn,
+        )
+        .await?;
         for i in stmts.iter().zip(shard_conns.into_iter()) {
             req.stmt_cache.put(stmt_id, i.0.stmt_id, i.1)
         }
@@ -292,7 +306,8 @@ where
 
     async fn shard_query_inner(req: &mut ReqContext<T, C>, payload: &[u8]) -> Result<(), Error> {
         let sess = req.framed.codec_mut().get_session();
-        let attrs = build_conn_attrs(sess);
+
+        apply_handshake_to_fsm(&mut req.fsm, sess);
         let raw_sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
         let (is_get_conn, input_typ, rewrite_outputs) = Self::query_rewrite(req, raw_sql)?;
         req.rewrite_outputs = rewrite_outputs;
@@ -306,7 +321,14 @@ where
         }
 
         route_sharding(input_typ, raw_sql, req.route_strategy.clone(), &mut req.rewrite_outputs);
-        Executor::shard_query_executor(req, attrs, is_get_conn).await?;
+        Executor::shard_query_executor(
+            req,
+            req.fsm.session_db().map(|s| s.to_owned()),
+            req.fsm.session_charset().to_owned(),
+            req.fsm.session_autocommit().map(|s| s.to_owned()),
+            is_get_conn,
+        )
+        .await?;
         Ok(())
     }
 
@@ -343,30 +365,27 @@ where
         req: &mut ReqContext<T, C>,
         payload: &[u8],
     ) -> Result<PoolConn<ClientConn>, Error> {
-        // 获取会话信息
         let sess = req.framed.codec_mut().get_session();
-        // 构建连接属性
-        let attrs = build_conn_attrs(sess);
-        // 将payload转换为字符串并清理
+        apply_handshake_to_fsm(&mut req.fsm, sess);
         let sql = std::str::from_utf8(payload).unwrap().trim_matches(char::from(0));
-        // 进行查询重写和分析
         let (is_get_conn, input_typ, _rewrite_outputs) = Self::query_rewrite(req, sql)?;
 
-        // 判断是否需要获取新连接
         if is_get_conn {
-            // 根据输入类型和SQL进行路由，确定目标数据库地址
             let endpoint = route(input_typ, sql, req.route_strategy.clone());
-            // 创建新的客户端连接工厂
             let factory =
                 ClientConn::with_opts(endpoint.user, endpoint.password, endpoint.addr.clone());
-            // 设置连接工厂到连接池
             req.pool.set_factory(&endpoint.addr, factory);
-            // 检查并获取连接
-            return check_get_conn(req.pool.clone(), &endpoint.addr, &attrs).await;
+            return check_get_conn(
+                req.pool.clone(),
+                &endpoint.addr,
+                req.fsm.session_db().map(|s| s.to_owned()),
+                req.fsm.session_charset().to_owned(),
+                req.fsm.session_autocommit().map(|s| s.to_owned()),
+            )
+            .await;
         }
 
-        // 使用现有连接
-        req.fsm.get_conn(&attrs).await
+        req.fsm.get_conn().await
     }
 
     /// 重写查询SQL的方法
@@ -808,7 +827,7 @@ where
         }
 
         let sess = cx.framed.codec_mut().get_session();
-        let mut client_conn = cx.fsm.get_conn(&build_conn_attrs(sess)).await?;
+        let mut client_conn = cx.fsm.get_conn().await?;
         let ep = client_conn.get_endpoint();
 
         collect_sql_processed_total!(cx, "COM_EXECUTE", ep.as_ref().unwrap());

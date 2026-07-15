@@ -25,7 +25,7 @@ use futures::{stream::FuturesOrdered, SinkExt, StreamExt};
 use mysql_protocol::{
     client::{
         codec::{MergeResultsetState, MergeStream, ResultsetStream},
-        conn::{ClientConn, SessionAttr},
+        conn::ClientConn,
         stmt::Stmt,
     },
     column::{decode_column, ColumnInfo},
@@ -72,7 +72,9 @@ where
 {
     pub async fn shard_query_executor(
         req: &mut ReqContext<T, C>,
-        attrs: Vec<SessionAttr>,
+        db: Option<String>,
+        charset: String,
+        autocommit: Option<String>,
         is_get_conn: bool,
     ) -> Result<(), Error> {
         let mut curr_server_stmt_id: Option<u32> = None;
@@ -86,7 +88,7 @@ where
                 for i in conns {
                     drop(i)
                 }
-                Self::get_shard_conns(&req.rewrite_outputs, req.pool.clone(), attrs).await?
+                Self::get_shard_conns(&req.rewrite_outputs, req.pool.clone(), db.clone(), charset.clone(), autocommit.clone()).await?
             } else {
                 conns
             }
@@ -610,7 +612,9 @@ where
     pub async fn get_shard_conns(
         rewrite_outputs: &ShardingRewriteOutput,
         pool: Pool<ClientConn>,
-        attrs: Vec<SessionAttr>,
+        db: Option<String>,
+        charset: String,
+        autocommit: Option<String>,
     ) -> Result<Vec<PoolConn<ClientConn>>, Error> {
         let endpoints = rewrite_outputs
             .results
@@ -628,12 +632,14 @@ where
             let user = ep.user.clone();
             let password = ep.password.clone();
             let pool = pool.clone();
-            let attrs = attrs.clone();
+            let db = db.clone();
+            let charset = charset.clone();
+            let autocommit = autocommit.clone();
 
             let f = tokio::spawn(async move {
                 let factory = ClientConn::with_opts(user, password, addr.clone());
                 pool.set_factory(&addr, factory);
-                check_get_conn(pool, &addr, &attrs).await
+                check_get_conn(pool, &addr, db, charset, autocommit).await
             });
             conn_futs.push_back(f);
         }
@@ -649,10 +655,19 @@ where
 
     pub async fn shard_prepare_executor(
         req: &mut ReqContext<T, C>,
-        attrs: Vec<SessionAttr>,
+        db: Option<String>,
+        charset: String,
+        autocommit: Option<String>,
         _is_get_conn: bool,
     ) -> Result<(Vec<Stmt>, Vec<PoolConn<ClientConn>>), Error> {
-        let conns = Self::get_shard_conns(&req.rewrite_outputs, req.pool.clone(), attrs).await?;
+        let conns = Self::get_shard_conns(
+            &req.rewrite_outputs,
+            req.pool.clone(),
+            db,
+            charset,
+            autocommit,
+        )
+        .await?;
         let mut send_futs = FuturesOrdered::new();
         let mut sended_conns = Vec::with_capacity(conns.len());
 
