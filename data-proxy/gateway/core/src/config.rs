@@ -21,6 +21,10 @@ pub struct ServiceConfig {
     pub route_policy: Option<String>,
     #[serde(default)]
     pub plugin_policies: Vec<String>,
+    /// Optional named translation policy for cross-protocol access.
+    /// Required (and must be enabled) when listener protocol != backend_protocol.
+    #[serde(default)]
+    pub translation_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +102,8 @@ pub struct GatewayConfig {
     pub auth_policies: Vec<AuthPolicyConfig>,
     #[serde(default)]
     pub plugin_policies: Vec<PluginPolicyConfig>,
+    #[serde(default)]
+    pub translation_policies: Vec<crate::TranslationPolicyConfig>,
 }
 
 impl GatewayConfig {
@@ -124,6 +130,10 @@ impl GatewayConfig {
         validate_unique("route policy", self.route_policies.iter().map(|item| &item.name))?;
         validate_unique("auth policy", self.auth_policies.iter().map(|item| &item.name))?;
         validate_unique("plugin policy", self.plugin_policies.iter().map(|item| &item.name))?;
+        validate_unique(
+            "translation policy",
+            self.translation_policies.iter().map(|item| &item.name),
+        )?;
 
         let services: HashSet<&str> = self.services.iter().map(|item| item.name.as_str()).collect();
         let endpoints: HashSet<&str> =
@@ -136,6 +146,11 @@ impl GatewayConfig {
             self.auth_policies.iter().map(|item| item.name.as_str()).collect();
         let plugins: HashSet<&str> =
             self.plugin_policies.iter().map(|item| item.name.as_str()).collect();
+        let translations: HashMap<&str, &crate::TranslationPolicyConfig> = self
+            .translation_policies
+            .iter()
+            .map(|item| (item.name.as_str(), item))
+            .collect();
 
         for listener in &self.listeners {
             require_non_empty("listener name", &listener.name)?;
@@ -157,16 +172,41 @@ impl GatewayConfig {
             if let Some(service) =
                 self.services.iter().find(|service| service.name == listener.service)
             {
-                // Same-protocol phase: listener frontend must match service backend.
-                // Cross-protocol translation is Phase M3 and must be explicit later.
                 if listener.protocol != service.backend_protocol {
-                    return Err(GatewayError::Configuration(format!(
-                        "listener '{}' protocol '{}' does not match service '{}' backend protocol '{}' (cross-protocol is disabled)",
-                        listener.name,
-                        listener.protocol,
-                        service.name,
-                        service.backend_protocol
-                    )));
+                    // Cross-protocol requires an explicit enabled translation_policy.
+                    let policy_name = service.translation_policy.as_deref().ok_or_else(|| {
+                        GatewayError::Configuration(format!(
+                            "listener '{}' protocol '{}' does not match service '{}' backend protocol '{}' (set service.translation_policy and enable it)",
+                            listener.name,
+                            listener.protocol,
+                            service.name,
+                            service.backend_protocol
+                        ))
+                    })?;
+                    let policy = translations.get(policy_name).ok_or_else(|| {
+                        GatewayError::Configuration(format!(
+                            "service '{}' references missing translation policy '{}'",
+                            service.name, policy_name
+                        ))
+                    })?;
+                    if !policy.enabled {
+                        return Err(GatewayError::Configuration(format!(
+                            "listener '{}' requires enabled translation policy '{}', but it is disabled",
+                            listener.name, policy_name
+                        )));
+                    }
+                    if policy.frontend_protocol != listener.protocol
+                        || policy.backend_protocol != service.backend_protocol
+                    {
+                        return Err(GatewayError::Configuration(format!(
+                            "translation policy '{}' is for {} -> {}, but listener/service need {} -> {}",
+                            policy.name,
+                            policy.frontend_protocol,
+                            policy.backend_protocol,
+                            listener.protocol,
+                            service.backend_protocol
+                        )));
+                    }
                 }
             }
         }
@@ -211,6 +251,14 @@ impl GatewayConfig {
                 if !plugins.contains(policy.as_str()) {
                     return Err(GatewayError::Configuration(format!(
                         "service '{}' references missing plugin policy '{}'",
+                        service.name, policy
+                    )));
+                }
+            }
+            if let Some(policy) = &service.translation_policy {
+                if !translations.contains_key(policy.as_str()) {
+                    return Err(GatewayError::Configuration(format!(
+                        "service '{}' references missing translation policy '{}'",
                         service.name, policy
                     )));
                 }
@@ -263,6 +311,7 @@ mod tests {
                 endpoints: vec!["orders-primary".into()],
                 route_policy: Some("primary-only".into()),
                 plugin_policies: vec!["audit".into()],
+                translation_policy: None,
             }],
             endpoints: vec![EndpointConfig {
                 name: "orders-primary".into(),
@@ -290,6 +339,7 @@ mod tests {
                 max_concurrency: None,
                 duration_secs: None,
             }],
+            translation_policies: vec![],
         }
     }
 
@@ -324,16 +374,52 @@ mod tests {
     }
 
     #[test]
-    fn rejects_listener_backend_protocol_mismatch() {
+    fn rejects_listener_backend_protocol_mismatch_without_translation_policy() {
         let mut config = config();
         config.listeners[0].protocol = ProtocolKind::PostgreSql;
 
         assert_eq!(
             config.validate(),
             Err(GatewayError::Configuration(
-                "listener 'mysql-public' protocol 'postgresql' does not match service 'orders' backend protocol 'mysql' (cross-protocol is disabled)".into()
+                "listener 'mysql-public' protocol 'postgresql' does not match service 'orders' backend protocol 'mysql' (set service.translation_policy and enable it)".into()
             ))
         );
+    }
+
+    #[test]
+    fn accepts_cross_protocol_when_translation_policy_enabled() {
+        let mut config = config();
+        config.listeners[0].protocol = ProtocolKind::MySql;
+        config.services[0].backend_protocol = ProtocolKind::PostgreSql;
+        config.services[0].translation_policy = Some("mysql-to-pg".into());
+        config.endpoints[0].protocol = ProtocolKind::PostgreSql;
+        config.translation_policies = vec![crate::TranslationPolicyConfig {
+            name: "mysql-to-pg".into(),
+            enabled: true,
+            frontend_protocol: ProtocolKind::MySql,
+            backend_protocol: ProtocolKind::PostgreSql,
+            allowed_statements: crate::default_allowed_statements(),
+        }];
+
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_cross_protocol_when_translation_policy_disabled() {
+        let mut config = config();
+        config.services[0].backend_protocol = ProtocolKind::PostgreSql;
+        config.services[0].translation_policy = Some("mysql-to-pg".into());
+        config.endpoints[0].protocol = ProtocolKind::PostgreSql;
+        config.translation_policies = vec![crate::TranslationPolicyConfig {
+            name: "mysql-to-pg".into(),
+            enabled: false,
+            frontend_protocol: ProtocolKind::MySql,
+            backend_protocol: ProtocolKind::PostgreSql,
+            allowed_statements: vec![],
+        }];
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("disabled"));
     }
 
     #[test]

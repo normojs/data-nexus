@@ -179,6 +179,7 @@ mod tests {
             endpoints: vec!["analytics-primary".into()],
             route_policy: None,
             plugin_policies: vec![],
+            translation_policy: None,
         });
         config.gateway.endpoints.push(EndpointConfig {
             name: "analytics-primary".into(),

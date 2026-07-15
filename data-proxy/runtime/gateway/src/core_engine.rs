@@ -927,6 +927,7 @@ mod tests {
                 endpoints: vec!["orders-primary".into()],
                 route_policy: None,
                 plugin_policies: vec![],
+                translation_policy: None,
             }],
             endpoints: vec![EndpointConfig {
                 name: "orders-primary".into(),
@@ -1140,7 +1141,8 @@ mod tests {
 
         let err = CoreGatewayRuntimePlan::from_config(&config).unwrap_err();
         assert!(
-            err.to_string().contains("cross-protocol is disabled"),
+            err.to_string().contains("translation_policy")
+                || err.to_string().contains("does not match"),
             "unexpected error: {err}"
         );
     }

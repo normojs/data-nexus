@@ -40,6 +40,7 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] TransFsm 与 SessionAttr 解耦（池边界内部转换）
 - [x] legacy RouteStrategy 输出 DispatchPlan（对齐 RoutePlan）
 - [x] ShardingPlanner 解耦入口 stub；legacy route 主路径 Result 化
+- [x] translation_policy（默认关闭）+ SQL 子集校验
 
 ### 关键缺口（阻塞可交付）
 
@@ -182,11 +183,11 @@ M3  受控跨协议（可选）
 
 前置：M0–M2 完成且同协议稳定。
 
-- [ ] `translation_policy` 配置，**默认关闭**
-- [ ] 明确 MySQL→PostgreSQL、PostgreSQL→MySQL 支持的 SQL 子集（先 SELECT/简单 DML）
-- [ ] 不支持的 DDL / 存储过程 / COPY / LOAD DATA / 厂商函数 → 明确错误
+- [x] `translation_policy` 配置，**默认关闭**（跨协议需显式 enabled policy）
+- [x] 明确支持子集入口：SELECT/INSERT/UPDATE/DELETE（`check_translation_sql`）
+- [x] 不支持的 DDL / 存储过程 / COPY / LOAD DATA / 厂商函数 → 明确错误
 - [ ] 结果类型映射表 + prepared statement 限制规则
-- [ ] 方言转换测试集（golden tests）
+- [ ] 实际跨协议执行与方言转换测试集（golden tests）
 
 **不做**：任意方言全量互转。
 

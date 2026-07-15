@@ -11,6 +11,7 @@ mod model;
 mod plugin;
 mod route;
 mod sharding;
+mod translation;
 mod transport;
 
 pub use config::{
@@ -26,4 +27,8 @@ pub use model::{
 pub use plugin::{CommandSummary, PluginContext, PluginDecision};
 pub use route::{EndpointRef, RoutePlan, ShardTarget};
 pub use sharding::{ShardingPlanner, UnsupportedShardingPlanner};
+pub use translation::{
+    check_translation_sql, default_allowed_statements, TranslationPolicyConfig,
+    TranslationStatementKind,
+};
 pub use transport::{BackendConnector, FrontendProtocolAdapter};

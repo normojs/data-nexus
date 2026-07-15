@@ -746,6 +746,7 @@ mod tests {
                 endpoints: vec!["orders-primary".into()],
                 route_policy: None,
                 plugin_policies: vec![],
+                translation_policy: None,
             }],
             endpoints: vec![EndpointConfig {
                 name: "orders-primary".into(),
@@ -776,6 +777,7 @@ mod tests {
                 endpoints: vec!["analytics-primary".into()],
                 route_policy: None,
                 plugin_policies: vec![],
+                translation_policy: None,
             }],
             endpoints: vec![EndpointConfig {
                 name: "analytics-primary".into(),
