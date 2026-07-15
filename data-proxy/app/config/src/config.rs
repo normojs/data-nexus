@@ -419,7 +419,8 @@ mod test {
                 .unwrap();
 
         assert_eq!(config.gateway.listeners.len(), 1);
-        assert_eq!(config.gateway.services.len(), 1);
+        assert_eq!(config.gateway.listeners[0].protocol, ProtocolKind::MySql);
+        assert_eq!(config.gateway.services[0].backend_protocol, ProtocolKind::MySql);
         assert_eq!(config.gateway.endpoints.len(), 2);
     }
 
@@ -439,6 +440,48 @@ mod test {
             .endpoints
             .iter()
             .all(|endpoint| endpoint.protocol == ProtocolKind::PostgreSql));
+    }
+
+    #[test]
+    fn parses_and_validates_dual_listener_gateway_config() {
+        let config = GatewayConfigDocument::from_toml(include_str!(
+            "../../../examples/dual-listener-gateway-config.toml"
+        ))
+        .unwrap();
+
+        assert_eq!(config.gateway.listeners.len(), 2);
+        assert_eq!(config.gateway.listeners[0].protocol, ProtocolKind::MySql);
+        assert_eq!(config.gateway.listeners[1].protocol, ProtocolKind::PostgreSql);
+        assert_eq!(config.gateway.services.len(), 2);
+    }
+
+    #[test]
+    fn accepts_legacy_protocol_aliases_in_toml() {
+        let toml = r#"
+version = "2"
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+[[listeners]]
+name = "l1"
+listen_addr = "0.0.0.0:1"
+protocol = "my_sql"
+service = "s1"
+[[services]]
+name = "s1"
+backend_protocol = "my_sql"
+endpoints = ["e1"]
+plugin_policies = []
+[[endpoints]]
+name = "e1"
+protocol = "MySQL"
+address = "127.0.0.1:3306"
+weight = 1
+"#;
+        let config = GatewayConfigDocument::from_toml(toml).unwrap();
+        assert_eq!(config.gateway.listeners[0].protocol, ProtocolKind::MySql);
+        assert_eq!(config.gateway.endpoints[0].protocol, ProtocolKind::MySql);
     }
 
     #[test]

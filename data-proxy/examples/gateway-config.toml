@@ -1,5 +1,6 @@
 # Native Data Nexus v2 configuration.
-# The frontend listener protocol and backend service protocol are independent.
+# Canonical protocol names: mysql, postgresql
+# Aliases still accepted: my_sql, postgres, postgre_sql, pg
 
 version = "2"
 
@@ -11,29 +12,33 @@ log_level = "INFO"
 [[listeners]]
 name = "orders-mysql"
 listen_addr = "0.0.0.0:9088"
-protocol = "my_sql"
+protocol = "mysql"
 service = "orders"
 auth_policy = "orders-users"
 
 [[services]]
 name = "orders"
-backend_protocol = "my_sql"
+backend_protocol = "mysql"
 endpoints = ["orders-primary", "orders-replica"]
 route_policy = "orders-balance"
 plugin_policies = ["orders-audit"]
 
 [[endpoints]]
 name = "orders-primary"
-protocol = "my_sql"
+protocol = "mysql"
 address = "127.0.0.1:3306"
 database = "orders"
+username = "root"
+password = "root"
 weight = 1
 
 [[endpoints]]
 name = "orders-replica"
-protocol = "my_sql"
+protocol = "mysql"
 address = "127.0.0.1:3307"
 database = "orders"
+username = "root"
+password = "root"
 weight = 1
 
 [[route_policies]]

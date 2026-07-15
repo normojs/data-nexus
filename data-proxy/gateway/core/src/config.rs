@@ -19,6 +19,7 @@ pub struct ServiceConfig {
     pub backend_protocol: ProtocolKind,
     pub endpoints: Vec<String>,
     pub route_policy: Option<String>,
+    #[serde(default)]
     pub plugin_policies: Vec<String>,
 }
 
@@ -86,6 +87,22 @@ pub struct GatewayConfig {
 
 impl GatewayConfig {
     pub fn validate(&self) -> GatewayResult<()> {
+        if self.listeners.is_empty() {
+            return Err(GatewayError::Configuration(
+                "gateway config must define at least one listener".into(),
+            ));
+        }
+        if self.services.is_empty() {
+            return Err(GatewayError::Configuration(
+                "gateway config must define at least one service".into(),
+            ));
+        }
+        if self.endpoints.is_empty() {
+            return Err(GatewayError::Configuration(
+                "gateway config must define at least one endpoint".into(),
+            ));
+        }
+
         validate_unique("listener", self.listeners.iter().map(|item| &item.name))?;
         validate_unique("service", self.services.iter().map(|item| &item.name))?;
         validate_unique("endpoint", self.endpoints.iter().map(|item| &item.name))?;
@@ -122,6 +139,21 @@ impl GatewayConfig {
                     )));
                 }
             }
+            if let Some(service) =
+                self.services.iter().find(|service| service.name == listener.service)
+            {
+                // Same-protocol phase: listener frontend must match service backend.
+                // Cross-protocol translation is Phase M3 and must be explicit later.
+                if listener.protocol != service.backend_protocol {
+                    return Err(GatewayError::Configuration(format!(
+                        "listener '{}' protocol '{}' does not match service '{}' backend protocol '{}' (cross-protocol is disabled)",
+                        listener.name,
+                        listener.protocol,
+                        service.name,
+                        service.backend_protocol
+                    )));
+                }
+            }
         }
 
         for service in &self.services {
@@ -139,10 +171,15 @@ impl GatewayConfig {
                         service.name, endpoint
                     )));
                 }
-                let endpoint_protocol = endpoint_protocols.get(endpoint.as_str()).unwrap();
+                let endpoint_protocol = endpoint_protocols.get(endpoint.as_str()).ok_or_else(|| {
+                    GatewayError::Configuration(format!(
+                        "service '{}' references missing endpoint '{}'",
+                        service.name, endpoint
+                    ))
+                })?;
                 if *endpoint_protocol != &service.backend_protocol {
                     return Err(GatewayError::Configuration(format!(
-                        "service '{}' backend protocol {:?} does not match endpoint '{}' protocol {:?}",
+                        "service '{}' backend protocol '{}' does not match endpoint '{}' protocol '{}'",
                         service.name, service.backend_protocol, endpoint, endpoint_protocol
                     )));
                 }
@@ -262,7 +299,32 @@ mod tests {
         assert_eq!(
             config.validate(),
             Err(GatewayError::Configuration(
-                "service 'orders' backend protocol MySql does not match endpoint 'orders-primary' protocol PostgreSql".into()
+                "service 'orders' backend protocol 'mysql' does not match endpoint 'orders-primary' protocol 'postgresql'".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_listener_backend_protocol_mismatch() {
+        let mut config = config();
+        config.listeners[0].protocol = ProtocolKind::PostgreSql;
+
+        assert_eq!(
+            config.validate(),
+            Err(GatewayError::Configuration(
+                "listener 'mysql-public' protocol 'postgresql' does not match service 'orders' backend protocol 'mysql' (cross-protocol is disabled)".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_listeners() {
+        let mut config = config();
+        config.listeners.clear();
+        assert_eq!(
+            config.validate(),
+            Err(GatewayError::Configuration(
+                "gateway config must define at least one listener".into()
             ))
         );
     }

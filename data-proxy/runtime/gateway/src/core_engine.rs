@@ -801,15 +801,17 @@ mod tests {
     }
 
     #[test]
-    fn builds_postgresql_backend_connector_from_runtime_plan() {
+    fn rejects_cross_protocol_listener_and_backend_in_v2_config() {
+        // Same-protocol only until M3 translation_policy is introduced.
         let mut config = mysql_config();
         config.services[0].backend_protocol = ProtocolKind::PostgreSql;
         config.endpoints[0].protocol = ProtocolKind::PostgreSql;
-        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
 
-        let connection = plan.build_connection("mysql-listener").unwrap();
-        assert_eq!(connection.backend_protocol(), ProtocolKind::PostgreSql);
-        assert_eq!(connection.frontend_protocol(), ProtocolKind::MySql);
+        let err = CoreGatewayRuntimePlan::from_config(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("cross-protocol is disabled"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

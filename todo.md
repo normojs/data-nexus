@@ -28,13 +28,14 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] 简单负载均衡 / 读写分离 route policy 协议无关化（core 路径）
 - [x] Admin API 骨架：`/admin/listeners|services|endpoints|pools|sessions|reload` 等
 - [x] metrics 维度：service / frontend protocol / backend protocol / endpoint（部分）
+- [x] 协议名 canonical + 别名解析；v2 示例 / dual-listener / compose 本地后端
 
 ### 关键缺口（阻塞可交付）
 
 1. **`GatewayRuntime` 仍双轨**：v2 启动已走 core accept；仍会派生 `ProxyConfig` / `UniSQLNode` 供 listener/legacy 兼容
-2. **事务 FSM 仍绑定 MySQL `SessionAttr`**
+2. **事务 FSM 仍绑定 MySQL `SessionAttr`**（legacy 路径）
 3. **插件仍吃 `String`**：并发控制 / 熔断未挂 `PluginContext`
-4. **同协议端到端验收未闭环**：v2 MySQL / PG 配置跑通真实客户端的验收项仍未勾选
+4. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选
 5. **legacy 类型未下线**：`ProxyConfig`、`UniSQLNode`、`backend_type` / `node_type` 字符串仍在主结构中
 
 ---
@@ -77,9 +78,9 @@ M3  受控跨协议（可选）
 
 ### M0.3 配置与示例
 
-- [ ] 统一示例配置字段命名（与解析器一致；避免 `my_sql` / `mysql` 混用导致踩坑）
-- [ ] 提供可本地一键验证的 compose 或脚本：MySQL 后端 + PG 后端 + 双 listener
-- [ ] 启动失败时打印：缺 listener / 协议不匹配 / endpoint 引用无效 / auth 缺失
+- [x] 统一协议名：canonical `mysql` / `postgresql`；兼容 `my_sql` / `postgre_sql` / `postgres` / `pg`
+- [x] 示例配置改为 canonical；`dual-listener-gateway-config.toml` + `docker-compose.dev.yml`
+- [x] 启动前校验：缺 listener/service/endpoint、协议不匹配、引用无效 fail fast
 
 ### M0.4 验收（必须全部通过）
 

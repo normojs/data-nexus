@@ -1082,12 +1082,12 @@ mod tests {
         let (status, listeners) = get_json("/admin/listeners").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(listeners.as_array().unwrap().len(), 1);
-        assert_eq!(listeners[0]["protocol"], "my_sql");
+        assert_eq!(listeners[0]["protocol"], "mysql");
 
         let (status, services) = get_json("/admin/services").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(services.as_array().unwrap().len(), 1);
-        assert_eq!(services[0]["backend_protocol"], "my_sql");
+        assert_eq!(services[0]["backend_protocol"], "mysql");
 
         let (status, endpoints) = get_json("/admin/endpoints").await;
         assert_eq!(status, StatusCode::OK);
@@ -1121,7 +1121,7 @@ mod tests {
             json!({
                 "name": "orders-mysql-extra",
                 "listen_addr": "127.0.0.1:0",
-                "protocol": "my_sql",
+                "protocol": "mysql",
                 "service": "orders",
                 "auth_policy": null
             }),
@@ -1154,7 +1154,7 @@ mod tests {
             json!({
                 "name": "orders-mysql",
                 "listen_addr": "127.0.0.1:0",
-                "protocol": "my_sql",
+                "protocol": "mysql",
                 "service": "orders",
                 "auth_policy": null
             }),

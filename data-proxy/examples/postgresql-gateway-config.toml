@@ -1,5 +1,6 @@
 # Native Data Nexus v2 PostgreSQL configuration.
-# This example validates the same protocol path: PostgreSQL client to PostgreSQL backend.
+# Same-protocol path: PostgreSQL client -> Data Nexus -> PostgreSQL backend.
+# Canonical protocol name: postgresql (aliases: postgre_sql, postgres, pg)
 
 version = "2"
 
@@ -10,21 +11,21 @@ log_level = "INFO"
 
 [[listeners]]
 name = "analytics-postgresql"
-listen_addr = "0.0.0.0:5432"
-protocol = "postgre_sql"
+listen_addr = "0.0.0.0:5433"
+protocol = "postgresql"
 service = "analytics"
 auth_policy = "analytics-users"
 
 [[services]]
 name = "analytics"
-backend_protocol = "postgre_sql"
+backend_protocol = "postgresql"
 endpoints = ["analytics-primary", "analytics-replica"]
 route_policy = "analytics-balance"
 plugin_policies = ["analytics-audit"]
 
 [[endpoints]]
 name = "analytics-primary"
-protocol = "postgre_sql"
+protocol = "postgresql"
 address = "127.0.0.1:5432"
 database = "analytics"
 username = "postgres"
@@ -33,8 +34,8 @@ weight = 1
 
 [[endpoints]]
 name = "analytics-replica"
-protocol = "postgre_sql"
-address = "127.0.0.1:5433"
+protocol = "postgresql"
+address = "127.0.0.1:5434"
 database = "analytics"
 username = "postgres"
 password = "postgres"

@@ -1,0 +1,35 @@
+# Local backends for Data Nexus dual-listener smoke tests.
+# Usage:
+#   docker compose -f examples/docker-compose.dev.yml up -d
+#   cargo run -p pisa -- daemon -c examples/dual-listener-gateway-config.toml
+#   mysql -h 127.0.0.1 -P 9088 -uroot -proot -e 'select 1'
+#   PGPASSWORD=postgres psql -h 127.0.0.1 -p 9089 -U postgres -d analytics -c 'select 1'
+
+services:
+  mysql-primary:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: orders
+    ports:
+      - "3306:3306"
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres-primary:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: analytics
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
