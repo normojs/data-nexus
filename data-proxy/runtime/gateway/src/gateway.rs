@@ -262,35 +262,49 @@ impl GatewayRuntime {
     }
 
     async fn start_core_listener(&mut self) -> Result<StartSource, Error> {
-        let listener_config = self.build_listener_config();
-        let protocol = self
-            .core_listener_plan()
-            .map(|plan| plan.listener().protocol.clone())
-            .unwrap_or(ProtocolKind::MySql);
-
-        let mut proxy = Proxy {
-            listener: listener_config,
-            app: self.proxy_config.clone(),
-            backend_nodes: self.nodes.clone(),
-            nodes: self.nodes.clone(),
-        };
-
-        let listener = proxy.build_listener().map_err(ErrorKind::Io)?;
         let core_plan = self.core_plan.clone().ok_or_else(|| {
             runtime_configuration_error("gateway core runtime requires v2 core config")
         })?;
-        let listener_name = self.proxy_config.name.clone();
-        let server_version = self.proxy_config.server_version.clone();
+        let listener_plan = self.core_listener_plan().ok_or_else(|| {
+            runtime_configuration_error("gateway core runtime requires a resolved listener plan")
+        })?;
+
+        // Core path bootstrap reads listener topology from GatewayConfig only.
+        // ProxyConfig/UniSQLNode remain for legacy start and admin pool snapshots.
+        let protocol = listener_plan.listener().protocol.clone();
+        let listener_name = listener_plan.listener().name.clone();
+        let listen_addr = listener_plan.listener().listen_addr.clone();
+        let server_version = match protocol {
+            ProtocolKind::MySql => "8.0".to_owned(),
+            ProtocolKind::PostgreSql => "14.0".to_owned(),
+        };
+        let auth_database =
+            listener_plan.default_database().unwrap_or_default().to_owned();
+        // Auth policies are not fully wired yet; keep optional legacy user/pass bridge.
         let auth_user = self.proxy_config.user.clone();
         let auth_password = self.proxy_config.password.clone();
-        let auth_database = self.proxy_config.db.clone();
+
+        let mut proxy = Proxy {
+            listener: Listener {
+                name: listener_name.clone(),
+                node_type: protocol_name(&protocol).to_owned(),
+                backend_type: protocol_name(&listener_plan.service().backend_protocol).to_owned(),
+                listen_addr,
+                server_version: server_version.clone(),
+            },
+            app: ProxyConfig::default(),
+            backend_nodes: Vec::new(),
+            nodes: Vec::new(),
+        };
+
+        let listener = proxy.build_listener().map_err(ErrorKind::Io)?;
         let session_registry = self.sessions.get_or_insert_with(SessionRegistry::default).clone();
         let mut start_source = StartSource::new(self.shutdown_handle.clone());
 
         loop {
             let socket = tokio::select! {
                 _ = self.shutdown_handle.cancelled() => {
-                    debug!("gateway '{}' shutdown requested", self.proxy_config.name);
+                    debug!("gateway '{}' shutdown requested", listener_name);
                     break;
                 }
                 accepted = proxy.accept(&listener) => {
