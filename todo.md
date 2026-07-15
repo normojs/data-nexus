@@ -38,11 +38,11 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] Admin reload apply：错误配置保留旧配置，合法 diff 更新共享配置
 - [x] Listener 字段收敛为 `protocol`；core audit 日志
 - [x] TransFsm 与 SessionAttr 解耦（池边界内部转换）
+- [x] legacy RouteStrategy 输出 DispatchPlan（对齐 RoutePlan）
 
 ### 关键缺口（阻塞可交付）
 
 1. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选（需 Docker）
-2. **legacy `RouteStrategy::dispatch`** 仍返回 `Endpoint`（仅 legacy 路径）
 
 ---
 
@@ -142,7 +142,7 @@ M3  受控跨协议（可选）
 - [x] 定义 `RoutePlan`：`Single` / `Broadcast` / `Sharded` / `Reject`（`gateway_core::route`）
 - [x] Core 路由 `plan_command` 返回 `RoutePlan`；`handle_frame` 经 `apply_route_plan` 写入 session
 - [x] 读写分离、simple LB 基于 `GatewayCommand` + `SessionState` 决策（core 路径）
-- [ ] legacy `RouteStrategy::dispatch` 仍返回 `Endpoint`（仅 legacy command service）
+- [x] legacy `RouteStrategy::dispatch` 返回 `DispatchPlan`（可转 core `RoutePlan`，保留 Endpoint 凭证）
 - [ ] sharding rewrite 与 MySQL parser 解耦入口（可先 stub Reject）
 
 ### M2.2 插件

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use endpoint::endpoint::Endpoint;
+use gateway_core::{EndpointRef, RoutePlan};
 use indexmap::{IndexMap, IndexSet};
 use loadbalance::balance::{BalanceType, LoadBalance};
 use thiserror::Error;
@@ -35,6 +36,106 @@ pub enum StragegyError {
 
     #[error("build node group name not found {0:?}")]
     NodeGroupNotFound(String),
+}
+
+/// Legacy-path routing decision with full Endpoint credentials.
+///
+/// Aligns with gateway_core::RoutePlan, but keeps Endpoint so callers can
+/// open backend connections without a separate lookup.
+#[derive(Debug, Clone)]
+pub enum DispatchPlan {
+    Single { endpoint: Endpoint, role: TargetRole },
+    Reject { reason: String },
+}
+
+impl DispatchPlan {
+    pub fn single(endpoint: Endpoint, role: TargetRole) -> Self {
+        Self::Single { endpoint, role }
+    }
+
+    pub fn reject(reason: impl Into<String>) -> Self {
+        Self::Reject { reason: reason.into() }
+    }
+
+    pub fn endpoint(self) -> Option<Endpoint> {
+        match self {
+            Self::Single { endpoint, .. } => Some(endpoint),
+            Self::Reject { .. } => None,
+        }
+    }
+
+    pub fn as_endpoint(&self) -> Option<&Endpoint> {
+        match self {
+            Self::Single { endpoint, .. } => Some(endpoint),
+            Self::Reject { .. } => None,
+        }
+    }
+
+    pub fn role(&self) -> Option<TargetRole> {
+        match self {
+            Self::Single { role, .. } => Some(role.clone()),
+            Self::Reject { .. } => None,
+        }
+    }
+
+    /// Convert to protocol-neutral RoutePlan (name+address only).
+    pub fn to_route_plan(&self) -> RoutePlan {
+        match self {
+            Self::Single { endpoint, .. } => {
+                RoutePlan::Single { endpoint: EndpointRef::new(endpoint.name.clone(), endpoint.addr.clone()) }
+            }
+            Self::Reject { reason } => RoutePlan::reject(reason.clone()),
+        }
+    }
+
+    /// Compatibility helper for code that still expects `(Option<Endpoint>, TargetRole)`.
+    pub fn into_legacy_tuple(self) -> (Option<Endpoint>, TargetRole) {
+        match self {
+            Self::Single { endpoint, role } => (Some(endpoint), role),
+            Self::Reject { .. } => (None, TargetRole::ReadWrite),
+        }
+    }
+}
+
+fn plan_from_endpoint_role(
+    endpoint: Option<Endpoint>,
+    role: TargetRole,
+) -> DispatchPlan {
+    match endpoint {
+        Some(endpoint) => DispatchPlan::single(endpoint, role),
+        None => DispatchPlan::reject("route strategy produced no endpoint"),
+    }
+}
+
+#[cfg(test)]
+mod dispatch_plan_tests {
+    use super::*;
+
+    #[test]
+    fn single_plan_converts_to_core_route_plan() {
+        let endpoint = Endpoint {
+            node_type: "mysql".into(),
+            weight: 1,
+            name: "primary".into(),
+            db: "orders".into(),
+            user: "root".into(),
+            password: "secret".into(),
+            addr: "127.0.0.1:3306".into(),
+        };
+        let plan = DispatchPlan::single(endpoint, TargetRole::ReadWrite);
+        assert_eq!(
+            plan.to_route_plan(),
+            RoutePlan::single("primary", "127.0.0.1:3306")
+        );
+        assert_eq!(plan.as_endpoint().unwrap().name, "primary");
+    }
+
+    #[test]
+    fn reject_plan_converts_to_core_reject() {
+        let plan = DispatchPlan::reject("no healthy endpoint");
+        assert!(matches!(plan.to_route_plan(), RoutePlan::Reject { reason } if reason.contains("no healthy")));
+        assert!(plan.as_endpoint().is_none());
+    }
 }
 
 #[derive(Debug)]
@@ -73,11 +174,8 @@ pub enum ReadWriteSplittingRouteInput<'a> {
 pub trait Route {
     type Error;
 
-    // The dispatch function, return a endpoint and role.
-    fn dispatch(
-        &mut self,
-        input: &RouteInput,
-    ) -> Result<(Option<Endpoint>, TargetRole), Self::Error>;
+    /// Dispatch returns a structured plan (Single or Reject).
+    fn dispatch(&mut self, input: &RouteInput) -> Result<DispatchPlan, Self::Error>;
 }
 
 /// Route rule, Currrently support `Regex` only.
@@ -209,7 +307,7 @@ impl RouteStrategy {
     fn readwritesplitting_dispatch(
         strategy: &mut ReadWriteSplittingRouteStrategy,
         input: &RouteInput,
-    ) -> Result<(Option<Endpoint>, TargetRole), BoxError> {
+    ) -> Result<DispatchPlan, BoxError> {
         match strategy {
             ReadWriteSplittingRouteStrategy::Static(ins) => ins.dispatch(input),
             ReadWriteSplittingRouteStrategy::Dynamic(ins) => ins.dispatch(input),
@@ -221,10 +319,7 @@ impl RouteStrategy {
 impl Route for RouteStrategy {
     type Error = BoxError;
 
-    fn dispatch(
-        &mut self,
-        input: &RouteInput,
-    ) -> Result<(Option<Endpoint>, TargetRole), Self::Error> {
+    fn dispatch(&mut self, input: &RouteInput) -> Result<DispatchPlan, Self::Error> {
         match self {
             Self::ReadWriteSplitting(strategy) => {
                 Self::readwritesplitting_dispatch(strategy, input)
@@ -236,13 +331,13 @@ impl Route for RouteStrategy {
 
             Self::Sharding(ins) => {
                 if let RouteInput::Sharding(input) = input {
-                    Ok((Some(input.clone()), TargetRole::ReadWrite))
+                    Ok(DispatchPlan::single(input.clone(), TargetRole::ReadWrite))
                 } else {
-                    Ok((ins.next(), TargetRole::ReadWrite))
+                    Ok(plan_from_endpoint_role(ins.next(), TargetRole::ReadWrite))
                 }
             }
 
-            Self::Simple(ins) => Ok((ins.next(), TargetRole::ReadWrite)),
+            Self::Simple(ins) => Ok(plan_from_endpoint_role(ins.next(), TargetRole::ReadWrite)),
 
             _ => unreachable!(),
         }

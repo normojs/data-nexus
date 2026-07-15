@@ -161,7 +161,9 @@ pub fn route(
         dispatch_res, input_typ, raw_sql
     );
 
-    return dispatch_res.0.unwrap();
+    dispatch_res
+        .endpoint()
+        .expect("route strategy must produce a Single endpoint for legacy path")
 }
 
 pub fn route_sharding(
@@ -206,7 +208,11 @@ pub fn route_sharding(
                     dispatch_res, input_typ, raw_sql
                 );
                 // reassign data_source, type should is DataSource::Endpoint
-                o.ds_idx.ds = DataSource::Endpoint(dispatch_res.0.unwrap());
+                o.ds_idx.ds = DataSource::Endpoint(
+                    dispatch_res
+                        .endpoint()
+                        .expect("route strategy must produce a Single endpoint for sharding"),
+                );
             }
             _ => unreachable!(),
         }

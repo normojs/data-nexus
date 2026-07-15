@@ -124,9 +124,9 @@ impl Route for ReadWriteSplittingDynamic {
     fn dispatch(
         &mut self,
         input: &RouteInput,
-    ) -> Result<(Option<Endpoint>, TargetRole), Self::Error> {
+    ) -> Result<crate::route::DispatchPlan, Self::Error> {
         let v: Vec<_> = self.rx.try_iter().collect();
-        match v.last() {
+        let b = match v.last() {
             Some(rw_endpoint) => {
                 self.rules_match.default_balance = RulesMatchBuilder::build_default_balance(
                     &self.rules_match.default_target,
@@ -148,14 +148,17 @@ impl Route for ReadWriteSplittingDynamic {
                     self.rules_match.default_target.clone(),
                 );
 
-                let b = self.rules_match.get(input);
-                Ok((b.0.next(), b.1))
+                self.rules_match.get(input)
             }
 
-            None => {
-                let b = self.rules_match.get(input);
-                Ok((b.0.next(), b.1))
-            }
+            None => self.rules_match.get(input),
+        };
+
+        match b.0.next() {
+            Some(endpoint) => Ok(crate::route::DispatchPlan::single(endpoint, b.1)),
+            None => Ok(crate::route::DispatchPlan::reject(
+                "read write splitting dynamic route produced no endpoint",
+            )),
         }
     }
 }

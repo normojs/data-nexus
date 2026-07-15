@@ -10,6 +10,7 @@ conn_pool = { path = "../../proxy/pool" }
 crossbeam-channel = "0.3"
 endpoint = { path = "../endpoint" }
 futures = "0.3.5"
+gateway_core = { path = "../../gateway/core" }
 loadbalance = { path = "../loadbalance" }
 mysql_protocol = { path = "../../protocol/mysql", package = "mysql_protocol" }
 postgresql_protocol = { path = "../../protocol/postgresql", package = "postgresql_protocol" }

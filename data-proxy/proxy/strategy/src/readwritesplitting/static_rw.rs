@@ -56,9 +56,14 @@ impl Route for ReadWriteSplittingStatic {
     fn dispatch(
         &mut self,
         input: &RouteInput,
-    ) -> Result<(Option<Endpoint>, TargetRole), Self::Error> {
+    ) -> Result<crate::route::DispatchPlan, Self::Error> {
         let b = self.rules_match.get(input);
-        Ok((b.0.next(), b.1))
+        match b.0.next() {
+            Some(endpoint) => Ok(crate::route::DispatchPlan::single(endpoint, b.1)),
+            None => Ok(crate::route::DispatchPlan::reject(
+                "read write splitting static route produced no endpoint",
+            )),
+        }
     }
 }
 
@@ -99,6 +104,7 @@ mod test {
 
         let rw_endpoint = ReadWriteEndpoint {
             read: vec![Endpoint {
+                node_type: String::new(),
                 weight: 1,
                 name: String::from("test1"),
                 db: String::from("db"),
@@ -107,6 +113,7 @@ mod test {
                 addr: String::from("127.0.0.1"),
             }],
             readwrite: vec![Endpoint {
+                node_type: String::new(),
                 weight: 1,
                 name: String::from("test2"),
                 db: String::from("db"),
@@ -130,22 +137,22 @@ mod test {
         );
         let input = RouteInput::Statement("insert");
         let res = rws.dispatch(&input).unwrap();
-        assert_eq!(res.0.unwrap().addr, "127.0.0.2");
+        assert_eq!(res.as_endpoint().unwrap().addr, "127.0.0.2");
 
         let input = RouteInput::Statement("set");
         let res = rws.dispatch(&input).unwrap();
-        assert_eq!(res.0.unwrap().addr, "127.0.0.2");
+        assert_eq!(res.as_endpoint().unwrap().addr, "127.0.0.2");
 
         let input = RouteInput::None;
         let res = rws.dispatch(&input).unwrap();
-        assert_eq!(res.0.unwrap().addr, "127.0.0.2");
+        assert_eq!(res.as_endpoint().unwrap().addr, "127.0.0.2");
 
         let input = RouteInput::Statement("select 1");
         let res = rws.dispatch(&input).unwrap();
-        assert_eq!(res.0.unwrap().addr, "127.0.0.1");
+        assert_eq!(res.as_endpoint().unwrap().addr, "127.0.0.1");
 
         let input = RouteInput::Transaction("begin");
         let res = rws.dispatch(&input).unwrap();
-        assert_eq!(res.0.unwrap().addr, "127.0.0.2");
+        assert_eq!(res.as_endpoint().unwrap().addr, "127.0.0.2");
     }
 }
