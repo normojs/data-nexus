@@ -3772,6 +3772,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_derive",
+ "sqlparser",
  "strategy",
  "thiserror",
  "tokio",
@@ -4191,6 +4192,15 @@ name = "sql_parser"
 version = "0.1.0"
 dependencies = [
  "mysql_parser",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.51.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fe11944a61da0da3f592e19a45ebe5ab92dc14a779907ff1f08fbb797bfefc7"
+dependencies = [
+ "log",
 ]
 
 [[package]]

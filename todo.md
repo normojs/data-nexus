@@ -15,16 +15,14 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 
 ### 已完成
 
-- M0–M4：同/跨协议 E2E、方言、tracing JSON、双向 smoke
-- Admin 自包含状态页：`GET /admin`
-- 可选 OTel OTLP：`--features otel` + `OTEL_EXPORTER_OTLP_ENDPOINT`
+- M0–M5：同/跨协议 E2E、方言、tracing、Admin UI、可选 OTel
+- PostgreSQL AST dialect：`sqlparser` + structured + heuristic 三级回退
 - 文档：`data-proxy/examples/OBSERVABILITY.md`
 
 ### 开放缺口（可选）
 
-1. 更完整的 PostgreSQL AST crate（structured classifier 已覆盖路由主路径）
-2. 独立 `data-ui` Nuxt 应用深化（Admin HTML 页已可用）
-3. OTel metrics/logs 导出（当前仅 traces）
+1. 独立 `data-ui` Nuxt 应用深化（Admin HTML 页已可用）
+2. OTel metrics/logs 导出（当前仅 traces）
 
 ---
 
@@ -33,6 +31,7 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 ```text
 M0–M4  核心网关 + 跨协议 + 方言/可观测   ✓
 M5     Admin UI + 可选 OTel              ✓
+M6     PostgreSQL AST dialect            ✓
 ```
 
 ---
@@ -56,6 +55,17 @@ M5     Admin UI + 可选 OTel              ✓
 - [x] 可选 feature `otel`（默认关闭，不拖累默认构建）
 - [x] 运行时需 `OTEL_EXPORTER_OTLP_ENDPOINT` 才激活 OTLP
 - [x] OBSERVABILITY.md 更新
+
+---
+
+## M6：PostgreSQL AST dialect（完成）
+
+- [x] `sqlparser` + `PostgreSqlDialect` 解析 `Statement` / `Query` / `SetExpr`
+- [x] 识别 SELECT/VALUES/TABLE/UNION、FOR UPDATE 锁、INSERT/UPDATE/DELETE/COPY/DDL
+- [x] WITH … INSERT/UPDATE/DELETE 判定为写
+- [x] 失败回退：structured classifier → heuristic
+- [x] `runtime_dialect_parser(PostgreSql)` 默认挂 AST 实现
+- [x] 单测覆盖 AST / structured / fallback
 
 ---
 

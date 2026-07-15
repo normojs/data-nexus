@@ -6,6 +6,9 @@
 use gateway_core::{DialectParser, HeuristicDialectParser, ProtocolKind};
 use mysql_parser::ast::SqlStmt;
 use mysql_parser::parser::Parser as MySqlAstParser;
+use sqlparser::ast::{Query, SetExpr, Statement};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser as SqlParser;
 
 /// MySQL dialect parser backed by `mysql_parser` AST when parse succeeds.
 ///
@@ -416,14 +419,213 @@ fn contains_dml_after_with(upper_sql: &str) -> bool {
         || compact.contains(" DELETE FROM")
 }
 
+/// PostgreSQL dialect parser backed by `sqlparser` AST when parse succeeds.
+///
+/// On parse failure (or panic), falls back to
+/// [`PostgreSqlStructuredDialectParser`] so routing remains available.
+#[derive(Debug, Clone)]
+pub struct PostgreSqlAstDialectParser {
+    fallback: PostgreSqlStructuredDialectParser,
+}
+
+impl PostgreSqlAstDialectParser {
+    pub fn new() -> Self {
+        Self {
+            fallback: PostgreSqlStructuredDialectParser::new(),
+        }
+    }
+}
+
+impl Default for PostgreSqlAstDialectParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DialectParser for PostgreSqlAstDialectParser {
+    fn dialect(&self) -> ProtocolKind {
+        ProtocolKind::PostgreSql
+    }
+
+    fn is_read_only(&self, sql: &str) -> bool {
+        match classify_postgresql_ast(sql) {
+            Some(kind) => kind.is_read_only_from_ast(),
+            None => self.fallback.is_read_only(sql),
+        }
+    }
+
+    fn leading_keyword(&self, sql: &str) -> Option<String> {
+        match classify_postgresql_ast(sql) {
+            Some(kind) => Some(kind.leading_keyword().to_owned()),
+            None => self.fallback.leading_keyword(sql),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostgresAstKind {
+    Select,
+    Values,
+    Show,
+    Explain,
+    Insert,
+    Update,
+    Delete,
+    Begin,
+    Commit,
+    Rollback,
+    Set,
+    Copy,
+    Create,
+    Other,
+}
+
+impl PostgresAstKind {
+    fn is_read_only_from_ast(self) -> bool {
+        matches!(
+            self,
+            Self::Select | Self::Values | Self::Show | Self::Explain
+        )
+    }
+
+    fn leading_keyword(self) -> &'static str {
+        match self {
+            Self::Select => "SELECT",
+            Self::Values => "VALUES",
+            Self::Show => "SHOW",
+            Self::Explain => "EXPLAIN",
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+            Self::Begin => "BEGIN",
+            Self::Commit => "COMMIT",
+            Self::Rollback => "ROLLBACK",
+            Self::Set => "SET",
+            Self::Copy => "COPY",
+            Self::Create => "CREATE",
+            Self::Other => "OTHER",
+        }
+    }
+}
+
+fn classify_postgresql_ast(sql: &str) -> Option<PostgresAstKind> {
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let dialect = PostgreSqlDialect {};
+        SqlParser::parse_sql(&dialect, sql)
+    }))
+    .ok()?
+    .ok()?;
+    let first = parsed.into_iter().next()?;
+    Some(statement_kind(&first))
+}
+
+fn statement_kind(stmt: &Statement) -> PostgresAstKind {
+    match stmt {
+        Statement::Query(query) => query_kind(query),
+        Statement::Insert(_) => PostgresAstKind::Insert,
+        Statement::Update { .. } => PostgresAstKind::Update,
+        Statement::Delete(_) => PostgresAstKind::Delete,
+        Statement::Copy { .. } | Statement::CopyIntoSnowflake { .. } => PostgresAstKind::Copy,
+        Statement::StartTransaction { .. } => PostgresAstKind::Begin,
+        Statement::Commit { .. } => PostgresAstKind::Commit,
+        Statement::Rollback { .. } => PostgresAstKind::Rollback,
+        Statement::SetVariable { .. }
+        | Statement::SetTimeZone { .. }
+        | Statement::SetNames { .. }
+        | Statement::SetNamesDefault { .. } => PostgresAstKind::Set,
+        Statement::ShowVariable { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::ShowCreate { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowTables { .. }
+        | Statement::ShowFunctions { .. }
+        | Statement::ShowCollation { .. } => PostgresAstKind::Show,
+        Statement::Explain { .. } | Statement::ExplainTable { .. } => PostgresAstKind::Explain,
+        Statement::CreateTable(_)
+        | Statement::CreateView { .. }
+        | Statement::CreateIndex(_)
+        | Statement::CreateSchema { .. }
+        | Statement::CreateDatabase { .. }
+        | Statement::CreateFunction { .. }
+        | Statement::CreateProcedure { .. }
+        | Statement::CreateType { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::CreateRole { .. }
+        | Statement::CreateVirtualTable { .. } => PostgresAstKind::Create,
+        // DDL / DCL / session control / unsupported for read routing.
+        Statement::Drop { .. }
+        | Statement::DropFunction { .. }
+        | Statement::AlterTable { .. }
+        | Statement::AlterIndex { .. }
+        | Statement::Truncate { .. }
+        | Statement::Grant { .. }
+        | Statement::Revoke { .. }
+        | Statement::Analyze { .. }
+        | Statement::Comment { .. }
+        | Statement::Prepare { .. }
+        | Statement::Execute { .. }
+        | Statement::Deallocate { .. }
+        | Statement::Declare { .. }
+        | Statement::Fetch { .. }
+        | Statement::Close { .. }
+        | Statement::Call(_) => PostgresAstKind::Other,
+        _ => PostgresAstKind::Other,
+    }
+}
+
+fn query_kind(query: &Query) -> PostgresAstKind {
+    // SELECT ... FOR UPDATE / FOR SHARE is write-bound for routing.
+    if !query.locks.is_empty() {
+        return PostgresAstKind::Other;
+    }
+    match query.body.as_ref() {
+        SetExpr::Select(_) => PostgresAstKind::Select,
+        SetExpr::Values(_) => PostgresAstKind::Values,
+        SetExpr::Query(inner) => query_kind(inner),
+        SetExpr::SetOperation { left, right, .. } => {
+            // UNION/INTERSECT/EXCEPT of read-only sides stays read-only unless locks.
+            let left_kind = set_expr_kind(left);
+            let right_kind = set_expr_kind(right);
+            if left_kind.is_read_only_from_ast() && right_kind.is_read_only_from_ast() {
+                PostgresAstKind::Select
+            } else {
+                PostgresAstKind::Other
+            }
+        }
+        SetExpr::Insert(stmt) => statement_kind(stmt),
+        SetExpr::Update(stmt) => statement_kind(stmt),
+        SetExpr::Table(_) => PostgresAstKind::Select, // PostgreSQL TABLE t
+    }
+}
+
+fn set_expr_kind(expr: &SetExpr) -> PostgresAstKind {
+    match expr {
+        SetExpr::Select(_) => PostgresAstKind::Select,
+        SetExpr::Values(_) => PostgresAstKind::Values,
+        SetExpr::Query(q) => query_kind(q),
+        SetExpr::SetOperation { left, right, .. } => {
+            let left_kind = set_expr_kind(left);
+            let right_kind = set_expr_kind(right);
+            if left_kind.is_read_only_from_ast() && right_kind.is_read_only_from_ast() {
+                PostgresAstKind::Select
+            } else {
+                PostgresAstKind::Other
+            }
+        }
+        SetExpr::Insert(stmt) => statement_kind(stmt),
+        SetExpr::Update(stmt) => statement_kind(stmt),
+        SetExpr::Table(_) => PostgresAstKind::Select,
+    }
+}
+
 /// Build a dialect parser for the given protocol.
 ///
-/// MySQL uses AST classification with heuristic fallback; PostgreSQL uses a
-/// structured classifier (comment-aware) with heuristic fallback.
+/// - MySQL: `mysql_parser` AST + heuristic fallback
+/// - PostgreSQL: `sqlparser` AST + structured fallback + heuristic
 pub fn runtime_dialect_parser(protocol: &ProtocolKind) -> Box<dyn DialectParser> {
     match protocol {
         ProtocolKind::MySql => Box::new(MySqlAstDialectParser::new()),
-        ProtocolKind::PostgreSql => Box::new(PostgreSqlStructuredDialectParser::new()),
+        ProtocolKind::PostgreSql => Box::new(PostgreSqlAstDialectParser::new()),
     }
 }
 
@@ -472,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn postgresql_classifies_read_and_write() {
+    fn postgresql_structured_classifies_read_and_write() {
         let parser = PostgreSqlStructuredDialectParser::new();
         assert!(parser.is_read_only("SELECT 1"));
         assert!(parser.is_read_only("TABLE users"));
@@ -491,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn postgresql_strips_comments_before_classify() {
+    fn postgresql_structured_strips_comments_before_classify() {
         let parser = PostgreSqlStructuredDialectParser::new();
         assert!(parser.is_read_only("-- comment\nSELECT 1"));
         assert!(parser.is_read_only("/* block */ SELECT 1"));
@@ -500,5 +702,55 @@ mod tests {
             parser.leading_keyword("-- hi\n  update t set a=1"),
             Some("UPDATE".into())
         );
+    }
+
+    #[test]
+    fn postgresql_ast_classifies_read_and_write() {
+        let parser = PostgreSqlAstDialectParser::new();
+        assert!(parser.is_read_only("SELECT 1"));
+        assert!(parser.is_read_only("SELECT id FROM users WHERE id = 1"));
+        assert!(parser.is_read_only("WITH cte AS (SELECT 1 AS x) SELECT * FROM cte"));
+        assert!(parser.is_read_only("VALUES (1), (2)"));
+        assert!(parser.is_read_only("SELECT 1 UNION SELECT 2"));
+        assert!(!parser.is_read_only("INSERT INTO t VALUES (1)"));
+        assert!(!parser.is_read_only("UPDATE t SET a = 1 WHERE id = 2"));
+        assert!(!parser.is_read_only("DELETE FROM t WHERE id = 1"));
+        assert!(!parser.is_read_only("SELECT * FROM t FOR UPDATE"));
+        assert!(!parser.is_read_only(
+            "WITH cte AS (SELECT id FROM t) INSERT INTO u SELECT id FROM cte"
+        ));
+        assert!(!parser.is_read_only("CREATE TABLE t (id INT)"));
+        assert!(!parser.is_read_only("DROP TABLE t"));
+    }
+
+    #[test]
+    fn postgresql_ast_leading_keyword() {
+        let parser = PostgreSqlAstDialectParser::new();
+        assert_eq!(parser.leading_keyword("select 1"), Some("SELECT".into()));
+        assert_eq!(
+            parser.leading_keyword("insert into t values (1)"),
+            Some("INSERT".into())
+        );
+        assert_eq!(
+            parser.leading_keyword("with c as (select 1) select * from c"),
+            Some("SELECT".into())
+        );
+    }
+
+    #[test]
+    fn postgresql_ast_falls_back_on_unparseable() {
+        let parser = PostgreSqlAstDialectParser::new();
+        // Garbage: structured/heuristic fallback (not read-only).
+        assert!(!parser.is_read_only("!!!"));
+        // Comment + select: structured fallback still read-only if AST fails.
+        assert!(parser.is_read_only("-- comment\nSELECT 1"));
+    }
+
+    #[test]
+    fn runtime_parser_selects_postgresql_ast() {
+        let parser = runtime_dialect_parser(&ProtocolKind::PostgreSql);
+        assert_eq!(parser.dialect(), ProtocolKind::PostgreSql);
+        assert!(parser.is_read_only("SELECT 1"));
+        assert!(!parser.is_read_only("DELETE FROM t"));
     }
 }
