@@ -53,13 +53,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error};
 
 use crate::{
-    backend::mysql::MySqlBackendConnector,
     core_engine::{CoreGatewayConnection, CoreGatewayListenerPlan, CoreGatewayRuntimePlan},
     frontend::{
         mysql::{MySqlFrontendConnection, MySqlFrontendProtocol, ReqContext},
         postgresql::PostgreSqlFrontendProtocol,
     },
-    server::{metrics::*, stmt_cache::StmtCache},
+    server::{metrics::*, stmt_cache::StmtCache, LegacyMySqlCommandService},
     transaction_fsm::*,
 };
 
@@ -262,8 +261,12 @@ impl GatewayRuntime {
         Arc::new(move || registry.snapshot())
     }
 
-    async fn start_postgresql_core(&mut self) -> Result<StartSource, Error> {
+    async fn start_core_listener(&mut self) -> Result<StartSource, Error> {
         let listener_config = self.build_listener_config();
+        let protocol = self
+            .core_listener_plan()
+            .map(|plan| plan.listener().protocol.clone())
+            .unwrap_or(ProtocolKind::MySql);
 
         let mut proxy = Proxy {
             listener: listener_config,
@@ -274,17 +277,20 @@ impl GatewayRuntime {
 
         let listener = proxy.build_listener().map_err(ErrorKind::Io)?;
         let core_plan = self.core_plan.clone().ok_or_else(|| {
-            runtime_configuration_error("postgresql gateway runtime requires v2 core config")
+            runtime_configuration_error("gateway core runtime requires v2 core config")
         })?;
         let listener_name = self.proxy_config.name.clone();
         let server_version = self.proxy_config.server_version.clone();
+        let auth_user = self.proxy_config.user.clone();
+        let auth_password = self.proxy_config.password.clone();
+        let auth_database = self.proxy_config.db.clone();
         let session_registry = self.sessions.get_or_insert_with(SessionRegistry::default).clone();
         let mut start_source = StartSource::new(self.shutdown_handle.clone());
 
         loop {
             let socket = tokio::select! {
                 _ = self.shutdown_handle.cancelled() => {
-                    debug!("postgresql gateway '{}' shutdown requested", self.proxy_config.name);
+                    debug!("gateway '{}' shutdown requested", self.proxy_config.name);
                     break;
                 }
                 accepted = proxy.accept(&listener) => {
@@ -295,19 +301,158 @@ impl GatewayRuntime {
             let core_plan = core_plan.clone();
             let listener_name = listener_name.clone();
             let server_version = server_version.clone();
+            let auth_user = auth_user.clone();
+            let auth_password = auth_password.clone();
+            let auth_database = auth_database.clone();
             let session_registry = session_registry.clone();
             let peer_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
+            let protocol = protocol.clone();
 
             let join_handle = tokio::spawn(async move {
-                run_postgresql_core_session(
-                    socket,
-                    core_plan,
-                    listener_name,
-                    server_version,
-                    session_registry,
+                match protocol {
+                    ProtocolKind::PostgreSql => {
+                        run_postgresql_core_session(
+                            socket,
+                            core_plan,
+                            listener_name,
+                            server_version,
+                            session_registry,
+                            peer_addr,
+                        )
+                        .await;
+                    }
+                    ProtocolKind::MySql => {
+                        run_mysql_core_session(
+                            socket,
+                            core_plan,
+                            listener_name,
+                            server_version,
+                            auth_user,
+                            auth_password,
+                            auth_database,
+                            session_registry,
+                            peer_addr,
+                        )
+                        .await;
+                    }
+                }
+            });
+
+            start_source.thread_handles.push(join_handle);
+        }
+
+        Ok(start_source)
+    }
+
+    async fn start_legacy_mysql(&mut self) -> Result<StartSource, Error> {
+        let listener = self.build_listener_config();
+
+        let mut proxy = Proxy {
+            listener,
+            app: self.proxy_config.clone(),
+            backend_nodes: self.nodes.clone(),
+            nodes: self.nodes.clone(),
+        };
+
+        let listener = proxy.build_listener().map_err(ErrorKind::Io)?;
+
+        let pool = self
+            .pool
+            .get_or_insert_with(|| Pool::<ClientConn>::new(self.proxy_config.pool_size as usize))
+            .clone();
+
+        let ast_cache = Arc::new(Mutex::new(ParserAstCache::new()));
+        let route_strategy = Arc::new(Mutex::new(self.build_route()?));
+        let rewriter = self.build_sharding_rewriter();
+
+        let mut plugin: Option<PluginPhase> = None;
+        if let Some(config) = &self.proxy_config.plugin {
+            plugin = Some(PluginPhase::new(config.clone()))
+        };
+
+        let parser = Arc::new(Parser::new());
+        let has_rw = self.proxy_config.read_write_splitting.is_some();
+        let mut start_source = StartSource::new(self.shutdown_handle.clone());
+        let session_registry = self.sessions.get_or_insert_with(SessionRegistry::default).clone();
+
+        loop {
+            let socket = tokio::select! {
+                _ = self.shutdown_handle.cancelled() => {
+                    debug!("gateway '{}' shutdown requested", self.proxy_config.name);
+                    break;
+                }
+                accepted = proxy.accept(&listener) => {
+                    accepted.map_err(ErrorKind::Io)?
+                }
+            };
+
+            let route_strategy = route_strategy.clone();
+            let plugin = plugin.clone();
+            let parser = parser.clone();
+            let ast_cache = ast_cache.clone();
+            let pool = pool.clone();
+            let proxy_name = self.proxy_config.name.clone();
+            let session_listener = proxy_name.clone();
+            let session_registry = session_registry.clone();
+            let peer_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
+            let frontend_protocol = self.frontend_protocol_name();
+            let backend_protocol = self.backend_protocol_name();
+            let service = self.service_name();
+            let database = optional_database(&self.proxy_config.db);
+            let rewriter = rewriter.clone();
+
+            let frontend = MySqlFrontendProtocol::new(
+                self.proxy_config.user.clone(),
+                self.proxy_config.password.clone(),
+                self.proxy_config.db.clone(),
+                self.proxy_config.server_version.clone(),
+            );
+
+            let mut instance = MySqlFrontendConnection::new(LegacyMySqlCommandService::new());
+            let join_handle = tokio::spawn(async move {
+                let _session_registration = session_registry.register(SessionEntrySnapshot {
+                    id: 0,
+                    listener: session_listener,
                     peer_addr,
-                )
-                .await;
+                    frontend_protocol: frontend_protocol.clone(),
+                    database,
+                });
+
+                let framed = match frontend.handshake(socket).await {
+                    Ok(framed) => framed,
+                    Err(e) => {
+                        error!("handshake error {:?}", e);
+                        return;
+                    }
+                };
+
+                let context = ReqContext {
+                    fsm: TransFsm::new(pool.clone()),
+                    route_strategy,
+                    pool,
+                    ast_cache,
+                    plugin,
+                    metrics_collector: MySQLServerMetricsCollector,
+                    concurrency_control_rule_idx: None,
+                    framed,
+                    name: proxy_name,
+                    service,
+                    frontend_protocol,
+                    backend_protocol,
+                    parser,
+                    rewriter,
+                    rewrite_outputs: ShardingRewriteOutput {
+                        results: vec![],
+                        agg_fields: IndexMap::new(),
+                    },
+                    has_readwritesplitting: has_rw,
+                    stmt_cache: StmtCache::new(),
+                    stmt_id: AtomicU32::new(0),
+                };
+
+                if let Err(e) = instance.run(context).await {
+                    error!("instance run error {:?}", e);
+                }
             });
 
             start_source.thread_handles.push(join_handle);
@@ -322,6 +467,155 @@ fn runtime_configuration_error(message: impl Into<String>) -> Error {
 }
 
 const MAX_POSTGRESQL_FRONTEND_MESSAGE_LEN: usize = 16 * 1024 * 1024;
+const MAX_MYSQL_FRONTEND_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
+
+async fn run_mysql_core_session(
+    socket: tokio::net::TcpStream,
+    core_plan: CoreGatewayRuntimePlan,
+    listener_name: String,
+    server_version: String,
+    auth_user: String,
+    auth_password: String,
+    auth_database: String,
+    session_registry: SessionRegistry,
+    peer_addr: Option<String>,
+) {
+    use futures::{SinkExt, StreamExt};
+    use mysql_protocol::{
+        server::codec::{make_err_packet, CommonPacket, PacketSend},
+        server::err::MySQLError,
+        session::Session,
+    };
+
+    let frontend = MySqlFrontendProtocol::new(
+        auth_user.clone(),
+        auth_password,
+        auth_database,
+        server_version,
+    );
+    let mut framed = match frontend.handshake(socket).await {
+        Ok(framed) => framed,
+        Err(error) => {
+            error!("mysql handshake error {:?}", error);
+            return;
+        }
+    };
+
+    let mut connection = match core_plan.build_connection(&listener_name) {
+        Ok(connection) => connection,
+        Err(error) => {
+            error!("mysql core connection build error {:?}", error);
+            return;
+        }
+    };
+
+    let handshake_session = framed.codec_mut().get_session();
+    let mut session = connection.session().clone();
+    if !auth_user.is_empty() {
+        session.user = Some(auth_user);
+    }
+    if let Some(database) = handshake_session.get_db() {
+        session.database = Some(database);
+    }
+    if let Some(charset) = handshake_session.get_charset() {
+        session.charset = Some(charset);
+    }
+    if let Some(autocommit) = handshake_session.get_autocommit() {
+        session.autocommit = Some(autocommit == "1" || autocommit.eq_ignore_ascii_case("true"));
+    }
+
+    let metric_labels = GatewayMetricLabels::from_plan(
+        &core_plan,
+        &listener_name,
+        session.backend_endpoint.as_deref(),
+    );
+    let metrics_collector = MySQLServerMetricsCollector;
+    *connection.session_mut() = session.clone();
+
+    let _session_registration = session_registry.register(SessionEntrySnapshot {
+        id: 0,
+        listener: listener_name.clone(),
+        peer_addr,
+        frontend_protocol: protocol_name(&ProtocolKind::MySql).to_owned(),
+        database: session.database.clone(),
+    });
+
+    while let Some(frame) = framed.next().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                error!("mysql frontend frame read error {:?}", error);
+                break;
+            }
+        };
+
+        if frame.len() > MAX_MYSQL_FRONTEND_PAYLOAD_LEN {
+            error!(
+                "mysql frontend payload length {} exceeds limit {}",
+                frame.len(),
+                MAX_MYSQL_FRONTEND_PAYLOAD_LEN
+            );
+            break;
+        }
+
+        let collect_query_metrics = frame.first() == Some(&mysql_protocol::mysql_const::COM_QUERY);
+        let terminate = frame.first() == Some(&mysql_protocol::mysql_const::COM_QUIT);
+        let started_at = Instant::now();
+
+        if collect_query_metrics {
+            let labels = metric_labels.values("QUERY");
+            metrics_collector.set_sql_under_processing_inc(&labels);
+        }
+
+        let packets = match connection.handle_frame(&frame).await {
+            Ok(packets) => packets,
+            Err(error) => {
+                if collect_query_metrics {
+                    let labels = metric_labels.values("QUERY");
+                    metrics_collector.set_sql_under_processing_dec(&labels);
+                    metrics_collector.set_sql_processed_total(&labels);
+                    metrics_collector
+                        .set_sql_processed_duration(&labels, started_at.elapsed().as_secs_f64());
+                }
+                let err_info = make_err_packet(MySQLError::new(
+                    1105,
+                    b"HY000".to_vec(),
+                    error.to_string(),
+                ));
+                if let Err(send_error) = framed
+                    .send(PacketSend::Encode::<Box<[u8]>>(err_info[4..].into()))
+                    .await
+                {
+                    error!("mysql error response write failed {:?}", send_error);
+                }
+                framed.codec_mut().reset_seq();
+                continue;
+            }
+        };
+
+        if collect_query_metrics {
+            let labels = metric_labels.values("QUERY");
+            metrics_collector.set_sql_under_processing_dec(&labels);
+            metrics_collector.set_sql_processed_total(&labels);
+            metrics_collector
+                .set_sql_processed_duration(&labels, started_at.elapsed().as_secs_f64());
+        }
+
+        for packet in packets {
+            if let Err(error) =
+                framed.send(PacketSend::Encode::<Box<[u8]>>(packet.into())).await
+            {
+                error!("mysql response write error {:?}", error);
+                return;
+            }
+        }
+        framed.codec_mut().reset_seq();
+
+        if terminate {
+            break;
+        }
+    }
+}
 
 async fn run_postgresql_core_session(
     socket: tokio::net::TcpStream,
@@ -768,142 +1062,13 @@ impl proxy::factory::Proxy for GatewayRuntime {
 
     // 3、退出循环
 
-    // async fn start(&mut self, &mut start_source: StartSource) -> Result<StartSource, Error> {
     async fn start(&mut self) -> Result<StartSource, Error> {
-        if self
-            .core_listener_plan()
-            .map(|plan| plan.listener().protocol == ProtocolKind::PostgreSql)
-            .unwrap_or(false)
-        {
-            return self.start_postgresql_core().await;
+        if self.core_plan.is_some() {
+            return self.start_core_listener().await;
         }
 
-        let listener = self.build_listener_config();
-
-        let mut proxy = Proxy {
-            listener,
-            app: self.proxy_config.clone(),
-            backend_nodes: self.nodes.clone(),
-            nodes: self.nodes.clone(),
-        };
-
-        let listener = proxy.build_listener().map_err(ErrorKind::Io)?;
-
-        let pool = self
-            .pool
-            .get_or_insert_with(|| Pool::<ClientConn>::new(self.proxy_config.pool_size as usize))
-            .clone();
-
-        let ast_cache = Arc::new(Mutex::new(ParserAstCache::new()));
-
-        // TODO: using a loadbalancer factory for different load balance strategy.
-        // Currently simple_loadbalancer purely provide a list of nodes without any strategy.
-        let route_strategy = Arc::new(Mutex::new(self.build_route()?));
-
-        // Build sharding rewriter
-        let rewriter = self.build_sharding_rewriter();
-
-        let mut plugin: Option<PluginPhase> = None;
-        if let Some(config) = &self.proxy_config.plugin {
-            plugin = Some(PluginPhase::new(config.clone()))
-        };
-
-        // TODO: 加载配置
-
-        let parser = Arc::new(Parser::new());
-        //let metrics_collector = MySQLServerMetricsCollector::new();
-
-        let has_rw = self.proxy_config.read_write_splitting.is_some();
-        let mut start_source = StartSource::new(self.shutdown_handle.clone());
-        let session_registry = self.sessions.get_or_insert_with(SessionRegistry::default).clone();
-
-        loop {
-            let socket = tokio::select! {
-                _ = self.shutdown_handle.cancelled() => {
-                    debug!("gateway '{}' shutdown requested", self.proxy_config.name);
-                    break;
-                }
-                accepted = proxy.accept(&listener) => {
-                    accepted.map_err(ErrorKind::Io)?
-                }
-            };
-
-            let route_strategy = route_strategy.clone();
-            let plugin = plugin.clone();
-            let parser = parser.clone();
-            let ast_cache = ast_cache.clone();
-            let pool = pool.clone();
-            let proxy_name = self.proxy_config.name.clone();
-            let session_listener = proxy_name.clone();
-            let session_registry = session_registry.clone();
-            let peer_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
-            let frontend_protocol = self.frontend_protocol_name();
-            let backend_protocol = self.backend_protocol_name();
-            let service = self.service_name();
-            let database = optional_database(&self.proxy_config.db);
-            let rewriter = rewriter.clone();
-
-            let frontend = MySqlFrontendProtocol::new(
-                self.proxy_config.user.clone(),
-                self.proxy_config.password.clone(),
-                self.proxy_config.db.clone(),
-                self.proxy_config.server_version.clone(),
-            );
-
-            // TODO: 根据node_type创建实例
-            let mut instance = MySqlFrontendConnection::new(MySqlBackendConnector::new());
-            debug!("loop start....");
-            let join_handle = tokio::spawn(async move {
-                let _session_registration = session_registry.register(SessionEntrySnapshot {
-                    id: 0,
-                    listener: session_listener,
-                    peer_addr,
-                    frontend_protocol: frontend_protocol.clone(),
-                    database,
-                });
-
-                let framed = match frontend.handshake(socket).await {
-                    Ok(framed) => framed,
-                    Err(e) => {
-                        error!("handshake error {:?}", e);
-                        return;
-                    }
-                };
-
-                let context = ReqContext {
-                    fsm: TransFsm::new(pool.clone()),
-                    route_strategy,
-                    pool,
-                    ast_cache,
-                    plugin,
-                    metrics_collector: MySQLServerMetricsCollector,
-                    concurrency_control_rule_idx: None,
-                    framed,
-                    name: proxy_name,
-                    service,
-                    frontend_protocol,
-                    backend_protocol,
-                    // mysql_parser: Arc::new(()),
-                    parser,
-                    rewriter,
-                    rewrite_outputs: ShardingRewriteOutput {
-                        results: vec![],
-                        agg_fields: IndexMap::new(),
-                    },
-                    has_readwritesplitting: has_rw,
-                    stmt_cache: StmtCache::new(),
-                    stmt_id: AtomicU32::new(0),
-                };
-
-                if let Err(e) = instance.run(context).await {
-                    error!("instance run error {:?}", e);
-                }
-            }); // end  tokio::spawn
-
-            start_source.thread_handles.push(join_handle);
-        }
-
-        Ok(start_source)
+        // Legacy MySQL packet path retained only for non-v2 startup.
+        self.start_legacy_mysql().await
     }
 
     // stop proxy server

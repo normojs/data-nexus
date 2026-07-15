@@ -1,117 +1,228 @@
-# Data Nexus TODO
+# Data Nexus 后续开发计划
 
-详细规划见：`docs/data-nexus-protocol-gateway-plan.md`
+详细架构见：`docs/data-nexus-protocol-gateway-plan.md`
 
-## 第一步：架构重塑
+## 产品定位
 
-- [ ] 将 Data Nexus 从当前的 MySQL 代理实现，改造成协议无关的 Gateway Core + 前端协议适配器 + 后端连接器。
-- [x] 明确 Gateway Core、FrontendProtocolAdapter、BackendConnector 三层边界。
-- [x] 先定义协议无关接口和核心数据结构，再迁移现有 MySQL 实现。
+Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 
-## 产品目标
+- 前端协议、后端协议、SQL 方言、路由、治理插件解耦
+- Phase A/B：同协议中转（MySQL↔MySQL、PostgreSQL↔PostgreSQL）
+- Phase C：治理协议无关化
+- Phase D：受控跨协议（明确 SQL 子集，默认关闭）
 
-- [ ] 将 Data Nexus 定位为数据库协议中转站，而不只是 MySQL proxy。
-- [ ] 支持不同客户端通过 Data Nexus 访问后端数据库，例如 MySQL client、JDBC MySQL、psql、PostgreSQL JDBC。
-- [ ] 第一阶段优先支持同协议中转：MySQL -> MySQL、PostgreSQL -> PostgreSQL。
-- [ ] 第二阶段再支持受控跨协议访问，例如 MySQL 客户端查询 PostgreSQL 后端的明确 SQL 子集。
-- [ ] 明确前端协议、后端协议、SQL 方言、路由策略、治理插件必须解耦。
+---
 
-## Phase 0：稳定现状和配置边界
+## 现状快照（2026-07）
 
-- [x] 不实现 v1 配置兼容层（项目尚未发布，直接采用 v2 配置）。
-- [x] 新增 `core` crate，沉淀协议无关的核心类型。
-- [x] 定义 `ProtocolKind`，替代 `node_type`、`backend_type` 等字符串驱动逻辑。
-- [x] 定义 `GatewayCommand`，统一表示 query、prepare、execute、use database、transaction、ping、quit 等命令。
-- [x] 定义 `GatewayResponse`，统一表示 OK、ERR、结果集、prepare response、流式响应等返回。
-- [x] 定义 `SessionState`，统一表达 user、database、charset、autocommit、transaction state 等会话状态。
-- [x] 定义 `GatewayConfig`，作为内部统一配置模型。
-- [x] 新增 v2 config schema：`listeners`、`services`、`endpoints`、`route_policies`、`auth_policies`、`plugin_policies`。
-- [x] 不实现 v1 config 到 `GatewayConfig` 的兼容转换。
-- [x] 实现配置校验器，启动前检查协议、service、endpoint、route policy 引用是否有效。
-- [x] 新增并校验 v2 Gateway 配置示例。
+### 已完成
 
-## Phase 1：抽出 MySQL 前端和后端
+- [x] `gateway/core`：`ProtocolKind` / `GatewayCommand` / `GatewayResponse` / `SessionState` / `GatewayConfig`
+- [x] v2 配置 schema：`listeners` / `services` / `endpoints` / `route_policies` / `auth_policies` / `plugin_policies`
+- [x] 配置校验器 + 示例：`examples/gateway-config.toml`、`examples/postgresql-gateway-config.toml`
+- [x] `MySqlFrontendProtocol` / `PostgreSqlFrontendProtocol`
+- [x] `MySqlBackendConnector`（池化 simple query）/ `PostgreSqlBackendConnector`
+- [x] `CoreGatewayConnection` + `CoreGatewayRuntimePlan`（`core_engine.rs`）
+- [x] `GatewayFactory` 按 v2 listener 构建 runtime
+- [x] v2 启动走 core accept：`start_core_listener` 同时支持 MySQL / PostgreSQL
+- [x] 简单负载均衡 / 读写分离 route policy 协议无关化（core 路径）
+- [x] Admin API 骨架：`/admin/listeners|services|endpoints|pools|sessions|reload` 等
+- [x] metrics 维度：service / frontend protocol / backend protocol / endpoint（部分）
 
-- [x] 将 `runtime/gateway` 中的 MySQL 协议处理抽成 `MySqlFrontendProtocol`。
-- [x] 将 MySQL 后端连接和执行逻辑收口为 `MySqlBackendConnector`。
-- [x] 让 `MySqlFrontendProtocol` 对接 `gateway_core::FrontendProtocolAdapter`。
-- [x] 让 `MySqlBackendConnector` 对接 `gateway_core::BackendConnector`。
-- [x] 新增 `GatewayRuntime` 运行时入口（当前内部仍复用迁移中的 MySQL 主链路）。
-- [ ] 让 `GatewayRuntime` 只依赖 `GatewayCommand`、`GatewayResponse`、`SessionState` 等 core 类型。
-- [x] 让 `PisaProxyFactory` 演进为 `GatewayFactory`。
-- [x] 根据 `listener.protocol` 构建对应 frontend adapter。
-- [x] 根据 `service.backend_protocol` 构建对应 backend connector。
-- [ ] 保持现有 MySQL 代理功能行为不变。
-- [x] 不保留旧 MySQL example config 的启动兼容，后续只支持 v2 Gateway 配置。
+### 关键缺口（阻塞可交付）
 
-## Phase 2：PostgreSQL 同协议中转
+1. **`GatewayRuntime` 仍双轨**：v2 启动已走 core accept；仍会派生 `ProxyConfig` / `UniSQLNode` 供 listener/legacy 兼容
+2. **事务 FSM 仍绑定 MySQL `SessionAttr`**
+3. **插件仍吃 `String`**：并发控制 / 熔断未挂 `PluginContext`
+4. **同协议端到端验收未闭环**：v2 MySQL / PG 配置跑通真实客户端的验收项仍未勾选
+5. **legacy 类型未下线**：`ProxyConfig`、`UniSQLNode`、`backend_type` / `node_type` 字符串仍在主结构中
 
-- [x] 支持 PostgreSQL simple query 基础链路。
-- [x] 支持 PostgreSQL session 状态同步。
-- [x] 支持 MySQL listener 和 PostgreSQL listener 同时存在。
-- [x] 在 metrics 中区分 service、frontend protocol、backend protocol、endpoint。
+---
 
-## Phase 3：治理能力协议无关化
+## 路线总览
 
-- [x] 将 simple load balance 改为协议无关。
-- [x] 将读写分离 route policy 改为协议无关。
-- [ ] 将并发控制插件改为基于 `PluginContext`。
-- [ ] 将熔断插件改为基于 `PluginContext`。
-- [ ] 定义 `PluginDecision`，支持 continue、reject、rewrite。
-- [ ] 定义 `RoutePlan`，支持 single、broadcast、sharded、reject。
-- [ ] 将 `RouteStrategy::dispatch` 返回值升级为 `RoutePlan`。
-- [ ] 抽出 `DialectParser` trait，让 MySQL/PostgreSQL parser 按 dialect 挂载。
-- [ ] 将 sharding rewrite 和 SQL parser 解耦，避免强绑定 MySQL。
-- [ ] 将 metrics、trace、audit 统一挂在 Gateway Core 层。
+```text
+M0  端到端可跑（同协议）     ← 当前最高优先
+M1  去掉 legacy 双轨
+M2  治理协议无关 + Admin 可用
+M3  受控跨协议（可选）
+```
 
-## Phase 4：受控跨协议访问
+原则：
 
-- [ ] 定义 `translation_policy` 配置，默认关闭跨协议翻译。
-- [ ] 明确 MySQL -> PostgreSQL 支持的 SQL 子集。
-- [ ] 明确 PostgreSQL -> MySQL 支持的 SQL 子集。
-- [ ] 为不支持的 DDL、存储过程、COPY、LOAD DATA、vendor-specific function 返回明确错误。
-- [ ] 建立 SQL 方言转换测试集。
-- [ ] 建立跨协议结果类型映射规则。
-- [ ] 建立跨协议 prepared statement 限制规则。
+- 先打通 **同协议生产可用**，再做插件/分片/跨协议
+- 新代码只依赖 `gateway_core` 类型；legacy 只允许在明确标记的 bridge 里
+- 配置错误 fail fast；请求错误只影响当前 session，禁止主路径 panic
 
-## 当前代码改造点
+---
 
-- [x] 将 `runtime/unisql` 改名或逐步替换为 `runtime/gateway`。
-- [x] 将 `SQLProxy` 入口迁移为 `GatewayRuntime`。
-- [x] 将 `PisaProxyFactory` 演进为 `GatewayFactory`，启动路径改为 `runtime_gateway::gateway::GatewayRuntime`。
-- [x] 将 `GatewayFactory` 改为按 listener/service 构建 runtime。
-- [ ] 拆分 `ProxyConfig`，避免一个结构同时承载监听、认证、后端、路由、插件和云端配置。
-- [x] 新增 `ListenerConfig`。
-- [x] 新增 `ServiceConfig`。
-- [x] 新增 `EndpointConfig`。
-- [x] 新增 `RoutePolicyConfig`。
-- [x] 新增 `AuthPolicyConfig`。
-- [x] 新增 `PluginPolicyConfig`。
-- [ ] 将 `UniSQLNode` 替换为更通用的 `EndpointConfig`。
-- [ ] 将 `node_type`、`backend_type` 字符串替换为 `ProtocolKind` enum。
-- [ ] 将事务 FSM 与 `mysql_protocol::client::conn::SessionAttr` 解耦。
-- [ ] 让 FSM 只负责事务状态和连接绑定决策。
-- [ ] 将协议 session 到通用 `SessionState` 的转换放在 frontend adapter。
-- [ ] 将插件接口从 `String` 输入升级为 `PluginContext`。
-- [ ] 减少主链路中的 `unwrap()`，把请求级错误转换成客户端协议错误包。
-- [x] 配置错误在启动阶段 fail fast，并输出明确错误信息。
+## M0：同协议端到端可交付（1–2 周）
 
-## 验收标准
+目标：v2 配置下，MySQL / PostgreSQL 客户端分别能稳定访问同协议后端。
 
-- [x] 不保留 v1 MySQL example config 的运行兼容（项目尚未发布）。
-- [ ] v2 MySQL config 可以运行同样链路。
-- [x] runtime 主路径不再依赖 `backend_type` 字符串。
-- [ ] 配置错误能在启动时给出明确错误。
-- [ ] MySQL 客户端可以通过 Data Nexus 连接 MySQL 后端。
-- [ ] PostgreSQL 客户端可以通过 Data Nexus 连接 PostgreSQL 后端。
-- [ ] MySQL listener 和 PostgreSQL listener 可以同时存在。
-- [ ] `/metrics` 能区分 service、frontend protocol、backend protocol、endpoint。
-- [ ] simple load balance、并发控制、熔断对 MySQL/PostgreSQL 都可用。
-- [ ] Admin API 能查看 listener、service、endpoint、pool 状态。
+### M0.1 打通 core 执行主路径
+
+- [x] `GatewayRuntime::start()` 有 v2 core_plan 时默认走 `CoreGatewayConnection`（MySQL/PG 共用 core accept）
+- [x] 补全 `MySqlBackendConnector`：连接池 + simple query + session attr 同步（prepare-execute 仍后续）
+- [x] `PostgreSqlBackendConnector` simple query + 基础 session 同步已在 runtime accept 路径可用
+- [x] listener accept → frontend handshake → `handle_frame` / command loop → backend → encode 主路径
+- [x] 请求级错误转为客户端协议错误包（MySQL ERR / PG ErrorResponse）
+
+### M0.2 会话与连接
+
+- [ ] 连接池按 `EndpointConfig` 建池，不经 `UniSQLNode` 转换（可先 bridge，再删）
+- [ ] session：user / database / charset(或 client_encoding) / autocommit / transaction 在 frontend 与 core `SessionState` 间双向同步
+- [ ] 事务：同连接绑定（事务中禁止切 endpoint），BEGIN/COMMIT/ROLLBACK 走 `GatewayCommand`
+- [ ] `TransFsm` 去掉对 `mysql_protocol::SessionAttr` 的直接依赖（FSM 只看 `SessionState` + 连接租约）
+
+### M0.3 配置与示例
+
+- [ ] 统一示例配置字段命名（与解析器一致；避免 `my_sql` / `mysql` 混用导致踩坑）
+- [ ] 提供可本地一键验证的 compose 或脚本：MySQL 后端 + PG 后端 + 双 listener
+- [ ] 启动失败时打印：缺 listener / 协议不匹配 / endpoint 引用无效 / auth 缺失
+
+### M0.4 验收（必须全部通过）
+
+- [ ] `mysql` 客户端经 Data Nexus 连 MySQL 后端：SELECT / 简单写 / 事务
+- [ ] `psql` 经 Data Nexus 连 PostgreSQL 后端：SELECT / 简单写 / 事务
+- [ ] MySQL listener 与 PostgreSQL listener **同时**存在
+- [ ] 错误 SQL / 断后端时客户端收到协议错误，进程不退出
+- [ ] `/metrics` 可区分 service、frontend protocol、backend protocol、endpoint
+
+**退出标准**：上述验收 + 单元测试覆盖 core route / protocol registry / config validate。
+
+---
+
+## M1：去掉 legacy 双轨（1–2 周）
+
+目标：runtime 只认 `GatewayConfig` + core 类型。
+
+### M1.1 删除启动期派生
+
+- [ ] 删除 `legacy_proxy_config_from_core_plan` / `legacy_nodes_from_core_plan` 主路径依赖
+- [ ] `GatewayRuntime` 字段改为：`GatewayConfig`（或 `CoreGatewayRuntimePlan`）+ pool registry + session registry + shutdown
+- [ ] `GatewayFactory` / `app/server` 只保留 v2 启动路径；legacy `ProxyKind` / `backend_type` 仅编译期隔离或删除
+
+### M1.2 配置类型收敛
+
+- [ ] 运行时不再读写 `ProxyConfig` / `UniSQLNode`（ShardingSphere 路径若仍需要，独立 crate，不污染 gateway）
+- [ ] `node_type` / `backend_type` 字符串从 gateway 主路径彻底移除
+- [ ] 旧 example-config（v1）标记废弃或移出默认文档；文档只写 v2
+
+### M1.3 错误模型
+
+- [ ] 主链路统一 `GatewayError` / `GatewayResult`
+- [ ] 减少 `runtime/gateway`、`core_engine`、frontend/backend adapter 中的 `unwrap()`
+- [ ] 配置错误：启动失败；协议/SQL 错误：session 级
+
+### M1.4 验收
+
+- [ ] 全仓 gateway 相关测试只依赖 v2 config
+- [ ] `rg "backend_type|UniSQLNode" runtime/gateway` 主路径无命中（测试/bridge 除外并标注）
+- [ ] `GatewayRuntime` 公共 API 不再暴露 `ProxyConfig`
+
+---
+
+## M2：治理协议无关 + 可运维（2 周）
+
+目标：LB / 读写分离 / 插件 / Admin 对 MySQL 与 PG 同样可用。
+
+### M2.1 路由
+
+- [ ] 定义 `RoutePlan`：`Single` / `Broadcast` / `Sharded` / `Reject`
+- [ ] `RouteStrategy::dispatch` 返回 `RoutePlan`，不再只返回单个 `Endpoint`
+- [ ] 读写分离、simple LB 基于 `GatewayCommand` + `SessionState` 决策
+- [ ] sharding rewrite 与 MySQL parser 解耦入口（可先 stub Reject）
+
+### M2.2 插件
+
+- [ ] 定义 `PluginContext`（service、协议、user、database、command 摘要、route_plan）
+- [ ] 定义 `PluginDecision`：`Continue` / `Reject` / `Rewrite { sql }`
+- [ ] 并发控制、熔断改为基于 `PluginContext`，输入不再是裸 `String`
+- [ ] 插件挂在 Gateway Core 命令执行前后，对 MySQL/PG 共用
+
+### M2.3 Parser / Dialect
+
+- [ ] 抽出 `DialectParser` trait
+- [ ] MySQL / PostgreSQL parser 按 dialect 挂载
+- [ ] 读路由、审计、rewrite 只依赖 dialect 抽象，不直接 import mysql_parser
+
+### M2.4 可观测与 Admin
+
+- [ ] metrics / trace / audit 统一挂 core 层（每命令：协议、service、endpoint、latency、错误码）
+- [ ] Admin 与真实 runtime 状态打通（listener 启停、pool snapshot、session 列表）
+- [ ] `POST /admin/reload`：先 diff，再安全应用（新增/停止 listener、替换 route policy、刷新 endpoint）
+- [ ] 补齐 shutdown：`stop()` 优雅关闭现有连接
+
+### M2.5 验收
+
+- [ ] 同一套 concurrency / circuit-break 策略在 MySQL 与 PG service 上行为一致
+- [ ] Admin 可查看 listener / service / endpoint / pool / session
+- [ ] reload 后错误配置被拒绝且不影响旧配置
+
+---
+
+## M3：受控跨协议（按需，2+ 周）
+
+前置：M0–M2 完成且同协议稳定。
+
+- [ ] `translation_policy` 配置，**默认关闭**
+- [ ] 明确 MySQL→PostgreSQL、PostgreSQL→MySQL 支持的 SQL 子集（先 SELECT/简单 DML）
+- [ ] 不支持的 DDL / 存储过程 / COPY / LOAD DATA / 厂商函数 → 明确错误
+- [ ] 结果类型映射表 + prepared statement 限制规则
+- [ ] 方言转换测试集（golden tests）
+
+**不做**：任意方言全量互转。
+
+---
+
+## 建议迭代顺序（按 PR）
+
+| 顺序 | PR 主题 | 依赖 |
+|------|---------|------|
+| 1 | 补全 MySQL backend connector + core accept 路径 | — |
+| 2 | PG accept 路径与 MySQL 对齐 + 双 listener 集成测试 | 1 |
+| 3 | SessionState 贯通 + TransFsm 解耦 MySQL | 1–2 |
+| 4 | 删除 legacy ProxyConfig/UniSQLNode 派生 | 3 |
+| 5 | RoutePlan + 读写分离/LB 收口 core | 4 |
+| 6 | PluginContext / PluginDecision + 并发/熔断迁移 | 4–5 |
+| 7 | DialectParser + metrics/audit 挂 core | 5–6 |
+| 8 | Admin 与 runtime 状态 / reload diff | 4+ |
+| 9 |（可选）translation_policy 与跨协议子集 | 6–7 |
+
+---
+
+## 模块边界（开发时遵守）
+
+```text
+gateway/core     协议无关类型与 trait（禁止依赖 mysql/pg wire）
+runtime/gateway  编排：listener、session、route、plugin 调用
+frontend/*       握手 + decode/encode only
+backend/*        连后端 + 执行 only
+proxy/*          池、endpoint、strategy（逐步只认 core 类型）
+plugin/*         输入 PluginContext，输出 PluginDecision
+app/config       v2 解析与校验
+http             Admin / metrics，不解析 SQL
+```
+
+---
 
 ## 暂不做
 
-- [ ] 暂不做任意 MySQL/PostgreSQL 全量互转。
-- [ ] 暂不继续在 `ProxyConfig` 上堆新字段。
-- [ ] 暂不让 `node_type` 字符串决定运行时行为。
-- [ ] 暂不优先做管理 UI，先完成 runtime state 和 admin API。
+- [ ] 任意 MySQL/PostgreSQL 全量互转
+- [ ] 继续在 `ProxyConfig` 上堆字段
+- [ ] 用 `node_type` 字符串决定运行时行为
+- [ ] 优先做管理 UI（`data-ui`）；先完成 runtime state + Admin API
+- [ ] 一次性大搬家到 `backend/mysql` 目录结构（可后置，先接口正确）
+
+---
+
+## 完成定义（Definition of Done）
+
+每个里程碑合并前：
+
+1. 有对应示例 config 或集成测试
+2. `cargo test`（相关 crate）通过
+3. 不引入新的主路径 `unwrap()` / 字符串协议分支
+4. 更新本文件勾选状态；重大接口变更同步 `docs/data-nexus-protocol-gateway-plan.md`
+)

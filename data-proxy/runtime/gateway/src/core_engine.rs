@@ -514,7 +514,7 @@ fn build_backend_connector(
 ) -> GatewayResult<Arc<dyn BackendConnector>> {
     match &service.backend_protocol {
         ProtocolKind::MySql => {
-            Ok(Arc::new(MySqlBackendConnector::<(), ()>::with_endpoints(endpoints.to_vec())))
+            Ok(Arc::new(MySqlBackendConnector::with_endpoints(endpoints.to_vec())))
         }
         ProtocolKind::PostgreSql => {
             Ok(Arc::new(PostgreSqlBackendConnector::with_endpoints(endpoints.to_vec())))
@@ -564,7 +564,7 @@ mod tests {
                 "test".into(),
                 "8.0".into(),
             )),
-            Arc::new(MySqlBackendConnector::<(), ()>::new()),
+            Arc::new(MySqlBackendConnector::new()),
             SessionState::default(),
         )
     }

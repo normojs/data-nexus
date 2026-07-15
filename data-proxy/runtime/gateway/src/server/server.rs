@@ -19,10 +19,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::BytesMut;
 use conn_pool::PoolConn;
 use futures::{SinkExt, StreamExt};
-use gateway_core::{
-    BackendConnector, Column as GatewayColumn, EndpointConfig, GatewayCommand, GatewayError,
-    GatewayResponse, GatewayResult, GatewayValue, ProtocolKind, SessionState, TransactionState,
-};
+use gateway_core::EndpointConfig;
 use mysql_parser::ast::*;
 use mysql_protocol::{
     client::{
@@ -57,312 +54,24 @@ use crate::{
     },
 };
 
-pub struct MySqlBackendConnector<T, C> {
+pub struct LegacyMySqlCommandService<T, C> {
     endpoints: Vec<EndpointConfig>,
     _phat: PhantomData<(T, C)>,
 }
 
-impl<T, C> MySqlBackendConnector<T, C> {
+impl<T, C> LegacyMySqlCommandService<T, C> {
     pub fn new() -> Self {
         Self { endpoints: Vec::new(), _phat: PhantomData }
     }
-
-    pub fn with_endpoints(endpoints: Vec<EndpointConfig>) -> Self {
-        Self { endpoints, _phat: PhantomData }
-    }
-
-    fn endpoint(&self, session: &SessionState) -> GatewayResult<&EndpointConfig> {
-        if let Some(endpoint_name) = session.backend_endpoint.as_deref() {
-            return self
-                .endpoints
-                .iter()
-                .find(|endpoint| endpoint.name == endpoint_name)
-                .ok_or_else(|| {
-                    GatewayError::Configuration(format!(
-                        "mysql backend connector has no configured endpoint '{}'",
-                        endpoint_name
-                    ))
-                });
-        }
-
-        self.endpoints.first().ok_or_else(|| {
-            GatewayError::Configuration(
-                "mysql backend connector has no configured endpoints".into(),
-            )
-        })
-    }
-
-    async fn execute_simple_query(
-        &self,
-        sql: &str,
-        session: &mut SessionState,
-    ) -> GatewayResult<GatewayResponse> {
-        let endpoint = self.endpoint(session)?;
-        let mut conn = ClientConn::with_opts(
-            endpoint.username.clone(),
-            endpoint.password.clone(),
-            endpoint.address.clone(),
-        )
-        .connect()
-        .await
-        .map_err(|error| GatewayError::Backend(format!("connect mysql backend: {}", error)))?;
-
-        if let Some(database) = session.database.clone().or_else(|| endpoint.database.clone()) {
-            if !database.is_empty() {
-                let (_, ok) = conn.send_use_db(&database).await.map_err(|error| {
-                    GatewayError::Backend(format!("select mysql database: {}", error))
-                })?;
-                if ok {
-                    session.database = Some(database);
-                } else {
-                    return Err(GatewayError::Backend(format!(
-                        "mysql backend rejected database '{}'",
-                        database
-                    )));
-                }
-            }
-        }
-
-        let mut stream = conn
-            .send_query(sql.as_bytes())
-            .await
-            .map_err(|error| GatewayError::Backend(format!("write mysql query: {}", error)))?;
-
-        read_mysql_query_response(&mut stream).await
-    }
 }
 
-impl<T, C> Default for MySqlBackendConnector<T, C> {
+impl<T, C> Default for LegacyMySqlCommandService<T, C> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-async fn read_mysql_query_response(
-    stream: &mut ResultsetStream<'_>,
-) -> GatewayResult<GatewayResponse> {
-    let header = read_mysql_result_packet(stream, "mysql query header").await?;
-    mysql_response_from_header_and_stream(header, stream).await
-}
-
-async fn mysql_response_from_header_and_stream(
-    header: BytesMut,
-    stream: &mut ResultsetStream<'_>,
-) -> GatewayResult<GatewayResponse> {
-    let payload = packet_payload("mysql query header", &header)?;
-    match payload.first().copied() {
-        Some(OK_HEADER) => ok_packet_to_gateway_response(payload),
-        Some(ERR_HEADER) => Ok(err_packet_to_gateway_response(payload)),
-        Some(_) => {
-            let (column_count, is_null, _) = decode_lenc_int(payload, "mysql column count")?;
-            if is_null {
-                return Err(GatewayError::Protocol(
-                    "mysql result set column count cannot be NULL".into(),
-                ));
-            }
-
-            let mut column_infos = Vec::with_capacity(column_count as usize);
-            for _ in 0..column_count {
-                let column_packet =
-                    read_mysql_result_packet(stream, "mysql column definition").await?;
-                let column_payload = packet_payload("mysql column definition", &column_packet)?;
-                column_infos.push(decode_column(column_payload));
-            }
-
-            let _ = read_mysql_result_packet(stream, "mysql column eof").await?;
-
-            let mut rows = Vec::new();
-            while let Some(row_packet) = read_optional_mysql_result_packet(stream).await? {
-                let row_payload = packet_payload("mysql row", &row_packet)?;
-                rows.push(text_row_to_gateway_values(row_payload, &column_infos)?);
-            }
-
-            Ok(GatewayResponse::ResultSet {
-                columns: column_infos.iter().map(mysql_column_to_gateway_column).collect(),
-                rows,
-            })
-        }
-        None => Err(GatewayError::Protocol("mysql query header packet has empty payload".into())),
-    }
-}
-
-async fn read_mysql_result_packet(
-    stream: &mut ResultsetStream<'_>,
-    context: &str,
-) -> GatewayResult<BytesMut> {
-    read_optional_mysql_result_packet(stream).await?.ok_or_else(|| {
-        GatewayError::Backend(format!("mysql backend closed while reading {}", context))
-    })
-}
-
-async fn read_optional_mysql_result_packet(
-    stream: &mut ResultsetStream<'_>,
-) -> GatewayResult<Option<BytesMut>> {
-    match stream.next().await {
-        Some(Ok(packet)) => Ok(Some(packet)),
-        Some(Err(error)) => {
-            Err(GatewayError::Backend(format!("read mysql result packet: {}", error)))
-        }
-        None => Ok(None),
-    }
-}
-
-fn packet_payload<'a>(context: &str, packet: &'a [u8]) -> GatewayResult<&'a [u8]> {
-    if packet.len() < 4 {
-        return Err(GatewayError::Protocol(format!(
-            "{} mysql packet is shorter than the 4-byte header",
-            context
-        )));
-    }
-    Ok(&packet[4..])
-}
-
-fn ok_packet_to_gateway_response(payload: &[u8]) -> GatewayResult<GatewayResponse> {
-    let (affected_rows, _, affected_pos) =
-        decode_lenc_int(payload.get(1..).unwrap_or_default(), "mysql OK affected rows")?;
-    let last_insert_id = payload
-        .get(1 + affected_pos..)
-        .and_then(|data| decode_lenc_int(data, "mysql OK last insert id").ok())
-        .map(|(id, ..)| id)
-        .filter(|id| *id > 0);
-
-    Ok(GatewayResponse::Ok { affected_rows, last_insert_id })
-}
-
-fn err_packet_to_gateway_response(payload: &[u8]) -> GatewayResponse {
-    let code = payload
-        .get(1..3)
-        .map(|code| LittleEndian::read_u16(code).to_string())
-        .unwrap_or_else(|| "HY000".into());
-
-    let message_offset = if payload.get(3) == Some(&b'#') && payload.len() >= 9 { 9 } else { 3 };
-    let message = payload
-        .get(message_offset..)
-        .map(|message| String::from_utf8_lossy(message).trim_start().to_string())
-        .filter(|message| !message.is_empty())
-        .unwrap_or_else(|| "mysql backend error".into());
-
-    GatewayResponse::Error { code, message }
-}
-
-fn mysql_column_to_gateway_column(column: &ColumnInfo) -> GatewayColumn {
-    GatewayColumn {
-        name: column.column_name.clone(),
-        data_type: column.column_type.as_ref().to_string(),
-    }
-}
-
-fn text_row_to_gateway_values(
-    row: &[u8],
-    columns: &[ColumnInfo],
-) -> GatewayResult<Vec<GatewayValue>> {
-    let mut values = Vec::with_capacity(columns.len());
-    let mut cursor = 0;
-
-    for column in columns {
-        if cursor >= row.len() {
-            return Err(GatewayError::Protocol(format!(
-                "mysql row has fewer values than the {} result columns",
-                columns.len()
-            )));
-        }
-
-        let (length, is_null, pos) =
-            decode_lenc_int(&row[cursor..], "mysql text row value length")?;
-        cursor += pos;
-
-        if is_null {
-            values.push(GatewayValue::Null);
-            continue;
-        }
-
-        let end = cursor + length as usize;
-        if end > row.len() {
-            return Err(GatewayError::Protocol(
-                "mysql text row value length exceeds packet payload".into(),
-            ));
-        }
-
-        values.push(mysql_text_value_to_gateway_value(column, &row[cursor..end]));
-        cursor = end;
-    }
-
-    if cursor != row.len() {
-        return Err(GatewayError::Protocol(
-            "mysql row has more values than the result column metadata".into(),
-        ));
-    }
-
-    Ok(values)
-}
-
-fn mysql_text_value_to_gateway_value(column: &ColumnInfo, value: &[u8]) -> GatewayValue {
-    match &column.column_type {
-        ColumnType::MYSQL_TYPE_TINY
-        | ColumnType::MYSQL_TYPE_SHORT
-        | ColumnType::MYSQL_TYPE_LONG
-        | ColumnType::MYSQL_TYPE_LONGLONG
-        | ColumnType::MYSQL_TYPE_INT24
-        | ColumnType::MYSQL_TYPE_YEAR => {
-            let value_text = String::from_utf8_lossy(value);
-            if column.column_flag & (ColumnFlag::UNSIGNED_FLAG as u16) > 0 {
-                value_text
-                    .parse::<u64>()
-                    .map(GatewayValue::UnsignedInteger)
-                    .unwrap_or_else(|_| GatewayValue::String(value_text.into_owned()))
-            } else {
-                value_text
-                    .parse::<i64>()
-                    .map(GatewayValue::Integer)
-                    .unwrap_or_else(|_| GatewayValue::String(value_text.into_owned()))
-            }
-        }
-        ColumnType::MYSQL_TYPE_FLOAT | ColumnType::MYSQL_TYPE_DOUBLE => {
-            String::from_utf8_lossy(value).parse::<f64>().map(GatewayValue::Float).unwrap_or_else(
-                |_| GatewayValue::String(String::from_utf8_lossy(value).into_owned()),
-            )
-        }
-        ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
-            GatewayValue::Decimal(String::from_utf8_lossy(value).into_owned())
-        }
-        ColumnType::MYSQL_TYPE_BLOB
-        | ColumnType::MYSQL_TYPE_TINY_BLOB
-        | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
-        | ColumnType::MYSQL_TYPE_LONG_BLOB => GatewayValue::Bytes(value.to_vec()),
-        _ => GatewayValue::String(String::from_utf8_lossy(value).into_owned()),
-    }
-}
-
-fn decode_lenc_int(data: &[u8], context: &str) -> GatewayResult<(u64, bool, usize)> {
-    let Some(first) = data.first().copied() else {
-        return Err(GatewayError::Protocol(format!("{} is missing", context)));
-    };
-
-    match first {
-        0xfb => Ok((0, true, 1)),
-        0xfc => decode_fixed_lenc_int(data, context, 2, 3),
-        0xfd => decode_fixed_lenc_int(data, context, 3, 4),
-        0xfe => decode_fixed_lenc_int(data, context, 8, 9),
-        value => Ok((value as u64, false, 1)),
-    }
-}
-
-fn decode_fixed_lenc_int(
-    data: &[u8],
-    context: &str,
-    value_len: usize,
-    total_len: usize,
-) -> GatewayResult<(u64, bool, usize)> {
-    if data.len() < total_len {
-        return Err(GatewayError::Protocol(format!(
-            "{} length-encoded integer is shorter than {} bytes",
-            context, total_len
-        )));
-    }
-    Ok((LittleEndian::read_uint(&data[1..], value_len), false, total_len))
-}
-
-impl<T, C> MySqlBackendConnector<T, C>
+impl<T, C> LegacyMySqlCommandService<T, C>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send,
     C: Decoder<Item = BytesMut>
@@ -981,46 +690,7 @@ where
 }
 
 #[async_trait]
-impl<T, C> BackendConnector for MySqlBackendConnector<T, C>
-where
-    T: Send + Sync,
-    C: Send + Sync,
-{
-    fn protocol(&self) -> ProtocolKind {
-        ProtocolKind::MySql
-    }
-
-    async fn execute(
-        &self,
-        command: GatewayCommand,
-        session: &mut SessionState,
-    ) -> GatewayResult<GatewayResponse> {
-        match command {
-            GatewayCommand::Ping => Ok(GatewayResponse::Pong),
-            GatewayCommand::Quit => Ok(GatewayResponse::Bye),
-            GatewayCommand::UseDatabase { database } => {
-                session.database = Some(database);
-                Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
-            }
-            GatewayCommand::Begin => {
-                session.transaction_state = TransactionState::Active;
-                Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
-            }
-            GatewayCommand::Commit | GatewayCommand::Rollback => {
-                session.transaction_state = TransactionState::Idle;
-                Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None })
-            }
-            GatewayCommand::Query { sql } => self.execute_simple_query(&sql, session).await,
-            command => Err(GatewayError::Unsupported(format!(
-                "mysql backend connector is not wired to execute {:?} through GatewayCommand yet",
-                command
-            ))),
-        }
-    }
-}
-
-#[async_trait]
-impl<'a, T, C> MySqlCommandService<T, C> for MySqlBackendConnector<T, C>
+impl<'a, T, C> MySqlCommandService<T, C> for LegacyMySqlCommandService<T, C>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send,
     C: Decoder<Item = BytesMut>
@@ -1194,78 +864,5 @@ where
         collect_sql_processed_duration!(cx, "COM_FIELD_LIST", ep.as_ref().unwrap(), now.elapsed());
 
         Ok(RespContext { ep, duration: now.elapsed() })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use mysql_protocol::server::codec::PacketCodec;
-    use tokio::io::DuplexStream;
-
-    use super::*;
-
-    fn column_info(name: &str, column_type: ColumnType) -> ColumnInfo {
-        ColumnInfo {
-            schema: None,
-            table_name: None,
-            column_name: name.to_string(),
-            charset: 0,
-            column_length: 0,
-            column_type,
-            column_flag: 0,
-            decimals: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_core_query_without_configured_endpoint() {
-        let connector = MySqlBackendConnector::<DuplexStream, PacketCodec>::new();
-        let mut session = SessionState::default();
-
-        let result =
-            connector.execute(GatewayCommand::Query { sql: "select 1".into() }, &mut session).await;
-
-        assert_eq!(
-            result,
-            Err(GatewayError::Configuration(
-                "mysql backend connector has no configured endpoints".into()
-            ))
-        );
-    }
-
-    #[test]
-    fn decodes_mysql_text_row_values() {
-        let columns = vec![
-            column_info("id", ColumnType::MYSQL_TYPE_LONG),
-            column_info("name", ColumnType::MYSQL_TYPE_VAR_STRING),
-            column_info("empty", ColumnType::MYSQL_TYPE_VAR_STRING),
-            column_info("deleted_at", ColumnType::MYSQL_TYPE_DATETIME),
-        ];
-        let row = b"\x0242\x05Alice\x00\xfb";
-
-        let values = text_row_to_gateway_values(row, &columns).unwrap();
-
-        assert_eq!(
-            values,
-            vec![
-                GatewayValue::Integer(42),
-                GatewayValue::String("Alice".into()),
-                GatewayValue::String(String::new()),
-                GatewayValue::Null,
-            ]
-        );
-    }
-
-    #[test]
-    fn decodes_mysql_ok_and_err_packets() {
-        assert_eq!(
-            ok_packet_to_gateway_response(&[OK_HEADER, 2, 5]).unwrap(),
-            GatewayResponse::Ok { affected_rows: 2, last_insert_id: Some(5) }
-        );
-
-        assert_eq!(
-            err_packet_to_gateway_response(b"\xff\x28\x04#HY000syntax error"),
-            GatewayResponse::Error { code: "1064".into(), message: "syntax error".into() }
-        );
     }
 }
