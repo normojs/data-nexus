@@ -32,11 +32,10 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 
 ### 关键缺口（阻塞可交付）
 
-1. **`GatewayRuntime` 字段仍含 legacy**：`proxy_config`/`nodes` 默认空；public 字段尚未删除
-2. **事务 FSM 仍绑定 MySQL `SessionAttr`**（legacy 路径）
+1. **`Listener.backend_type` / `node_type`** 仍在 proxy listener 结构（兼容字段，不决定协议）
+2. **事务 FSM 仍绑定 MySQL `SessionAttr`**（legacy command service 路径）
 3. **插件仍吃 `String`**：并发控制 / 熔断未挂 `PluginContext`
 4. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选
-5. **`Listener.backend_type` / `node_type` 字符串**仍在 proxy listener 结构中
 
 ---
 
@@ -108,21 +107,22 @@ M3  受控跨协议（可选）
 
 ### M1.2 配置类型收敛
 
-- [x] Factory/启动路径不再读写 `ProxyConfig` / `UniSQLNode`（runtime 字段仍为 legacy 预留，默认空）
-- [ ] `node_type` / `backend_type` 字符串从 gateway 主路径彻底移除（`Listener` 结构仍带字段）
+- [x] Factory/启动路径不再读写 `ProxyConfig` / `UniSQLNode`
+- [x] 删除 `start_legacy_mysql` 与 `GatewayRuntime::{proxy_config,nodes,node_group}` 公共字段
+- [ ] `Listener.node_type` / `backend_type` 字段仍存在（仅日志/兼容，不决定路由）
 - [x] 旧 example-config（v1）标记废弃；文档/示例只写 v2
 
 ### M1.3 错误模型
 
-- [ ] 主链路统一 `GatewayError` / `GatewayResult`
+- [x] 无 core_plan 时 `start()` fail fast（明确错误，不再走 legacy）
 - [ ] 减少 `runtime/gateway`、`core_engine`、frontend/backend adapter 中的 `unwrap()`
-- [ ] 配置错误：启动失败；协议/SQL 错误：session 级
+- [x] 配置错误：启动失败；协议/SQL 错误：session 级（core 路径）
 
 ### M1.4 验收
 
-- [ ] 全仓 gateway 相关测试只依赖 v2 config
-- [ ] `rg "backend_type|UniSQLNode" runtime/gateway` 主路径无命中（测试/bridge 除外并标注）
-- [ ] `GatewayRuntime` 公共 API 不再暴露 `ProxyConfig`
+- [x] gateway 相关测试只依赖 v2 config
+- [x] `gateway.rs` 主路径不再引用 `UniSQLNode` / `ProxyConfig`（`Listener.backend_type` 仍兼容填充）
+- [x] `GatewayRuntime` 公共 API 不再暴露 `ProxyConfig`
 
 ---
 

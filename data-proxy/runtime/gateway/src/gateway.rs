@@ -14,23 +14,15 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{atomic::AtomicU32, Arc},
+    sync::Arc,
     time::Instant,
 };
 
-use common::ast_cache::ParserAstCache;
 use conn_pool::Pool;
-use endpoint::endpoint::Endpoint;
-use gateway_core::{
-    EndpointConfig, EndpointRole, GatewayConfig, GatewayError, GatewayResult, ProtocolKind,
-};
-use indexmap::IndexMap;
-use loadbalance::balance::{AlgorithmName, Balance, LoadBalance};
-use mysql_parser::parser::Parser;
+use gateway_core::{GatewayConfig, GatewayError, GatewayResult, ProtocolKind};
 use mysql_protocol::client::conn::ClientConn;
 use parking_lot::Mutex;
 use pisa_error::error::{Error, ErrorKind};
-use plugin::build_phase::PluginPhase;
 use proxy::{
     factory::{
         PoolEndpointRefresh, PoolEndpointSnapshot, PoolRefresh, PoolRefresher, PoolSnapshot,
@@ -38,16 +30,7 @@ use proxy::{
         StartSource,
     },
     listener::Listener,
-    proxy::{Proxy, ProxyConfig, UniSQLNode},
-};
-use strategy::{
-    config::{
-        GenericRule, NodeGroup, ReadWriteSplitting, ReadWriteSplittingRule,
-        ReadWriteSplittingStatic, TargetRole,
-    },
-    readwritesplitting::ReadWriteEndpoint,
-    route::RouteStrategy,
-    sharding_rewrite::{ShardingRewrite, ShardingRewriteOutput},
+    proxy::Proxy,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error};
@@ -55,24 +38,19 @@ use tracing::{debug, error};
 use crate::{
     core_engine::{CoreGatewayConnection, CoreGatewayListenerPlan, CoreGatewayRuntimePlan},
     frontend::{
-        mysql::{MySqlFrontendConnection, MySqlFrontendProtocol, ReqContext},
+        mysql::MySqlFrontendProtocol,
         postgresql::PostgreSqlFrontendProtocol,
     },
-    server::{metrics::*, stmt_cache::StmtCache, LegacyMySqlCommandService},
-    transaction_fsm::*,
+    server::metrics::*,
 };
 
 const DEFAULT_CORE_POOL_SIZE: usize = 64;
 
 #[derive(Default)]
 pub struct GatewayRuntime {
-    /// Legacy-only fields. v2 native startup keeps these empty/default.
-    pub proxy_config: ProxyConfig,
-    pub node_group: Option<NodeGroup>,
-    pub nodes: Vec<UniSQLNode>,
     pub pisa_version: String,
     pub core_plan: Option<CoreGatewayRuntimePlan>,
-    /// Listener this runtime instance serves (v2 native path).
+    /// Listener this runtime instance serves.
     pub listener_name: Option<String>,
     pub pool_size: usize,
     pub shutdown_handle: ShutdownHandle,
@@ -143,150 +121,39 @@ impl GatewayRuntime {
                 return Some(listener);
             }
         }
-        // Legacy bridge: proxy_config.name may still identify the listener.
-        if !self.proxy_config.name.is_empty() {
-            return plan.listener(&self.proxy_config.name);
-        }
         plan.listeners().first()
-    }
-
-    fn frontend_protocol_name(&self) -> String {
-        self.core_listener_plan()
-            .map(|plan| protocol_name(&plan.listener().protocol).to_owned())
-            .unwrap_or_else(|| self.proxy_config.node_type.clone())
-    }
-
-    fn service_name(&self) -> String {
-        self.core_listener_plan()
-            .map(|plan| plan.service().name.clone())
-            .unwrap_or_else(|| self.proxy_config.name.clone())
-    }
-
-    #[allow(deprecated)]
-    fn backend_protocol_name(&self) -> String {
-        self.core_listener_plan()
-            .map(|plan| protocol_name(&plan.service().backend_protocol).to_owned())
-            .unwrap_or_else(|| self.proxy_config.backend_type.clone())
     }
 
     fn effective_pool_size(&self) -> usize {
         if self.pool_size > 0 {
             self.pool_size
-        } else if self.proxy_config.pool_size > 0 {
-            self.proxy_config.pool_size as usize
         } else {
             DEFAULT_CORE_POOL_SIZE
         }
     }
 
     fn configured_endpoint_addresses(&self) -> Vec<String> {
-        if let Some(plan) = self.core_listener_plan() {
-            return plan.endpoints().iter().map(|endpoint| endpoint.address.clone()).collect();
-        }
-        configured_pool_endpoints(&self.nodes)
+        self.core_listener_plan()
+            .map(|plan| plan.endpoints().iter().map(|endpoint| endpoint.address.clone()).collect())
+            .unwrap_or_default()
     }
 
-    #[allow(deprecated)]
     fn build_listener_config(&self) -> Listener {
-        if let Some(plan) = self.core_listener_plan() {
-            return Listener {
-                name: plan.listener().name.clone(),
-                node_type: protocol_name(&plan.listener().protocol).to_owned(),
-                backend_type: protocol_name(&plan.service().backend_protocol).to_owned(),
-                listen_addr: plan.listener().listen_addr.clone(),
-                server_version: match plan.listener().protocol {
-                    ProtocolKind::MySql => "8.0".into(),
-                    ProtocolKind::PostgreSql => "14.0".into(),
-                },
-            };
-        }
-
+        let plan = self
+            .core_listener_plan()
+            .expect("core listener plan must exist for native gateway runtime");
+        let protocol = protocol_name(&plan.listener().protocol).to_owned();
         Listener {
-            name: self.proxy_config.name.clone(),
-            node_type: self.frontend_protocol_name(),
-            backend_type: self.backend_protocol_name(),
-            listen_addr: self.proxy_config.listen_addr.clone(),
-            server_version: self.proxy_config.server_version.clone(),
+            name: plan.listener().name.clone(),
+            node_type: protocol.clone(),
+            // Kept for Listener struct compatibility; not used for routing decisions.
+            backend_type: protocol_name(&plan.service().backend_protocol).to_owned(),
+            listen_addr: plan.listener().listen_addr.clone(),
+            server_version: match plan.listener().protocol {
+                ProtocolKind::MySql => "8.0".into(),
+                ProtocolKind::PostgreSql => "14.0".into(),
+            },
         }
-    }
-
-    // 构建路由
-    fn build_route(&self) -> Result<RouteStrategy, Error> {
-        let length = self.nodes.len();
-        let (mut rw, mut ro) = (Vec::with_capacity(length), Vec::with_capacity(length));
-        for node in &self.nodes {
-            let ep = Endpoint::from(node.clone());
-            match node.role {
-                TargetRole::Read => ro.push(ep),
-                TargetRole::ReadWrite => rw.push(ep),
-            }
-        }
-
-        // 路由策略
-        let strategy = if let Some(read_write_splitting) = &self.proxy_config.read_write_splitting {
-            let rw_endpoint = ReadWriteEndpoint { read: ro, readwrite: rw };
-            RouteStrategy::new(
-                read_write_splitting.clone(),
-                &self.node_group,
-                rw_endpoint,
-                self.proxy_config.sharding.is_some(),
-            )
-            .map_err(|e| Error::new(ErrorKind::Runtime(e.into())))?
-        } else {
-            //let rw_endpoint = ReadWriteEndpoint { read: ro, readwrite: rw };
-            let simple_loadbalance = self.proxy_config.simple_loadbalance.as_ref().ok_or_else(|| {
-                runtime_configuration_error(format!(
-                    "gateway '{}' requires simple_loadbalance when read_write_splitting is not configured",
-                    self.proxy_config.name
-                ))
-            })?;
-            let balance_type = simple_loadbalance.balance_type.clone();
-            let mut balance = Balance.build_balance(balance_type);
-            rw.append(&mut ro);
-            for ep in rw.into_iter() {
-                balance.add(ep)
-            }
-
-            if let Some(sharding) = &self.proxy_config.sharding {
-                let has_strategy = sharding.iter().all(|x| {
-                    x.table_strategy.is_some()
-                        || x.database_strategy.is_some()
-                        || x.database_table_strategy.is_some()
-                });
-                if has_strategy {
-                    RouteStrategy::new_with_sharding_only(balance)
-                } else {
-                    RouteStrategy::new_with_simple_route(balance)
-                }
-            } else {
-                RouteStrategy::new_with_simple_route(balance)
-            }
-        };
-
-        Ok(strategy)
-    } // end build route
-
-    fn build_sharding_rewriter(&self) -> Option<ShardingRewrite> {
-        let config = self.proxy_config.sharding.clone()?;
-
-        let has_strategy = config.iter().all(|x| {
-            x.table_strategy.is_some()
-                || x.database_strategy.is_some()
-                || x.database_table_strategy.is_some()
-        });
-        if !has_strategy {
-            return None;
-        }
-
-        let mut endpoints: Vec<Endpoint> = vec![];
-        for node in &self.nodes {
-            let endpoint = Endpoint::from(node.clone());
-            endpoints.push(endpoint);
-        }
-
-        let has_rw = self.proxy_config.read_write_splitting.is_some();
-
-        Some(ShardingRewrite::new(config, endpoints, self.node_group.clone(), has_rw))
     }
 
     pub fn pool_snapshotter(&mut self) -> PoolSnapshotter {
@@ -319,8 +186,6 @@ impl GatewayRuntime {
             runtime_configuration_error("gateway core runtime requires a resolved listener plan")
         })?;
 
-        // Core path bootstrap reads listener topology from GatewayConfig only.
-        // ProxyConfig/UniSQLNode remain for legacy start and admin pool snapshots.
         let protocol = listener_plan.listener().protocol.clone();
         let listener_name = listener_plan.listener().name.clone();
         let listen_addr = listener_plan.listener().listen_addr.clone();
@@ -329,19 +194,19 @@ impl GatewayRuntime {
             ProtocolKind::PostgreSql => "14.0".to_owned(),
         };
         let auth_database = listener_plan.default_database().unwrap_or_default().to_owned();
-        // Auth policies are not fully wired yet; empty means frontend uses default handshake user.
         let auth_user = String::new();
         let auth_password = String::new();
+        let protocol_label = protocol_name(&protocol).to_owned();
 
         let mut proxy = Proxy {
             listener: Listener {
                 name: listener_name.clone(),
-                node_type: protocol_name(&protocol).to_owned(),
+                node_type: protocol_label.clone(),
                 backend_type: protocol_name(&listener_plan.service().backend_protocol).to_owned(),
                 listen_addr,
                 server_version: server_version.clone(),
             },
-            app: ProxyConfig::default(),
+            app: Default::default(),
             backend_nodes: Vec::new(),
             nodes: Vec::new(),
         };
@@ -398,123 +263,6 @@ impl GatewayRuntime {
                         )
                         .await;
                     }
-                }
-            });
-
-            start_source.thread_handles.push(join_handle);
-        }
-
-        Ok(start_source)
-    }
-
-    async fn start_legacy_mysql(&mut self) -> Result<StartSource, Error> {
-        let listener = self.build_listener_config();
-
-        let mut proxy = Proxy {
-            listener,
-            app: self.proxy_config.clone(),
-            backend_nodes: self.nodes.clone(),
-            nodes: self.nodes.clone(),
-        };
-
-        let listener = proxy.build_listener().map_err(ErrorKind::Io)?;
-
-        let pool = self
-            .pool
-            .get_or_insert_with(|| Pool::<ClientConn>::new(self.proxy_config.pool_size as usize))
-            .clone();
-
-        let ast_cache = Arc::new(Mutex::new(ParserAstCache::new()));
-        let route_strategy = Arc::new(Mutex::new(self.build_route()?));
-        let rewriter = self.build_sharding_rewriter();
-
-        let mut plugin: Option<PluginPhase> = None;
-        if let Some(config) = &self.proxy_config.plugin {
-            plugin = Some(PluginPhase::new(config.clone()))
-        };
-
-        let parser = Arc::new(Parser::new());
-        let has_rw = self.proxy_config.read_write_splitting.is_some();
-        let mut start_source = StartSource::new(self.shutdown_handle.clone());
-        let session_registry = self.sessions.get_or_insert_with(SessionRegistry::default).clone();
-
-        loop {
-            let socket = tokio::select! {
-                _ = self.shutdown_handle.cancelled() => {
-                    debug!("gateway '{}' shutdown requested", self.proxy_config.name);
-                    break;
-                }
-                accepted = proxy.accept(&listener) => {
-                    accepted.map_err(ErrorKind::Io)?
-                }
-            };
-
-            let route_strategy = route_strategy.clone();
-            let plugin = plugin.clone();
-            let parser = parser.clone();
-            let ast_cache = ast_cache.clone();
-            let pool = pool.clone();
-            let proxy_name = self.proxy_config.name.clone();
-            let session_listener = proxy_name.clone();
-            let session_registry = session_registry.clone();
-            let peer_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
-            let frontend_protocol = self.frontend_protocol_name();
-            let backend_protocol = self.backend_protocol_name();
-            let service = self.service_name();
-            let database = optional_database(&self.proxy_config.db);
-            let rewriter = rewriter.clone();
-
-            let frontend = MySqlFrontendProtocol::new(
-                self.proxy_config.user.clone(),
-                self.proxy_config.password.clone(),
-                self.proxy_config.db.clone(),
-                self.proxy_config.server_version.clone(),
-            );
-
-            let mut instance = MySqlFrontendConnection::new(LegacyMySqlCommandService::new());
-            let join_handle = tokio::spawn(async move {
-                let _session_registration = session_registry.register(SessionEntrySnapshot {
-                    id: 0,
-                    listener: session_listener,
-                    peer_addr,
-                    frontend_protocol: frontend_protocol.clone(),
-                    database,
-                });
-
-                let framed = match frontend.handshake(socket).await {
-                    Ok(framed) => framed,
-                    Err(e) => {
-                        error!("handshake error {:?}", e);
-                        return;
-                    }
-                };
-
-                let context = ReqContext {
-                    fsm: TransFsm::new(pool.clone()),
-                    route_strategy,
-                    pool,
-                    ast_cache,
-                    plugin,
-                    metrics_collector: MySQLServerMetricsCollector,
-                    concurrency_control_rule_idx: None,
-                    framed,
-                    name: proxy_name,
-                    service,
-                    frontend_protocol,
-                    backend_protocol,
-                    parser,
-                    rewriter,
-                    rewrite_outputs: ShardingRewriteOutput {
-                        results: vec![],
-                        agg_fields: IndexMap::new(),
-                    },
-                    has_readwritesplitting: has_rw,
-                    stmt_cache: StmtCache::new(),
-                    stmt_id: AtomicU32::new(0),
-                };
-
-                if let Err(e) = instance.run(context).await {
-                    error!("instance run error {:?}", e);
                 }
             });
 
@@ -891,13 +639,6 @@ fn protocol_name(protocol: &ProtocolKind) -> &'static str {
     }
 }
 
-fn configured_pool_endpoints(nodes: &[UniSQLNode]) -> Vec<String> {
-    let mut endpoints =
-        nodes.iter().map(|node| Endpoint::from(node.clone()).addr).collect::<Vec<_>>();
-    endpoints.sort();
-    endpoints.dedup();
-    endpoints
-}
 
 fn build_pool_snapshot(pool: &Pool<ClientConn>, configured_endpoints: &[String]) -> PoolSnapshot {
     let endpoints = known_pool_endpoints(pool, configured_endpoints);
@@ -991,13 +732,6 @@ impl Drop for SessionRegistration {
     }
 }
 
-fn optional_database(database: &str) -> Option<String> {
-    if database.is_empty() {
-        None
-    } else {
-        Some(database.to_owned())
-    }
-}
 
 #[async_trait::async_trait]
 impl proxy::factory::Proxy for GatewayRuntime {
@@ -1009,12 +743,12 @@ impl proxy::factory::Proxy for GatewayRuntime {
     // 3、退出循环
 
     async fn start(&mut self) -> Result<StartSource, Error> {
-        if self.core_plan.is_some() {
-            return self.start_core_listener().await;
+        if self.core_plan.is_none() {
+            return Err(runtime_configuration_error(
+                "gateway runtime requires v2 core config; legacy ProxyConfig startup is removed",
+            ));
         }
-
-        // Legacy MySQL packet path retained only for non-v2 startup.
-        self.start_legacy_mysql().await
+        self.start_core_listener().await
     }
 
     // stop proxy server
@@ -1109,8 +843,7 @@ mod tests {
         assert_eq!(connection.backend_protocol(), ProtocolKind::MySql);
         assert_eq!(connection.session().database, Some("orders_db".into()));
         assert_eq!(runtime.listener_name(), Some("mysql-listener"));
-        assert!(runtime.proxy_config.name.is_empty());
-        assert!(runtime.nodes.is_empty());
+        assert_eq!(runtime.pool_size, 64);
     }
 
     #[test]
@@ -1146,8 +879,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(runtime.listener_name(), Some("postgresql-listener"));
-        assert!(runtime.nodes.is_empty());
-        assert!(runtime.proxy_config.name.is_empty());
+        assert_eq!(runtime.pool_size, 64);
 
         let connection = runtime.build_core_connection("postgresql-listener").unwrap();
         assert_eq!(connection.frontend_protocol(), ProtocolKind::PostgreSql);
@@ -1155,17 +887,14 @@ mod tests {
         assert_eq!(connection.session().database, Some("analytics_db".into()));
     }
 
-    #[test]
-    #[allow(deprecated)]
-    fn listener_protocols_prefer_core_plan_over_legacy_strings() {
-        let mut runtime = GatewayRuntime::from_core_config(&mysql_config()).unwrap();
-        runtime.proxy_config.node_type = "legacy-front".into();
-        runtime.proxy_config.backend_type = "legacy-back".into();
-
-        let listener = runtime.build_listener_config();
-
-        assert_eq!(listener.node_type, "mysql");
-        assert_eq!(listener.backend_type, "mysql");
+    #[tokio::test]
+    async fn start_rejects_runtime_without_core_plan() {
+        let mut runtime = GatewayRuntime::default();
+        let error = match proxy::factory::Proxy::start(&mut runtime).await {
+            Ok(_) => panic!("missing core plan should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requires v2 core config"));
     }
 
     #[test]
@@ -1197,18 +926,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_route_reports_missing_simple_loadbalance() {
-        let mut runtime = GatewayRuntime::default();
-        runtime.proxy_config.name = "broken".into();
-
-        let error = match runtime.build_route() {
-            Ok(_) => panic!("missing simple_loadbalance should be rejected"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("gateway 'broken' requires simple_loadbalance"));
-    }
 
     #[test]
     fn reports_missing_core_config() {
