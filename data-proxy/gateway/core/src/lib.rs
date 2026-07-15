@@ -7,6 +7,7 @@
 mod config;
 mod error;
 mod model;
+mod route;
 mod transport;
 
 pub use config::{
@@ -18,4 +19,5 @@ pub use model::{
     Column, GatewayCommand, GatewayResponse, GatewayValue, ProtocolKind, SessionState,
     TransactionState,
 };
+pub use route::{EndpointRef, RoutePlan, ShardTarget};
 pub use transport::{BackendConnector, FrontendProtocolAdapter};

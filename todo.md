@@ -29,6 +29,7 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] Admin API 骨架：`/admin/listeners|services|endpoints|pools|sessions|reload` 等
 - [x] metrics 维度：service / frontend protocol / backend protocol / endpoint（部分）
 - [x] 协议名 canonical + 别名解析；v2 示例 / dual-listener / compose 本地后端
+- [x] `RoutePlan` / `EndpointRef` 进入 gateway_core；core 路由输出 RoutePlan
 
 ### 关键缺口（阻塞可交付）
 
@@ -132,9 +133,10 @@ M3  受控跨协议（可选）
 
 ### M2.1 路由
 
-- [ ] 定义 `RoutePlan`：`Single` / `Broadcast` / `Sharded` / `Reject`
-- [ ] `RouteStrategy::dispatch` 返回 `RoutePlan`，不再只返回单个 `Endpoint`
-- [ ] 读写分离、simple LB 基于 `GatewayCommand` + `SessionState` 决策
+- [x] 定义 `RoutePlan`：`Single` / `Broadcast` / `Sharded` / `Reject`（`gateway_core::route`）
+- [x] Core 路由 `plan_command` 返回 `RoutePlan`；`handle_frame` 经 `apply_route_plan` 写入 session
+- [x] 读写分离、simple LB 基于 `GatewayCommand` + `SessionState` 决策（core 路径）
+- [ ] legacy `RouteStrategy::dispatch` 仍返回 `Endpoint`（仅 legacy command service）
 - [ ] sharding rewrite 与 MySQL parser 解耦入口（可先 stub Reject）
 
 ### M2.2 插件

@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
-    BackendConnector, EndpointConfig, EndpointRole, FrontendProtocolAdapter, GatewayCommand,
-    GatewayConfig, GatewayError, GatewayResponse, GatewayResult, ListenerConfig, ProtocolKind,
-    ServiceConfig, SessionState, TransactionState,
+    BackendConnector, EndpointConfig, EndpointRef, EndpointRole, FrontendProtocolAdapter,
+    GatewayCommand, GatewayConfig, GatewayError, GatewayResponse, GatewayResult, ListenerConfig,
+    ProtocolKind, RoutePlan, ServiceConfig, SessionState, TransactionState,
 };
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use parking_lot::Mutex;
@@ -81,7 +81,8 @@ impl CoreGatewayConnection {
 
         for command in commands {
             if let Some(route_policy) = &self.route_policy {
-                route_policy.route_command(&command, &mut self.session)?;
+                let plan = route_policy.plan_command(&command, &self.session)?;
+                apply_route_plan(&plan, &mut self.session)?;
             }
 
             let response = match self.backend.execute(command, &mut self.session).await {
@@ -328,40 +329,54 @@ impl CoreRoutePolicy {
     }
 
     fn select_initial_endpoint(&self) -> GatewayResult<EndpointConfig> {
-        self.select_for_role(RouteTargetRole::ReadWrite)
+        match self.plan_for_role(RouteTargetRole::ReadWrite)? {
+            RoutePlan::Single { endpoint } => self.endpoint_by_name(&endpoint.name),
+            RoutePlan::Reject { reason } => Err(GatewayError::Configuration(reason)),
+            other => Err(GatewayError::Unsupported(format!(
+                "initial endpoint selection only supports Single route plans, got {:?}",
+                other
+            ))),
+        }
     }
 
-    fn route_command(
+    /// Build a protocol-neutral route plan for one command.
+    fn plan_command(
         &self,
         command: &GatewayCommand,
-        session: &mut SessionState,
-    ) -> GatewayResult<()> {
-        if matches!(self.kind, CoreRoutePolicyKind::First | CoreRoutePolicyKind::Simple { .. })
-            && session.backend_endpoint.is_some()
-        {
-            return Ok(());
+        session: &SessionState,
+    ) -> GatewayResult<RoutePlan> {
+        // Sticky endpoint for simple policies once chosen.
+        if matches!(self.kind, CoreRoutePolicyKind::First | CoreRoutePolicyKind::Simple { .. }) {
+            if let Some(name) = session.backend_endpoint.as_deref() {
+                let endpoint = self.endpoint_by_name(name)?;
+                return Ok(endpoint_to_route_plan(&endpoint));
+            }
         }
 
-        let endpoint = self.select_for_role(command_target_role(command, session))?;
-        session.backend_endpoint = Some(endpoint.name);
-        if session.database.is_none() {
-            session.database = endpoint.database;
+        // Transactions stick to the already chosen endpoint when present.
+        if session.transaction_state == TransactionState::Active {
+            if let Some(name) = session.backend_endpoint.as_deref() {
+                let endpoint = self.endpoint_by_name(name)?;
+                return Ok(endpoint_to_route_plan(&endpoint));
+            }
         }
-        Ok(())
+
+        self.plan_for_role(command_target_role(command, session))
     }
 
-    fn select_for_role(&self, target_role: RouteTargetRole) -> GatewayResult<EndpointConfig> {
-        match &self.kind {
-            CoreRoutePolicyKind::First => self.first_endpoint(),
-            CoreRoutePolicyKind::Simple { balancer } => self.select_from_balancer(balancer),
+    fn plan_for_role(&self, target_role: RouteTargetRole) -> GatewayResult<RoutePlan> {
+        let endpoint = match &self.kind {
+            CoreRoutePolicyKind::First => self.first_endpoint()?,
+            CoreRoutePolicyKind::Simple { balancer } => self.select_from_balancer(balancer)?,
             CoreRoutePolicyKind::ReadWrite { read_balancer, readwrite_balancer } => {
                 let balancer = match target_role {
                     RouteTargetRole::Read => read_balancer,
                     RouteTargetRole::ReadWrite => readwrite_balancer,
                 };
-                self.select_from_balancer(balancer)
+                self.select_from_balancer(balancer)?
             }
-        }
+        };
+        Ok(endpoint_to_route_plan(&endpoint))
     }
 
     fn first_endpoint(&self) -> GatewayResult<EndpointConfig> {
@@ -371,25 +386,48 @@ impl CoreRoutePolicy {
             .ok_or_else(|| GatewayError::Configuration("service has no endpoints".into()))
     }
 
+    fn endpoint_by_name(&self, name: &str) -> GatewayResult<EndpointConfig> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                GatewayError::Configuration(format!(
+                    "route policy references missing endpoint '{}'",
+                    name
+                ))
+            })
+    }
+
     fn select_from_balancer(
         &self,
         balancer: &Arc<Mutex<BalanceType>>,
     ) -> GatewayResult<EndpointConfig> {
         let selected = balancer.lock().next();
         if let Some(selected) = selected {
-            if let Some(endpoint) =
-                self.endpoints.iter().find(|endpoint| endpoint.name == selected.name)
-            {
-                return Ok(endpoint.clone());
-            }
-
-            return Err(GatewayError::Configuration(format!(
-                "route policy selected missing endpoint '{}'",
-                selected.name
-            )));
+            return self.endpoint_by_name(&selected.name);
         }
 
         self.first_endpoint()
+    }
+}
+
+fn endpoint_to_route_plan(endpoint: &EndpointConfig) -> RoutePlan {
+    RoutePlan::Single {
+        endpoint: EndpointRef::new(endpoint.name.clone(), endpoint.address.clone()),
+    }
+}
+
+fn apply_route_plan(plan: &RoutePlan, session: &mut SessionState) -> GatewayResult<()> {
+    match plan {
+        RoutePlan::Single { endpoint } => {
+            session.backend_endpoint = Some(endpoint.name.clone());
+            Ok(())
+        }
+        RoutePlan::Reject { reason } => Err(GatewayError::Configuration(reason.clone())),
+        RoutePlan::Broadcast { .. } | RoutePlan::Sharded { .. } => Err(GatewayError::Unsupported(
+            "broadcast/sharded route plans are not executed by core runtime yet".into(),
+        )),
     }
 }
 
@@ -860,22 +898,34 @@ mod tests {
             ..SessionState::default()
         };
 
-        listener
-            .route_policy
-            .route_command(
-                &GatewayCommand::Query { sql: "select * from orders".into() },
-                &mut session,
-            )
-            .unwrap();
+        let plan = listener.route_policy.plan_command(
+
+
+            &GatewayCommand::Query { sql: "select * from orders".into() },
+
+
+            &session,
+
+
+        ).unwrap();
+
+
+        apply_route_plan(&plan, &mut session).unwrap();
         assert_eq!(session.backend_endpoint, Some("orders-replica".into()));
 
-        listener
-            .route_policy
-            .route_command(
-                &GatewayCommand::Query { sql: "insert into orders values (1)".into() },
-                &mut session,
-            )
-            .unwrap();
+        let plan = listener.route_policy.plan_command(
+
+
+            &GatewayCommand::Query { sql: "insert into orders values (1)".into() },
+
+
+            &session,
+
+
+        ).unwrap();
+
+
+        apply_route_plan(&plan, &mut session).unwrap();
         assert_eq!(session.backend_endpoint, Some("orders-primary".into()));
     }
 
@@ -899,13 +949,19 @@ mod tests {
             ..SessionState::default()
         };
 
-        listener
-            .route_policy
-            .route_command(
-                &GatewayCommand::Query { sql: "select * from orders".into() },
-                &mut session,
-            )
-            .unwrap();
+        let plan = listener.route_policy.plan_command(
+
+
+            &GatewayCommand::Query { sql: "select * from orders".into() },
+
+
+            &session,
+
+
+        ).unwrap();
+
+
+        apply_route_plan(&plan, &mut session).unwrap();
 
         assert_eq!(session.backend_endpoint, Some("orders-replica".into()));
     }
@@ -922,13 +978,19 @@ mod tests {
             ..SessionState::default()
         };
 
-        listener
-            .route_policy
-            .route_command(
-                &GatewayCommand::Query { sql: "select * from orders".into() },
-                &mut session,
-            )
-            .unwrap();
+        let plan = listener.route_policy.plan_command(
+
+
+            &GatewayCommand::Query { sql: "select * from orders".into() },
+
+
+            &session,
+
+
+        ).unwrap();
+
+
+        apply_route_plan(&plan, &mut session).unwrap();
 
         assert_eq!(session.backend_endpoint, Some("orders-primary".into()));
     }
@@ -946,14 +1008,54 @@ mod tests {
             ..SessionState::default()
         };
 
-        listener
-            .route_policy
-            .route_command(
-                &GatewayCommand::Query { sql: "select * from orders".into() },
-                &mut session,
-            )
-            .unwrap();
+        let plan = listener.route_policy.plan_command(
+
+
+            &GatewayCommand::Query { sql: "select * from orders".into() },
+
+
+            &session,
+
+
+        ).unwrap();
+
+
+        apply_route_plan(&plan, &mut session).unwrap();
 
         assert_eq!(session.backend_endpoint, Some("orders-primary".into()));
+    }
+
+    #[test]
+    fn plan_command_returns_single_route_plan() {
+        let config = mysql_config();
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+        let listener = plan.listener("mysql-listener").unwrap();
+        let session = SessionState::default();
+
+        let route_plan = listener
+            .route_policy
+            .plan_command(&GatewayCommand::Query { sql: "select 1".into() }, &session)
+            .unwrap();
+
+        assert_eq!(route_plan, RoutePlan::single("orders-primary", "127.0.0.1:3306"));
+    }
+
+    #[test]
+    fn apply_single_plan_updates_session_endpoint() {
+        let mut session = SessionState::default();
+        apply_route_plan(&RoutePlan::single("orders-primary", "127.0.0.1:3306"), &mut session)
+            .unwrap();
+        assert_eq!(session.backend_endpoint, Some("orders-primary".into()));
+    }
+
+    #[test]
+    fn apply_reject_plan_returns_configuration_error() {
+        let mut session = SessionState::default();
+        let err = apply_route_plan(&RoutePlan::reject("no healthy endpoint"), &mut session)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GatewayError::Configuration(message) if message.contains("no healthy")
+        ));
     }
 }
