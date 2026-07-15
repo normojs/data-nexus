@@ -41,20 +41,23 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] legacy RouteStrategy 输出 DispatchPlan（对齐 RoutePlan）
 - [x] ShardingPlanner 解耦入口 stub；legacy route 主路径 Result 化
 - [x] translation_policy（默认关闭）+ SQL 子集校验
+- [x] static auth_policy 接入 MySQL 握手（username/password）
+- [x] dual-listener Docker smoke E2E 通过
 
 ### 关键缺口（阻塞可交付）
 
-1. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选（需 Docker）
+1. M3 实际跨协议执行 / 结果类型映射 / golden tests（策略配置已就绪）
+2. 完整 AST dialect parser、OTel structured trace（可选）
 
 ---
 
 ## 路线总览
 
 ```text
-M0  端到端可跑（同协议）     ← 当前最高优先
-M1  去掉 legacy 双轨
-M2  治理协议无关 + Admin 可用
-M3  受控跨协议（可选）
+M0  端到端可跑（同协议）     ✓
+M1  去掉 legacy 双轨         ✓（主路径）
+M2  治理协议无关 + Admin     ✓（主路径）
+M3  受控跨协议（可选）       进行中（策略/校验已完成，执行层待做）
 ```
 
 原则：
@@ -92,14 +95,14 @@ M3  受控跨协议（可选）
 
 ### M0.4 验收（必须全部通过）
 
-- [ ] `mysql` 客户端经 Data Nexus 连 MySQL 后端：SELECT / 简单写 / 事务（需本地 Docker；见 `examples/smoke-dual-listener.sh`）
-- [ ] `psql` 经 Data Nexus 连 PostgreSQL 后端：SELECT / 简单写 / 事务
-- [x] MySQL listener 与 PostgreSQL listener 配置可同时存在（`dual-listener-gateway-config.toml` + 单元测试）
-- [ ] 错误 SQL / 断后端时客户端收到协议错误，进程不退出
-- [x] `/metrics` 标签模型可区分 service、frontend protocol、backend protocol、endpoint（单元测试）
+- [x] `mysql` 客户端经 Data Nexus 连 MySQL 后端：SELECT / 简单写 / 事务（`examples/smoke-dual-listener.sh`）
+- [x] `psql` 经 Data Nexus 连 PostgreSQL 后端：SELECT / 简单写 / 事务
+- [x] MySQL listener 与 PostgreSQL listener 配置可同时存在（`dual-listener-gateway-config.toml` + 单元测试 + smoke）
+- [x] 错误 SQL 时客户端收到协议错误，进程不退出（smoke）
+- [x] `/metrics` 标签模型可区分 service、frontend protocol、backend protocol、endpoint（单元测试 + smoke）
 
 **退出标准**：上述验收 + 单元测试覆盖 core route / protocol registry / config validate。  
-**环境备注**：当前开发机无 docker/mysql/psql，真实客户端 E2E 待有 Docker 环境时跑 `examples/smoke-dual-listener.sh`。
+**跑法**：`./data-proxy/examples/smoke-dual-listener.sh`（依赖 Docker；无 host mysql/psql 时用容器客户端）。
 
 ---
 

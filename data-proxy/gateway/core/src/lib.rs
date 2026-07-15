@@ -15,7 +15,7 @@ mod translation;
 mod transport;
 
 pub use config::{
-    AuthPolicyConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
+    AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
     PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,
 };
 pub use dialect::{default_dialect_parser, DialectParser, HeuristicDialectParser};

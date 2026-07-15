@@ -352,6 +352,8 @@ pub struct CoreGatewayListenerPlan {
     route_policy_kind: Option<String>,
     route_policy: CoreRoutePolicy,
     plugin_config: Option<plugin::config::Plugin>,
+    /// Frontend static auth credential (username, password), if configured.
+    auth_user: Option<(String, String)>,
 }
 
 impl PartialEq for CoreGatewayListenerPlan {
@@ -417,6 +419,7 @@ impl CoreGatewayListenerPlan {
             &service.backend_protocol,
         )?;
         let plugin_config = build_plugin_config(config, &service.plugin_policies)?;
+        let auth_user = resolve_auth_user(config, listener.auth_policy.as_deref())?;
 
         Ok(Self {
             listener: listener.clone(),
@@ -425,6 +428,7 @@ impl CoreGatewayListenerPlan {
             route_policy_kind,
             route_policy,
             plugin_config,
+            auth_user,
         })
     }
 
@@ -446,6 +450,10 @@ impl CoreGatewayListenerPlan {
 
     pub fn default_database(&self) -> Option<&str> {
         self.endpoints.iter().find_map(|endpoint| endpoint.database.as_deref())
+    }
+
+    pub fn auth_user(&self) -> Option<&(String, String)> {
+        self.auth_user.as_ref()
     }
 
     pub fn build_connection(&self) -> GatewayResult<CoreGatewayConnection> {
@@ -480,6 +488,26 @@ impl CoreGatewayListenerPlan {
     pub fn has_plugins(&self) -> bool {
         self.plugin_config.is_some()
     }
+}
+
+fn resolve_auth_user(
+    config: &GatewayConfig,
+    auth_policy_name: Option<&str>,
+) -> GatewayResult<Option<(String, String)>> {
+    let Some(name) = auth_policy_name else {
+        return Ok(None);
+    };
+    let policy = config.auth_policies.iter().find(|policy| policy.name == name).ok_or_else(|| {
+        GatewayError::Configuration(format!("listener references missing auth policy '{}'", name))
+    })?;
+    let kind = policy.kind.to_ascii_lowercase();
+    if kind != "static" {
+        return Err(GatewayError::Configuration(format!(
+            "unsupported auth policy kind '{}' for policy '{}'",
+            policy.kind, policy.name
+        )));
+    }
+    Ok(policy.primary_static_user())
 }
 
 fn build_plugin_config(

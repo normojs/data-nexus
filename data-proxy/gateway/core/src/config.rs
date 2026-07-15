@@ -62,9 +62,41 @@ pub struct RoutePolicyConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUserConfig {
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+/// Frontend authentication policy.
+///
+/// Supported kinds:
+/// - `static`: validate against `users` (preferred) or single `username`/`password`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthPolicyConfig {
     pub name: String,
     pub kind: String,
+    /// Single-user shorthand for static policies.
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// Multi-user static credentials. When non-empty, takes precedence.
+    #[serde(default)]
+    pub users: Vec<AuthUserConfig>,
+}
+
+impl AuthPolicyConfig {
+    /// Resolve the primary static credential used by simple handshake adapters.
+    pub fn primary_static_user(&self) -> Option<(String, String)> {
+        if let Some(user) = self.users.first() {
+            return Some((user.username.clone(), user.password.clone()));
+        }
+        if !self.username.is_empty() {
+            return Some((self.username.clone(), self.password.clone()));
+        }
+        None
+    }
 }
 
 /// Named governance policy referenced by `ServiceConfig.plugin_policies`.
@@ -330,6 +362,9 @@ mod tests {
             auth_policies: vec![AuthPolicyConfig {
                 name: "local-users".into(),
                 kind: "static".into(),
+                username: "app".into(),
+                password: "secret".into(),
+                users: vec![],
             }],
             plugin_policies: vec![PluginPolicyConfig {
                 name: "audit".into(),

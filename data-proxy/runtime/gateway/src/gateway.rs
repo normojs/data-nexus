@@ -193,8 +193,10 @@ impl GatewayRuntime {
             ProtocolKind::PostgreSql => "14.0".to_owned(),
         };
         let auth_database = listener_plan.default_database().unwrap_or_default().to_owned();
-        let auth_user = String::new();
-        let auth_password = String::new();
+        let (auth_user, auth_password) = listener_plan
+            .auth_user()
+            .cloned()
+            .unwrap_or_else(|| ("root".to_owned(), "root".to_owned()));
         let protocol_label = protocol_name(&protocol).to_owned();
 
         let mut proxy = Proxy {

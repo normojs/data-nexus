@@ -39,7 +39,7 @@ plugin_policies = []
 [[endpoints]]
 name = "orders-primary"
 protocol = "mysql"
-address = "127.0.0.1:3306"
+address = "127.0.0.1:13306"
 database = "orders"
 username = "root"
 password = "root"
@@ -48,7 +48,7 @@ weight = 1
 [[endpoints]]
 name = "analytics-primary"
 protocol = "postgresql"
-address = "127.0.0.1:5432"
+address = "127.0.0.1:15433"
 database = "analytics"
 username = "postgres"
 password = "postgres"
@@ -65,3 +65,5 @@ kind = "simple_load_balance"
 [[auth_policies]]
 name = "local-users"
 kind = "static"
+username = "root"
+password = "root"
