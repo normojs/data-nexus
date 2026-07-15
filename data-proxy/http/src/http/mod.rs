@@ -22,7 +22,7 @@ use std::{
 use axum::{
     body::Body,
     extract::{Json, Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     response::Response,
     routing::{get, post, put},
     Router,
@@ -39,6 +39,8 @@ use serde::Serialize;
 use server::server::{start_gateway_server, GatewayFactory};
 use tracing::info;
 use ver::version::get_version;
+
+mod admin_ui;
 
 #[async_trait::async_trait]
 pub trait HttpServer {
@@ -542,6 +544,8 @@ impl AxumServer {
             .route("/version", get(Self::version))
             .route("/healthz", get(Self::healthz))
             .route("/metrics", get(Self::metrics))
+            .route("/admin", get(Self::admin_dashboard))
+            .route("/admin/", get(Self::admin_dashboard))
             .route("/config", get(Self::admin_config))
             .route("/admin/config", get(Self::admin_config))
             .route("/admin/listeners", get(Self::admin_listeners).post(Self::admin_add_listener))
@@ -555,6 +559,17 @@ impl AxumServer {
             .route("/admin/sessions", get(Self::admin_sessions))
             .route("/admin/reload", post(Self::admin_reload))
             .with_state(state)
+    }
+
+    async fn admin_dashboard(_state: State<Self>) -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            )
+            .body(Body::from(admin_ui::ADMIN_DASHBOARD_HTML))
+            .unwrap_or_else(|_| Response::new(Body::from("admin ui unavailable")))
     }
 
     async fn healthz(_state: State<Self>) -> StatusCode {
@@ -1040,7 +1055,7 @@ mod tests {
     use super::*;
 
     fn gateway_config() -> GatewayConfigDocument {
-        GatewayConfigDocument::from_toml(include_str!("../../examples/gateway-config.toml"))
+        GatewayConfigDocument::from_toml(include_str!("../../../examples/gateway-config.toml"))
             .unwrap()
     }
 
@@ -1144,6 +1159,27 @@ mod tests {
 
     async fn put_json_body(server: AxumServer, path: &str, value: Value) -> (StatusCode, Value) {
         json_body_request(server, Method::PUT, path, value).await
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_returns_html() {
+        let app = gateway_server().routes();
+        let response = app
+            .oneshot(Request::builder().uri("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(content_type.contains("text/html"), "content-type={content_type}");
+        let body = to_bytes(response.into_body()).await.unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("Data Nexus Admin"));
+        assert!(html.contains("/admin/listeners"));
+        assert!(html.contains("/admin/reload"));
     }
 
     #[tokio::test]
@@ -1384,7 +1420,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_reload_validates_current_config_and_reports_no_changes() {
-        let path = write_temp_gateway_config(include_str!("../../examples/gateway-config.toml"));
+        let path = write_temp_gateway_config(include_str!("../../../examples/gateway-config.toml"));
         let server = gateway_server_with_config_source(path.clone());
 
         let (status, value) = post_json(server, "/admin/reload").await;
@@ -1399,7 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_reload_applies_shared_config_when_diff_exists() {
-        let changed_config = include_str!("../../examples/gateway-config.toml")
+        let changed_config = include_str!("../../../examples/gateway-config.toml")
             .replace("address = \"127.0.0.1:3307\"", "address = \"127.0.0.1:3317\"");
         let path = write_temp_gateway_config(&changed_config);
         let server = gateway_server_with_config_source(path.clone());

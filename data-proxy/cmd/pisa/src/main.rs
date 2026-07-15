@@ -16,12 +16,18 @@
 #![allow(dead_code)]
 
 mod node;
+#[cfg(feature = "otel")]
+mod otel;
 
+#[cfg(not(feature = "otel"))]
 use std::str::FromStr;
 
 use ::server::server::{start_gateway_server, GatewayFactory};
 use tokio::runtime::{Builder, Runtime};
-use tracing::{error, info, log::debug, Level};
+use tracing::{error, info, log::debug};
+#[cfg(not(feature = "otel"))]
+use tracing::Level;
+#[cfg(not(feature = "otel"))]
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 extern crate tokio;
@@ -35,11 +41,14 @@ use pisa_metrics::metrics::MetricsManager;
 
 use crate::node::NodeInstance;
 
-/// Initialize structured logging.
+/// Initialize structured logging (default build, no OTel).
 ///
 /// - `RUST_LOG` / `DATA_NEXUS_LOG` env filters (default: admin.log_level)
 /// - `DATA_NEXUS_LOG_FORMAT=json` for JSON logs (spans included)
 /// - spans from runtime (`gateway.handle_frame`, `gateway.command`) attach fields
+///
+/// With `--features otel` and `OTEL_EXPORTER_OTLP_ENDPOINT`, see [`otel::init_tracing`].
+#[cfg(not(feature = "otel"))]
 fn init_tracing(admin_log_level: &str) {
     let default_level = Level::from_str(admin_log_level).unwrap_or(Level::INFO);
     let filter = EnvFilter::try_from_default_env()
@@ -69,6 +78,9 @@ fn main() {
             std::process::exit(-1);
         }
     };
+    #[cfg(feature = "otel")]
+    let _otel_guard = otel::init_tracing(config.admin.log_level.as_str());
+    #[cfg(not(feature = "otel"))]
     init_tracing(config.admin.log_level.as_str());
     info!("data-nexus gateway start: {}", config.version.as_deref().unwrap_or("unknown"));
 

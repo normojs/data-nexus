@@ -38,12 +38,33 @@ GET /metrics
 
 Command metrics labels include listener, service, frontend protocol, backend protocol, command type, endpoint.
 
-## OpenTelemetry / OTLP (optional next step)
+## OpenTelemetry / OTLP (optional feature)
 
-Runtime already emits `tracing` spans. To export to an OTel collector without code changes in gateway_core:
+Default builds stay free of the OTel SDK. Enable export with:
 
-1. Add a process-level OTLP layer (e.g. `tracing-opentelemetry` + `opentelemetry-otlp`) in `cmd/pisa` only.
-2. Keep span names above stable so dashboards can key on `gateway.command`.
-3. Prefer env-based enablement (`OTEL_EXPORTER_OTLP_ENDPOINT`) so default deployments stay dependency-light.
+```bash
+cargo build -p data-proxy --bin proxy --features otel
 
-This repository intentionally does **not** hard-require the OTel SDK in the default build.
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+./target/debug/proxy daemon -c examples/dual-listener-gateway-config.toml
+```
+
+| Item | Detail |
+|------|--------|
+| Feature flag | `otel` on crate `data-proxy` |
+| Runtime gate | `OTEL_EXPORTER_OTLP_ENDPOINT` must be set (non-empty) |
+| Protocol | OTLP gRPC (tonic), default collector port `4317` |
+| Service name | `data-nexus` |
+| Span names | `gateway.handle_frame`, `gateway.command` |
+
+If the exporter fails to initialize, the process logs an error and continues with fmt-only logging.
+
+## Admin UI
+
+Self-contained status page (no separate frontend package required):
+
+```text
+GET http://127.0.0.1:8082/admin
+```
+
+Loads live JSON from `/admin/listeners|services|endpoints|pools|sessions` and can trigger `POST /admin/reload`.
