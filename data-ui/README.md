@@ -15,6 +15,7 @@ Consumes the gateway Admin HTTP API (default `http://127.0.0.1:8082`).
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `NUXT_PUBLIC_ADMIN_API_BASE` | `http://127.0.0.1:8082` | Gateway Admin API base URL |
+| `NUXT_PUBLIC_ADMIN_PASSWORD` | _(empty)_ | Optional UI password; empty disables login |
 
 Gateway CORS is enabled by default for browser UIs. Restrict with:
 
@@ -33,16 +34,31 @@ cargo run -p data-proxy --bin proxy -- daemon -c examples/dual-listener-gateway-
 cd ../data-ui
 pnpm install
 pnpm dev
+# with password gate:
+# NUXT_PUBLIC_ADMIN_PASSWORD=secret pnpm dev
 ```
 
 Open `http://localhost:3000`.
 
+## Routes
+
+| Path | Page |
+|------|------|
+| `/` | Overview (counts + quick links) |
+| `/topology` | Listeners / services / endpoints / pools |
+| `/sessions` | Active sessions |
+| `/settings` | API base + config reload |
+| `/login` | Password gate (only when password set) |
+
+Auth session is stored in `localStorage` for 12 hours.
+
 ## Features
 
-- Live listeners / services / endpoints / pools / sessions
-- Configurable API base URL
+- Multi-page layout with nav
+- Optional password gate
+- Configurable API base URL (localStorage)
 - `POST /admin/reload`
-- Links to `/metrics` and embedded `/admin` HTML
+- Links to `/metrics` and embedded `/admin`
 
 ## Embedded alternative
 

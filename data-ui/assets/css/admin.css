@@ -62,10 +62,59 @@ a:hover { text-decoration: underline; }
   align-items: center;
 }
 
+.nav-links {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.nav-link {
+  color: var(--muted);
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+
+.nav-link:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+  text-decoration: none;
+}
+
+.nav-link.active {
+  color: var(--text);
+  background: rgba(61, 156, 240, 0.15);
+}
+
 .admin-main {
   padding: 20px 24px 40px;
   display: grid;
   gap: 16px;
+}
+
+.page {
+  display: grid;
+  gap: 16px;
+}
+
+.page-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.meta {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 4px 0 0;
 }
 
 .btn {

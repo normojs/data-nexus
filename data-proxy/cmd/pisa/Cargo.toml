@@ -16,6 +16,7 @@ otel = [
   "dep:opentelemetry",
   "dep:opentelemetry_sdk",
   "dep:opentelemetry-otlp",
+  "dep:opentelemetry-appender-tracing2",
   "dep:tracing-opentelemetry",
 ]
 
@@ -46,8 +47,10 @@ tracing-subscriber = { version = "0.3.9", features = ["env-filter", "json"] }
 warp = { version = "0.3" }
 vergen = "7.5.0"
 # Optional OTel stack (feature = "otel"). Versions aligned for otlp + tracing bridge.
-opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", optional = true, default-features = false, features = ["trace", "grpc-tonic"] }
+opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.27", optional = true, default-features = false, features = ["trace", "metrics", "logs", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", optional = true, default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic"] }
+# 0.27-compatible appender (upstream crate jumped to 0.32+).
+opentelemetry-appender-tracing2 = { version = "0.27.1", optional = true, default-features = false }
 tracing-opentelemetry = { version = "0.28", optional = true, default-features = false }
 

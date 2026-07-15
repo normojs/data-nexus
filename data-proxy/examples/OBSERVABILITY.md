@@ -55,7 +55,10 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
 | Runtime gate | `OTEL_EXPORTER_OTLP_ENDPOINT` must be set (non-empty) |
 | Protocol | OTLP gRPC (tonic), default collector port `4317` |
 | Service name | `data-nexus` |
-| Span names | `gateway.handle_frame`, `gateway.command` |
+| Traces | always on when endpoint set; spans `gateway.handle_frame`, `gateway.command` |
+| Metrics | default on; disable with `DATA_NEXUS_OTEL_METRICS=0` |
+| Logs | default on (tracing → OTLP logs); disable with `DATA_NEXUS_OTEL_LOGS=0` |
+| Sample metric | `data_nexus.otel.up` counter (emitted once at startup) |
 
 If the exporter fails to initialize, the process logs an error and continues with fmt-only logging.
 
@@ -74,10 +77,14 @@ Loads live JSON from `/admin/listeners|services|endpoints|pools|sessions` and ca
 ```bash
 cd data-ui
 pnpm install
-NUXT_PUBLIC_ADMIN_API_BASE=http://127.0.0.1:8082 pnpm dev
+NUXT_PUBLIC_ADMIN_API_BASE=http://127.0.0.1:8082 \
+NUXT_PUBLIC_ADMIN_PASSWORD=secret \
+pnpm dev
 ```
 
-Open `http://localhost:3000`. The UI calls the Admin API over HTTP.
+Open `http://localhost:3000`. Routes: `/`, `/topology`, `/sessions`, `/settings`, `/login`.
+
+`NUXT_PUBLIC_ADMIN_PASSWORD` enables a browser login gate (optional; empty disables auth).
 
 ### CORS
 

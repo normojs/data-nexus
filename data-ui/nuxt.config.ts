@@ -11,6 +11,8 @@ export default defineNuxtConfig({
     public: {
       // Gateway Admin API base URL (override with NUXT_PUBLIC_ADMIN_API_BASE)
       adminApiBase: process.env.NUXT_PUBLIC_ADMIN_API_BASE || 'http://127.0.0.1:8082',
+      // Optional UI password gate (leave empty to disable)
+      adminPassword: process.env.NUXT_PUBLIC_ADMIN_PASSWORD || '',
     },
   },
   app: {
