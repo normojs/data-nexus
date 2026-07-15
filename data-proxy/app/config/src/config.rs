@@ -456,6 +456,24 @@ mod test {
     }
 
     #[test]
+    fn parses_and_validates_cross_protocol_mysql_to_pg_config() {
+        let config = GatewayConfigDocument::from_toml(include_str!(
+            "../../../examples/cross-protocol-mysql-to-pg.toml"
+        ))
+        .unwrap();
+
+        assert_eq!(config.gateway.listeners.len(), 1);
+        assert_eq!(config.gateway.listeners[0].protocol, ProtocolKind::MySql);
+        assert_eq!(config.gateway.services[0].backend_protocol, ProtocolKind::PostgreSql);
+        assert_eq!(
+            config.gateway.services[0].translation_policy.as_deref(),
+            Some("mysql-to-pg")
+        );
+        assert_eq!(config.gateway.translation_policies.len(), 1);
+        assert!(config.gateway.translation_policies[0].enabled);
+    }
+
+    #[test]
     fn accepts_legacy_protocol_aliases_in_toml() {
         let toml = r#"
 version = "2"

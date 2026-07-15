@@ -428,8 +428,37 @@ fn postgresql_session_attrs(session: &SessionState) -> Vec<PostgreSqlSessionAttr
     session
         .charset
         .as_ref()
-        .map(|client_encoding| vec![PostgreSqlSessionAttr::ClientEncoding(client_encoding.clone())])
+        .map(|charset| {
+            // Map MySQL charset/collation names (or aliases) to PG client_encoding.
+            let client_encoding = map_charset_to_postgresql_encoding(charset);
+            vec![PostgreSqlSessionAttr::ClientEncoding(client_encoding)]
+        })
         .unwrap_or_default()
+}
+
+/// Normalize frontend charset (often MySQL) into a PostgreSQL client_encoding value.
+fn map_charset_to_postgresql_encoding(charset: &str) -> String {
+    let lower = charset.to_ascii_lowercase();
+    // MySQL collations look like utf8mb4_general_ci / utf8mb4_unicode_ci.
+    let base = lower.split('_').next().unwrap_or(lower.as_str());
+    match base {
+        "utf8mb4" | "utf8mb3" | "utf8" | "utf-8" => "UTF8".into(),
+        "latin1" | "iso-8859-1" | "iso88591" => "LATIN1".into(),
+        "latin9" | "iso-8859-15" => "LATIN9".into(),
+        "ascii" | "us-ascii" => "SQL_ASCII".into(),
+        "gbk" => "GBK".into(),
+        "gb18030" => "GB18030".into(),
+        "big5" => "BIG5".into(),
+        "ujis" | "eucjpms" => "EUC_JP".into(),
+        "euckr" => "EUC_KR".into(),
+        "binary" => "SQL_ASCII".into(),
+        "default" => "DEFAULT".into(),
+        // Already a PG-style name (UTF8, LATIN1, ...).
+        other if other.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+            other.to_ascii_uppercase()
+        }
+        _ => "UTF8".into(),
+    }
 }
 
 fn postgresql_client_encoding_statement(client_encoding: &str) -> String {
@@ -553,11 +582,25 @@ mod tests {
     #[test]
     fn builds_session_attrs_from_client_encoding() {
         let session = SessionState { charset: Some("LATIN1".into()), ..Default::default() };
+        let attrs = postgresql_session_attrs(&session);
+        assert_eq!(attrs, vec![PostgreSqlSessionAttr::ClientEncoding("LATIN1".into())]);
 
-        assert_eq!(
-            postgresql_session_attrs(&session),
-            vec![PostgreSqlSessionAttr::ClientEncoding("LATIN1".into())]
-        );
+        let mysql_session =
+            SessionState { charset: Some("utf8mb4_general_ci".into()), ..Default::default() };
+        let attrs = postgresql_session_attrs(&mysql_session);
+        assert_eq!(attrs, vec![PostgreSqlSessionAttr::ClientEncoding("UTF8".into())]);
+    }
+
+    #[test]
+    fn maps_mysql_charset_names_to_postgresql_encoding() {
+        assert_eq!(map_charset_to_postgresql_encoding("utf8mb4"), "UTF8");
+        assert_eq!(map_charset_to_postgresql_encoding("utf8mb4_unicode_ci"), "UTF8");
+        assert_eq!(map_charset_to_postgresql_encoding("latin1"), "LATIN1");
+        assert_eq!(map_charset_to_postgresql_encoding("UTF8"), "UTF8");
+    }
+
+    #[test]
+    fn builds_session_attrs_empty_without_charset() {
         assert!(postgresql_session_attrs(&SessionState::default()).is_empty());
     }
 

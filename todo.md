@@ -21,12 +21,11 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - dual-listener Docker smoke E2E
 - M3：`translation_policy` + SQL 子集校验 + prepared 限制 + 结果类型映射 + MySQL→PG 保守改写 + core 执行路径接入 + golden tests
 
-### 关键缺口
+### 开放缺口（可选）
 
-1. 完整 AST dialect parser（mysql_parser 等，可选）
-2. OTel structured trace（可选）
-3. 跨协议 Docker E2E smoke（示例配置已有，真实客户端联调可选）
-4. PostgreSQL→MySQL 改写深化（当前 passthrough + 类型映射）
+1. 完整 AST dialect parser（mysql_parser 等）
+2. OTel structured trace
+3. PostgreSQL→MySQL 改写深化（当前 passthrough + 类型映射）
 
 ---
 
@@ -36,7 +35,7 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 M0  端到端可跑（同协议）     ✓
 M1  去掉 legacy 双轨         ✓（主路径）
 M2  治理协议无关 + Admin     ✓（主路径）
-M3  受控跨协议（可选）       ✓（受控子集；非全量方言互转）
+M3  受控跨协议（可选）       ✓（含 Docker smoke）
 ```
 
 原则：
@@ -67,12 +66,13 @@ M3  受控跨协议（可选）       ✓（受控子集；非全量方言互转
 - [x] 实际跨协议执行路径（core `handle_frame`：校验 → 改写 → execute → 列类型映射）
 - [x] 方言转换 golden tests（MySQL→PG：反引号、IFNULL、LIMIT offset）
 - [x] 示例配置：`examples/cross-protocol-mysql-to-pg.toml`
+- [x] 跨协议 Docker smoke（`examples/smoke-cross-protocol.sh`）
+- [x] MySQL charset/collation → PG `client_encoding` 映射（跨协议 session 同步）
 
 **不做**：任意方言全量互转。
 
 可选后续：
 
-- [ ] 跨协议 Docker smoke（MySQL client → PG backend）
 - [ ] PG→MySQL 标识符/函数改写扩展
 - [ ] 完整 AST parser 按 dialect 挂载
 - [ ] structured trace（OpenTelemetry）
