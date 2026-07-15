@@ -44,7 +44,10 @@ use ver::version::get_version;
 mod admin_auth;
 mod admin_ui;
 
-use admin_auth::{authenticate_request, me_response, AdminAuthError, AdminAuthPublicConfig};
+use admin_auth::{
+    authenticate_request, break_glass_login, me_response, AdminAuthError, AdminAuthPublicConfig,
+    AdminLoginRequest,
+};
 
 /// CORS for Admin API / metrics so independent UIs can call the gateway.
 ///
@@ -610,6 +613,7 @@ impl AxumServer {
             .route("/admin/reload", post(Self::admin_reload))
             .route("/admin/me", get(Self::admin_me))
             .route("/admin/auth/config", get(Self::admin_auth_config))
+            .route("/admin/auth/login", post(Self::admin_auth_login))
             .layer(cors)
             .with_state(state)
     }
@@ -670,6 +674,20 @@ impl AxumServer {
     async fn admin_auth_config(State(state): State<Self>) -> Response<Body> {
         let auth = state.admin_auth_config_snapshot();
         json_response(&AdminAuthPublicConfig::from(&auth))
+    }
+
+    async fn admin_auth_login(
+        State(state): State<Self>,
+        Json(body): Json<AdminLoginRequest>,
+    ) -> Response<Body> {
+        let auth = state.admin_auth_config_snapshot();
+        match break_glass_login(&auth, &body.password) {
+            Ok(token) => {
+                info!(target: "data_nexus::audit", auth_method = "break_glass", "admin break-glass login");
+                json_response(&token)
+            }
+            Err(err) => admin_auth_error_response(err),
+        }
     }
 
     async fn admin_me(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {

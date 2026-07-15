@@ -12,7 +12,10 @@ issuer = "data-nexus"
 audience = "data-nexus-admin"
 leeway_secs = 60
 public_metrics = true
+# Optional: POST /admin/auth/login { "password": "..." } → Bearer JWT
+break_glass_password = "change-me-break-glass"
 break_glass_role = "admin"
+token_ttl_secs = 3600
 role_claim_paths = ["roles", "groups", "realm_access.roles"]
 
 [admin_auth.role_bindings]

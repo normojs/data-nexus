@@ -9,7 +9,7 @@ use gateway_core::{
     AdminRole,
 };
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,6 +26,7 @@ pub struct AdminAuthPublicConfig {
     pub enabled: bool,
     pub mode: &'static str,
     pub public_metrics: bool,
+    pub break_glass_login: bool,
 }
 
 impl From<&AdminAuthConfig> for AdminAuthPublicConfig {
@@ -37,8 +38,46 @@ impl From<&AdminAuthConfig> for AdminAuthPublicConfig {
                 AdminAuthMode::JwtHmac => "jwt_hmac",
             },
             public_metrics: config.public_metrics,
+            break_glass_login: config.break_glass_enabled(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminLoginRequest {
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminLoginResponse {
+    pub access_token: String,
+    pub token_type: &'static str,
+    pub expires_in: u64,
+    pub roles: Vec<&'static str>,
+}
+
+/// Exchange break-glass password for a short-lived HS256 JWT.
+pub fn break_glass_login(
+    config: &AdminAuthConfig,
+    password: &str,
+) -> Result<AdminLoginResponse, AdminAuthError> {
+    if !config.break_glass_enabled() {
+        return Err(AdminAuthError::Unauthorized(
+            "break-glass password login is not configured".into(),
+        ));
+    }
+    if password != config.break_glass_password {
+        return Err(AdminAuthError::Unauthorized("invalid password".into()));
+    }
+    let role = config.break_glass_role_parsed();
+    let ttl = config.token_ttl_secs.max(60);
+    let token = issue_hmac_token(config, "break-glass", &[role], ttl as i64)?;
+    Ok(AdminLoginResponse {
+        access_token: token,
+        token_type: "Bearer",
+        expires_in: ttl,
+        roles: vec![role.as_str()],
+    })
 }
 
 #[derive(Debug)]
@@ -123,8 +162,8 @@ pub fn authenticate_request(
     method: &str,
     path: &str,
 ) -> Result<Option<AdminAuthContext>, AdminAuthError> {
-    // Public discovery endpoint.
-    if path_is_public_auth_config(path) {
+    // Public discovery / login endpoints.
+    if path_is_public_auth_path(path) {
         return Ok(None);
     }
 
@@ -159,9 +198,9 @@ pub fn authenticate_request(
     Ok(Some(ctx))
 }
 
-fn path_is_public_auth_config(path: &str) -> bool {
+fn path_is_public_auth_path(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
-    path == "/admin/auth/config"
+    path == "/admin/auth/config" || path == "/admin/auth/login"
 }
 
 fn is_metrics_path(path: &str) -> bool {
@@ -388,5 +427,26 @@ mod tests {
         let cfg = enabled_hmac();
         let result = authenticate_request(&cfg, None, "GET", "/admin/auth/config").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn break_glass_login_issues_admin_token() {
+        let mut cfg = enabled_hmac();
+        cfg.break_glass_password = "super-secret".into();
+        let err = break_glass_login(&cfg, "wrong").unwrap_err();
+        assert!(matches!(err, AdminAuthError::Unauthorized(_)));
+        let token = break_glass_login(&cfg, "super-secret").unwrap();
+        assert_eq!(token.token_type, "Bearer");
+        assert!(token.roles.contains(&"admin"));
+        let ctx = authenticate_request(
+            &cfg,
+            Some(&format!("Bearer {}", token.access_token)),
+            "POST",
+            "/admin/reload",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ctx.subject, "break-glass");
+        assert!(ctx.allows(AdminPermission::ConfigReload));
     }
 }

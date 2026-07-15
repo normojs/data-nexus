@@ -130,9 +130,15 @@ pub struct AdminAuthConfig {
     /// When true, GET /metrics skips auth (Prometheus scrape).
     #[serde(default = "default_true")]
     pub public_metrics: bool,
-    /// Role for break-glass password tokens (future login endpoint).
+    /// Role for break-glass password tokens.
     #[serde(default = "default_break_glass_role")]
     pub break_glass_role: String,
+    /// Optional break-glass password for `POST /admin/auth/login` (not for data plane).
+    #[serde(default)]
+    pub break_glass_password: String,
+    /// Break-glass token TTL seconds (default 1h).
+    #[serde(default = "default_token_ttl_secs")]
+    pub token_ttl_secs: u64,
 }
 
 fn default_leeway_secs() -> u64 {
@@ -155,6 +161,10 @@ fn default_break_glass_role() -> String {
     "admin".into()
 }
 
+fn default_token_ttl_secs() -> u64 {
+    3600
+}
+
 impl Default for AdminAuthConfig {
     fn default() -> Self {
         Self {
@@ -168,6 +178,8 @@ impl Default for AdminAuthConfig {
             role_bindings: default_role_bindings(),
             public_metrics: true,
             break_glass_role: default_break_glass_role(),
+            break_glass_password: String::new(),
+            token_ttl_secs: default_token_ttl_secs(),
         }
     }
 }
@@ -184,6 +196,16 @@ fn default_role_bindings() -> HashMap<String, String> {
 }
 
 impl AdminAuthConfig {
+    pub fn break_glass_enabled(&self) -> bool {
+        self.enabled
+            && matches!(self.mode, AdminAuthMode::JwtHmac)
+            && !self.break_glass_password.is_empty()
+    }
+
+    pub fn break_glass_role_parsed(&self) -> AdminRole {
+        AdminRole::parse(&self.break_glass_role).unwrap_or(AdminRole::Admin)
+    }
+
     pub fn validate(&self) -> GatewayResult<()> {
         if !self.enabled {
             return Ok(());
@@ -201,6 +223,12 @@ impl AdminAuthConfig {
                 if self.jwt_secret.len() < 16 {
                     return Err(GatewayError::Configuration(
                         "admin_auth.jwt_secret must be at least 16 characters".into(),
+                    ));
+                }
+                if !self.break_glass_password.is_empty() && self.break_glass_password.len() < 8 {
+                    return Err(GatewayError::Configuration(
+                        "admin_auth.break_glass_password must be at least 8 characters when set"
+                            .into(),
                     ));
                 }
                 Ok(())

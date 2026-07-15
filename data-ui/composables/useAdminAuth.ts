@@ -2,7 +2,7 @@ const AUTH_KEY = 'data-nexus-admin-auth'
 
 type AuthSession = {
   ok?: boolean
-  method?: 'password' | 'oidc'
+  method?: 'password' | 'oidc' | 'break_glass'
   at?: number
   access_token?: string
   id_token?: string
@@ -11,7 +11,11 @@ type AuthSession = {
 
 export function useAdminAuth() {
   const config = useRuntimeConfig()
-  const requiredPassword = computed(() => {
+  const api = useAdminApi()
+  const { apiBase } = useAdminSettings()
+
+  /** UI-local password (legacy / offline). Prefer gateway break-glass when API auth is on. */
+  const localPassword = computed(() => {
     const p = String(config.public.adminPassword || '').trim()
     return p.length > 0 ? p : null
   })
@@ -20,10 +24,22 @@ export function useAdminAuth() {
     const clientId = String(config.public.oidcClientId || '').trim()
     return issuer.length > 0 && clientId.length > 0
   })
-  const authRequired = computed(() => requiredPassword.value !== null || oidcConfigured.value)
+
+  const apiAuthEnabled = useState<boolean>('admin-api-auth-enabled', () => false)
+  const breakGlassLogin = useState<boolean>('admin-break-glass-login', () => false)
+
+  const passwordEnabled = computed(
+    () => localPassword.value !== null || breakGlassLogin.value,
+  )
+  const authRequired = computed(
+    () => passwordEnabled.value || oidcConfigured.value || apiAuthEnabled.value,
+  )
 
   const authenticated = useState<boolean>('admin-authenticated', () => false)
-  const authMethod = useState<'password' | 'oidc' | null>('admin-auth-method', () => null)
+  const authMethod = useState<'password' | 'oidc' | 'break_glass' | null>(
+    'admin-auth-method',
+    () => null,
+  )
 
   function hydrateFromStorage() {
     if (!import.meta.client) return
@@ -40,11 +56,14 @@ export function useAdminAuth() {
         return
       }
       const parsed = JSON.parse(raw) as AuthSession
-      const maxAge = parsed.method === 'oidc' && parsed.expires_in
+      const maxAge = parsed.expires_in
         ? Math.min(parsed.expires_in * 1000, 12 * 60 * 60 * 1000)
         : 12 * 60 * 60 * 1000
       const fresh = typeof parsed.at === 'number' && Date.now() - parsed.at < maxAge
-      authenticated.value = Boolean(parsed.ok && fresh)
+      // When API auth is on, password sessions must carry a token.
+      const needsToken = apiAuthEnabled.value && parsed.method !== 'oidc'
+      const hasToken = Boolean(parsed.access_token)
+      authenticated.value = Boolean(parsed.ok && fresh && (!needsToken || hasToken))
       authMethod.value = authenticated.value ? (parsed.method || 'password') : null
       if (!authenticated.value) localStorage.removeItem(AUTH_KEY)
     }
@@ -54,24 +73,63 @@ export function useAdminAuth() {
     }
   }
 
-  function login(password: string): boolean {
+  async function refreshApiAuthFlags() {
+    try {
+      const cfg = await api.authConfig(apiBase.value)
+      apiAuthEnabled.value = Boolean(cfg.enabled)
+      breakGlassLogin.value = Boolean(cfg.break_glass_login)
+    }
+    catch {
+      // Gateway unreachable: keep previous flags.
+    }
+  }
+
+  /** Local-only password gate (no Admin API JWT). */
+  function loginLocal(password: string): boolean {
+    if (!localPassword.value) return false
+    if (password !== localPassword.value) return false
+    authenticated.value = true
+    authMethod.value = 'password'
+    if (import.meta.client) {
+      localStorage.setItem(
+        AUTH_KEY,
+        JSON.stringify({ ok: true, method: 'password', at: Date.now() }),
+      )
+    }
+    return true
+  }
+
+  /** Prefer gateway break-glass; fall back to local password when API auth is off. */
+  async function login(password: string): Promise<boolean> {
     if (!authRequired.value) {
       authenticated.value = true
       return true
     }
-    if (!requiredPassword.value) {
-      // Only OIDC configured — password form is not valid.
-      return false
-    }
-    if (password === requiredPassword.value) {
-      authenticated.value = true
-      authMethod.value = 'password'
-      if (import.meta.client) {
-        localStorage.setItem(AUTH_KEY, JSON.stringify({ ok: true, method: 'password', at: Date.now() }))
+    await refreshApiAuthFlags()
+    if (breakGlassLogin.value) {
+      try {
+        const token = await api.login(password, apiBase.value)
+        authenticated.value = true
+        authMethod.value = 'break_glass'
+        if (import.meta.client) {
+          localStorage.setItem(
+            AUTH_KEY,
+            JSON.stringify({
+              ok: true,
+              method: 'break_glass',
+              at: Date.now(),
+              access_token: token.access_token,
+              expires_in: token.expires_in,
+            }),
+          )
+        }
+        return true
       }
-      return true
+      catch {
+        return false
+      }
     }
-    return false
+    return loginLocal(password)
   }
 
   function markOidcAuthenticated() {
@@ -99,10 +157,14 @@ export function useAdminAuth() {
     authRequired,
     authenticated,
     authMethod,
-    passwordEnabled: computed(() => requiredPassword.value !== null),
+    passwordEnabled,
     oidcEnabled: oidcConfigured,
+    apiAuthEnabled,
+    breakGlassLogin,
     hydrateFromStorage,
+    refreshApiAuthFlags,
     login,
+    loginLocal,
     markOidcAuthenticated,
     logout,
   }

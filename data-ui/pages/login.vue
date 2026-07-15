@@ -17,24 +17,34 @@ const password = ref('')
 const error = ref('')
 const busy = ref(false)
 
-onMounted(() => {
+const { refreshApiAuthFlags } = useAdminAuth()
+
+onMounted(async () => {
+  await refreshApiAuthFlags()
   hydrateFromStorage()
   if (!authRequired.value || authenticated.value) {
     navigateTo(String(route.query.next || '/'))
   }
 })
 
-function submit() {
+async function submit() {
   error.value = ''
-  if (!passwordEnabled.value) {
-    error.value = 'Password auth is disabled; use SSO'
-    return
+  busy.value = true
+  try {
+    if (!passwordEnabled.value) {
+      error.value = 'Password auth is disabled; use SSO'
+      return
+    }
+    const ok = await login(password.value)
+    if (ok) {
+      navigateTo(String(route.query.next || '/'))
+      return
+    }
+    error.value = 'Invalid password'
   }
-  if (login(password.value)) {
-    navigateTo(String(route.query.next || '/'))
-    return
+  finally {
+    busy.value = false
   }
-  error.value = 'Invalid password'
 }
 
 async function sso() {
@@ -75,8 +85,9 @@ async function sso() {
           type="submit"
           class="btn primary"
           style="width: 100%; margin-top: 12px"
+          :disabled="busy"
         >
-          Sign in with password
+          {{ busy ? 'Signing in…' : 'Sign in with password' }}
         </button>
       </template>
 

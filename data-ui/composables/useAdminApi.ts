@@ -56,6 +56,14 @@ export type AdminAuthPublicConfig = {
   enabled: boolean
   mode: string
   public_metrics: boolean
+  break_glass_login?: boolean
+}
+
+export type AdminLoginResponse = {
+  access_token: string
+  token_type: string
+  expires_in: number
+  roles: string[]
 }
 
 const AUTH_KEY = 'data-nexus-admin-auth'
@@ -114,6 +122,12 @@ export function useAdminApi() {
       $fetch(`${normalizeBase(base)}/admin/reload`, {
         method: 'POST',
         headers: authHeaders(),
+      }),
+    login: (password: string, base?: string) =>
+      $fetch<AdminLoginResponse>(`${normalizeBase(base)}/admin/auth/login`, {
+        method: 'POST',
+        body: { password },
+        headers: { Accept: 'application/json' },
       }),
   }
 }
