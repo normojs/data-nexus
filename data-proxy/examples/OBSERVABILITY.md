@@ -90,7 +90,28 @@ Prometheus text metrics on `/metrics` remain available regardless of OTel.
 
 If the exporter fails to initialize, the process logs an error and continues with fmt-only logging.
 
-## Admin UI
+## Admin API auth (management plane)
+
+Optional. Default `admin_auth.enabled = false` keeps open Admin API (local dev).
+
+When enabled (`mode = "jwt_hmac"`):
+
+| Endpoint | Auth |
+|----------|------|
+| `GET /admin/auth/config` | public |
+| `GET /healthz`, `GET /version` | public |
+| `GET /metrics` | public if `public_metrics = true` (default) |
+| other `/admin/*` | `Authorization: Bearer <HS256 JWT>` |
+
+Roles: `viewer` / `operator` / `admin` (permission union).  
+Claims: `roles` / `groups` / configured paths → `role_bindings`.
+
+See `examples/admin-auth.snippet.toml` and `docs/admin-rbac-design.md`.
+
+```bash
+# enabled: no token → 401 on reload
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8082/admin/reload
+```
 
 ### Embedded (zero dependency)
 

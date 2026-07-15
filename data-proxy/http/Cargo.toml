@@ -21,6 +21,8 @@ axum = "0.6.20"
 tower-http = { version = "0.4", features = ["cors"] }
 tracing = "0.1.37"
 tracing-subscriber = "0.3.9"
+# default-features off avoids simple_asn1/time MSRV issues on older rustc.
+jsonwebtoken = { version = "9.3", default-features = false }
 
 [dev-dependencies]
 hyper = "0.14"

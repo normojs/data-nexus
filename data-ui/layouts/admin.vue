@@ -1,19 +1,39 @@
 <script setup lang="ts">
 const route = useRoute()
+const api = useAdminApi()
 const { apiBase, hydrate: hydrateSettings } = useAdminSettings()
 const { authRequired, logout, hydrateFromStorage } = useAdminAuth()
 
-onMounted(() => {
+const meLabel = ref('')
+const canReload = ref(true)
+
+onMounted(async () => {
   hydrateSettings()
   hydrateFromStorage()
+  try {
+    const cfg = await api.authConfig(apiBase.value)
+    if (cfg.enabled) {
+      const me = await api.me(apiBase.value)
+      meLabel.value = `${me.subject} (${me.roles.join(',') || 'no-role'})`
+      canReload.value = me.permissions.includes('config:reload')
+    }
+  }
+  catch {
+    // API auth off or token missing; pages will surface errors.
+  }
 })
 
-const links = [
-  { to: '/', label: 'Overview' },
-  { to: '/topology', label: 'Topology' },
-  { to: '/sessions', label: 'Sessions' },
-  { to: '/settings', label: 'Settings' },
-]
+const links = computed(() => {
+  const base = [
+    { to: '/', label: 'Overview' },
+    { to: '/topology', label: 'Topology' },
+    { to: '/sessions', label: 'Sessions' },
+  ]
+  if (canReload.value) {
+    base.push({ to: '/settings', label: 'Settings' })
+  }
+  return base
+})
 
 function isActive(path: string) {
   if (path === '/') return route.path === '/'
@@ -33,6 +53,7 @@ function onLogout() {
         <h1>Data Nexus Admin</h1>
         <div class="meta">
           API <span class="mono">{{ apiBase }}</span>
+          <span v-if="meLabel"> · {{ meLabel }}</span>
         </div>
       </div>
       <nav class="nav-links">

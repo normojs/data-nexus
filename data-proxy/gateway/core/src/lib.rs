@@ -4,6 +4,7 @@
 //! connection pool, or runtime implementation. Protocol adapters and backend
 //! connectors meet at these types instead.
 
+mod admin_auth;
 mod config;
 mod dialect;
 mod error;
@@ -15,6 +16,10 @@ mod translation;
 mod transport;
 mod types;
 
+pub use admin_auth::{
+    required_permission, AdminAuthConfig, AdminAuthContext, AdminAuthMode, AdminPermission,
+    AdminRole,
+};
 pub use config::{
     AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
     PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,

@@ -22,14 +22,14 @@ use std::{
 use axum::{
     body::Body,
     extract::{Json, Path, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::Response,
     routing::{get, post, put},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
 use config::config::{GatewayConfigDocument, GatewayConfigLoadError, PisaProxyConfig};
-use gateway_core::{ListenerConfig, RoutePolicyConfig};
+use gateway_core::{AdminAuthConfig, ListenerConfig, RoutePolicyConfig};
 use pisa_error::error::*;
 use pisa_metrics::metrics::MetricsManager;
 use proxy::factory::{
@@ -41,7 +41,10 @@ use server::server::{start_gateway_server, GatewayFactory};
 use tracing::info;
 use ver::version::get_version;
 
+mod admin_auth;
 mod admin_ui;
+
+use admin_auth::{authenticate_request, me_response, AdminAuthError, AdminAuthPublicConfig};
 
 /// CORS for Admin API / metrics so independent UIs can call the gateway.
 ///
@@ -605,11 +608,34 @@ impl AxumServer {
             .route("/admin/pools/:name/refresh", post(Self::admin_refresh_pool))
             .route("/admin/sessions", get(Self::admin_sessions))
             .route("/admin/reload", post(Self::admin_reload))
+            .route("/admin/me", get(Self::admin_me))
+            .route("/admin/auth/config", get(Self::admin_auth_config))
             .layer(cors)
             .with_state(state)
     }
 
-    async fn admin_dashboard(_state: State<Self>) -> Response<Body> {
+    fn admin_auth_config_snapshot(&self) -> AdminAuthConfig {
+        self.gateway_config
+            .as_ref()
+            .and_then(|config| config.read().ok().map(|guard| guard.admin_auth.clone()))
+            .unwrap_or_default()
+    }
+
+    fn authorize(&self, headers: &HeaderMap, method: &str, path: &str) -> Result<(), Response<Body>> {
+        let auth = self.admin_auth_config_snapshot();
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        match authenticate_request(&auth, authorization, method, path) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(admin_auth_error_response(err)),
+        }
+    }
+
+    async fn admin_dashboard(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin") {
+            return response;
+        }
         Response::builder()
             .status(StatusCode::OK)
             .header(
@@ -629,7 +655,10 @@ impl AxumServer {
         get_version()
     }
 
-    async fn metrics(State(state): State<Self>) -> Response<Body> {
+    async fn metrics(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/metrics") {
+            return response;
+        }
         let buf = state.metrics_manager.gather();
 
         Response::builder()
@@ -638,7 +667,35 @@ impl AxumServer {
             .unwrap()
     }
 
-    async fn admin_config(State(state): State<Self>) -> Response<Body> {
+    async fn admin_auth_config(State(state): State<Self>) -> Response<Body> {
+        let auth = state.admin_auth_config_snapshot();
+        json_response(&AdminAuthPublicConfig::from(&auth))
+    }
+
+    async fn admin_me(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        let auth = state.admin_auth_config_snapshot();
+        if !auth.enabled {
+            return json_response(&me_response(None, false));
+        }
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        // When auth is enabled, /admin/me always requires a valid Bearer token.
+        match authenticate_request(&auth, authorization, "GET", "/admin/me") {
+            Ok(Some(ctx)) => json_response(&me_response(Some(&ctx), true)),
+            Ok(None) | Err(AdminAuthError::Unauthorized(_)) => {
+                admin_auth_error_response(AdminAuthError::Unauthorized(
+                    "authentication required".into(),
+                ))
+            }
+            Err(err) => admin_auth_error_response(err),
+        }
+    }
+
+    async fn admin_config(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/config") {
+            return response;
+        }
         match &state.gateway_config {
             Some(config) => match gateway_config_snapshot(config) {
                 Ok(config) => json_response(&config),
@@ -648,7 +705,10 @@ impl AxumServer {
         }
     }
 
-    async fn admin_listeners(State(state): State<Self>) -> Response<Body> {
+    async fn admin_listeners(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/listeners") {
+            return response;
+        }
         match &state.gateway_config {
             Some(config) => match gateway_config_snapshot(config) {
                 Ok(config) => json_response(&config.gateway.listeners),
@@ -658,7 +718,10 @@ impl AxumServer {
         }
     }
 
-    async fn admin_services(State(state): State<Self>) -> Response<Body> {
+    async fn admin_services(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/services") {
+            return response;
+        }
         match &state.gateway_config {
             Some(config) => match gateway_config_snapshot(config) {
                 Ok(config) => json_response(&config.gateway.services),
@@ -668,7 +731,10 @@ impl AxumServer {
         }
     }
 
-    async fn admin_endpoints(State(state): State<Self>) -> Response<Body> {
+    async fn admin_endpoints(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/endpoints") {
+            return response;
+        }
         match &state.gateway_config {
             Some(config) => match gateway_config_snapshot(config) {
                 Ok(config) => json_response(&config.gateway.endpoints),
@@ -680,8 +746,12 @@ impl AxumServer {
 
     async fn admin_add_listener(
         State(state): State<Self>,
+        headers: HeaderMap,
         Json(listener): Json<ListenerConfig>,
     ) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "POST", "/admin/listeners") {
+            return response;
+        }
         let gateway_config = match &state.gateway_config {
             Some(gateway_config) => gateway_config.clone(),
             None => return gateway_config_not_available(),
@@ -758,8 +828,13 @@ impl AxumServer {
     async fn admin_replace_route_policy(
         Path(name): Path<String>,
         State(state): State<Self>,
+        headers: HeaderMap,
         Json(route_policy): Json<RoutePolicyConfig>,
     ) -> Response<Body> {
+        let policy_path = format!("/admin/route-policies/{}", name);
+        if let Err(response) = state.authorize(&headers, "PUT", &policy_path) {
+            return response;
+        }
         let gateway_config = match &state.gateway_config {
             Some(gateway_config) => gateway_config.clone(),
             None => return gateway_config_not_available(),
@@ -828,7 +903,10 @@ impl AxumServer {
         json_response(&response)
     }
 
-    async fn admin_pools(State(state): State<Self>) -> Response<Body> {
+    async fn admin_pools(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/pools") {
+            return response;
+        }
         match &state.runtime_state {
             Some(runtime_state) => json_response(&runtime_state.pool_statuses()),
             None => admin_runtime_not_found("admin runtime state is not available"),
@@ -838,7 +916,12 @@ impl AxumServer {
     async fn admin_refresh_pool(
         Path(name): Path<String>,
         State(state): State<Self>,
+        headers: HeaderMap,
     ) -> Response<Body> {
+        let path = format!("/admin/pools/{}/refresh", name);
+        if let Err(response) = state.authorize(&headers, "POST", &path) {
+            return response;
+        }
         match &state.runtime_state {
             Some(runtime_state) => match runtime_state.refresh_pool(&name) {
                 Some(status) => json_response(&status),
@@ -848,21 +931,30 @@ impl AxumServer {
         }
     }
 
-    async fn admin_refresh_pools(State(state): State<Self>) -> Response<Body> {
+    async fn admin_refresh_pools(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "POST", "/admin/pools/refresh") {
+            return response;
+        }
         match &state.runtime_state {
             Some(runtime_state) => json_response(&runtime_state.refresh_pools()),
             None => admin_runtime_not_found("admin runtime state is not available"),
         }
     }
 
-    async fn admin_sessions(State(state): State<Self>) -> Response<Body> {
+    async fn admin_sessions(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/sessions") {
+            return response;
+        }
         match &state.runtime_state {
             Some(runtime_state) => json_response(&runtime_state.session_statuses()),
             None => admin_runtime_not_found("admin runtime state is not available"),
         }
     }
 
-    async fn admin_reload(State(state): State<Self>) -> Response<Body> {
+    async fn admin_reload(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "POST", "/admin/reload") {
+            return response;
+        }
         let shared_config = match &state.gateway_config {
             Some(config) => config.clone(),
             None => return gateway_config_not_available(),
@@ -981,7 +1073,12 @@ impl AxumServer {
     async fn admin_stop_listener(
         Path(name): Path<String>,
         State(state): State<Self>,
+        headers: HeaderMap,
     ) -> Response<Body> {
+        let path = format!("/admin/listeners/{}/stop", name);
+        if let Err(response) = state.authorize(&headers, "POST", &path) {
+            return response;
+        }
         match &state.runtime_state {
             Some(runtime_state) => match runtime_state.stop_listener(&name) {
                 Some(status) => json_response(&status),
@@ -990,6 +1087,10 @@ impl AxumServer {
             None => admin_runtime_not_found("admin runtime state is not available"),
         }
     }
+}
+
+fn admin_auth_error_response(error: AdminAuthError) -> Response<Body> {
+    admin_json_error(error.status(), error.code(), error.message().to_owned())
 }
 
 fn json_response<T: Serialize>(value: &T) -> Response<Body> {
@@ -1228,6 +1329,96 @@ mod tests {
         assert!(html.contains("Data Nexus Admin"));
         assert!(html.contains("/admin/listeners"));
         assert!(html.contains("/admin/reload"));
+    }
+
+    fn gateway_server_with_auth(auth: gateway_core::AdminAuthConfig) -> AxumServer {
+        let server = gateway_server();
+        if let Some(shared) = &server.gateway_config {
+            let mut guard = shared.write().unwrap();
+            guard.admin_auth = auth;
+        }
+        server
+    }
+
+    #[tokio::test]
+    async fn admin_auth_config_is_public_when_enabled() {
+        let auth = gateway_core::AdminAuthConfig {
+            enabled: true,
+            mode: gateway_core::AdminAuthMode::JwtHmac,
+            jwt_secret: "test-secret-16b!!".into(),
+            ..gateway_core::AdminAuthConfig::default()
+        };
+        let server = gateway_server_with_auth(auth);
+        let (status, value) = get_json_from(server, "/admin/auth/config").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["mode"], "jwt_hmac");
+    }
+
+    #[tokio::test]
+    async fn enabled_auth_rejects_reload_without_token() {
+        let auth = gateway_core::AdminAuthConfig {
+            enabled: true,
+            mode: gateway_core::AdminAuthMode::JwtHmac,
+            jwt_secret: "test-secret-16b!!".into(),
+            issuer: "data-nexus-test".into(),
+            audience: "data-nexus-admin".into(),
+            ..gateway_core::AdminAuthConfig::default()
+        };
+        let server = gateway_server_with_auth(auth);
+        let (status, value) = post_json(server, "/admin/reload").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(value["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn enabled_auth_allows_admin_token_on_me_and_forbids_viewer_reload() {
+        use gateway_core::{AdminAuthMode, AdminRole};
+
+        let auth = gateway_core::AdminAuthConfig {
+            enabled: true,
+            mode: AdminAuthMode::JwtHmac,
+            jwt_secret: "test-secret-16b!!".into(),
+            issuer: "data-nexus-test".into(),
+            audience: "data-nexus-admin".into(),
+            ..gateway_core::AdminAuthConfig::default()
+        };
+        let viewer = admin_auth::issue_hmac_token(&auth, "viewer1", &[AdminRole::Viewer], 3600)
+            .expect("token");
+        let admin =
+            admin_auth::issue_hmac_token(&auth, "admin1", &[AdminRole::Admin], 3600).expect("token");
+        let server = gateway_server_with_auth(auth);
+
+        let response = server
+            .routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/me")
+                    .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body()).await.unwrap();
+        let me: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(me["subject"], "admin1");
+        assert!(me["roles"].as_array().unwrap().iter().any(|r| r == "admin"));
+
+        let response = server
+            .routes()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/reload")
+                    .header(header::AUTHORIZATION, format!("Bearer {viewer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

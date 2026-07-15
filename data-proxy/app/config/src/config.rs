@@ -17,7 +17,7 @@ use std::{env, fs::File, io::prelude::*};
 
 use api::config::Admin;
 use clap::{value_parser, Arg, Command};
-use gateway_core::{GatewayConfig, GatewayError};
+use gateway_core::{AdminAuthConfig, GatewayConfig, GatewayError};
 use proxy::proxy::{ProxiesConfig, ProxyConfig, UniSQLNode, UniSQLNodes};
 use serde::{Deserialize, Serialize};
 use strategy::config::NodeGroup;
@@ -340,6 +340,9 @@ impl PisaProxyConfig {
 pub struct GatewayConfigDocument {
     #[serde(default)]
     pub admin: Admin,
+    /// Management-plane Admin API auth (not data-plane RBAC).
+    #[serde(default)]
+    pub admin_auth: AdminAuthConfig,
     #[serde(flatten)]
     pub gateway: GatewayConfig,
     pub version: Option<String>,
@@ -349,6 +352,7 @@ impl GatewayConfigDocument {
     pub fn from_toml(input: &str) -> Result<Self, GatewayConfigLoadError> {
         let document: Self = toml::from_str(input).map_err(GatewayConfigLoadError::Parse)?;
         document.gateway.validate().map_err(GatewayConfigLoadError::Validation)?;
+        document.admin_auth.validate().map_err(GatewayConfigLoadError::Validation)?;
         Ok(document)
     }
 }
