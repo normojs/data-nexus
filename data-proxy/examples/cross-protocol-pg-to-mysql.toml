@@ -1,0 +1,51 @@
+# Controlled cross-protocol example: PostgreSQL client -> MySQL backend.
+# Requires an enabled translation_policy. Only SELECT/INSERT/UPDATE/DELETE subset.
+# Pair with: docker compose -f examples/docker-compose.dev.yml up -d
+
+version = "2"
+
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+
+[[listeners]]
+name = "pg-to-mysql"
+listen_addr = "0.0.0.0:9091"
+protocol = "postgresql"
+service = "orders-via-pg"
+auth_policy = "local-users"
+
+[[services]]
+name = "orders-via-pg"
+backend_protocol = "mysql"
+endpoints = ["orders-primary"]
+route_policy = "orders-balance"
+translation_policy = "pg-to-mysql"
+plugin_policies = []
+
+[[endpoints]]
+name = "orders-primary"
+protocol = "mysql"
+address = "127.0.0.1:13306"
+database = "orders"
+username = "root"
+password = "root"
+weight = 1
+
+[[route_policies]]
+name = "orders-balance"
+kind = "simple_load_balance"
+
+[[auth_policies]]
+name = "local-users"
+kind = "static"
+username = "root"
+password = "root"
+
+[[translation_policies]]
+name = "pg-to-mysql"
+enabled = true
+frontend_protocol = "postgresql"
+backend_protocol = "mysql"
+allowed_statements = ["select", "insert", "update", "delete"]

@@ -14,6 +14,7 @@
 
 pub mod backend;
 pub mod core_engine;
+pub mod dialect;
 pub mod frontend;
 pub mod gateway;
 pub mod server;

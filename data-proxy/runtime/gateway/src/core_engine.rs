@@ -16,20 +16,20 @@ use std::{sync::Arc, time::Instant};
 
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
-    default_dialect_parser, map_response_types, prepare_cross_protocol_command, BackendConnector,
-    CommandSummary, DialectParser, EndpointConfig, EndpointRef, EndpointRole,
-    FrontendProtocolAdapter, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse,
-    GatewayResult, HeuristicDialectParser, ListenerConfig, PluginContext, PluginDecision,
-    ProtocolKind, RoutePlan, ServiceConfig, SessionState, TransactionState,
-    TranslationPolicyConfig,
+    map_response_types, prepare_cross_protocol_command, BackendConnector, CommandSummary,
+    DialectParser, EndpointConfig, EndpointRef, EndpointRole, FrontendProtocolAdapter,
+    GatewayCommand, GatewayConfig, GatewayError, GatewayResponse, GatewayResult, ListenerConfig,
+    PluginContext, PluginDecision, ProtocolKind, RoutePlan, ServiceConfig, SessionState,
+    TransactionState, TranslationPolicyConfig,
 };
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use parking_lot::Mutex;
 use plugin::build_phase::PluginPhase;
-use tracing::info;
+use tracing::{info, info_span, Instrument};
 
 use crate::{
     backend::{mysql::MySqlBackendConnector, postgresql::PostgreSqlBackendConnector},
+    dialect::runtime_dialect_parser,
     frontend::{mysql::MySqlFrontendProtocol, postgresql::PostgreSqlFrontendProtocol},
     server::metrics::MySQLServerMetricsCollector,
 };
@@ -50,7 +50,7 @@ pub struct CoreGatewayConnection {
     /// Present only for cross-protocol services with an enabled policy.
     translation_policy: Option<TranslationPolicyConfig>,
     /// Frontend dialect used for translation checks (SQL arrives as client dialect).
-    frontend_dialect: HeuristicDialectParser,
+    frontend_dialect: Arc<dyn DialectParser>,
     metrics: MySQLServerMetricsCollector,
 }
 
@@ -70,7 +70,7 @@ impl CoreGatewayConnection {
             route_policy: None,
             plugins: None,
             translation_policy: None,
-            frontend_dialect: default_dialect_parser(&frontend_protocol),
+            frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
             metrics: MySQLServerMetricsCollector,
         }
     }
@@ -94,7 +94,7 @@ impl CoreGatewayConnection {
             route_policy: Some(route_policy),
             plugins: None,
             translation_policy,
-            frontend_dialect: default_dialect_parser(&frontend_protocol),
+            frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
             metrics: MySQLServerMetricsCollector,
         }
     }
@@ -121,12 +121,33 @@ impl CoreGatewayConnection {
     }
 
     pub async fn handle_frame(&mut self, frame: &[u8]) -> GatewayResult<Vec<Vec<u8>>> {
+        let frame_span = info_span!(
+            "gateway.handle_frame",
+            listener = %self.listener_name,
+            service = %self.service_name,
+            frontend_protocol = %protocol_metric_name(&self.frontend.protocol()),
+            backend_protocol = %protocol_metric_name(&self.backend.protocol()),
+        );
+        async {
+            self.handle_frame_inner(frame).await
+        }
+        .instrument(frame_span)
+        .await
+    }
+
+    async fn handle_frame_inner(&mut self, frame: &[u8]) -> GatewayResult<Vec<Vec<u8>>> {
         let commands = self.frontend.decode(frame, &mut self.session)?;
         let mut packets = Vec::with_capacity(commands.len());
 
         for mut command in commands {
             let command_type = command_metric_type(&command);
             let started_at = Instant::now();
+            let command_span = info_span!(
+                "gateway.command",
+                command_type = %command_type,
+                endpoint = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+            );
 
             let route_plan = if let Some(route_policy) = &self.route_policy {
                 let plan = route_policy.plan_command(&command, &self.session)?;
@@ -137,6 +158,7 @@ impl CoreGatewayConnection {
             };
 
             let endpoint_label = route_endpoint_label(route_plan.as_ref(), &self.session);
+            command_span.record("endpoint", tracing::field::display(&endpoint_label));
             let label_owned = [
                 self.listener_name.clone(),
                 self.service_name.clone(),
@@ -208,7 +230,11 @@ impl CoreGatewayConnection {
 
             // Cross-protocol: validate subset, rewrite SQL, reject prepared stmts.
             if let Some(policy) = &self.translation_policy {
-                match prepare_cross_protocol_command(policy, command, &self.frontend_dialect) {
+                match prepare_cross_protocol_command(
+                    policy,
+                    command,
+                    self.frontend_dialect.as_ref(),
+                ) {
                     Ok(translated) => command = translated,
                     Err(error) => {
                         let response = GatewayResponse::Error {
@@ -227,6 +253,7 @@ impl CoreGatewayConnection {
                             message = %error,
                             "gateway command rejected by translation policy"
                         );
+                        command_span.record("outcome", "translation_reject");
                         packets.extend(self.frontend.encode(response, &mut self.session)?);
                         finish_command_metrics(&self.metrics, &labels, started_at);
                         continue;
@@ -234,7 +261,12 @@ impl CoreGatewayConnection {
                 }
             }
 
-            let response = match self.backend.execute(command, &mut self.session).await {
+            let response = match self
+                .backend
+                .execute(command, &mut self.session)
+                .instrument(command_span.clone())
+                .await
+            {
                 Ok(response) => map_response_types(
                     response,
                     &self.backend.protocol(),
@@ -254,6 +286,7 @@ impl CoreGatewayConnection {
                 GatewayResponse::Bye => "bye".to_owned(),
                 GatewayResponse::Prepared { .. } => "prepared".to_owned(),
             };
+            command_span.record("outcome", tracing::field::display(&outcome));
             info!(
                 target: "data_nexus::audit",
                 listener = %self.listener_name,
@@ -660,11 +693,21 @@ fn build_plugin_config(
     }))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CoreRoutePolicy {
     endpoints: Vec<EndpointConfig>,
     kind: CoreRoutePolicyKind,
-    dialect: HeuristicDialectParser,
+    dialect: Arc<dyn DialectParser>,
+}
+
+impl std::fmt::Debug for CoreRoutePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreRoutePolicy")
+            .field("endpoints", &self.endpoints)
+            .field("kind", &self.kind)
+            .field("dialect", &self.dialect.dialect())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -702,7 +745,7 @@ impl CoreRoutePolicy {
         Ok(Self {
             endpoints,
             kind,
-            dialect: default_dialect_parser(backend_protocol),
+            dialect: Arc::from(runtime_dialect_parser(backend_protocol)),
         })
     }
 
@@ -739,7 +782,7 @@ impl CoreRoutePolicy {
             }
         }
 
-        self.plan_for_role(command_target_role(command, session, &self.dialect))
+        self.plan_for_role(command_target_role(command, session, self.dialect.as_ref()))
     }
 
     fn plan_for_role(&self, target_role: RouteTargetRole) -> GatewayResult<RoutePlan> {

@@ -17,15 +17,16 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 
 ### 已完成
 
-- M0–M2 主路径：同协议 E2E、v2-only 配置、RoutePlan/Plugin/Dialect/metrics/audit/Admin reload
-- dual-listener Docker smoke E2E
-- M3：`translation_policy` + SQL 子集校验 + prepared 限制 + 结果类型映射 + MySQL→PG 保守改写 + core 执行路径接入 + golden tests
+- M0–M3 主路径：同协议 E2E、v2-only、RoutePlan/Plugin、跨协议 translation + smoke
+- PG→MySQL 标识符改写 + 反向示例配置
+- MySQL AST `DialectParser`（runtime，失败回退 heuristic）
+- structured tracing spans：`gateway.handle_frame` / `gateway.command`
 
-### 开放缺口（可选）
+### 开放缺口（可选 / 后续）
 
-1. 完整 AST dialect parser（mysql_parser 等）
-2. OTel structured trace
-3. PostgreSQL→MySQL 改写深化（当前 passthrough + 类型映射）
+1. PostgreSQL AST dialect parser（当前 heuristic）
+2. 完整 OTel exporter（当前 tracing span，可接 subscriber/OTLP）
+3. 管理 UI（`data-ui`）消费 Admin API
 
 ---
 
@@ -33,63 +34,51 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 
 ```text
 M0  端到端可跑（同协议）     ✓
-M1  去掉 legacy 双轨         ✓（主路径）
-M2  治理协议无关 + Admin     ✓（主路径）
-M3  受控跨协议（可选）       ✓（含 Docker smoke）
+M1  去掉 legacy 双轨         ✓
+M2  治理协议无关 + Admin     ✓
+M3  受控跨协议               ✓
+M4  深化（方言/可观测）      ✓（主项完成，PG AST / OTLP 可选）
 ```
 
 原则：
 
-- 先打通 **同协议生产可用**，再做插件/分片/跨协议
 - 新代码只依赖 `gateway_core` 类型；legacy 只允许在明确标记的 bridge 里
 - 配置错误 fail fast；请求错误只影响当前 session，禁止主路径 panic
 
 ---
 
-## M0–M2：已完成（摘要）
+## M0–M3：已完成
 
-同协议 MySQL/PG E2E、v2 配置收敛、RoutePlan/PluginContext/DialectParser、metrics/audit、Admin reload、优雅关闭。详见 git 历史与 `docs/data-nexus-protocol-gateway-plan.md`。
+详见 git 历史。验收：
 
-验收跑法：`./data-proxy/examples/smoke-dual-listener.sh`
+- 同协议：`./data-proxy/examples/smoke-dual-listener.sh`
+- 跨协议 MySQL→PG：`./data-proxy/examples/smoke-cross-protocol.sh`
 
 ---
 
-## M3：受控跨协议（已完成主路径）
+## M4：方言与可观测（已完成主项）
 
-前置：M0–M2 完成且同协议稳定。
-
-- [x] `translation_policy` 配置，**默认关闭**（跨协议需显式 enabled policy）
-- [x] 明确支持子集入口：SELECT/INSERT/UPDATE/DELETE（`check_translation_sql`）
-- [x] 不支持的 DDL / 存储过程 / COPY / LOAD DATA / 厂商函数 → 明确错误
-- [x] 结果类型映射表（`CanonicalDataType` / `map_column_type` / `map_response_types`）
-- [x] prepared statement 限制（跨协议 Prepare/Execute/Close → Unsupported）
-- [x] 实际跨协议执行路径（core `handle_frame`：校验 → 改写 → execute → 列类型映射）
-- [x] 方言转换 golden tests（MySQL→PG：反引号、IFNULL、LIMIT offset）
-- [x] 示例配置：`examples/cross-protocol-mysql-to-pg.toml`
-- [x] 跨协议 Docker smoke（`examples/smoke-cross-protocol.sh`）
-- [x] MySQL charset/collation → PG `client_encoding` 映射（跨协议 session 同步）
-
-**不做**：任意方言全量互转。
-
-可选后续：
-
-- [ ] PG→MySQL 标识符/函数改写扩展
-- [ ] 完整 AST parser 按 dialect 挂载
-- [ ] structured trace（OpenTelemetry）
+- [x] PG→MySQL 标识符改写（`"x"` → `` `x` ``）+ golden tests
+- [x] 示例配置：`examples/cross-protocol-pg-to-mysql.toml`
+- [x] MySQL AST dialect parser（`runtime/gateway/src/dialect.rs`，`mysql_parser` + fallback）
+- [x] core 路由 / translation 使用 runtime dialect
+- [x] structured spans on `handle_frame` / command / backend execute
+- [ ] PostgreSQL AST dialect（可选）
+- [ ] OpenTelemetry exporter 接入（可选）
 
 ---
 
 ## 模块边界（开发时遵守）
 
 ```text
-gateway/core     协议无关类型与 trait（禁止依赖 mysql/pg wire）
-runtime/gateway  编排：listener、session、route、plugin 调用
+gateway/core     协议无关类型与 trait（禁止依赖 mysql/pg wire / parser）
+runtime/gateway  编排 + runtime dialect（可依赖 mysql_parser）
 frontend/*       握手 + decode/encode only
 backend/*        连后端 + 执行 only
-proxy/*          池、endpoint、strategy（逐步只认 core 类型）
-plugin/*         输入 PluginContext，输出 PluginDecision
+proxy/*          池、endpoint、strategy
+plugin/*         PluginContext → PluginDecision
 app/config       v2 解析与校验
-http             Admin / metrics，不解析 SQL
+http             Admin / metrics
 ```
 
 ---
@@ -99,16 +88,14 @@ http             Admin / metrics，不解析 SQL
 - [ ] 任意 MySQL/PostgreSQL 全量互转
 - [ ] 继续在 `ProxyConfig` 上堆字段
 - [ ] 用 `node_type` 字符串决定运行时行为
-- [ ] 优先做管理 UI（`data-ui`）；先完成 runtime state + Admin API
-- [ ] 一次性大搬家到 `backend/mysql` 目录结构（可后置，先接口正确）
+- [ ] 优先做管理 UI；先完成 runtime state + Admin API
+- [ ] 一次性大搬家目录结构
 
 ---
 
 ## 完成定义（Definition of Done）
 
-每个里程碑合并前：
-
 1. 有对应示例 config 或集成测试
 2. `cargo test`（相关 crate）通过
 3. 不引入新的主路径 `unwrap()` / 字符串协议分支
-4. 更新本文件勾选状态；重大接口变更同步 `docs/data-nexus-protocol-gateway-plan.md`
+4. 更新本文件；重大接口变更同步 `docs/data-nexus-protocol-gateway-plan.md`

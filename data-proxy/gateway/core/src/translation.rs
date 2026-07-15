@@ -226,9 +226,70 @@ fn rewrite_mysql_to_postgresql(sql: &str) -> String {
 }
 
 fn rewrite_postgresql_to_mysql(sql: &str) -> String {
-    // Double-quoted identifiers are valid in MySQL ANSI_QUOTES mode; keep them.
-    // COALESCE is portable. LIMIT/OFFSET form is portable when already standard.
-    sql.to_owned()
+    // Prefer MySQL-native identifiers; COALESCE / LIMIT OFFSET are portable.
+    convert_double_quotes_to_backticks(sql)
+}
+
+fn convert_double_quotes_to_backticks(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut in_single = false;
+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_single {
+            out.push(c);
+            if c == '\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match c {
+            '\'' => {
+                in_single = true;
+                out.push(c);
+                i += 1;
+            }
+            '"' => {
+                // Convert "ident" -> `ident`, doubling internal backticks.
+                i += 1;
+                out.push('`');
+                while i < bytes.len() {
+                    let ch = bytes[i] as char;
+                    if ch == '"' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                            out.push('"');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    if ch == '`' {
+                        out.push('`');
+                        out.push('`');
+                    } else {
+                        out.push(ch);
+                    }
+                    i += 1;
+                }
+                out.push('`');
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 fn convert_backticks_to_double_quotes(sql: &str) -> String {
@@ -582,6 +643,37 @@ mod tests {
                 input,
                 &ProtocolKind::MySql,
                 &ProtocolKind::PostgreSql,
+            )
+            .unwrap();
+            assert_eq!(out, expected, "input={input}");
+        }
+    }
+
+    #[test]
+    fn golden_rewrite_postgresql_to_mysql() {
+        let cases = [
+            (
+                "SELECT \"id\", COALESCE(name, '') FROM \"users\" LIMIT 20 OFFSET 10",
+                "SELECT `id`, COALESCE(name, '') FROM `users` LIMIT 20 OFFSET 10",
+            ),
+            (
+                "INSERT INTO \"t\" (\"a\") VALUES ('\"keep\"')",
+                "INSERT INTO `t` (`a`) VALUES ('\"keep\"')",
+            ),
+            (
+                "SELECT * FROM t WHERE name = 'hello'",
+                "SELECT * FROM t WHERE name = 'hello'",
+            ),
+            (
+                "UPDATE \"users\" SET \"name\" = 'x' WHERE \"id\" = 1",
+                "UPDATE `users` SET `name` = 'x' WHERE `id` = 1",
+            ),
+        ];
+        for (input, expected) in cases {
+            let out = rewrite_sql_for_backend(
+                input,
+                &ProtocolKind::PostgreSql,
+                &ProtocolKind::MySql,
             )
             .unwrap();
             assert_eq!(out, expected, "input={input}");
