@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Cross-protocol smoke: PostgreSQL client -> Data Nexus -> MySQL backend.
+# Requires: docker, cargo, curl
+# DDL is rejected by translation_policy; seed tables via backend container.
+set -euo pipefail
+
+export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${PATH:-}"
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+COMPOSE_FILE="$ROOT/examples/docker-compose.dev.yml"
+CONFIG_FILE="$ROOT/examples/cross-protocol-pg-to-mysql.toml"
+PROXY_LOG="${TMPDIR:-/tmp}/data-nexus-cross-pg-mysql-smoke.log"
+COMPOSE=(docker compose -f "$COMPOSE_FILE")
+
+cleanup() {
+  if [[ -n "${PROXY_PID:-}" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
+    kill "$PROXY_PID" 2>/dev/null || true
+    wait "$PROXY_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "missing required command: $1" >&2
+    exit 1
+  }
+}
+
+need docker
+need cargo
+need curl
+
+echo "==> starting MySQL backend"
+"${COMPOSE[@]}" up -d mysql-primary
+
+echo "==> waiting for MySQL"
+for _ in $(seq 1 90); do
+  if "${COMPOSE[@]}" exec -T mysql-primary \
+    mysqladmin ping -h 127.0.0.1 -uroot -proot --silent 2>/dev/null; then
+    break
+  fi
+  sleep 2
+done
+"${COMPOSE[@]}" exec -T mysql-primary mysqladmin ping -h 127.0.0.1 -uroot -proot --silent
+
+echo "==> seed table on MySQL backend (DDL not allowed via translation)"
+"${COMPOSE[@]}" exec -T mysql-primary \
+  mysql -uroot -proot -e \
+  "CREATE DATABASE IF NOT EXISTS orders;
+   USE orders;
+   CREATE TABLE IF NOT EXISTS xproto_t (id INT PRIMARY KEY, name VARCHAR(64));
+   DELETE FROM xproto_t;"
+
+echo "==> building and starting gateway (pg->mysql cross-protocol config)"
+PROXY_BIN=""
+for candidate in \
+  "${CARGO_TARGET_DIR:-}/debug/proxy" \
+  /Volumes/fushilu/.caches/data-nexus-target/debug/proxy \
+  "$ROOT/target/debug/proxy"
+do
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    PROXY_BIN="$candidate"
+    break
+  fi
+done
+(
+  cd "$ROOT"
+  if [[ -n "$PROXY_BIN" ]]; then
+    echo "using binary: $PROXY_BIN" >>"$PROXY_LOG"
+    "$PROXY_BIN" daemon -c "$CONFIG_FILE"
+  else
+    cargo run -p data-proxy --bin proxy -- daemon -c "$CONFIG_FILE"
+  fi
+) >"$PROXY_LOG" 2>&1 &
+PROXY_PID=$!
+
+echo "==> waiting for listener 9091 and admin 8082"
+for _ in $(seq 1 120); do
+  if curl -fsS "http://127.0.0.1:8082/admin/listeners" >/dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "gateway exited early; log:"
+    cat "$PROXY_LOG"
+    exit 1
+  fi
+  sleep 1
+done
+curl -fsS "http://127.0.0.1:8082/admin/listeners" >/tmp/data-nexus-xproto-pg-listeners.json
+python3 - <<'PY'
+import json
+data=json.load(open("/tmp/data-nexus-xproto-pg-listeners.json"))
+names=sorted(x["name"] for x in data)
+assert names==["pg-to-mysql"], names
+print("listeners:", names)
+PY
+
+psql_via_gateway() {
+  local sql="$1"
+  docker run --rm --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+    env PGPASSWORD=root \
+    psql -h host.docker.internal -p 9091 -U root -d orders -tAc "$sql"
+}
+
+echo "==> PostgreSQL client SELECT 1 via gateway -> MySQL"
+out="$(psql_via_gateway 'SELECT 1;')"
+echo "$out" | tr -d '[:space:]' | grep -qx '1'
+
+echo "==> PostgreSQL client write/read with identifier rewrite"
+psql_via_gateway "INSERT INTO \"xproto_t\" (\"id\", \"name\") VALUES (1, 'alice');"
+out="$(psql_via_gateway 'SELECT name FROM xproto_t WHERE id=1;')"
+echo "$out" | tr -d '[:space:]' | grep -qx 'alice'
+
+echo "==> PostgreSQL client UPDATE/DELETE subset"
+psql_via_gateway "INSERT INTO xproto_t VALUES (2, 'bob');"
+psql_via_gateway "UPDATE xproto_t SET name='bobby' WHERE id=2;"
+out="$(psql_via_gateway 'SELECT name FROM xproto_t WHERE id=2;')"
+echo "$out" | tr -d '[:space:]' | grep -qx 'bobby'
+psql_via_gateway 'DELETE FROM xproto_t WHERE id=2;'
+
+echo "==> DDL must be rejected by translation policy; process stays up"
+set +e
+psql_via_gateway 'DROP TABLE xproto_t;' >/tmp/data-nexus-xproto-pg-ddl-err.txt 2>&1
+ddl_rc=$?
+set -e
+[[ $ddl_rc -ne 0 ]]
+kill -0 "$PROXY_PID"
+
+echo "==> metrics show postgresql frontend + mysql backend"
+metrics="$(curl -fsS "http://127.0.0.1:8082/metrics")"
+echo "$metrics" | grep -E 'frontend_protocol' >/dev/null
+echo "$metrics" | grep -E 'backend_protocol' >/dev/null
+
+echo "smoke cross-protocol pg->mysql: OK"

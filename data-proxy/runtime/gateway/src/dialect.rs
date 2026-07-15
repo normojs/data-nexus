@@ -163,14 +163,267 @@ fn stmt_kind(stmt: &SqlStmt) -> MysqlStmtKind {
     }
 }
 
+/// PostgreSQL dialect classifier with structured statement detection.
+///
+/// Not a full SQL parser crate: strips comments, classifies leading statements,
+/// and treats locking / DML CTE shapes as non-read-only. Falls back to the
+/// shared heuristic only for empty or unknown leading forms.
+#[derive(Debug, Clone)]
+pub struct PostgreSqlStructuredDialectParser {
+    fallback: HeuristicDialectParser,
+}
+
+impl PostgreSqlStructuredDialectParser {
+    pub fn new() -> Self {
+        Self {
+            fallback: HeuristicDialectParser::postgresql(),
+        }
+    }
+}
+
+impl Default for PostgreSqlStructuredDialectParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DialectParser for PostgreSqlStructuredDialectParser {
+    fn dialect(&self) -> ProtocolKind {
+        ProtocolKind::PostgreSql
+    }
+
+    fn is_read_only(&self, sql: &str) -> bool {
+        match classify_postgresql_sql(sql) {
+            Some(kind) => kind.is_read_only(sql),
+            None => self.fallback.is_read_only(sql),
+        }
+    }
+
+    fn leading_keyword(&self, sql: &str) -> Option<String> {
+        match classify_postgresql_sql(sql) {
+            Some(kind) => Some(kind.leading_keyword().to_owned()),
+            None => self.fallback.leading_keyword(sql),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostgresStmtKind {
+    Select,
+    Table,
+    Values,
+    With,
+    Show,
+    Explain,
+    Insert,
+    Update,
+    Delete,
+    Begin,
+    Commit,
+    Rollback,
+    Set,
+    Copy,
+    Other,
+}
+
+impl PostgresStmtKind {
+    fn is_read_only(self, sql: &str) -> bool {
+        let upper = strip_sql_comments(sql).to_ascii_uppercase();
+        if has_row_lock_clause(&upper) {
+            return false;
+        }
+        match self {
+            Self::Select | Self::Table | Self::Values | Self::Show | Self::Explain => true,
+            Self::With => {
+                // WITH ... INSERT/UPDATE/DELETE is a write; WITH ... SELECT is read.
+                !contains_dml_after_with(&upper)
+            }
+            _ => false,
+        }
+    }
+
+    fn leading_keyword(self) -> &'static str {
+        match self {
+            Self::Select => "SELECT",
+            Self::Table => "TABLE",
+            Self::Values => "VALUES",
+            Self::With => "WITH",
+            Self::Show => "SHOW",
+            Self::Explain => "EXPLAIN",
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+            Self::Begin => "BEGIN",
+            Self::Commit => "COMMIT",
+            Self::Rollback => "ROLLBACK",
+            Self::Set => "SET",
+            Self::Copy => "COPY",
+            Self::Other => "OTHER",
+        }
+    }
+}
+
+fn classify_postgresql_sql(sql: &str) -> Option<PostgresStmtKind> {
+    let cleaned = strip_sql_comments(sql);
+    let trimmed = cleaned.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    let token = first_sql_token(&upper)?;
+    Some(match token.as_str() {
+        "SELECT" => PostgresStmtKind::Select,
+        "TABLE" => PostgresStmtKind::Table,
+        "VALUES" => PostgresStmtKind::Values,
+        "WITH" => PostgresStmtKind::With,
+        "SHOW" => PostgresStmtKind::Show,
+        "EXPLAIN" => PostgresStmtKind::Explain,
+        "INSERT" => PostgresStmtKind::Insert,
+        "UPDATE" => PostgresStmtKind::Update,
+        "DELETE" => PostgresStmtKind::Delete,
+        "BEGIN" | "START" => PostgresStmtKind::Begin,
+        "COMMIT" | "END" => PostgresStmtKind::Commit,
+        "ROLLBACK" | "ABORT" => PostgresStmtKind::Rollback,
+        "SET" => PostgresStmtKind::Set,
+        "COPY" => PostgresStmtKind::Copy,
+        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "VACUUM" | "ANALYZE" | "REINDEX"
+        | "CLUSTER" | "CALL" | "DO" | "LISTEN" | "NOTIFY" | "UNLISTEN" | "LOCK"
+        | "GRANT" | "REVOKE" | "COMMENT" | "SECURITY" | "PREPARE" | "EXECUTE"
+        | "DEALLOCATE" | "DECLARE" | "FETCH" | "MOVE" | "CLOSE" | "DISCARD" => {
+            PostgresStmtKind::Other
+        }
+        _ => return None,
+    })
+}
+
+fn first_sql_token(upper_sql: &str) -> Option<String> {
+    let mut token = String::new();
+    for ch in upper_sql.chars() {
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            token.push(ch);
+        } else if !token.is_empty() {
+            break;
+        } else if ch.is_ascii_whitespace() || ch == '(' {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn strip_sql_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_single {
+            out.push(c);
+            if c == '\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            out.push(c);
+            if c == '"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    out.push('"');
+                    i += 2;
+                    continue;
+                }
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Line comment --
+        if c == '-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment /* */
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            out.push(' ');
+            continue;
+        }
+
+        match c {
+            '\'' => {
+                in_single = true;
+                out.push(c);
+            }
+            '"' => {
+                in_double = true;
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
+fn has_row_lock_clause(upper_sql: &str) -> bool {
+    upper_sql.contains(" FOR UPDATE")
+        || upper_sql.contains(" FOR SHARE")
+        || upper_sql.contains(" FOR NO KEY UPDATE")
+        || upper_sql.contains(" FOR KEY SHARE")
+}
+
+fn contains_dml_after_with(upper_sql: &str) -> bool {
+    // Approximate: CTE write forms usually contain these verbs after WITH.
+    // Avoid matching INSERT/UPDATE/DELETE only inside string literals by
+    // operating on comment-stripped upper text (good enough for routing).
+    for needle in [" INSERT ", " UPDATE ", " DELETE ", "\nINSERT ", "\nUPDATE ", "\nDELETE "] {
+        if upper_sql.contains(needle) {
+            return true;
+        }
+    }
+    // Leading forms without surrounding spaces near end of CTE list.
+    let compact = upper_sql.replace('\n', " ");
+    compact.contains(") INSERT ")
+        || compact.contains(") UPDATE ")
+        || compact.contains(") DELETE ")
+        || compact.contains(" INSERT INTO")
+        || compact.contains(" UPDATE ")
+        || compact.contains(" DELETE FROM")
+}
+
 /// Build a dialect parser for the given protocol.
 ///
-/// MySQL uses AST classification with heuristic fallback; PostgreSQL stays on
-/// the shared heuristic until a PG AST crate is wired.
+/// MySQL uses AST classification with heuristic fallback; PostgreSQL uses a
+/// structured classifier (comment-aware) with heuristic fallback.
 pub fn runtime_dialect_parser(protocol: &ProtocolKind) -> Box<dyn DialectParser> {
     match protocol {
         ProtocolKind::MySql => Box::new(MySqlAstDialectParser::new()),
-        ProtocolKind::PostgreSql => Box::new(HeuristicDialectParser::postgresql()),
+        ProtocolKind::PostgreSql => Box::new(PostgreSqlStructuredDialectParser::new()),
     }
 }
 
@@ -216,5 +469,36 @@ mod tests {
         let parser = MySqlAstDialectParser::new();
         assert_eq!(parser.leading_keyword("  select 1"), Some("SELECT".into()));
         assert_eq!(parser.leading_keyword("insert into t values (1)"), Some("INSERT".into()));
+    }
+
+    #[test]
+    fn postgresql_classifies_read_and_write() {
+        let parser = PostgreSqlStructuredDialectParser::new();
+        assert!(parser.is_read_only("SELECT 1"));
+        assert!(parser.is_read_only("TABLE users"));
+        assert!(parser.is_read_only("VALUES (1), (2)"));
+        assert!(parser.is_read_only("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+        assert!(parser.is_read_only("EXPLAIN SELECT 1"));
+        assert!(parser.is_read_only("SHOW search_path"));
+        assert!(!parser.is_read_only("INSERT INTO t VALUES (1)"));
+        assert!(!parser.is_read_only("UPDATE t SET a = 1"));
+        assert!(!parser.is_read_only("DELETE FROM t"));
+        assert!(!parser.is_read_only("COPY t FROM STDIN"));
+        assert!(!parser.is_read_only("SELECT * FROM t FOR UPDATE"));
+        assert!(!parser.is_read_only(
+            "WITH cte AS (SELECT id FROM t) INSERT INTO u SELECT * FROM cte"
+        ));
+    }
+
+    #[test]
+    fn postgresql_strips_comments_before_classify() {
+        let parser = PostgreSqlStructuredDialectParser::new();
+        assert!(parser.is_read_only("-- comment\nSELECT 1"));
+        assert!(parser.is_read_only("/* block */ SELECT 1"));
+        assert!(!parser.is_read_only("/* x */ INSERT INTO t VALUES (1)"));
+        assert_eq!(
+            parser.leading_keyword("-- hi\n  update t set a=1"),
+            Some("UPDATE".into())
+        );
     }
 }

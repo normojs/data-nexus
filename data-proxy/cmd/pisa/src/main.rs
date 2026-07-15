@@ -22,6 +22,7 @@ use std::str::FromStr;
 use ::server::server::{start_gateway_server, GatewayFactory};
 use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info, log::debug, Level};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 extern crate tokio;
 
@@ -34,13 +35,30 @@ use pisa_metrics::metrics::MetricsManager;
 
 use crate::node::NodeInstance;
 
+/// Initialize structured logging.
+///
+/// - `RUST_LOG` / `DATA_NEXUS_LOG` env filters (default: admin.log_level)
+/// - `DATA_NEXUS_LOG_FORMAT=json` for JSON logs (spans included)
+/// - spans from runtime (`gateway.handle_frame`, `gateway.command`) attach fields
+fn init_tracing(admin_log_level: &str) {
+    let default_level = Level::from_str(admin_log_level).unwrap_or(Level::INFO);
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_from_env("DATA_NEXUS_LOG"))
+        .unwrap_or_else(|_| EnvFilter::new(default_level.as_str()));
+
+    let json = std::env::var("DATA_NEXUS_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    let registry = tracing_subscriber::registry().with(filter);
+    if json {
+        registry.with(fmt::layer().json().with_span_list(true).with_current_span(true)).init();
+    } else {
+        registry.with(fmt::layer().with_target(true)).init();
+    }
+}
+
 fn main() {
-    // --config examples/example-config.toml
-    // info!("uni-proxy info");
-    // warn!("uni-proxy warn");
-    // error!("uni-proxy error");
-    // print!("xxxxx");
-    // return;
     let config_builder = PisaProxyConfigBuilder::new().collect_from_cmd();
     let gateway_config_source =
         config_builder.gateway_config_path().map(|path| GatewayConfigSource::file(path.to_owned()));
@@ -51,9 +69,7 @@ fn main() {
             std::process::exit(-1);
         }
     };
-    tracing_subscriber::fmt()
-        .with_max_level(Level::from_str(config.admin.log_level.as_str()).ok())
-        .init();
+    init_tracing(config.admin.log_level.as_str());
     info!("data-nexus gateway start: {}", config.version.as_deref().unwrap_or("unknown"));
 
     // TODO: 获取数据库中的配置
