@@ -33,6 +33,7 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 - [x] `PluginContext` / `PluginDecision`；core 执行前插件评估
 - [x] v2 `plugin_policies` → PluginPhase 自动装载
 - [x] `DialectParser` 驱动 core 读写路由
+- [x] core 层命令 metrics（accept 循环不再重复统计）
 
 ### 关键缺口（阻塞可交付）
 
@@ -159,8 +160,9 @@ M3  受控跨协议（可选）
 
 ### M2.4 可观测与 Admin
 
-- [ ] metrics / trace / audit 统一挂 core 层（每命令：协议、service、endpoint、latency、错误码）
-- [ ] Admin 与真实 runtime 状态打通（listener 启停、pool snapshot、session 列表）
+- [x] metrics 统一挂 core `handle_frame`（每命令：listener/service/frontend/backend/type/endpoint + latency）
+- [ ] trace / audit 挂 core 层
+- [ ] Admin 与真实 runtime 状态打通（listener 启停、pool snapshot、session 列表；骨架已有）
 - [ ] `POST /admin/reload`：先 diff，再安全应用（新增/停止 listener、替换 route policy、刷新 endpoint）
 - [ ] 补齐 shutdown：`stop()` 优雅关闭现有连接
 

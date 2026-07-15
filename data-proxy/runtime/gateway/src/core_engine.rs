@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
@@ -29,6 +29,7 @@ use plugin::build_phase::PluginPhase;
 use crate::{
     backend::{mysql::MySqlBackendConnector, postgresql::PostgreSqlBackendConnector},
     frontend::{mysql::MySqlFrontendProtocol, postgresql::PostgreSqlFrontendProtocol},
+    server::metrics::MySQLServerMetricsCollector,
 };
 
 /// Protocol-neutral execution path for one frontend connection.
@@ -40,9 +41,11 @@ pub struct CoreGatewayConnection {
     frontend: Box<dyn FrontendProtocolAdapter>,
     backend: Arc<dyn BackendConnector>,
     session: SessionState,
+    listener_name: String,
     service_name: String,
     route_policy: Option<CoreRoutePolicy>,
     plugins: Option<PluginPhase>,
+    metrics: MySQLServerMetricsCollector,
 }
 
 impl CoreGatewayConnection {
@@ -55,9 +58,11 @@ impl CoreGatewayConnection {
             frontend,
             backend,
             session,
+            listener_name: String::new(),
             service_name: String::new(),
             route_policy: None,
             plugins: None,
+            metrics: MySQLServerMetricsCollector,
         }
     }
 
@@ -65,6 +70,7 @@ impl CoreGatewayConnection {
         frontend: Box<dyn FrontendProtocolAdapter>,
         backend: Arc<dyn BackendConnector>,
         session: SessionState,
+        listener_name: String,
         service_name: String,
         route_policy: CoreRoutePolicy,
     ) -> Self {
@@ -72,9 +78,11 @@ impl CoreGatewayConnection {
             frontend,
             backend,
             session,
+            listener_name,
             service_name,
             route_policy: Some(route_policy),
             plugins: None,
+            metrics: MySQLServerMetricsCollector,
         }
     }
 
@@ -104,6 +112,9 @@ impl CoreGatewayConnection {
         let mut packets = Vec::with_capacity(commands.len());
 
         for mut command in commands {
+            let command_type = command_metric_type(&command);
+            let started_at = Instant::now();
+
             let route_plan = if let Some(route_policy) = &self.route_policy {
                 let plan = route_policy.plan_command(&command, &self.session)?;
                 apply_route_plan(&plan, &mut self.session)?;
@@ -111,6 +122,25 @@ impl CoreGatewayConnection {
             } else {
                 None
             };
+
+            let endpoint_label = route_endpoint_label(route_plan.as_ref(), &self.session);
+            let label_owned = [
+                self.listener_name.clone(),
+                self.service_name.clone(),
+                protocol_metric_name(&self.frontend.protocol()).to_owned(),
+                protocol_metric_name(&self.backend.protocol()).to_owned(),
+                command_type.to_owned(),
+                endpoint_label,
+            ];
+            let labels = [
+                label_owned[0].as_str(),
+                label_owned[1].as_str(),
+                label_owned[2].as_str(),
+                label_owned[3].as_str(),
+                label_owned[4].as_str(),
+                label_owned[5].as_str(),
+            ];
+            self.metrics.set_sql_under_processing_inc(&labels);
 
             let mut concurrency_rule_idx = None;
             if let Some(plugins) = self.plugins.as_mut() {
@@ -124,21 +154,26 @@ impl CoreGatewayConnection {
                 };
                 match plugins.evaluate(&ctx).map_err(|error| {
                     GatewayError::Configuration(format!("plugin evaluate failed: {}", error))
-                })? {
-                    PluginDecision::Continue { concurrency_rule_idx: idx } => {
+                }) {
+                    Ok(PluginDecision::Continue { concurrency_rule_idx: idx }) => {
                         concurrency_rule_idx = idx;
                     }
-                    PluginDecision::Reject { code, message } => {
+                    Ok(PluginDecision::Reject { code, message }) => {
                         let response = GatewayResponse::Error { code, message };
                         packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        finish_command_metrics(&self.metrics, &labels, started_at);
                         continue;
                     }
-                    PluginDecision::Rewrite { sql } => {
+                    Ok(PluginDecision::Rewrite { sql }) => {
                         if let Some(rewritten) =
                             CommandSummary::from_command(&command).rewritten_sql(sql)
                         {
                             command = rewritten;
                         }
+                    }
+                    Err(error) => {
+                        finish_command_metrics(&self.metrics, &labels, started_at);
+                        return Err(error);
                     }
                 }
             }
@@ -156,10 +191,50 @@ impl CoreGatewayConnection {
             }
 
             packets.extend(self.frontend.encode(response, &mut self.session)?);
+            finish_command_metrics(&self.metrics, &labels, started_at);
         }
 
         Ok(packets)
     }
+}
+
+fn finish_command_metrics(
+    metrics: &MySQLServerMetricsCollector,
+    labels: &[&str],
+    started_at: Instant,
+) {
+    metrics.set_sql_under_processing_dec(labels);
+    metrics.set_sql_processed_total(labels);
+    metrics.set_sql_processed_duration(labels, started_at.elapsed().as_secs_f64());
+}
+
+fn protocol_metric_name(protocol: &ProtocolKind) -> &'static str {
+    match protocol {
+        ProtocolKind::MySql => "mysql",
+        ProtocolKind::PostgreSql => "postgresql",
+    }
+}
+
+fn command_metric_type(command: &GatewayCommand) -> &'static str {
+    match command {
+        GatewayCommand::Query { .. } => "QUERY",
+        GatewayCommand::Prepare { .. } => "PREPARE",
+        GatewayCommand::Execute { .. } => "EXECUTE",
+        GatewayCommand::CloseStatement { .. } => "CLOSE",
+        GatewayCommand::UseDatabase { .. } => "USE",
+        GatewayCommand::Begin => "BEGIN",
+        GatewayCommand::Commit => "COMMIT",
+        GatewayCommand::Rollback => "ROLLBACK",
+        GatewayCommand::Ping => "PING",
+        GatewayCommand::Quit => "QUIT",
+    }
+}
+
+fn route_endpoint_label(route_plan: Option<&RoutePlan>, session: &SessionState) -> String {
+    if let Some(endpoint) = route_plan.and_then(RoutePlan::as_single_endpoint) {
+        return endpoint.address.clone();
+    }
+    session.backend_endpoint.clone().unwrap_or_default()
 }
 
 pub async fn handle_gateway_frame(
@@ -348,6 +423,7 @@ impl CoreGatewayListenerPlan {
             frontend,
             backend,
             session,
+            self.listener.name.clone(),
             self.service.name.clone(),
             self.route_policy.clone(),
         );

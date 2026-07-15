@@ -335,12 +335,6 @@ async fn run_mysql_core_session(
         session.autocommit = Some(autocommit == "1" || autocommit.eq_ignore_ascii_case("true"));
     }
 
-    let metric_labels = GatewayMetricLabels::from_plan(
-        &core_plan,
-        &listener_name,
-        session.backend_endpoint.as_deref(),
-    );
-    let metrics_collector = MySQLServerMetricsCollector;
     *connection.session_mut() = session.clone();
 
     let _session_registration = session_registry.register(SessionEntrySnapshot {
@@ -369,25 +363,12 @@ async fn run_mysql_core_session(
             break;
         }
 
-        let collect_query_metrics = frame.first() == Some(&mysql_protocol::mysql_const::COM_QUERY);
         let terminate = frame.first() == Some(&mysql_protocol::mysql_const::COM_QUIT);
-        let started_at = Instant::now();
 
-        if collect_query_metrics {
-            let labels = metric_labels.values("QUERY");
-            metrics_collector.set_sql_under_processing_inc(&labels);
-        }
-
+        // Command metrics are recorded inside CoreGatewayConnection::handle_frame.
         let packets = match connection.handle_frame(&frame).await {
             Ok(packets) => packets,
             Err(error) => {
-                if collect_query_metrics {
-                    let labels = metric_labels.values("QUERY");
-                    metrics_collector.set_sql_under_processing_dec(&labels);
-                    metrics_collector.set_sql_processed_total(&labels);
-                    metrics_collector
-                        .set_sql_processed_duration(&labels, started_at.elapsed().as_secs_f64());
-                }
                 let err_info = make_err_packet(MySQLError::new(
                     1105,
                     b"HY000".to_vec(),
@@ -403,14 +384,6 @@ async fn run_mysql_core_session(
                 continue;
             }
         };
-
-        if collect_query_metrics {
-            let labels = metric_labels.values("QUERY");
-            metrics_collector.set_sql_under_processing_dec(&labels);
-            metrics_collector.set_sql_processed_total(&labels);
-            metrics_collector
-                .set_sql_processed_duration(&labels, started_at.elapsed().as_secs_f64());
-        }
 
         for packet in packets {
             if let Err(error) =
@@ -460,12 +433,6 @@ async fn run_postgresql_core_session(
     if session.backend_endpoint.is_none() {
         session.backend_endpoint = connection.session().backend_endpoint.clone();
     }
-    let metric_labels = GatewayMetricLabels::from_plan(
-        &core_plan,
-        &listener_name,
-        session.backend_endpoint.as_deref(),
-    );
-    let metrics_collector = MySQLServerMetricsCollector;
     *connection.session_mut() = session.clone();
 
     let _session_registration = session_registry.register(SessionEntrySnapshot {
@@ -486,36 +453,15 @@ async fn run_postgresql_core_session(
             }
         };
         let terminate = frame.first() == Some(&b'X');
-        let collect_query_metrics = frame.first() == Some(&b'Q');
-        let started_at = Instant::now();
 
-        if collect_query_metrics {
-            let labels = metric_labels.values("QUERY");
-            metrics_collector.set_sql_under_processing_inc(&labels);
-        }
-
+        // Command metrics are recorded inside CoreGatewayConnection::handle_frame.
         let packets = match connection.handle_frame(&frame).await {
             Ok(packets) => packets,
             Err(error) => {
-                if collect_query_metrics {
-                    let labels = metric_labels.values("QUERY");
-                    metrics_collector.set_sql_under_processing_dec(&labels);
-                    metrics_collector.set_sql_processed_total(&labels);
-                    metrics_collector
-                        .set_sql_processed_duration(&labels, started_at.elapsed().as_secs_f64());
-                }
                 error!("postgresql core frame handling error {:?}", error);
                 break;
             }
         };
-
-        if collect_query_metrics {
-            let labels = metric_labels.values("QUERY");
-            metrics_collector.set_sql_under_processing_dec(&labels);
-            metrics_collector.set_sql_processed_total(&labels);
-            metrics_collector
-                .set_sql_processed_duration(&labels, started_at.elapsed().as_secs_f64());
-        }
 
         for packet in packets {
             if let Err(error) = stream.write_all(&packet).await {
