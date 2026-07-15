@@ -32,11 +32,11 @@ Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
 
 ### 关键缺口（阻塞可交付）
 
-1. **`GatewayRuntime` 仍双轨**：v2 启动已走 core accept；仍会派生 `ProxyConfig` / `UniSQLNode` 供 listener/legacy 兼容
+1. **`GatewayRuntime` 字段仍含 legacy**：v2 已不再派生填充；`proxy_config`/`nodes` 仅 legacy 启动使用
 2. **事务 FSM 仍绑定 MySQL `SessionAttr`**（legacy 路径）
 3. **插件仍吃 `String`**：并发控制 / 熔断未挂 `PluginContext`
 4. **同协议端到端验收未闭环**：v2 MySQL / PG 真实客户端验收项仍未勾选
-5. **legacy 类型未下线**：`ProxyConfig`、`UniSQLNode`、`backend_type` / `node_type` 字符串仍在主结构中
+5. **GatewayFactory Legacy 分支**、public API 仍暴露 `ProxyConfig` 字段
 
 ---
 
@@ -102,9 +102,9 @@ M3  受控跨协议（可选）
 ### M1.1 删除启动期派生
 
 - [x] core accept 路径从 `core_plan` 构建 listener（不再用派生 ProxyConfig 驱动 accept）
-- [ ] 完全删除 `legacy_proxy_config_from_core_plan` / `legacy_nodes_from_core_plan`（admin pool snapshot 仍可能用）
-- [ ] `GatewayRuntime` 字段改为：`GatewayConfig`（或 `CoreGatewayRuntimePlan`）+ pool registry + session registry + shutdown
-- [ ] `GatewayFactory` / `app/server` 只保留 v2 启动路径；legacy `ProxyKind` / `backend_type` 仅编译期隔离或删除
+- [x] 删除 `legacy_proxy_config_from_core_plan` / `legacy_nodes_from_core_plan`；v2 构造不再填充 `ProxyConfig`/`nodes`
+- [x] `GatewayRuntime` 增加 `listener_name` / `pool_size` / `core_plan`；pool snapshot 从 core endpoints 取地址
+- [ ] `GatewayFactory` 去掉 `Legacy` 分支（仍保留编译兼容，非 v2 主路径）
 
 ### M1.2 配置类型收敛
 
