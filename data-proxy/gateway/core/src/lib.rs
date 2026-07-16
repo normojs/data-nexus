@@ -22,6 +22,7 @@ mod ticket;
 mod translation;
 mod transport;
 mod types;
+mod vault;
 
 pub use admin_auth::{
     required_permission, AdminAuthConfig, AdminAuthContext, AdminAuthMode, AdminPermission,
@@ -55,6 +56,9 @@ pub use security::{
 pub use ticket::{
     extract_ticket_id, global_ticket_store, is_write_without_where, sql_fingerprint,
     strip_ticket_comment, IssueTicketRequest, Ticket, TicketStore,
+};
+pub use vault::{
+    global_vault_store, IssueVaultLeaseRequest, ProjectEnv, VaultLease, VaultStore,
 };
 pub use dialect::{default_dialect_parser, DialectParser, HeuristicDialectParser};
 pub use error::{GatewayError, GatewayResult};

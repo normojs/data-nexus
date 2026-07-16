@@ -15,13 +15,13 @@
 
 ```text
 v1 = L0   数据库协议中转站 + 管理面鉴权 + 运维 UI + 观测     ✅ 已完成（M0–M10）
-v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   ⏳ 待开发（S0–S6）
+v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   ✅ MVP（S0–S6 + A1–A4）
 ```
 
 | 版本 | 一句话 | 状态 |
 |------|--------|:----:|
 | **v1** | 客户端 ↔ 网关 ↔ MySQL/PG；路由/池/跨协议/Admin | **完成** |
-| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **进行中（S0–S5 完成）** |
+| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **S0–S6 + A1–A4 完成（MVP）** |
 
 **原则**
 
@@ -52,7 +52,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 - [x] **S3** — 动态脱敏 + 行级雏形（物化路径 MVP）
 - [x] **S4** — 持久化审计 + 查询 API（Admin；UI 后置）
 - [x] **S5** — 审批票据门闩（高危 DDL / 无 WHERE 写）
-- [ ] **S6** — Web SQL 门户 + Vault + 导出运营
+- [x] **S6** — Web SQL 门户 + Vault lease + Audit UI（MVP）
 - [x] **A 轨** — 性能：流式窗口 + 同协议透传 + 跨协议流式（A1–A4 完成）
 
 ### 1.3 v1 可选增强（不挡 v2）
@@ -127,9 +127,9 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 - [ ] **F18** 金库（双人/限时/限次增强） — 金库 — S5 — P2（MVP 已有 ttl/max_uses）
 - [x] **F19** 通道标签雏形（protocol 默认；export 规则 kind） — 通道管控 — S5 — P1
 - [x] **F20** 导出/OUTFILE/COPY 门闩 kind=export — 外发 — S5 — P1
-- [ ] **F21** Web SQL 门户（经 PEP） — SQLDEV 体验 — S6 — P2
-- [ ] **F22** 项目/环境权限 — 多租户运营 — S6 — P2
-- [ ] **F23** 账号保险箱 / Vault — 凭据 — S6 — P2
+- [x] **F21** Web SQL 门户（经 PEP /portal/query） — SQLDEV 体验 — S6 — P2
+- [x] **F22** 项目/环境模型（自动从 services 生成） — 多租户运营 — S6 — P2
+- [x] **F23** 账号保险箱 / Vault lease（不回传密码） — 凭据 — S6 — P2
 - [x] **F24** 同协议结果透传（MySQL Wire）— 性能 — A3 — P0
 - [x] **F25** Backend 窗口读 + Frontend 分阶段窗口 encode（A1/A2）— 性能 — P0
 - [ ] **F26** Cedar PDP（可选 feature） — 高级策略 — S2+ — P2
@@ -290,7 +290,7 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 ---
 
-### S6 — SQLDEV 向门户 + Vault + 导出运营
+### S6 — SQLDEV 向门户 + Vault + 导出运营 ✅ MVP
 
 | 项 | 内容 |
 |----|------|
@@ -299,14 +299,16 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 **功能 / 任务**
 
-- [ ] 项目 / 环境模型
-- [ ] Web SQL 门户（查询走网关或门户专用 listener，禁止直连库）
-- [ ] 账号保险箱 / Vault 发短时凭据
-- [ ] 导出限制与审计联动
-- [ ] 水印运营化
-- [ ] 与 data-ui / Admin 整合导航
+- [x] 项目 / 环境模型（`GET /admin/projects`，自 services 生成）
+- [x] Web SQL 门户 API `POST /admin/portal/query`（Local PDP + backend，禁止直连）
+- [x] Vault lease `POST/GET /admin/vault/leases`（响应不含 password）
+- [x] 导出限制：沿用 S5 export 门闩 + portal `max_rows`
+- [ ] 水印运营化 — **延后**
+- [x] data-ui：`/portal`、`/audit` 导航整合
 
-**明确不做**：主机堡垒、操作录屏（可集成第三方）
+**代码**：`gateway/core/src/vault.rs`、`http` portal/vault 路由、`data-ui/pages/portal.vue` / `audit.vue`；`smoke-security-portal.sh`
+
+**明确不做**：主机堡垒、操作录屏、完整 BPM、生产级 KMS
 
 ---
 
@@ -367,12 +369,12 @@ data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 
 ## 9. 当前下一动作（唯一焦点）
 
-**>>> S6 门户 / Vault（可选） <<<**
+**>>> 路线图主线 MVP 已闭环 <<<**
 
-- [ ] 项目/环境模型
-- [ ] Web SQL 经 PEP（禁止直连）
-- [ ] 账号保险箱 / 短时凭据
-- [ ] data-ui Audit 页（S4 API 已就绪）
+可选增强（非阻塞）：
 
-S0–S5 + **A1–A4** 性能轨完成。  
-smoke：deny / column / mask / audit / ticket / stream / passthrough / cross-protocol-stream。
+- [ ] 水印 / 双人金库 / Cedar PDP
+- [ ] portal 查询结果流式 JSON / 导出按钮
+- [ ] data-ui 生产化与 OIDC 联调
+
+S0–S6 + A1–A4 完成。smoke 含 `smoke-security-portal`。

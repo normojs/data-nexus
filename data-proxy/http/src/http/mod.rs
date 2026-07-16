@@ -517,6 +517,34 @@ struct AdminTicketsResponse {
     tickets: Vec<gateway_core::Ticket>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AdminPortalQueryRequest {
+    /// Target gateway service (must exist in config).
+    service: String,
+    sql: String,
+    /// Optional vault lease id (subject binding / audit).
+    #[serde(default)]
+    lease_id: Option<String>,
+    /// Data-plane subject override (defaults to admin subject or lease).
+    #[serde(default)]
+    subject_id: Option<String>,
+    #[serde(default)]
+    max_rows: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminPortalQueryResponse {
+    columns: Vec<String>,
+    rows: Vec<Vec<serde_json::Value>>,
+    row_count: usize,
+    truncated: bool,
+    service: String,
+    decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+
 
 
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
@@ -685,6 +713,12 @@ impl AxumServer {
                 "/admin/tickets",
                 get(Self::admin_list_tickets).post(Self::admin_issue_ticket),
             )
+            .route("/admin/projects", get(Self::admin_list_projects))
+            .route(
+                "/admin/vault/leases",
+                get(Self::admin_list_vault_leases).post(Self::admin_issue_vault_lease),
+            )
+            .route("/admin/portal/query", post(Self::admin_portal_query))
             .route("/admin/pools", get(Self::admin_pools))
             .route("/admin/pools/refresh", post(Self::admin_refresh_pools))
             .route("/admin/pools/:name/refresh", post(Self::admin_refresh_pool))
@@ -999,6 +1033,240 @@ impl AxumServer {
             ..gateway_core::AuditEvent::default()
         });
         json_response(&ticket)
+    }
+
+
+    async fn admin_list_projects(
+        State(state): State<Self>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/projects") {
+            return response;
+        }
+        // Seed projects from services if empty.
+        if let Some(cfg) = &state.gateway_config {
+            if let Ok(guard) = cfg.read() {
+                let services: Vec<String> = guard
+                    .gateway
+                    .services
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+                gateway_core::global_vault_store().ensure_default_projects_from_services(&services);
+            }
+        }
+        json_response(&gateway_core::global_vault_store().list_projects())
+    }
+
+    async fn admin_list_vault_leases(
+        State(state): State<Self>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/vault/leases") {
+            return response;
+        }
+        json_response(&gateway_core::global_vault_store().list_leases(100))
+    }
+
+    async fn admin_issue_vault_lease(
+        State(state): State<Self>,
+        headers: HeaderMap,
+        Json(mut body): Json<gateway_core::IssueVaultLeaseRequest>,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(&headers, "POST", "/admin/vault/leases") {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        if body.issued_by.is_none() {
+            if let Some(ctx) = auth_ctx.as_ref() {
+                body.issued_by = Some(ctx.subject.clone());
+            }
+        }
+        let Some(cfg_lock) = &state.gateway_config else {
+            return gateway_config_not_available();
+        };
+        let config = match cfg_lock.read() {
+            Ok(g) => g.clone(),
+            Err(_) => return gateway_config_not_available(),
+        };
+        // Resolve project -> service
+        let store = gateway_core::global_vault_store();
+        let services: Vec<String> = config
+            .gateway
+            .services
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        store.ensure_default_projects_from_services(&services);
+        let projects = store.list_projects();
+        let project = projects.iter().find(|p| {
+            p.name.eq_ignore_ascii_case(&body.project)
+                && p.environment.eq_ignore_ascii_case(&body.environment)
+        });
+        let service_name = match project {
+            Some(p) => p.service.clone(),
+            None => {
+                // allow direct service name as project
+                body.project.clone()
+            }
+        };
+        let service = match config
+            .gateway
+            .services
+            .iter()
+            .find(|s| s.name == service_name)
+        {
+            Some(s) => s.clone(),
+            None => {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "unknown_service",
+                    format!("service '{service_name}' not found"),
+                );
+            }
+        };
+        let endpoint_name = match service.endpoints.first() {
+            Some(n) => n.clone(),
+            None => {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "no_endpoint",
+                    "service has no endpoints",
+                );
+            }
+        };
+        let endpoint = match config
+            .gateway
+            .endpoints
+            .iter()
+            .find(|e| e.name == endpoint_name)
+        {
+            Some(e) => e.clone(),
+            None => {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "unknown_endpoint",
+                    format!("endpoint '{endpoint_name}' missing"),
+                );
+            }
+        };
+        let lease = store.issue_lease(
+            body,
+            &service.name,
+            &endpoint.name,
+            endpoint.protocol.as_str(),
+            &endpoint.address,
+            endpoint.database.clone(),
+            &endpoint.username,
+            &endpoint.password,
+        );
+        info!(
+            target: AUDIT_TARGET,
+            action = AuditAction::AdminWrite.as_str(),
+            decision = AuditDecision::Allow.as_str(),
+            lease_id = %lease.lease_id,
+            service = %lease.service,
+            "admin issued vault lease"
+        );
+        gateway_core::try_audit(gateway_core::AuditEvent {
+            action: Some(AuditAction::AdminWrite.as_str().into()),
+            decision: Some(AuditDecision::Allow.as_str().into()),
+            subject_id: lease.project.clone().into(),
+            service: Some(lease.service.clone()),
+            outcome: Some("vault_lease_issued".into()),
+            message: Some(format!("lease {} for {}", lease.lease_id, lease.endpoint)),
+            audit_level: Some("L0".into()),
+            ..gateway_core::AuditEvent::default()
+        });
+        json_response(&lease)
+    }
+
+    async fn admin_portal_query(
+        State(state): State<Self>,
+        headers: HeaderMap,
+        Json(body): Json<AdminPortalQueryRequest>,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(&headers, "POST", "/admin/portal/query") {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        if body.sql.trim().is_empty() || body.service.trim().is_empty() {
+            return admin_json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_portal_query",
+                "service and sql are required",
+            );
+        }
+        let Some(cfg_lock) = &state.gateway_config else {
+            return gateway_config_not_available();
+        };
+        let config = match cfg_lock.read() {
+            Ok(g) => g.gateway.clone(),
+            Err(_) => return gateway_config_not_available(),
+        };
+
+        if let Some(lease_id) = body.lease_id.as_deref() {
+            match gateway_core::global_vault_store().get_valid_lease(lease_id) {
+                Some(lease) if lease.service == body.service => {}
+                Some(_) => {
+                    return admin_json_error(
+                        StatusCode::FORBIDDEN,
+                        "lease_service_mismatch",
+                        "vault lease does not match service",
+                    );
+                }
+                None => {
+                    return admin_json_error(
+                        StatusCode::FORBIDDEN,
+                        "lease_invalid",
+                        "vault lease missing or expired",
+                    );
+                }
+            }
+        }
+
+        let subject_id = body
+            .subject_id
+            .clone()
+            .or_else(|| auth_ctx.as_ref().map(|c| c.subject.clone()))
+            .unwrap_or_else(|| "portal".into());
+
+        match portal_execute_logical(
+            &config,
+            &body.service,
+            &body.sql,
+            &subject_id,
+            body.max_rows,
+        )
+        .await
+        {
+            Ok(resp) => {
+                gateway_core::try_audit(gateway_core::AuditEvent {
+                    action: Some(AuditAction::Query.as_str().into()),
+                    decision: Some(AuditDecision::Execute.as_str().into()),
+                    subject_id: Some(subject_id),
+                    service: Some(body.service.clone()),
+                    outcome: Some("portal_query".into()),
+                    audit_level: Some("L0".into()),
+                    ..gateway_core::AuditEvent::default()
+                });
+                json_response(&resp)
+            }
+            Err((code, msg)) => {
+                gateway_core::try_audit(gateway_core::AuditEvent {
+                    action: Some(AuditAction::Query.as_str().into()),
+                    decision: Some(AuditDecision::Deny.as_str().into()),
+                    subject_id: Some(subject_id),
+                    service: Some(body.service.clone()),
+                    outcome: Some("portal_deny".into()),
+                    message: Some(msg.clone()),
+                    code: Some(code.clone()),
+                    audit_level: Some("L0".into()),
+                    ..gateway_core::AuditEvent::default()
+                });
+                admin_json_error(StatusCode::FORBIDDEN, "portal_denied", msg)
+            }
+        }
     }
 
 
@@ -1416,6 +1684,199 @@ fn audit_admin_write(
 
 fn admin_auth_error_response(error: AdminAuthError) -> Response<Body> {
     admin_json_error(error.status(), error.code(), error.message().to_owned())
+}
+
+
+
+async fn portal_execute_logical(
+    config: &gateway_core::GatewayConfig,
+    service_name: &str,
+    sql: &str,
+    subject_id: &str,
+    max_rows: Option<u64>,
+) -> Result<AdminPortalQueryResponse, (String, String)> {
+    use gateway_core::{
+        apply_obligations_to_response, default_dialect_parser, map_response_types, BackendConnector,
+        ExecuteMode, GatewayCommand, GatewayResponse, LocalPdp, Subject,
+    };
+    use runtime_gateway::core_engine::CoreGatewayRuntimePlan;
+
+    let plan = CoreGatewayRuntimePlan::from_config(config)
+        .map_err(|e| ("plan".into(), e.to_string()))?;
+    let _listener_ok = plan
+        .listeners()
+        .iter()
+        .any(|l| l.service().name == service_name);
+    if !_listener_ok {
+        return Err((
+            "no_listener".into(),
+            format!("no listener for service '{service_name}'"),
+        ));
+    }
+
+    let service = config
+        .services
+        .iter()
+        .find(|s| s.name == service_name)
+        .cloned()
+        .ok_or_else(|| ("service".into(), "missing service".into()))?;
+    let endpoints: Vec<_> = service
+        .endpoints
+        .iter()
+        .filter_map(|n| config.endpoints.iter().find(|e| e.name == *n).cloned())
+        .collect();
+    if endpoints.is_empty() {
+        return Err(("endpoint".into(), "service has no endpoints".into()));
+    }
+
+    // Frontend protocol for type mapping: prefer listener protocol for this service.
+    let frontend_protocol = plan
+        .listeners()
+        .iter()
+        .find(|l| l.service().name == service_name)
+        .map(|l| l.listener().protocol.clone())
+        .unwrap_or_else(|| service.backend_protocol.clone());
+
+    let objects = runtime_gateway::object_extract::extract_object_set(
+        sql,
+        frontend_protocol.as_str(),
+    );
+    let dialect = default_dialect_parser(&frontend_protocol);
+    let subject = Subject::from_protocol_user(Some(subject_id), None);
+    let mut sql_exec = sql.to_owned();
+    let mut obligations = gateway_core::Obligations::default();
+
+    if let Some(pdp) = LocalPdp::from_config(&config.security) {
+        match pdp.authorize_command_with_objects(
+            &subject,
+            service_name,
+            &GatewayCommand::Query {
+                sql: sql_exec.clone(),
+            },
+            &dialect,
+            Some(&objects),
+        ) {
+            gateway_core::SecurityDecision::Deny { rule, message }
+            | gateway_core::SecurityDecision::RequireTicket { rule, message, .. } => {
+                return Err((rule, message));
+            }
+            gateway_core::SecurityDecision::Allow { obligations: obl } => {
+                obligations = obl;
+            }
+            gateway_core::SecurityDecision::AllowRewrite {
+                sql: rewritten,
+                obligations: obl,
+            } => {
+                sql_exec = rewritten;
+                obligations = obl;
+            }
+        }
+    }
+
+    let mut command = GatewayCommand::Query { sql: sql_exec };
+    if let Some(policy_name) = &service.translation_policy {
+        if let Some(policy) = config
+            .translation_policies
+            .iter()
+            .find(|p| p.name == *policy_name)
+        {
+            command = gateway_core::prepare_cross_protocol_command(
+                policy,
+                command,
+                &dialect,
+            )
+            .map_err(|e| ("translation".into(), e.to_string()))?;
+        }
+    }
+
+    let backend: std::sync::Arc<dyn BackendConnector> = match service.backend_protocol {
+        gateway_core::ProtocolKind::MySql => std::sync::Arc::new(
+            runtime_gateway::backend::mysql::MySqlBackendConnector::with_endpoints(endpoints.clone()),
+        ),
+        gateway_core::ProtocolKind::PostgreSql => std::sync::Arc::new(
+            runtime_gateway::backend::postgresql::PostgreSqlBackendConnector::with_endpoints(
+                endpoints.clone(),
+            ),
+        ),
+    };
+
+    let mut session = gateway_core::SessionState {
+        user: Some(subject_id.to_owned()),
+        database: endpoints.first().and_then(|e| e.database.clone()),
+        ..Default::default()
+    };
+    let mode = ExecuteMode::from_streaming_config(
+        config.security.streaming.window_rows.max(1),
+        max_rows.or(obligations.max_rows),
+    );
+    let response = backend
+        .execute_with_mode(command, &mut session, mode)
+        .await
+        .map_err(|e| ("backend".into(), e.to_string()))?;
+    let response = map_response_types(
+        response,
+        &service.backend_protocol,
+        &frontend_protocol,
+    );
+    let response = if obligations.has_result_obligations() {
+        apply_obligations_to_response(response, &obligations)
+    } else {
+        response
+    };
+
+    match response {
+        GatewayResponse::ResultSet { columns, rows } => {
+            let limit = max_rows.or(obligations.max_rows);
+            let truncated = limit.map(|m| rows.len() as u64 >= m).unwrap_or(false);
+            let col_names: Vec<String> = columns.into_iter().map(|c| c.name).collect();
+            let json_rows = rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| match v {
+                            gateway_core::GatewayValue::Null => serde_json::Value::Null,
+                            gateway_core::GatewayValue::Boolean(b) => serde_json::Value::Bool(b),
+                            gateway_core::GatewayValue::Integer(i) => serde_json::json!(i),
+                            gateway_core::GatewayValue::UnsignedInteger(u) => serde_json::json!(u),
+                            gateway_core::GatewayValue::Float(f) => serde_json::json!(f),
+                            gateway_core::GatewayValue::Decimal(s)
+                            | gateway_core::GatewayValue::String(s) => {
+                                serde_json::Value::String(s)
+                            }
+                            gateway_core::GatewayValue::Bytes(b) => {
+                                serde_json::Value::String(format!("bytes:{}", b.len()))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let row_count = json_rows.len();
+            Ok(AdminPortalQueryResponse {
+                columns: col_names,
+                rows: json_rows,
+                row_count,
+                truncated,
+                service: service_name.to_owned(),
+                decision: "allow".into(),
+                message: None,
+            })
+        }
+        GatewayResponse::Error { code, message } => Err((code, message)),
+        GatewayResponse::Ok { affected_rows, .. } => Ok(AdminPortalQueryResponse {
+            columns: vec!["affected_rows".into()],
+            rows: vec![vec![serde_json::json!(affected_rows)]],
+            row_count: 1,
+            truncated: false,
+            service: service_name.to_owned(),
+            decision: "allow".into(),
+            message: Some("ok".into()),
+        }),
+        GatewayResponse::Wire { .. } => Err((
+            "wire".into(),
+            "portal expects logical result set".into(),
+        )),
+        other => Err(("unsupported".into(), format!("{other:?}"))),
+    }
 }
 
 fn json_response<T: Serialize>(value: &T) -> Response<Body> {

@@ -8,6 +8,7 @@ edition = "2021"
 async-trait = "0.1"
 config = { path = "../app/config" }
 gateway_core = { path = "../gateway/core" }
+runtime_gateway = { path = "../runtime/gateway" }
 once_cell = "1.10.0"
 pisa_error = { path = "../error", package = "error" }
 pisa_metrics = { path = "../app/metrics", package = "metrics" }

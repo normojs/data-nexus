@@ -28,6 +28,8 @@ const links = computed(() => {
     { to: '/', label: 'Overview' },
     { to: '/topology', label: 'Topology' },
     { to: '/sessions', label: 'Sessions' },
+    { to: '/audit', label: 'Audit' },
+    { to: '/portal', label: 'SQL Portal' },
   ]
   if (canReload.value) {
     base.push({ to: '/settings', label: 'Settings' })
