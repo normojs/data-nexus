@@ -242,12 +242,47 @@ export function useAdminApi() {
         headers: { 'Content-Type': 'application/json' },
         body,
       }, base),
-    portalQuery: (body: { service: string, sql: string, lease_id?: string, subject_id?: string, max_rows?: number }, base?: string) =>
+    portalQuery: (body: {
+      service: string
+      sql: string
+      lease_id?: string
+      subject_id?: string
+      max_rows?: number
+      format?: 'json' | 'csv' | 'ndjson'
+      download?: boolean
+    }, base?: string) =>
       adminFetch<AdminPortalQueryResult>('/admin/portal/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body,
       }, base),
+    /** Download portal result as CSV/NDJSON/JSON blob (B05). */
+    portalExport: async (body: {
+      service: string
+      sql: string
+      lease_id?: string
+      subject_id?: string
+      max_rows?: number
+      format: 'csv' | 'ndjson' | 'json'
+    }, base?: string) => {
+      const path = '/admin/portal/query'
+      try {
+        return await $fetch<Blob>(`${normalizeBase(base)}${path}`, {
+          method: 'POST',
+          headers: {
+            ...authHeaders(),
+            'Content-Type': 'application/json',
+            Accept: '*/*',
+          },
+          body: { ...body, download: true },
+          responseType: 'blob',
+        })
+      }
+      catch (err) {
+        handleAdminApiAuthError(err, path)
+        throw err
+      }
+    },
     reload: (base?: string) =>
       adminFetch('/admin/reload', {
         method: 'POST',

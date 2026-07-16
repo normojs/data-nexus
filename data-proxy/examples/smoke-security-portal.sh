@@ -126,4 +126,65 @@ assert "denied" in raw.lower() or "deny" in raw.lower() or "secret" in raw.lower
 print("deny ok")
 PY
 
+echo "==> portal export CSV (B05)"
+curl -fsS -D /tmp/dn-portal-csv.hdr -o /tmp/dn-portal.csv \
+  -X POST "http://127.0.0.1:8082/admin/portal/query" \
+  -H 'content-type: application/json' \
+  -d "$(python3 - <<PY
+import json
+print(json.dumps({
+  "service": "orders",
+  "sql": "SELECT id, name FROM portal_t WHERE id=1",
+  "subject_id": "portal-user",
+  "max_rows": 10,
+  "format": "csv",
+  "download": True
+}))
+PY
+)"
+python3 - <<'PY'
+hdr=open("/tmp/dn-portal-csv.hdr").read().lower()
+body=open("/tmp/dn-portal.csv").read()
+assert "text/csv" in hdr, hdr
+assert "content-disposition" in hdr and "portal-export.csv" in hdr, hdr
+assert "id,name" in body.replace(" ", "").lower() or body.splitlines()[0].lower().startswith("id")
+assert "portal" in body.lower()
+print("csv export ok", body.splitlines()[:3])
+PY
+
+echo "==> portal export NDJSON (B05)"
+curl -fsS -D /tmp/dn-portal-ndjson.hdr -o /tmp/dn-portal.ndjson \
+  -X POST "http://127.0.0.1:8082/admin/portal/query" \
+  -H 'content-type: application/json' \
+  -d '{"service":"orders","sql":"SELECT id, name FROM portal_t WHERE id=1","subject_id":"portal-user","format":"ndjson","max_rows":10}'
+python3 - <<'PY'
+import json
+hdr=open("/tmp/dn-portal-ndjson.hdr").read().lower()
+assert "ndjson" in hdr or "json" in hdr, hdr
+lines=[ln for ln in open("/tmp/dn-portal.ndjson") if ln.strip()]
+assert len(lines) >= 2, lines
+meta=json.loads(lines[0])
+assert meta.get("_meta") is True
+assert meta.get("decision")=="allow"
+row=json.loads(lines[1])
+assert "id" in row and "name" in row
+print("ndjson export ok", meta.get("row_count"), row)
+PY
+
+echo "==> portal invalid format rejected"
+set +e
+curl -sS -o /tmp/dn-portal-badfmt.json -w "%{http_code}" \
+  -X POST "http://127.0.0.1:8082/admin/portal/query" \
+  -H 'content-type: application/json' \
+  -d '{"service":"orders","sql":"SELECT 1","format":"xlsx"}' \
+  >/tmp/dn-portal-badfmt.code
+set -e
+python3 - <<'PY'
+code=open("/tmp/dn-portal-badfmt.code").read().strip()
+body=open("/tmp/dn-portal-badfmt.json").read().lower()
+assert code.startswith("4"), code
+assert "format" in body or "invalid" in body, body
+print("bad format rejected", code)
+PY
+
 echo "smoke-security-portal: OK"

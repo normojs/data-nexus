@@ -75,20 +75,21 @@ data-ui        运维台 + SQL Portal + Audit
 | **F26** | Cedar PDP feature | 可选 feature，与 Local 对照 | 延后 |
 | **B03** | OTel 自定义 attributes / 采样 | 可观测加深 | 延后 |
 | **B04** | 审计保留清理 / OpenDAL L2 | 冷归档 | 延后 |
-| **B05** | portal 导出按钮 / 流式 JSON | 门户体验 | 延后 |
+| **B05** | portal 导出按钮 / 流式 JSON | 门户体验 | **完成** |
 
 ---
 
 ## 3. 当前下一动作（唯一焦点）
 
-**>>> B05 portal 导出 / 或 F26 Cedar PDP <<<**
+**>>> F26 Cedar PDP / 或 B03 OTel / B04 审计归档 <<<**
 
-F27 已完成：`security.time_rules`（工作时间窗 / 维护冻结）；`DATA_NEXUS_SECURITY_NOW_UNIX` 可测时钟；`smoke-security-time` 全绿。
+B05 已完成：`POST /admin/portal/query` 支持 `format=json|csv|ndjson` + `download`；CSV/NDJSON 经同一 PEP；data-ui 导出按钮；`smoke-security-portal` 覆盖导出。
 
 建议下一任务：
 
-1. **B05** — portal 导出 / 流式 JSON  
-2. **F26** — Cedar PDP feature  
+1. **F26** — Cedar PDP feature  
+2. **B03** — OTel 自定义 attributes / 采样  
+3. **B04** — 审计保留清理 / OpenDAL L2  
 
 ---
 

@@ -78,6 +78,35 @@ async function runQuery() {
   }
 }
 
+async function exportResult(format: 'csv' | 'ndjson' | 'json') {
+  if (!service.value || !sql.value.trim()) {
+    setStatus('Service and SQL are required for export', 'error')
+    return
+  }
+  setStatus(`Exporting ${format} via PEP…`)
+  try {
+    const blob = await api.portalExport({
+      service: service.value,
+      sql: sql.value,
+      lease_id: leaseId.value || undefined,
+      max_rows: maxRows.value || 5000,
+      format,
+    }, apiBase.value)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `portal-export.${format === 'ndjson' ? 'ndjson' : format}`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    setStatus(`Exported ${format} (still enforced by PEP + max_rows)`, 'ok')
+  }
+  catch (e: any) {
+    setStatus(e?.data?.message || e?.message || String(e), 'error')
+  }
+}
+
 onMounted(async () => {
   hydrate()
   try {
@@ -151,9 +180,23 @@ onMounted(async () => {
           >
             Run SQL
           </button>
+          <button
+            type="button"
+            class="btn"
+            @click="exportResult('csv')"
+          >
+            Export CSV
+          </button>
+          <button
+            type="button"
+            class="btn"
+            @click="exportResult('ndjson')"
+          >
+            Export NDJSON
+          </button>
         </div>
         <p class="hint">
-          Leases never include backend passwords. SQL is authorized by Local PDP and executed via gateway backends only.
+          Leases never include backend passwords. SQL is authorized by Local PDP and executed via gateway backends only. Exports use the same PEP path with format=csv|ndjson.
         </p>
         <div
           v-if="projects.length"

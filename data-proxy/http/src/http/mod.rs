@@ -530,6 +530,12 @@ struct AdminPortalQueryRequest {
     subject_id: Option<String>,
     #[serde(default)]
     max_rows: Option<u64>,
+    /// Response encoding: `json` (default), `csv`, or `ndjson` (B05 export).
+    #[serde(default)]
+    format: Option<String>,
+    /// When true, set Content-Disposition attachment for browser download.
+    #[serde(default)]
+    download: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -543,6 +549,10 @@ struct AdminPortalQueryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
+
+/// Portal export hard cap (rows) to keep Admin path bounded.
+const PORTAL_MAX_ROWS_CAP: u64 = 10_000;
+const PORTAL_DEFAULT_EXPORT_MAX_ROWS: u64 = 5_000;
 
 
 
@@ -1321,6 +1331,17 @@ impl AxumServer {
                 "service and sql are required",
             );
         }
+        let format = normalize_portal_format(body.format.as_deref());
+        if format.is_none() {
+            return admin_json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_portal_format",
+                "format must be json, csv, or ndjson",
+            );
+        }
+        let format = format.unwrap_or("json");
+        let download = body.download.unwrap_or(false) || format != "json";
+
         let Some(cfg_lock) = &state.gateway_config else {
             return gateway_config_not_available();
         };
@@ -1355,26 +1376,38 @@ impl AxumServer {
             .or_else(|| auth_ctx.as_ref().map(|c| c.subject.clone()))
             .unwrap_or_else(|| "portal".into());
 
+        // Bound portal result size; export defaults higher but still capped.
+        let max_rows = clamp_portal_max_rows(body.max_rows, format);
+
         match portal_execute_logical(
             &config,
             &body.service,
             &body.sql,
             &subject_id,
-            body.max_rows,
+            Some(max_rows),
         )
         .await
         {
             Ok(resp) => {
+                let outcome = if format == "json" {
+                    "portal_query"
+                } else {
+                    "portal_export"
+                };
                 gateway_core::try_audit(gateway_core::AuditEvent {
                     action: Some(AuditAction::Query.as_str().into()),
                     decision: Some(AuditDecision::Execute.as_str().into()),
                     subject_id: Some(subject_id),
                     service: Some(body.service.clone()),
-                    outcome: Some("portal_query".into()),
+                    outcome: Some(outcome.into()),
+                    message: Some(format!(
+                        "format={format} rows={} truncated={}",
+                        resp.row_count, resp.truncated
+                    )),
                     audit_level: Some("L0".into()),
                     ..gateway_core::AuditEvent::default()
                 });
-                json_response(&resp)
+                portal_format_response(&resp, format, download)
             }
             Err((code, msg)) => {
                 gateway_core::try_audit(gateway_core::AuditEvent {
@@ -2018,6 +2051,173 @@ fn json_response<T: Serialize>(value: &T) -> Response<Body> {
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::from(error.to_string()))
             .expect("static internal server error response is valid"),
+    }
+}
+
+fn normalize_portal_format(raw: Option<&str>) -> Option<&'static str> {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("json") => Some("json"),
+        Some("csv") => Some("csv"),
+        Some("ndjson") | Some("jsonl") | Some("json-lines") => Some("ndjson"),
+        _ => None,
+    }
+}
+
+fn clamp_portal_max_rows(requested: Option<u64>, format: &str) -> u64 {
+    let default = if format == "json" {
+        1_000
+    } else {
+        PORTAL_DEFAULT_EXPORT_MAX_ROWS
+    };
+    requested
+        .unwrap_or(default)
+        .clamp(1, PORTAL_MAX_ROWS_CAP)
+}
+
+fn portal_format_response(
+    resp: &AdminPortalQueryResponse,
+    format: &str,
+    download: bool,
+) -> Response<Body> {
+    match format {
+        "csv" => {
+            let body = portal_to_csv(resp);
+            portal_download_response(
+                body,
+                "text/csv; charset=utf-8",
+                download,
+                "portal-export.csv",
+            )
+        }
+        "ndjson" => {
+            let body = portal_to_ndjson(resp);
+            portal_download_response(
+                body,
+                "application/x-ndjson; charset=utf-8",
+                download,
+                "portal-export.ndjson",
+            )
+        }
+        _ => {
+            if download {
+                match serde_json::to_vec(resp) {
+                    Ok(body) => portal_download_response(
+                        body,
+                        "application/json",
+                        true,
+                        "portal-export.json",
+                    ),
+                    Err(error) => Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from(error.to_string()))
+                        .expect("static internal server error response is valid"),
+                }
+            } else {
+                json_response(resp)
+            }
+        }
+    }
+}
+
+fn portal_download_response(
+    body: impl Into<Vec<u8>>,
+    content_type: &str,
+    download: bool,
+    filename: &str,
+) -> Response<Body> {
+    let bytes = body.into();
+    let mut builder = Response::builder().header(header::CONTENT_TYPE, content_type);
+    if download {
+        builder = builder.header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        );
+    }
+    builder
+        .body(Body::from(bytes))
+        .unwrap_or_else(|error| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(error.to_string()))
+                .expect("static internal server error response is valid")
+        })
+}
+
+fn portal_to_csv(resp: &AdminPortalQueryResponse) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str(
+        &resp
+            .columns
+            .iter()
+            .map(|c| csv_escape(c))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    out.push('\n');
+    for row in &resp.rows {
+        let line = resp
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                csv_escape(&json_cell_to_string(
+                    row.get(i).unwrap_or(&serde_json::Value::Null),
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if resp.truncated {
+        out.push_str("# truncated=true\n");
+    }
+    out.into_bytes()
+}
+
+fn portal_to_ndjson(resp: &AdminPortalQueryResponse) -> Vec<u8> {
+    let mut out = Vec::new();
+    let meta = serde_json::json!({
+        "_meta": true,
+        "service": resp.service,
+        "decision": resp.decision,
+        "row_count": resp.row_count,
+        "truncated": resp.truncated,
+        "columns": resp.columns,
+    });
+    if let Ok(b) = serde_json::to_vec(&meta) {
+        out.extend_from_slice(&b);
+        out.push(b'\n');
+    }
+    for row in &resp.rows {
+        let mut obj = serde_json::Map::new();
+        for (i, col) in resp.columns.iter().enumerate() {
+            let v = row.get(i).cloned().unwrap_or(serde_json::Value::Null);
+            obj.insert(col.clone(), v);
+        }
+        if let Ok(b) = serde_json::to_vec(&serde_json::Value::Object(obj)) {
+            out.extend_from_slice(&b);
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+fn json_cell_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_owned()
     }
 }
 
