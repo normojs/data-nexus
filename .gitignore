@@ -6,3 +6,4 @@ target
 .DS_Store
 *.p12
 .cargo-target/
+.cargo-target-a1/
