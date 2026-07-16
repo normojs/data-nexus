@@ -99,6 +99,8 @@ pub enum AdminAuthMode {
     None,
     /// HS256 JWT with shared secret (tests + simple break-glass).
     JwtHmac,
+    /// RS256/ES256 JWT validated against an OIDC JWKS URL (enterprise IdP).
+    JwtJwks,
 }
 
 /// Admin API auth configuration (management plane).
@@ -112,7 +114,13 @@ pub struct AdminAuthConfig {
     /// HS256 secret when mode = jwt_hmac.
     #[serde(default)]
     pub jwt_secret: String,
-    /// Expected `iss` claim (optional).
+    /// JWKS URL when mode = jwt_jwks (e.g. IdP `.../protocol/openid-connect/certs`).
+    #[serde(default)]
+    pub jwks_url: String,
+    /// JWKS cache TTL seconds (default 300).
+    #[serde(default = "default_jwks_cache_secs")]
+    pub jwks_cache_secs: u64,
+    /// Expected `iss` claim (optional for hmac; recommended for jwks).
     #[serde(default)]
     pub issuer: String,
     /// Expected `aud` claim (optional).
@@ -165,12 +173,18 @@ fn default_token_ttl_secs() -> u64 {
     3600
 }
 
+fn default_jwks_cache_secs() -> u64 {
+    300
+}
+
 impl Default for AdminAuthConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             mode: AdminAuthMode::None,
             jwt_secret: String::new(),
+            jwks_url: String::new(),
+            jwks_cache_secs: default_jwks_cache_secs(),
             issuer: String::new(),
             audience: String::new(),
             leeway_secs: default_leeway_secs(),
@@ -198,8 +212,9 @@ fn default_role_bindings() -> HashMap<String, String> {
 impl AdminAuthConfig {
     pub fn break_glass_enabled(&self) -> bool {
         self.enabled
-            && matches!(self.mode, AdminAuthMode::JwtHmac)
             && !self.break_glass_password.is_empty()
+            && !self.jwt_secret.is_empty()
+            && matches!(self.mode, AdminAuthMode::JwtHmac | AdminAuthMode::JwtJwks)
     }
 
     pub fn break_glass_role_parsed(&self) -> AdminRole {
@@ -212,7 +227,7 @@ impl AdminAuthConfig {
         }
         match self.mode {
             AdminAuthMode::None => Err(GatewayError::Configuration(
-                "admin_auth.enabled=true requires mode != none (use jwt_hmac)".into(),
+                "admin_auth.enabled=true requires mode jwt_hmac or jwt_jwks".into(),
             )),
             AdminAuthMode::JwtHmac => {
                 if self.jwt_secret.trim().is_empty() {
@@ -225,15 +240,52 @@ impl AdminAuthConfig {
                         "admin_auth.jwt_secret must be at least 16 characters".into(),
                     ));
                 }
-                if !self.break_glass_password.is_empty() && self.break_glass_password.len() < 8 {
+                self.validate_break_glass_password()?;
+                Ok(())
+            }
+            AdminAuthMode::JwtJwks => {
+                if self.jwks_url.trim().is_empty() {
                     return Err(GatewayError::Configuration(
-                        "admin_auth.break_glass_password must be at least 8 characters when set"
+                        "admin_auth.jwks_url is required when mode=jwt_jwks".into(),
+                    ));
+                }
+                if !(self.jwks_url.starts_with("https://") || self.jwks_url.starts_with("http://"))
+                {
+                    return Err(GatewayError::Configuration(
+                        "admin_auth.jwks_url must be an http(s) URL".into(),
+                    ));
+                }
+                if self.issuer.trim().is_empty() {
+                    return Err(GatewayError::Configuration(
+                        "admin_auth.issuer is required when mode=jwt_jwks".into(),
+                    ));
+                }
+                // Optional local HS256 break-glass alongside JWKS.
+                if !self.jwt_secret.is_empty() && self.jwt_secret.len() < 16 {
+                    return Err(GatewayError::Configuration(
+                        "admin_auth.jwt_secret must be at least 16 characters when set for break-glass"
                             .into(),
                     ));
                 }
+                if self.break_glass_enabled() && self.jwt_secret.is_empty() {
+                    return Err(GatewayError::Configuration(
+                        "admin_auth.break_glass_password requires jwt_secret (HS256 minting) when mode=jwt_jwks"
+                            .into(),
+                    ));
+                }
+                self.validate_break_glass_password()?;
                 Ok(())
             }
         }
+    }
+
+    fn validate_break_glass_password(&self) -> GatewayResult<()> {
+        if !self.break_glass_password.is_empty() && self.break_glass_password.len() < 8 {
+            return Err(GatewayError::Configuration(
+                "admin_auth.break_glass_password must be at least 8 characters when set".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve built-in roles from raw IdP claim strings.
@@ -358,6 +410,18 @@ mod tests {
         cfg.jwt_secret = "short".into();
         assert!(cfg.validate().is_err());
         cfg.jwt_secret = "long-enough-secret!".into();
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn enabled_jwks_requires_url_and_issuer() {
+        let mut cfg = AdminAuthConfig::default();
+        cfg.enabled = true;
+        cfg.mode = AdminAuthMode::JwtJwks;
+        assert!(cfg.validate().is_err());
+        cfg.jwks_url = "https://idp.example.com/certs".into();
+        assert!(cfg.validate().is_err());
+        cfg.issuer = "https://idp.example.com".into();
         assert_eq!(cfg.validate(), Ok(()));
     }
 

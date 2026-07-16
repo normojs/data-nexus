@@ -43,6 +43,7 @@ use ver::version::get_version;
 
 mod admin_auth;
 mod admin_ui;
+mod jwks;
 
 use admin_auth::{
     authenticate_request, break_glass_login, me_response, AdminAuthError, AdminAuthPublicConfig,

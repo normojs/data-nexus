@@ -15,7 +15,7 @@ Consumes the gateway Admin HTTP API (default `http://127.0.0.1:8082`).
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `NUXT_PUBLIC_ADMIN_API_BASE` | `http://127.0.0.1:8082` | Gateway Admin API base URL |
-| `NUXT_PUBLIC_ADMIN_PASSWORD` | _(empty)_ | Optional password gate |
+| `NUXT_PUBLIC_ADMIN_PASSWORD` | _(empty)_ | Legacy UI-only gate; prefer gateway `break_glass_password` (see `docs/admin-auth-password.md`) |
 | `NUXT_PUBLIC_OIDC_ISSUER` | _(empty)_ | OIDC issuer URL (enables SSO) |
 | `NUXT_PUBLIC_OIDC_CLIENT_ID` | _(empty)_ | Public OIDC client id |
 | `NUXT_PUBLIC_OIDC_REDIRECT_URI` | `{origin}/auth/callback` | Redirect URI registered with IdP |

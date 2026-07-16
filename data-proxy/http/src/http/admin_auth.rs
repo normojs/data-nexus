@@ -1,16 +1,21 @@
-//! Admin API authentication helpers (JWT HS256 + role mapping).
+//! Admin API authentication helpers (JWT HS256 / JWKS RS256 + role mapping).
 //!
 //! Management-plane only. When `AdminAuthConfig.enabled` is false, checks are skipped.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use gateway_core::{
     required_permission, AdminAuthConfig, AdminAuthContext, AdminAuthMode, AdminPermission,
     AdminRole,
 };
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use super::jwks;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AdminMeResponse {
@@ -36,6 +41,7 @@ impl From<&AdminAuthConfig> for AdminAuthPublicConfig {
             mode: match config.mode {
                 AdminAuthMode::None => "none",
                 AdminAuthMode::JwtHmac => "jwt_hmac",
+                AdminAuthMode::JwtJwks => "jwt_jwks",
             },
             public_metrics: config.public_metrics,
             break_glass_login: config.break_glass_enabled(),
@@ -180,7 +186,7 @@ pub fn authenticate_request(
         AdminAuthError::Unauthorized("missing or invalid Authorization Bearer token".into())
     })?;
 
-    let ctx = validate_hmac_token(config, token)?;
+    let ctx = validate_token(config, token)?;
     if let Some(required) = required_permission(method, path) {
         if !ctx.allows(required) {
             return Err(AdminAuthError::Forbidden(format!(
@@ -219,14 +225,57 @@ fn extract_bearer(authorization: Option<&str>) -> Option<&str> {
     }
 }
 
-fn validate_hmac_token(config: &AdminAuthConfig, token: &str) -> Result<AdminAuthContext, AdminAuthError> {
-    if !matches!(config.mode, AdminAuthMode::JwtHmac) {
-        return Err(AdminAuthError::Misconfigured(
-            "admin auth enabled with unsupported mode".into(),
-        ));
+fn validate_token(config: &AdminAuthConfig, token: &str) -> Result<AdminAuthContext, AdminAuthError> {
+    match config.mode {
+        AdminAuthMode::None => Err(AdminAuthError::Misconfigured(
+            "admin auth enabled with mode=none".into(),
+        )),
+        AdminAuthMode::JwtHmac => validate_with_key(
+            config,
+            token,
+            DecodingKey::from_secret(config.jwt_secret.as_bytes()),
+            Algorithm::HS256,
+            "jwt_hmac",
+        ),
+        AdminAuthMode::JwtJwks => {
+            // Prefer JWKS RS256; allow local HS256 break-glass tokens when secret is set.
+            if !config.jwt_secret.is_empty() {
+                if let Ok(ctx) = validate_with_key(
+                    config,
+                    token,
+                    DecodingKey::from_secret(config.jwt_secret.as_bytes()),
+                    Algorithm::HS256,
+                    "break_glass",
+                ) {
+                    return Ok(ctx);
+                }
+            }
+            let header = decode_header(token)
+                .map_err(|e| AdminAuthError::Unauthorized(format!("invalid jwt header: {e}")))?;
+            let alg = header.alg;
+            if !matches!(alg, Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512) {
+                return Err(AdminAuthError::Unauthorized(format!(
+                    "unsupported JWT alg for jwks mode: {alg:?}"
+                )));
+            }
+            let key = jwks::decoding_key_for(
+                &config.jwks_url,
+                header.kid.as_deref(),
+                Duration::from_secs(config.jwks_cache_secs.max(30)),
+            )?;
+            validate_with_key(config, token, key, alg, "jwt_jwks")
+        }
     }
+}
 
-    let mut validation = Validation::new(Algorithm::HS256);
+fn validate_with_key(
+    config: &AdminAuthConfig,
+    token: &str,
+    key: DecodingKey,
+    alg: Algorithm,
+    auth_method: &str,
+) -> Result<AdminAuthContext, AdminAuthError> {
+    let mut validation = Validation::new(alg);
     validation.leeway = config.leeway_secs;
     validation.validate_exp = true;
     if config.issuer.is_empty() {
@@ -241,12 +290,8 @@ fn validate_hmac_token(config: &AdminAuthConfig, token: &str) -> Result<AdminAut
         validation.set_audience(&[config.audience.as_str()]);
     }
 
-    let data = decode::<Value>(
-        token,
-        &DecodingKey::from_secret(config.jwt_secret.as_bytes()),
-        &validation,
-    )
-    .map_err(|e| AdminAuthError::Unauthorized(format!("invalid token: {e}")))?;
+    let data = decode::<Value>(token, &key, &validation)
+        .map_err(|e| AdminAuthError::Unauthorized(format!("invalid token: {e}")))?;
 
     let claims = data.claims;
     let subject = claims
@@ -260,7 +305,7 @@ fn validate_hmac_token(config: &AdminAuthConfig, token: &str) -> Result<AdminAut
 
     let raw_roles = collect_role_strings(&claims, &config.role_claim_paths);
     let roles = config.map_claim_values(&raw_roles);
-    Ok(AdminAuthContext::from_roles(subject, roles, "jwt_hmac"))
+    Ok(AdminAuthContext::from_roles(subject, roles, auth_method))
 }
 
 fn collect_role_strings(claims: &Value, paths: &[String]) -> Vec<String> {
@@ -448,5 +493,68 @@ mod tests {
         .unwrap();
         assert_eq!(ctx.subject, "break-glass");
         assert!(ctx.allows(AdminPermission::ConfigReload));
+    }
+
+    #[test]
+    fn jwks_rs256_token_validates_with_injected_key() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::traits::PublicKeyParts;
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+
+        let mut rng = rand::thread_rng();
+        let private = RsaPrivateKey::new(&mut rng, 2048).expect("rsa key");
+        let public = RsaPublicKey::from(&private);
+        let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
+        let jwks_url = "https://test.local/jwks";
+        super::super::jwks::clear_cache();
+        super::super::jwks::inject_test_key(jwks_url, "kid-1", &n, &e);
+
+        // jsonwebtoken built without pem feature: use PKCS#1 DER.
+        let der = private.to_pkcs1_der().expect("pkcs1 der");
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("kid-1".into());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = serde_json::json!({
+            "sub": "oidc-user",
+            "iss": "https://idp.example.com",
+            "aud": "data-nexus-admin",
+            "exp": now + 3600,
+            "iat": now,
+            "groups": ["data-nexus-operators"],
+        });
+        let token = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_der(der.as_bytes()),
+        )
+        .expect("sign");
+
+        let cfg = AdminAuthConfig {
+            enabled: true,
+            mode: AdminAuthMode::JwtJwks,
+            jwks_url: jwks_url.into(),
+            issuer: "https://idp.example.com".into(),
+            audience: "data-nexus-admin".into(),
+            ..AdminAuthConfig::default()
+        };
+        let ctx = authenticate_request(
+            &cfg,
+            Some(&format!("Bearer {token}")),
+            "POST",
+            "/admin/pools/refresh",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ctx.subject, "oidc-user");
+        assert_eq!(ctx.auth_method, "jwt_jwks");
+        assert!(ctx.allows(AdminPermission::RuntimeRefresh));
+        assert!(!ctx.allows(AdminPermission::ConfigReload));
     }
 }

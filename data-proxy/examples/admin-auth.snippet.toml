@@ -1,9 +1,8 @@
 # Copy into a v2 gateway config to enable management-plane Admin API auth.
 # This is NOT data-plane / table-level RBAC.
-#
-# Issue HS256 tokens via tests or a future POST /admin/auth/login.
-# For local minting, use gateway_core roles + http::admin_auth::issue_hmac_token.
+# Password UX docs: docs/admin-auth-password.md
 
+# --- Option A: HS256 (local / break-glass) ---
 [admin_auth]
 enabled = true
 mode = "jwt_hmac"
@@ -12,7 +11,6 @@ issuer = "data-nexus"
 audience = "data-nexus-admin"
 leeway_secs = 60
 public_metrics = true
-# Optional: POST /admin/auth/login { "password": "..." } → Bearer JWT
 break_glass_password = "change-me-break-glass"
 break_glass_role = "admin"
 token_ttl_secs = 3600
@@ -25,3 +23,22 @@ role_claim_paths = ["roles", "groups", "realm_access.roles"]
 "viewer" = "viewer"
 "operator" = "operator"
 "admin" = "admin"
+
+# --- Option B: enterprise OIDC access_token via JWKS (uncomment & disable A) ---
+# [admin_auth]
+# enabled = true
+# mode = "jwt_jwks"
+# jwks_url = "https://idp.example.com/realms/ops/protocol/openid-connect/certs"
+# issuer = "https://idp.example.com/realms/ops"
+# audience = "data-nexus-admin"
+# jwks_cache_secs = 300
+# # optional emergency login (needs jwt_secret for HS256 mint)
+# jwt_secret = "change-me-to-a-long-random-secret"
+# break_glass_password = "change-me-break-glass"
+# break_glass_role = "admin"
+# role_claim_paths = ["roles", "groups", "realm_access.roles"]
+#
+# [admin_auth.role_bindings]
+# "data-nexus-viewers" = "viewer"
+# "data-nexus-operators" = "operator"
+# "data-nexus-admins" = "admin"

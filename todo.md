@@ -61,7 +61,8 @@ M10    管理面鉴权（轻量 RBAC）           进行中（HMAC JWT 已落地
 - [x] `enabled=false` 兼容
 - [x] data-ui 请求附带 Bearer（OIDC access_token）+ `/admin/me` 裁剪 Settings
 - [x] `POST /admin/auth/login` break-glass 换票（密码 → HS256 JWT）+ UI 对接
-- [ ] JWKS 模式（企业 OIDC access_token 验签）
+- [x] JWKS 模式（`jwt_jwks` + 缓存 + RS256 验签企业 access_token）
+- [x] UI / gateway 密码配置统一文档（`docs/admin-auth-password.md`）
 
 ---
 

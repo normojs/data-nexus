@@ -23,8 +23,16 @@ tracing = "0.1.37"
 tracing-subscriber = "0.3.9"
 # default-features off avoids simple_asn1/time MSRV issues on older rustc.
 jsonwebtoken = { version = "9.3", default-features = false }
+# Blocking client for JWKS fetch (Admin auth path is sync per-request with cache).
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.22"
+parking_lot = "0.12"
 
 [dev-dependencies]
 hyper = "0.14"
 tokio = { version = "1.34.0", features = ["macros", "rt"] }
 tower = { version = "0.4", features = ["util"] }
+# RSA keygen for JWKS unit tests only.
+rsa = { version = "0.9", default-features = false, features = ["std"] }
+rand = "0.8"
+pkcs1 = { version = "0.7", default-features = false, features = ["alloc"] }

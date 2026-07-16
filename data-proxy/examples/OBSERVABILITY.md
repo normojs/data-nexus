@@ -94,23 +94,34 @@ If the exporter fails to initialize, the process logs an error and continues wit
 
 Optional. Default `admin_auth.enabled = false` keeps open Admin API (local dev).
 
-When enabled (`mode = "jwt_hmac"`):
+When enabled:
+
+| Mode | Use |
+|------|-----|
+| `jwt_hmac` | HS256 shared secret (+ optional break-glass login) |
+| `jwt_jwks` | RS256 via IdP JWKS URL (enterprise OIDC access_token) |
 
 | Endpoint | Auth |
 |----------|------|
 | `GET /admin/auth/config` | public |
+| `POST /admin/auth/login` | public (break-glass password → JWT) |
 | `GET /healthz`, `GET /version` | public |
 | `GET /metrics` | public if `public_metrics = true` (default) |
-| other `/admin/*` | `Authorization: Bearer <HS256 JWT>` |
+| other `/admin/*` | `Authorization: Bearer <JWT>` |
 
 Roles: `viewer` / `operator` / `admin` (permission union).  
-Claims: `roles` / `groups` / configured paths → `role_bindings`.
+Claims: `roles` / `groups` / paths → `role_bindings`.
 
-See `examples/admin-auth.snippet.toml` and `docs/admin-rbac-design.md`.
+Docs: `examples/admin-auth.snippet.toml`, `docs/admin-auth-password.md`, `docs/admin-rbac-design.md`.
 
 ```bash
 # enabled: no token → 401 on reload
 curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8082/admin/reload
+
+# break-glass mint
+curl -s -X POST http://127.0.0.1:8082/admin/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"password":"change-me-break-glass"}'
 ```
 
 ### Embedded (zero dependency)
