@@ -9,6 +9,15 @@ host = "0.0.0.0"
 port = 8082
 log_level = "INFO"
 
+# A4: cross-protocol uses streaming window encode after type mapping.
+[security]
+enabled = false
+fail_closed = false
+
+[security.streaming]
+window_rows = 2
+passthrough = false
+
 [[listeners]]
 name = "pg-to-mysql"
 listen_addr = "0.0.0.0:9091"

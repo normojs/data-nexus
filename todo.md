@@ -53,7 +53,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 - [x] **S4** — 持久化审计 + 查询 API（Admin；UI 后置）
 - [x] **S5** — 审批票据门闩（高危 DDL / 无 WHERE 写）
 - [ ] **S6** — Web SQL 门户 + Vault + 导出运营
-- [ ] **A 轨** — 性能：流式窗口 + 同协议透传（A1–A3 完成；A4 待做）
+- [x] **A 轨** — 性能：流式窗口 + 同协议透传 + 跨协议流式（A1–A4 完成）
 
 ### 1.3 v1 可选增强（不挡 v2）
 
@@ -211,9 +211,9 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 - [x] **A1** Backend 窗口化读取 + `ExecuteMode` + `max_rows` 早截断（MySQL 窗口解码；PG max_rows）
 - [x] **A2** Frontend 分阶段 encode + 窗口写出（header/rows/footer；窗口间可 await write）
 - [x] **A3** 同协议结果透传（无义务；MySQL wire；PG 降级物化）
-- [ ] **A4** 跨协议流式
+- [x] **A4** 跨协议流式（强制 Streaming + 类型映射后窗口 encode）
 
-**A1–A3 代码**：`ExecuteMode::{Streaming,Passthrough}`、`GatewayResponse::Wire`、`write_resultset_windowed`；smoke-stream / smoke-passthrough
+**A1–A4 代码**：`ExecuteMode`、`Wire`、窗口 encode、跨协议 `xproto_stream`；smoke-stream / passthrough / cross-protocol-stream
 
 ---
 
@@ -367,16 +367,12 @@ data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 
 ## 9. 当前下一动作（唯一焦点）
 
-**>>> S6 门户 / 或 A4 跨协议流式 <<<**
-
-**S6 — SQLDEV 向门户 + Vault（可选）**
+**>>> S6 门户 / Vault（可选） <<<**
 
 - [ ] 项目/环境模型
-- [ ] Web SQL 经 PEP
-- [ ] 账号保险箱
+- [ ] Web SQL 经 PEP（禁止直连）
+- [ ] 账号保险箱 / 短时凭据
+- [ ] data-ui Audit 页（S4 API 已就绪）
 
-**A4 — 跨协议流式（可选）**
-
-- [ ] 翻译路径窗口化
-
-S0–S5 + **A1–A3** 已完成。smoke 另加 `smoke-security-passthrough`。
+S0–S5 + **A1–A4** 性能轨完成。  
+smoke：deny / column / mask / audit / ticket / stream / passthrough / cross-protocol-stream。

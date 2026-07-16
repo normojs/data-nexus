@@ -135,14 +135,19 @@ impl CoreGatewayConnection {
     ) -> GatewayResult<Vec<Vec<u8>>> {
         match response {
             GatewayResponse::ResultSet { columns, rows } => {
+                // A4: cross-protocol always window-encodes after type mapping so
+                // frontend dialect packets are produced without one giant encode.
+                // A2: same-protocol Streaming also window-encodes.
+                let cross = self.translation_policy.is_some();
                 let window = self
                     .stream_mode
                     .window_rows()
+                    .or(if cross { Some(256) } else { None })
                     .unwrap_or(usize::MAX)
                     .max(1);
-                // Always use windowed encoder when Streaming mode is active so
-                // row memory can be drained; Materialized uses a single encode.
-                if matches!(self.stream_mode, ExecuteMode::Streaming { .. }) {
+                let use_windowed = cross
+                    || matches!(self.stream_mode, ExecuteMode::Streaming { .. });
+                if use_windowed {
                     let mut writer = CollectingWriter::new();
                     write_resultset_windowed(
                         self.frontend.as_mut(),
@@ -547,8 +552,15 @@ impl CoreGatewayConnection {
                 && !pending_obligations.has_result_obligations()
                 && matches!(command, GatewayCommand::Query { .. })
                 && self.translation_policy.is_none();
+            // A4: cross-protocol never uses wire passthrough; force Streaming so
+            // backend max_rows/window apply and encode path is windowed.
             let exec_mode = if want_passthrough {
                 ExecuteMode::Passthrough
+            } else if self.translation_policy.is_some() {
+                match self.stream_mode {
+                    ExecuteMode::Streaming { .. } => self.stream_mode,
+                    _ => ExecuteMode::from_streaming_config(256, None),
+                }
             } else {
                 self.stream_mode
             };
@@ -592,6 +604,9 @@ impl CoreGatewayConnection {
 
             let outcome = match &response {
                 GatewayResponse::Error { code, .. } => format!("error:{code}"),
+                GatewayResponse::ResultSet { .. } if self.translation_policy.is_some() => {
+                    "xproto_stream".to_owned()
+                }
                 GatewayResponse::ResultSet { .. } => "resultset".to_owned(),
                 GatewayResponse::Wire { .. } => "passthrough".to_owned(),
                 GatewayResponse::Ok { .. } => "ok".to_owned(),
@@ -893,13 +908,20 @@ impl CoreGatewayListenerPlan {
         let translation_policy =
             resolve_translation_policy(config, listener, service)?;
         let security = gateway_core::LocalPdp::from_config(&config.security);
-        let stream_mode = ExecuteMode::from_streaming_config(
+        let mut stream_mode = ExecuteMode::from_streaming_config(
             config.security.streaming.window_rows,
             config.security.streaming.max_rows,
         );
-        // Passthrough only meaningful when security shell present; default true
-        // mirrors security.streaming.passthrough default. When security disabled,
-        // still allow same-protocol wire relay for performance.
+        // A4: cross-protocol listeners always stream (never pure Materialized).
+        if service.translation_policy.is_some() {
+            if !matches!(stream_mode, ExecuteMode::Streaming { .. }) {
+                stream_mode = ExecuteMode::from_streaming_config(
+                    config.security.streaming.window_rows.max(1),
+                    config.security.streaming.max_rows,
+                );
+            }
+        }
+        // Passthrough only for same-protocol; default true from security.streaming.
         let passthrough_enabled = config.security.streaming.passthrough;
 
         Ok(Self {
@@ -2041,10 +2063,16 @@ mod tests {
     fn builds_cross_protocol_connection_when_translation_enabled() {
         let plan =
             CoreGatewayRuntimePlan::from_config(&cross_protocol_mysql_to_pg_config()).unwrap();
+        // A4: translation path forces Streaming mode.
         let connection = plan.build_connection("mysql-listener").unwrap();
         assert_eq!(connection.frontend_protocol(), ProtocolKind::MySql);
         assert_eq!(connection.backend_protocol(), ProtocolKind::PostgreSql);
         assert!(connection.translation_policy.is_some());
+        assert!(
+            matches!(connection.stream_mode, ExecuteMode::Streaming { .. }),
+            "cross-protocol must use Streaming mode, got {:?}",
+            connection.stream_mode
+        );
     }
 
     #[tokio::test]
