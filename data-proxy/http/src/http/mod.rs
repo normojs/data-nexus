@@ -717,6 +717,11 @@ impl AxumServer {
             .route("/admin/services", get(Self::admin_services))
             .route("/admin/endpoints", get(Self::admin_endpoints))
             .route("/admin/security-policies", get(Self::admin_security_policies))
+            .route("/admin/security/cedar", get(Self::admin_cedar_status))
+            .route(
+                "/admin/security/cedar/reload",
+                post(Self::admin_cedar_reload),
+            )
             .route("/admin/audit/events", get(Self::admin_audit_events))
             .route("/admin/audit/stats", get(Self::admin_audit_stats))
             .route(
@@ -942,6 +947,138 @@ impl AxumServer {
                 Err(response) => response,
             },
             None => gateway_config_not_available(),
+        }
+    }
+
+    async fn admin_cedar_status(
+        State(state): State<Self>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/security/cedar") {
+            return response;
+        }
+        #[cfg(feature = "security-cedar")]
+        {
+            if let Some(store) = gateway_core::global_cedar_store() {
+                return json_response(&store.status());
+            }
+            // Not installed yet — report config intent.
+            let (backend, dir, epoch_reload) = state
+                .gateway_config
+                .as_ref()
+                .and_then(|c| c.read().ok())
+                .map(|g| {
+                    (
+                        g.gateway.security.pdp.backend.clone(),
+                        g.gateway.security.pdp.policy_dir.clone(),
+                        g.gateway.security.pdp.cache_epoch_reload,
+                    )
+                })
+                .unwrap_or_else(|| ("local".into(), String::new(), true));
+            return json_response(&serde_json::json!({
+                "installed": false,
+                "ready": false,
+                "epoch": 0,
+                "source": dir,
+                "files": 0,
+                "policy_count": 0,
+                "loaded_at_unix_ms": 0,
+                "pdp_backend": backend,
+                "cache_epoch_reload": epoch_reload,
+            }));
+        }
+        #[cfg(not(feature = "security-cedar"))]
+        {
+            json_response(&serde_json::json!({
+                "installed": false,
+                "ready": false,
+                "feature": "security-cedar",
+                "message": "binary built without --features security-cedar",
+            }))
+        }
+    }
+
+    async fn admin_cedar_reload(
+        State(state): State<Self>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(&headers, "POST", "/admin/security/cedar/reload") {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        #[cfg(feature = "security-cedar")]
+        {
+            let (backend, policy_dir, cache_epoch_reload) = match &state.gateway_config {
+                Some(cfg) => match cfg.read() {
+                    Ok(g) => (
+                        g.gateway.security.pdp.backend.clone(),
+                        g.gateway.security.pdp.policy_dir.clone(),
+                        g.gateway.security.pdp.cache_epoch_reload,
+                    ),
+                    Err(_) => {
+                        return admin_json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "gateway_config_poisoned",
+                            "gateway config lock is poisoned",
+                        );
+                    }
+                },
+                None => return gateway_config_not_available(),
+            };
+            if !backend.eq_ignore_ascii_case("cedar") {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "cedar_not_active",
+                    format!("security.pdp.backend is '{backend}', not cedar"),
+                );
+            }
+            if policy_dir.trim().is_empty() {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "cedar_policy_dir_empty",
+                    "security.pdp.policy_dir is empty",
+                );
+            }
+            if !cache_epoch_reload {
+                return admin_json_error(
+                    StatusCode::CONFLICT,
+                    "cedar_epoch_reload_disabled",
+                    "security.pdp.cache_epoch_reload=false; restart process to load policies",
+                );
+            }
+            match gateway_core::reload_global_cedar(&policy_dir) {
+                Ok(info) => {
+                    audit_admin_write(
+                        auth_ctx.as_ref(),
+                        "POST",
+                        "/admin/security/cedar/reload",
+                        if info.swapped { "swapped" } else { "unchanged" },
+                        Some(policy_dir.as_str()),
+                    );
+                    info!(
+                        target: AUDIT_TARGET,
+                        epoch = info.epoch,
+                        swapped = info.swapped,
+                        files = info.files,
+                        "admin reloaded cedar policies"
+                    );
+                    json_response(&info)
+                }
+                Err(e) => admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "cedar_reload_failed",
+                    e.to_string(),
+                ),
+            }
+        }
+        #[cfg(not(feature = "security-cedar"))]
+        {
+            let _ = auth_ctx;
+            admin_json_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "cedar_feature_disabled",
+                "binary built without --features security-cedar",
+            )
         }
     }
 
@@ -1783,6 +1920,10 @@ impl AxumServer {
             }
         }
 
+        // Cedar policy hot-reload (keep-old on failure): when security.pdp is cedar
+        // and cache_epoch_reload is true, re-read policy_dir without restarting listeners.
+        maybe_reload_cedar_policies(&next_config.gateway.security);
+
         audit_admin_write(auth_ctx.as_ref(), "POST", "/admin/reload", "applied", None);
         json_response(&GatewayReloadResponse {
             status: "applied",
@@ -1813,6 +1954,53 @@ impl AxumServer {
             },
             None => admin_runtime_not_found("admin runtime state is not available"),
         }
+    }
+}
+
+
+fn maybe_reload_cedar_policies(security: &gateway_core::SecurityPolicyConfig) {
+    #[cfg(feature = "security-cedar")]
+    {
+        if !security.enabled {
+            return;
+        }
+        if !security.pdp.backend.eq_ignore_ascii_case("cedar") {
+            return;
+        }
+        if !security.pdp.cache_epoch_reload {
+            tracing::info!(
+                target: AUDIT_TARGET,
+                "cedar cache_epoch_reload=false; skip policy hot-reload on admin reload"
+            );
+            return;
+        }
+        let dir = security.pdp.policy_dir.trim();
+        if dir.is_empty() {
+            return;
+        }
+        match gateway_core::reload_global_cedar(dir) {
+            Ok(info) => {
+                tracing::info!(
+                    target: AUDIT_TARGET,
+                    epoch = info.epoch,
+                    swapped = info.swapped,
+                    files = info.files,
+                    "cedar policies hot-reloaded with admin reload"
+                );
+            }
+            Err(e) => {
+                // Keep-old: do not fail the whole admin reload; log loudly.
+                tracing::error!(
+                    target: AUDIT_TARGET,
+                    error = %e,
+                    "cedar hot-reload failed; kept previous policy epoch"
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "security-cedar"))]
+    {
+        let _ = security;
     }
 }
 

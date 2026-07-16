@@ -43,7 +43,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 
 ### 1.2 关键 smoke
 
-`smoke-security-deny` / `column` / `mask` / `audit` / `ticket` / `dual-control` / `time` / `cedar` / `stream` / `passthrough` / `portal` / `watermark` / `cross-protocol` / `cross-protocol-stream` / `smoke-dual-listener` / `smoke-admin-auth`
+`smoke-security-deny` / `column` / `mask` / `audit` / `ticket` / `dual-control` / `time` / `cedar` / `cedar-reload` / `stream` / `passthrough` / `portal` / `watermark` / `cross-protocol` / `cross-protocol-stream` / `smoke-dual-listener` / `smoke-admin-auth`
 
 ### 1.3 代码落点（摘要）
 
@@ -73,6 +73,7 @@ data-ui        运维台 + SQL Portal + Audit
 | **F18** | 双人金库 | 票据需第二审批人确认后再生效 | **完成** |
 | **F27** | 时间维策略 | 仅工作时间可写等高危规则 | **完成** |
 | **F26** | Cedar PDP feature | 可选 feature，与 Local 对照 | **完成** |
+| **F26b** | Cedar 策略热更新 | epoch 快照 + keep-old；Admin reload | **完成** |
 | **B03** | OTel 自定义 attributes / 采样 | 可观测加深 | **完成** |
 | **B04** | 审计保留清理 / OpenDAL L2 | 冷归档 | **完成**（JSONL 轮转 + `audit-opendal`） |
 | **B05** | portal 导出按钮 / 流式 JSON | 门户体验 | **完成** |
@@ -81,16 +82,16 @@ data-ui        运维台 + SQL Portal + Audit
 
 ## 3. 当前下一动作（唯一焦点）
 
-**>>> 看板主线已清空；可选 Cedar 策略热更新 / 生产 hardening / 扩库协议 <<<**
+**>>> 可选：生产 hardening / 扩库协议 / OpenDAL S3 <<<**
 
-B04 完整：本地 JSONL 轮转/保留 + 可选 `audit-opendal`（OpenDAL `fs`/`memory` 归档 rotated 文件）。配置：`opendal_scheme` / `opendal_root` / `opendal_prefix`。
+F26b：进程内 `CedarPolicyStore`（epoch）；`POST /admin/security/cedar/reload` + admin reload 联动（`cache_epoch_reload`）；校验失败 keep-old；`smoke-security-cedar-reload`。
 
 ```bash
-cargo build -p data-proxy --bin proxy --features audit-opendal
-# security.audit.opendal_scheme = "fs"  # or "memory"
+cargo build -p data-proxy --bin proxy --features security-cedar
+curl -X POST http://127.0.0.1:8082/admin/security/cedar/reload
 ```
 
-主线 S0–S6 + A1–A4 + P1/P2（含 F26 Cedar、B03 OTel、B04 OpenDAL）已交付。  
+主线 S0–S6 + A1–A4 + P1/P2（含 Cedar 热更新）已交付。  
 
 ---
 

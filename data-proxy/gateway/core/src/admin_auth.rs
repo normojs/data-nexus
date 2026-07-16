@@ -374,6 +374,8 @@ pub fn required_permission(method: &str, path: &str) -> Option<AdminPermission> 
         ("GET", "/admin/services") => Some(AdminPermission::TopologyRead),
         ("GET", "/admin/endpoints") => Some(AdminPermission::TopologyRead),
         ("GET", "/admin/security-policies") => Some(AdminPermission::TopologyRead),
+        ("GET", "/admin/security/cedar") => Some(AdminPermission::TopologyRead),
+        ("POST", "/admin/security/cedar/reload") => Some(AdminPermission::PolicyWrite),
         ("GET", "/admin/audit/events") => Some(AdminPermission::RuntimeRead),
         ("GET", "/admin/audit/stats") => Some(AdminPermission::RuntimeRead),
         ("GET", "/admin/tickets") => Some(AdminPermission::RuntimeRead),

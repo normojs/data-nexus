@@ -43,7 +43,10 @@ pub use audit_pipeline::{
     AuditPipelineStats,
 };
 #[cfg(feature = "security-cedar")]
-pub use cedar_pdp::CedarEngine;
+pub use cedar_pdp::{
+    global_cedar_store, install_cedar_store, reload_global_cedar, CedarEngine, CedarPolicyStore,
+    CedarReloadInfo, CedarStatus,
+};
 pub use config::{
     AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
     PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,
