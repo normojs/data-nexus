@@ -29,6 +29,11 @@ queue_capacity = 65536
 overflow = "drop_new"
 sinks = ["tracing", "file"]
 file_path = "/tmp/data-nexus-audit-events.jsonl"
+# B04 retention: small max size forces rotate under heavy load; keep few files.
+max_file_bytes = 1048576
+retain_days = 7
+rotate_keep = 16
+archive_dir = "/tmp/data-nexus-audit-archive"
 
 # Deny SELECT (and other listed actions) against secret_* tables.
 [[security.rules]]

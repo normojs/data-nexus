@@ -74,22 +74,18 @@ data-ui        运维台 + SQL Portal + Audit
 | **F27** | 时间维策略 | 仅工作时间可写等高危规则 | **完成** |
 | **F26** | Cedar PDP feature | 可选 feature，与 Local 对照 | **完成** |
 | **B03** | OTel 自定义 attributes / 采样 | 可观测加深 | **完成** |
-| **B04** | 审计保留清理 / OpenDAL L2 | 冷归档 | 延后 |
+| **B04** | 审计保留清理 / OpenDAL L2 | 冷归档 | **完成（JSONL 轮转/保留；OpenDAL 后置）** |
 | **B05** | portal 导出按钮 / 流式 JSON | 门户体验 | **完成** |
 
 ---
 
 ## 3. 当前下一动作（唯一焦点）
 
-**>>> B04 审计保留清理 / OpenDAL L2 <<<**
+**>>> backlog 已基本清空；可选 OpenDAL 冷归档 / Cedar 策略热更新 / 生产 hardening <<<**
 
-B03 已完成：OTel command 指标增加低基数 `security_decision` / `security_rule_class` / `execute_path`；`security_denies` counter；`DATA_NEXUS_OTEL_ATTR_SECURITY`；采样 env 文档已有。
+B04 MVP：`security.audit.max_file_bytes` / `retain_days` / `rotate_keep` / `archive_dir`；worker 侧轮转与 prune；stats 暴露 `rotated`/`pruned`。OpenDAL 对象存储仍后置（可选 feature）。
 
-F26/B03 起 workspace 解析部分依赖要求 **rustc ≥1.88**（推荐 1.94.1）；Cedar smoke 已 pin。
-
-建议下一任务：
-
-1. **B04** — 审计保留清理 / OpenDAL L2  
+主线 S0–S6 + A1–A4 + P1/P2 增强（F14/F18/F26/F27/B01–B05）已交付。  
 
 ---
 

@@ -323,6 +323,18 @@ pub struct SecurityAuditConfig {
     pub sinks: Vec<String>,
     #[serde(default)]
     pub file_path: String,
+    /// Rotate active JSONL when size ≥ this many bytes (0 = never by size). B04.
+    #[serde(default)]
+    pub max_file_bytes: u64,
+    /// Delete rotated files older than this many days (0 = no age prune). B04.
+    #[serde(default = "default_retain_days")]
+    pub retain_days: u32,
+    /// Keep at most this many rotated siblings (0 = unlimited count). B04.
+    #[serde(default = "default_rotate_keep")]
+    pub rotate_keep: u32,
+    /// Directory to move/copy rotated files into (empty = same dir as file_path). B04.
+    #[serde(default)]
+    pub archive_dir: String,
 }
 
 fn default_queue_capacity() -> u32 {
@@ -337,6 +349,14 @@ fn default_audit_sinks() -> Vec<String> {
     vec!["tracing".into()]
 }
 
+fn default_retain_days() -> u32 {
+    7
+}
+
+fn default_rotate_keep() -> u32 {
+    32
+}
+
 impl Default for SecurityAuditConfig {
     fn default() -> Self {
         Self {
@@ -344,6 +364,10 @@ impl Default for SecurityAuditConfig {
             overflow: default_overflow(),
             sinks: default_audit_sinks(),
             file_path: String::new(),
+            max_file_bytes: 0,
+            retain_days: default_retain_days(),
+            rotate_keep: default_rotate_keep(),
+            archive_dir: String::new(),
         }
     }
 }

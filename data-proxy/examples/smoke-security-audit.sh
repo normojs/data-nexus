@@ -69,6 +69,9 @@ python3 - <<'PY'
 import json
 s=json.load(open("/tmp/dn-audit-stats.json"))
 assert s.get("accepted",0) >= 1, s
+# B04 fields present (defaults 0 when no rotate yet)
+assert "rotated" in s, s
+assert "pruned" in s, s
 print("stats ok", s)
 PY
 

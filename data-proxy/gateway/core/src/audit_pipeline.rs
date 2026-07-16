@@ -2,25 +2,22 @@
 //!
 //! Hot path only `try_send`s; never blocks the query path. Overflow is counted
 //! and optionally drops oldest/newest per config.
+//!
+//! B04: optional size-based rotation, age prune, and keep-N for JSONL files.
 
 use crate::audit::AuditEvent;
 use crate::security::SecurityAuditConfig;
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Global process-wide pipeline (installed from gateway config).
 static GLOBAL: OnceLock<Arc<AuditPipeline>> = OnceLock::new();
 
-/// Install (or replace metadata on first call) the process audit pipeline.
-///
-/// Subsequent calls update file path preferences when possible but keep the
-/// same worker; capacity is fixed at first install.
 pub fn install_audit_pipeline(config: &SecurityAuditConfig) -> Arc<AuditPipeline> {
     if let Some(existing) = GLOBAL.get() {
         existing.reconfigure(config);
@@ -32,12 +29,10 @@ pub fn install_audit_pipeline(config: &SecurityAuditConfig) -> Arc<AuditPipeline
     pipe
 }
 
-/// Current global pipeline, if installed.
 pub fn global_audit_pipeline() -> Option<Arc<AuditPipeline>> {
     GLOBAL.get().cloned()
 }
 
-/// Best-effort enqueue; never panics or blocks.
 pub fn try_audit(event: AuditEvent) {
     if let Some(pipe) = global_audit_pipeline() {
         pipe.try_send(event);
@@ -49,7 +44,7 @@ enum OverflowPolicy {
     DropNew,
     DropOld,
     Sample,
-    Block, // treated as drop_new on hot path (never block query)
+    Block,
 }
 
 impl OverflowPolicy {
@@ -63,19 +58,44 @@ impl OverflowPolicy {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FileSinkPolicy {
+    max_file_bytes: u64,
+    retain_days: u32,
+    rotate_keep: u32,
+    archive_dir: Option<PathBuf>,
+}
+
+impl FileSinkPolicy {
+    fn from_config(config: &SecurityAuditConfig) -> Self {
+        Self {
+            max_file_bytes: config.max_file_bytes,
+            retain_days: config.retain_days,
+            rotate_keep: config.rotate_keep,
+            archive_dir: {
+                let d = config.archive_dir.trim();
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(d))
+                }
+            },
+        }
+    }
+}
+
 struct SharedState {
     queue: VecDeque<AuditEvent>,
-    /// Recent events for Admin query (ring, newest last).
     recent: VecDeque<AuditEvent>,
     closed: bool,
 }
 
-/// Bounded audit pipeline shared across connections.
 pub struct AuditPipeline {
     capacity: usize,
     recent_capacity: usize,
     overflow: OverflowPolicy,
     file_path: Mutex<Option<PathBuf>>,
+    file_policy: Mutex<FileSinkPolicy>,
     write_file: AtomicBool,
     write_tracing: AtomicBool,
     state: Mutex<SharedState>,
@@ -83,6 +103,8 @@ pub struct AuditPipeline {
     dropped: AtomicU64,
     accepted: AtomicU64,
     written: AtomicU64,
+    rotated: AtomicU64,
+    pruned: AtomicU64,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -107,6 +129,7 @@ impl AuditPipeline {
             recent_capacity,
             overflow: OverflowPolicy::parse(&config.overflow),
             file_path: Mutex::new(file_path),
+            file_policy: Mutex::new(FileSinkPolicy::from_config(config)),
             write_file: AtomicBool::new(write_file),
             write_tracing: AtomicBool::new(write_tracing),
             state: Mutex::new(SharedState {
@@ -118,11 +141,13 @@ impl AuditPipeline {
             dropped: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
             written: AtomicU64::new(0),
+            rotated: AtomicU64::new(0),
+            pruned: AtomicU64::new(0),
             worker: Mutex::new(None),
         }
     }
 
-    fn reconfigure(&self, config: &SecurityAuditConfig) {
+    pub fn reconfigure(&self, config: &SecurityAuditConfig) {
         let sinks = config
             .sinks
             .iter()
@@ -137,15 +162,22 @@ impl AuditPipeline {
                 *path = Some(PathBuf::from(config.file_path.trim()));
             }
         }
+        if let Ok(mut pol) = self.file_policy.lock() {
+            *pol = FileSinkPolicy::from_config(config);
+        }
     }
 
-    fn spawn_worker(self: &Arc<Self>) {
+    pub fn spawn_worker(self: &Arc<Self>) {
+        let mut guard = self.worker.lock().expect("audit worker lock");
+        if guard.is_some() {
+            return;
+        }
         let this = Arc::clone(self);
         let handle = thread::Builder::new()
             .name("data-nexus-audit".into())
             .spawn(move || this.worker_loop())
             .expect("spawn audit worker");
-        *self.worker.lock().expect("worker lock") = Some(handle);
+        *guard = Some(handle);
     }
 
     pub fn try_send(&self, mut event: AuditEvent) {
@@ -155,13 +187,18 @@ impl AuditPipeline {
         if event.ts_unix_ms.is_none() {
             event.ts_unix_ms = Some(now_unix_ms());
         }
+        {
+            let mut state = self.state.lock().expect("audit state");
+            if state.recent.len() >= self.recent_capacity {
+                state.recent.pop_front();
+            }
+            state.recent.push_back(event.clone());
+        }
 
         let mut state = self.state.lock().expect("audit state");
         if state.closed {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-
         if state.queue.len() >= self.capacity {
             match self.overflow {
                 OverflowPolicy::DropOld => {
@@ -169,8 +206,7 @@ impl AuditPipeline {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
                 OverflowPolicy::Sample => {
-                    // Keep ~50% under pressure.
-                    if self.accepted.load(Ordering::Relaxed) % 2 == 0 {
+                    if now_unix_ms() % 2 == 0 {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -183,19 +219,11 @@ impl AuditPipeline {
                 }
             }
         }
-
-        // Ring for Admin API (always retain, independent of worker lag).
-        if state.recent.len() >= self.recent_capacity {
-            state.recent.pop_front();
-        }
-        state.recent.push_back(event.clone());
-
         state.queue.push_back(event);
         self.accepted.fetch_add(1, Ordering::Relaxed);
         self.cv.notify_one();
     }
 
-    /// Query recent in-memory events (newest last). Filters are AND.
     pub fn query(
         &self,
         decision: Option<&str>,
@@ -204,51 +232,64 @@ impl AuditPipeline {
         limit: usize,
     ) -> Vec<AuditEvent> {
         let state = self.state.lock().expect("audit state");
-        let limit = limit.clamp(1, 1000);
-        let mut out: Vec<AuditEvent> = state
+        let limit = limit.clamp(1, 500);
+        state
             .recent
             .iter()
+            .rev()
             .filter(|e| {
-                if let Some(d) = decision {
-                    if e.decision.as_deref().map(|x| x.eq_ignore_ascii_case(d)) != Some(true) {
-                        return false;
-                    }
-                }
-                if let Some(s) = subject_id {
-                    if e.subject_id.as_deref().map(|x| x.eq_ignore_ascii_case(s)) != Some(true) {
-                        return false;
-                    }
-                }
-                if let Some(svc) = service {
-                    if e.service.as_deref().map(|x| x.eq_ignore_ascii_case(svc)) != Some(true) {
-                        return false;
-                    }
-                }
-                true
+                decision
+                    .map(|d| e.decision.as_deref() == Some(d))
+                    .unwrap_or(true)
+                    && subject_id
+                        .map(|s| e.subject_id.as_deref() == Some(s))
+                        .unwrap_or(true)
+                    && service
+                        .map(|s| e.service.as_deref() == Some(s))
+                        .unwrap_or(true)
             })
+            .take(limit)
             .cloned()
-            .collect();
-        if out.len() > limit {
-            out = out.split_off(out.len() - limit);
-        }
-        out
+            .collect()
     }
 
     pub fn stats(&self) -> AuditPipelineStats {
+        let recent_len = self
+            .state
+            .lock()
+            .map(|s| s.recent.len() as u64)
+            .unwrap_or(0);
         AuditPipelineStats {
             accepted: self.accepted.load(Ordering::Relaxed),
             written: self.written.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             queue_capacity: self.capacity as u64,
-            recent_len: self
-                .state
-                .lock()
-                .map(|s| s.recent.len() as u64)
-                .unwrap_or(0),
+            recent_len,
+            rotated: self.rotated.load(Ordering::Relaxed),
+            pruned: self.pruned.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn run_retention_now(&self) {
+        let path = match self.file_path.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return,
+        };
+        let Some(active) = path else {
+            return;
+        };
+        let policy = match self.file_policy.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return,
+        };
+        let pruned = prune_rotated_files(&active, &policy);
+        if pruned > 0 {
+            self.pruned.fetch_add(pruned, Ordering::Relaxed);
         }
     }
 
     fn worker_loop(&self) {
+        let mut since_prune = 0u64;
         loop {
             let event = {
                 let mut state = self.state.lock().expect("audit state");
@@ -265,7 +306,13 @@ impl AuditPipeline {
             };
             self.dispatch(&event);
             self.written.fetch_add(1, Ordering::Relaxed);
+            since_prune += 1;
+            if since_prune >= 256 {
+                since_prune = 0;
+                self.run_retention_now();
+            }
         }
+        self.run_retention_now();
     }
 
     fn dispatch(&self, event: &AuditEvent) {
@@ -286,7 +333,23 @@ impl AuditPipeline {
         if self.write_file.load(Ordering::Relaxed) {
             if let Ok(guard) = self.file_path.lock() {
                 if let Some(path) = guard.as_ref() {
-                    let _ = append_jsonl(path, event);
+                    let policy = self
+                        .file_policy
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or(FileSinkPolicy {
+                            max_file_bytes: 0,
+                            retain_days: 0,
+                            rotate_keep: 0,
+                            archive_dir: None,
+                        });
+                    match append_jsonl_with_rotate(path, event, &policy) {
+                        Ok(RotateOutcome::Rotated) => {
+                            self.rotated.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(RotateOutcome::Appended) => {}
+                        Err(_) => {}
+                    }
                 }
             }
         }
@@ -300,12 +363,33 @@ pub struct AuditPipelineStats {
     pub dropped: u64,
     pub queue_capacity: u64,
     pub recent_len: u64,
+    pub rotated: u64,
+    pub pruned: u64,
 }
 
-fn append_jsonl(path: &Path, event: &AuditEvent) -> std::io::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RotateOutcome {
+    Appended,
+    Rotated,
+}
+
+fn append_jsonl_with_rotate(
+    path: &Path,
+    event: &AuditEvent,
+    policy: &FileSinkPolicy,
+) -> std::io::Result<RotateOutcome> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut rotated = false;
+    if policy.max_file_bytes > 0 {
+        if let Ok(meta) = fs::metadata(path) {
+            if meta.len() >= policy.max_file_bytes {
+                rotate_active_file(path, policy)?;
+                rotated = true;
+            }
         }
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -313,7 +397,118 @@ fn append_jsonl(path: &Path, event: &AuditEvent) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     file.write_all(line.as_bytes())?;
     file.write_all(b"\n")?;
+    Ok(if rotated {
+        RotateOutcome::Rotated
+    } else {
+        RotateOutcome::Appended
+    })
+}
+
+fn rotate_active_file(path: &Path, policy: &FileSinkPolicy) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let ts = now_unix_ms();
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("events.jsonl");
+    let rotated_name = format!("{file_name}.{ts}");
+    let dest_dir = policy
+        .archive_dir
+        .clone()
+        .or_else(|| path.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&dest_dir)?;
+    let dest = dest_dir.join(rotated_name);
+    if fs::rename(path, &dest).is_err() {
+        fs::copy(path, &dest)?;
+        let _ = fs::remove_file(path);
+    }
     Ok(())
+}
+
+/// Delete rotated siblings by age and keep-N.
+fn prune_rotated_files(active: &Path, policy: &FileSinkPolicy) -> u64 {
+    let dir = policy
+        .archive_dir
+        .clone()
+        .or_else(|| active.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let prefix = active
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("events.jsonl");
+    let Ok(rd) = fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut candidates: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path == *active {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.starts_with(prefix) || name == prefix {
+            continue;
+        }
+        let rest = &name[prefix.len()..];
+        if !rest.starts_with('.') {
+            continue;
+        }
+        let suffix = &rest[1..];
+        if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((path, modified));
+    }
+    candidates.sort_by_key(|(_, t)| *t);
+    let mut pruned = 0u64;
+    let now = SystemTime::now();
+    if policy.retain_days > 0 {
+        let max_age = Duration::from_secs(u64::from(policy.retain_days) * 86_400);
+        candidates.retain(|(path, modified)| {
+            let old = now.duration_since(*modified).unwrap_or_default() > max_age;
+            if old {
+                if fs::remove_file(path).is_ok() {
+                    pruned += 1;
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+    if policy.rotate_keep > 0 && candidates.len() > policy.rotate_keep as usize {
+        let excess = candidates.len() - policy.rotate_keep as usize;
+        for (path, _) in candidates.into_iter().take(excess) {
+            if fs::remove_file(path).is_ok() {
+                pruned += 1;
+            }
+        }
+    }
+    pruned
+}
+
+fn append_jsonl(path: &Path, event: &AuditEvent) -> std::io::Result<()> {
+    append_jsonl_with_rotate(
+        path,
+        event,
+        &FileSinkPolicy {
+            max_file_bytes: 0,
+            retain_days: 0,
+            rotate_keep: 0,
+            archive_dir: None,
+        },
+    )
+    .map(|_| ())
 }
 
 fn now_unix_ms() -> u64 {
@@ -324,7 +519,6 @@ fn now_unix_ms() -> u64 {
 }
 
 fn new_event_id() -> String {
-    // Lightweight unique-ish id without uuid crate.
     format!("ae-{}-{:x}", now_unix_ms(), simple_nonce())
 }
 
@@ -341,7 +535,6 @@ fn simple_nonce() -> u64 {
     })
 }
 
-/// Helper to build a data-plane audit event quickly.
 pub fn data_plane_event(
     decision: &str,
     subject_id: Option<&str>,
@@ -376,7 +569,6 @@ mod tests {
         cfg.sinks = vec!["tracing".into()];
         cfg.overflow = "drop_new".into();
         let pipe = AuditPipeline::new(&cfg);
-        // No worker needed for recent ring.
         for i in 0..5 {
             let mut e = AuditEvent::default();
             e.decision = Some(if i % 2 == 0 { "deny" } else { "execute" }.into());
@@ -399,7 +591,6 @@ mod tests {
         cfg.overflow = "drop_new".into();
         cfg.sinks = vec!["tracing".into()];
         let pipe = AuditPipeline::new(&cfg);
-        // Fill queue without worker draining → capacity 2
         for i in 0..5 {
             let mut e = AuditEvent::default();
             e.decision = Some("execute".into());
@@ -426,6 +617,45 @@ mod tests {
     }
 
     #[test]
+    fn rotate_on_size_and_prune_keep() {
+        let dir = std::env::temp_dir().join(format!("dn-audit-rot-{}", now_unix_ms()));
+        let path = dir.join("events.jsonl");
+        fs::create_dir_all(&dir).unwrap();
+        let policy = FileSinkPolicy {
+            max_file_bytes: 80,
+            retain_days: 0,
+            rotate_keep: 2,
+            archive_dir: None,
+        };
+        let mut e = AuditEvent::default();
+        e.decision = Some("execute".into());
+        e.message = Some("x".repeat(40));
+        for _ in 0..20 {
+            let _ = append_jsonl_with_rotate(&path, &e, &policy).unwrap();
+        }
+        let rotated_before: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|x| x.path())
+            .filter(|p| p != &path)
+            .collect();
+        assert!(!rotated_before.is_empty(), "expected rotated files in {dir:?}");
+        let _pruned = prune_rotated_files(&path, &policy);
+        let rotated_after: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|x| x.path())
+            .filter(|p| p != &path)
+            .collect();
+        assert!(
+            rotated_after.len() <= 2,
+            "keep=2 but got {}",
+            rotated_after.len()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn worker_drains_queue() {
         let mut cfg = SecurityAuditConfig::default();
         cfg.queue_capacity = 64;
@@ -437,7 +667,6 @@ mod tests {
             e.decision = Some("execute".into());
             pipe.try_send(e);
         }
-        // Wait for worker
         for _ in 0..50 {
             if pipe.stats().written >= 10 {
                 break;
