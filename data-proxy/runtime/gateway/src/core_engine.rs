@@ -295,19 +295,59 @@ impl CoreGatewayConnection {
                 }
             }
 
-            // S1: data-plane Local PDP (table/statement deny) before backend execute.
+            // S1/S2: data-plane Local PDP (table/statement/column) before backend execute.
+            let mut command = command;
             if let Some(pdp) = &self.security {
                 let subject = gateway_core::Subject::from_protocol_user(
                     self.session.user.as_deref(),
                     self.session.database.as_deref(),
                 );
-                match pdp.authorize_command(
+                let objects = match &command {
+                    GatewayCommand::Query { sql } | GatewayCommand::Prepare { sql } => {
+                        let set = crate::object_extract::extract_object_set(
+                            sql,
+                            self.frontend.protocol().as_str(),
+                        );
+                        if set.parse_failed {
+                            tracing::warn!(
+                                target: "data_nexus::security",
+                                listener = %self.listener_name,
+                                service = %self.service_name,
+                                subject_id = %subject.subject_id,
+                                heuristic = set.heuristic,
+                                "security object extraction failed or partial"
+                            );
+                        }
+                        Some(set)
+                    }
+                    _ => None,
+                };
+                match pdp.authorize_command_with_objects(
                     &subject,
                     &self.service_name,
                     &command,
                     self.frontend_dialect.as_ref(),
+                    objects.as_ref(),
                 ) {
                     gateway_core::SecurityDecision::Allow => {}
+                    gateway_core::SecurityDecision::AllowRewrite { sql } => {
+                        info!(
+                            target: gateway_core::AUDIT_TARGET,
+                            action = gateway_core::AuditAction::Query.as_str(),
+                            listener = %self.listener_name,
+                            service = %self.service_name,
+                            subject_id = %subject.subject_id,
+                            decision = gateway_core::AuditDecision::Allow.as_str(),
+                            "security policy rewrote SQL (column ACL)"
+                        );
+                        match &mut command {
+                            GatewayCommand::Query { sql: original }
+                            | GatewayCommand::Prepare { sql: original } => {
+                                *original = sql;
+                            }
+                            _ => {}
+                        }
+                    }
                     gateway_core::SecurityDecision::Deny { rule, message } => {
                         info!(
                             target: gateway_core::AUDIT_TARGET,
@@ -1200,6 +1240,7 @@ mod tests {
             effect: "deny".into(),
             actions: vec!["select".into()],
             tables: vec!["secret_*".into()],
+            columns: vec![],
             subjects: vec![],
         });
         let pdp = LocalPdp::from_config(&security).expect("enabled pdp");
@@ -1240,6 +1281,7 @@ mod tests {
             effect: "deny".into(),
             actions: vec!["ddl".into()],
             tables: vec![],
+            columns: vec![],
             subjects: vec![],
         });
         let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();

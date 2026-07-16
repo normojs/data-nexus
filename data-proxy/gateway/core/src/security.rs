@@ -16,6 +16,9 @@ pub struct SecurityPolicyConfig {
     /// When true, parse/policy failures deny access (safer). Default true.
     #[serde(default = "default_true")]
     pub fail_closed: bool,
+    /// How `SELECT *` is treated when column ACL rules apply: `deny` | `allow`.
+    #[serde(default = "default_star_policy")]
+    pub star_policy: String,
     /// Default audit verbosity for data-plane commands: L0 | L1 | L2.
     #[serde(default = "default_audit_level")]
     pub default_audit_level: String,
@@ -27,9 +30,13 @@ pub struct SecurityPolicyConfig {
     pub streaming: SecurityStreamingConfig,
     #[serde(default)]
     pub audit: SecurityAuditConfig,
-    /// Placeholder rule list for S1+ (ignored while `enabled` is false).
+    /// Rule list for Local PDP (ignored while `enabled` is false).
     #[serde(default)]
     pub rules: Vec<SecurityRuleConfig>,
+}
+
+fn default_star_policy() -> String {
+    "deny".into()
 }
 
 fn default_true() -> bool {
@@ -45,6 +52,7 @@ impl Default for SecurityPolicyConfig {
         Self {
             enabled: false,
             fail_closed: true,
+            star_policy: default_star_policy(),
             default_audit_level: default_audit_level(),
             subject: SecuritySubjectConfig::default(),
             pdp: SecurityPdpConfig::default(),
@@ -57,6 +65,15 @@ impl Default for SecurityPolicyConfig {
 
 impl SecurityPolicyConfig {
     pub fn validate(&self) -> GatewayResult<()> {
+        match self.star_policy.to_ascii_lowercase().as_str() {
+            "deny" | "allow" => {}
+            other => {
+                return Err(GatewayError::Configuration(format!(
+                    "security.star_policy must be deny or allow, got '{other}'"
+                )));
+            }
+        }
+
         match self.default_audit_level.as_str() {
             "L0" | "L1" | "L2" | "l0" | "l1" | "l2" => {}
             other => {
@@ -223,7 +240,7 @@ impl Default for SecurityAuditConfig {
     }
 }
 
-/// Placeholder rule entry consumed by S1+ Local PDP.
+/// Rule entry consumed by Local PDP (S1 table/statement, S2 columns).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityRuleConfig {
     pub name: String,
@@ -233,6 +250,9 @@ pub struct SecurityRuleConfig {
     pub actions: Vec<String>,
     #[serde(default)]
     pub tables: Vec<String>,
+    /// Column globs (bare or `table.col`). Empty = table-level only.
+    #[serde(default)]
+    pub columns: Vec<String>,
     #[serde(default)]
     pub subjects: Vec<String>,
 }
@@ -275,6 +295,7 @@ mod tests {
             effect: "deny".into(),
             actions: vec![],
             tables: vec![],
+            columns: vec![],
             subjects: vec![],
         });
         assert!(cfg.validate().is_err());
@@ -289,8 +310,16 @@ mod tests {
             effect: "deny".into(),
             actions: vec!["select".into()],
             tables: vec!["*.*.secret_*".into()],
+            columns: vec![],
             subjects: vec![],
         });
         assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_bad_star_policy() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.star_policy = "expand".into();
+        assert!(cfg.validate().is_err());
     }
 }

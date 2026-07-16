@@ -17,6 +17,7 @@ pub mod core_engine;
 pub mod dialect;
 pub mod frontend;
 pub mod gateway;
+pub mod object_extract;
 #[cfg(feature = "otel")]
 pub mod otel_metrics;
 #[cfg(not(feature = "otel"))]

@@ -5,3 +5,4 @@ target
 .cache
 .DS_Store
 *.p12
+.cargo-target/

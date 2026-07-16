@@ -10,6 +10,7 @@ mod config;
 mod dialect;
 mod error;
 mod model;
+mod object_set;
 mod pdp;
 mod plugin;
 mod route;
@@ -30,6 +31,7 @@ pub use config::{
     AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
     PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,
 };
+pub use object_set::{ColumnAclOutcome, ObjectAccess, ObjectSet, StarPolicy};
 pub use pdp::{
     action_from_command, extract_table_names, sql_from_command, AccessRequest, LocalPdp,
     SecurityDecision, StatementAction, Subject,

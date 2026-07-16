@@ -21,7 +21,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 | 版本 | 一句话 | 状态 |
 |------|--------|:----:|
 | **v1** | 客户端 ↔ 网关 ↔ MySQL/PG；路由/池/跨协议/Admin | **完成** |
-| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **进行中（S0–S1 完成）** |
+| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **进行中（S0–S2 完成）** |
 
 **原则**
 
@@ -48,7 +48,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 
 - [x] **S0** — 边界 + 审计模型 + security 配置空壳
 - [x] **S1** — Subject + 语句/表级 Deny MVP
-- [ ] **S2** — AST 对象抽取 + 表/列 ACL
+- [x] **S2** — AST 对象抽取 + 表/列 ACL
 - [ ] **S3** — 流式结果钩子 + 动态脱敏 + 行级雏形
 - [ ] **S4** — 持久化审计 + 查询 API/UI
 - [ ] **S5** — 审批/金库 + 通道高危门闩
@@ -114,9 +114,9 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 - [x] **F06** 表级 Allow/Deny — 权限 — S1 — P0
 - [x] **F07** Local PDP + Decision — 策略引擎 — S1 — P0
 - [x] **F28** 策略热更（失败 keep-old） — 运维 — S1（security 变更重建 listener）
-- [ ] **F08** AST → ObjectSet（表/列/操作） — 细粒度前置 — S2 — P0
-- [ ] **F09** 列级 ACL（投影剔除/拒绝） — 字段权限 — S2 — P0
-- [ ] **F10** SQL 改写义务（LIMIT/列/行谓词） — 权限执行 — S2–S3 — P0
+- [x] **F08** AST → ObjectSet（表/列/操作） — 细粒度前置 — S2 — P0
+- [x] **F09** 列级 ACL（投影剔除/拒绝） — 字段权限 — S2 — P0
+- [x] **F10** SQL 改写义务（列剔除；LIMIT/行谓词 → S3） — 权限执行 — S2–S3 — P0
 - [ ] **F11** 结果流钩子 + 动态脱敏 Mask — 数据脱敏 — S3 — P0
 - [ ] **F12** 行级过滤（改写优先，结果回退） — 行级管控 — S3 — P0
 - [ ] **F13** 敏感列标签 / 规则识别 MVP — 敏感识别 — S3 — P1
@@ -181,7 +181,7 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 ---
 
-### S2 — 对象抽取 + 表/列 ACL
+### S2 — 对象抽取 + 表/列 ACL ✅
 
 | 项 | 内容 |
 |----|------|
@@ -190,13 +190,17 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 **功能 / 任务**
 
-- [ ] MySQL/PG AST visitor → `ObjectAccess[]` / `ObjectSet`
-- [ ] 列级 allow/deny；`SELECT *` 策略（拒绝或依赖 schema 展开，可分期）
-- [ ] SQL 改写：剔除无权限列（优先）/ 无法改写则 Deny
-- [ ] 多表 JOIN / 别名 / schema 限定单测矩阵
-- [ ] 解析失败路径：指标 + fail_closed 行为
-- [ ] Admin：策略 CRUD 雏形或文件加载（二选一，先文件可接受）
-- [ ] （可选 P2）Cedar feature 开关，与 Local 决策对照测试
+- [x] MySQL/PG AST visitor → `ObjectAccess[]` / `ObjectSet`（`runtime/gateway/src/object_extract.rs`）
+- [x] 列级 allow/deny；`SELECT *` 策略 `star_policy=deny|allow`（默认 deny，无 schema 展开）
+- [x] SQL 改写：SELECT 投影剔除无权限列（启发式）；无法改写则 Deny
+- [x] 多表 JOIN / 别名 / schema 限定单测矩阵（object_extract + pdp）
+- [x] 解析失败路径：warn 日志 + `fail_closed` Deny
+- [x] Admin：文件加载策略 + `GET /admin/security-policies` 暴露 columns/star_policy
+- [ ] （可选 P2）Cedar feature 开关，与 Local 决策对照测试 — **延后**
+
+**代码**：`gateway/core/src/object_set.rs`、`pdp.rs`、`security.rs`；`runtime/gateway/src/object_extract.rs`、`core_engine.rs`；`examples/smoke-security-column.sh`、`security-column-gateway-config.toml`
+
+**不做**：schema 展开 `SELECT *`、行谓词、脱敏、Cedar、Admin 策略 CRUD
 
 ---
 
@@ -349,12 +353,14 @@ data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 
 ## 9. 当前下一动作（唯一焦点）
 
-**>>> 开始 S2 <<<**
+**>>> 开始 S3（可并行 A1） <<<**
 
-- [ ] MySQL/PG AST visitor → `ObjectSet` / `ObjectAccess[]`
-- [ ] 列级 allow/deny + `SELECT *` 策略
-- [ ] SQL 改写剔除无权限列（无法改写则 Deny）
-- [ ] 解析失败路径：指标 + fail_closed
-- [ ] 单测矩阵：JOIN / 别名 / schema
+- [ ] Decision → `Obligations`（mask / row_filter / max_rows / audit_level）
+- [ ] 结果钩子：物化路径 MVP → 后续 SecureStream（依赖 A1/A2）
+- [ ] Mask 算法：`nullify` / `partial` / `hash` / `replace` / `keep_prefix`
+- [ ] 行级：SQL 谓词注入优先；不能改写时结果过滤
+- [ ] `smoke-security-mask.sh`
 
-S0–S1 已完成：配置壳、审计字段、Local PDP 表/语句 Deny、Admin security-policies、smoke-security-deny。
+S0–S2 已完成：配置壳、审计字段、Local PDP 表/语句/列 ACL、AST ObjectSet、列改写、Admin security-policies、smoke-security-deny / smoke-security-column。
+
+**建议并行**：A1 Backend 窗口化读取（S3 大数据脱敏前置）。

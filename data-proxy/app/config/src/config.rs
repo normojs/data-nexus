@@ -442,6 +442,7 @@ log_level = "INFO"
 [security]
 enabled = false
 fail_closed = true
+star_policy = "deny"
 default_audit_level = "L0"
 [security.pdp]
 backend = "local"
@@ -452,6 +453,7 @@ name = "deny-secret"
 effect = "deny"
 actions = ["select"]
 tables = ["*.*.secret_*"]
+columns = ["salary"]
 [[listeners]]
 name = "l1"
 listen_addr = "0.0.0.0:1"
@@ -471,8 +473,29 @@ weight = 1
         let config = GatewayConfigDocument::from_toml(toml).unwrap();
         assert!(!config.gateway.security.enabled);
         assert_eq!(config.gateway.security.streaming.window_rows, 64);
+        assert_eq!(config.gateway.security.star_policy, "deny");
         assert_eq!(config.gateway.security.rules.len(), 1);
         assert_eq!(config.gateway.security.rules[0].name, "deny-secret");
+        assert_eq!(
+            config.gateway.security.rules[0].columns,
+            vec!["salary".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_security_column_example_config() {
+        let config = GatewayConfigDocument::from_toml(include_str!(
+            "../../../examples/security-column-gateway-config.toml"
+        ))
+        .unwrap();
+        assert!(config.gateway.security.enabled);
+        assert_eq!(config.gateway.security.star_policy, "deny");
+        assert!(config
+            .gateway
+            .security
+            .rules
+            .iter()
+            .any(|r| r.name == "deny-employee-pii" && r.columns.contains(&"salary".into())));
     }
 
     #[test]

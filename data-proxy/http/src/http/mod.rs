@@ -474,6 +474,7 @@ struct AdminReplaceRoutePolicyResponse {
 struct AdminSecurityPoliciesResponse {
     enabled: bool,
     fail_closed: bool,
+    star_policy: String,
     default_audit_level: String,
     pdp_backend: String,
     rule_count: usize,
@@ -486,6 +487,7 @@ struct AdminSecurityRuleSummary {
     effect: String,
     actions: Vec<String>,
     tables: Vec<String>,
+    columns: Vec<String>,
     subjects: Vec<String>,
 }
 
@@ -833,6 +835,7 @@ impl AxumServer {
                     json_response(&AdminSecurityPoliciesResponse {
                         enabled: security.enabled,
                         fail_closed: security.fail_closed,
+                        star_policy: security.star_policy.clone(),
                         default_audit_level: security.default_audit_level.clone(),
                         pdp_backend: security.pdp.backend.clone(),
                         rule_count: security.rules.len(),
@@ -844,6 +847,7 @@ impl AxumServer {
                                 effect: rule.effect.clone(),
                                 actions: rule.actions.clone(),
                                 tables: rule.tables.clone(),
+                                columns: rule.columns.clone(),
                                 subjects: rule.subjects.clone(),
                             })
                             .collect(),
