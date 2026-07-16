@@ -1,102 +1,108 @@
 # Data Nexus 后续开发计划
 
-详细架构见：`docs/data-nexus-protocol-gateway-plan.md`
+详细架构见：`docs/data-nexus-protocol-gateway-plan.md`  
+数据安全升级见：`docs/data-security-roadmap.md`
 
 ## 产品定位
 
-Data Nexus = **数据库协议中转站**（不是单协议 MySQL proxy）。
+Data Nexus = **数据库协议中转站** + 规划中的 **数据访问安全能力**（PEP）。
 
-- 前端协议、后端协议、SQL 方言、路由、治理插件解耦
-- Phase A/B：同协议中转；Phase C：治理协议无关；Phase D：受控跨协议
-- 管理面轻量鉴权；**不做**数据面库表 RBAC（对标防水坝/SQLDev）
+- L0：前端/后端协议、方言、路由、治理、观测（M0–M10 已完成）
+- L1：数据面身份、表/列/行授权、脱敏、审批、通道管控（S0–S6，见路线图）
+- 管理面鉴权（Admin RBAC）与数据面授权 **分离**
+- 对标参考：美创数据防水坝、数安 SQLDev（竞争 + 差异化：协议原生 PEP）
 
 ---
 
 ## 现状快照（2026-07）
 
-### 已完成
+### 已完成（L0 + 管理面）
 
-- M0–M10：同/跨协议 E2E、方言 AST、Admin API、data-ui、OTel、管理面鉴权
-- Admin 鉴权：`jwt_hmac` / `jwt_jwks`、break-glass 换票、UI Bearer、`/admin/me`
-- 文档：`docs/admin-rbac-design.md`、`docs/admin-auth-password.md`、`examples/OBSERVABILITY.md`
+- 同/跨协议 E2E、方言 AST、Admin API、data-ui、OTel
+- Admin：`jwt_hmac` / `jwt_jwks`、break-glass、UI Bearer、`smoke-admin-auth.sh`
 
-### 开放缺口（可选）
+### 数据安全（L1）— 按路线图推进
 
-1. OTel：span 自定义 attributes 与按 service 采样覆盖  
-2. Admin 写操作 audit 带 `sub` / role  
-3. data-ui 403 友好页  
+| 阶段 | 主题 | 状态 |
+|------|------|------|
+| S0 | 边界修订 + 审计模型 + security 配置空壳 | 待办 |
+| S1 | Subject + 语句/表级 Deny MVP | 待办 |
+| S2 | AST 对象抽取 + 表/列 ACL | 待办 |
+| S3 | ResultSet 钩子 + 动态脱敏（+ 行/水印雏形） | 待办 |
+| S4 | 持久化审计 + 查询 API/UI | 待办 |
+| S5 | 审批/金库 + 通道高危门闩 | 待办 |
+| S6 | 门户/环境/Vault/导出运营 | 待办 |
 
-### 明确不做
+### 开放缺口（L0 运维增强，可选）
 
-- 数据面库表/列 RBAC、审批工单、脱敏中心  
+1. OTel span 自定义 attributes 与按 service 采样  
+2. data-ui 403 友好页  
+
+### 早期非目标（S0–S2）
+
+- 一次做齐防水坝全家桶  
 - 任意方言全量互转  
-- 默认构建硬依赖 OTel SDK  
+- Admin JWT 直接当数据面身份  
+- 默认 fail-open 且无指标  
 
 ---
 
 ## 路线总览
 
 ```text
-M0–M4  核心网关 + 跨协议 + 方言/可观测   ✓
-M5–M8  Admin / Nuxt / OTel 基础          ✓
-M9     生产打包 + SSO + 采样/业务指标    ✓
-M10    管理面鉴权（轻量 RBAC）           ✓
+M0–M10  协议网关 + 管理面鉴权 + UI + 观测     ✓
+S0–S6   数据安全（对标防水坝/SQLDev 的升级）  规划中
 ```
 
 ---
 
-## 验收跑法
+## 验收跑法（L0）
 
 | 场景 | 命令 |
 |------|------|
 | 同协议双 listener | `./data-proxy/examples/smoke-dual-listener.sh` |
 | MySQL → PG | `./data-proxy/examples/smoke-cross-protocol.sh` |
 | PG → MySQL | `./data-proxy/examples/smoke-cross-protocol-pg-to-mysql.sh` |
-| **Admin 鉴权** | `./data-proxy/examples/smoke-admin-auth.sh` |
-| 嵌入式 Admin | `http://127.0.0.1:8082/admin` |
-| Nuxt dev | `cd data-ui && pnpm dev` |
-| Nuxt 生产镜像 | `cd data-ui && docker build -t data-nexus-ui .` |
-| OTel | `--features otel` + `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| Admin 鉴权 | `./data-proxy/examples/smoke-admin-auth.sh` |
+| Nuxt / Docker UI | 见 `data-ui/README.md` |
 
 ---
 
 ## M10：管理面鉴权（完成）
 
-设计：`docs/admin-rbac-design.md`（边界：只管 Admin API，不管库表列）。
-
-- [x] `AdminAuthConfig` / roles / permissions / 路由表  
-- [x] `jwt_hmac` + claim 映射  
-- [x] `jwt_jwks` + JWKS 缓存 + RS256  
-- [x] Admin 路由鉴权；`enabled=false` 兼容  
-- [x] `GET /admin/me`、`GET /admin/auth/config`  
-- [x] `POST /admin/auth/login` break-glass  
-- [x] data-ui Bearer + Settings 按 permission 裁剪  
-- [x] 密码配置统一文档  
-- [x] E2E smoke：`examples/smoke-admin-auth.sh` + `admin-auth-gateway-config.toml`  
+- [x] HMAC / JWKS、break-glass、UI Bearer、`/admin/me`  
+- [x] `smoke-admin-auth.sh`  
+- 文档：`docs/admin-rbac-design.md`、`docs/admin-auth-password.md`  
 
 ---
 
-## M9：生产打包 / SSO / OTel（完成）
+## S0：数据安全启动（下一工程里程碑）
 
-- data-ui Docker/nginx、OIDC PKCE、OTel traces/metrics/logs + 采样 + 业务指标  
+详见 `docs/data-security-roadmap.md` §6–§7。
+
+- [ ] `todo` / 路线图边界与团队对齐  
+- [ ] `SecurityPolicyConfig` 空壳 + validate（default off）  
+- [ ] 统一 `data_nexus::audit` 字段 schema  
+- [ ] Admin 写操作 audit 带 `sub`  
+- [ ] 现有 smoke 在 default off 下全绿  
 
 ---
 
 ## 模块边界
 
 ```text
-gateway/core     协议无关类型 + AdminAuth 模型
-runtime/gateway  编排 + dialect + spans + 可选 OTel 业务 metrics
-cmd/pisa         进程入口、OTLP exporter + 采样
-http             Admin API + 鉴权 + /admin HTML + CORS
-data-ui          Nuxt SPA（密码换票 / OIDC / Docker 生产）
+gateway/core     协议无关类型 + AdminAuth +（规划）Security 类型
+runtime/gateway  PEP：编排 + dialect + 策略执行 + 结果改写
+policy / workflow（规划）  PDP / 工单（可进程内后拆分）
+http             Admin API（管理面）
+data-ui          运维台 → 逐步扩展策略/审计/工单
 ```
 
 ---
 
 ## 完成定义
 
-1. 示例 config 或集成 / smoke 测试  
+1. 示例 config 或 smoke  
 2. 相关 `cargo test` / `cargo check` 通过  
-3. 无新主路径 `unwrap()` / 字符串协议分支  
-4. 更新本文件  
+3. 无新主路径 panic；数据安全 default off 兼容  
+4. 更新本文件与 `docs/data-security-roadmap.md`  
