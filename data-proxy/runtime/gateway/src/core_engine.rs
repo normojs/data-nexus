@@ -51,6 +51,8 @@ pub struct CoreGatewayConnection {
     translation_policy: Option<TranslationPolicyConfig>,
     /// Frontend dialect used for translation checks (SQL arrives as client dialect).
     frontend_dialect: Arc<dyn DialectParser>,
+    /// Data-plane Local PDP when `security.enabled` (S1+).
+    security: Option<gateway_core::LocalPdp>,
     metrics: MySQLServerMetricsCollector,
 }
 
@@ -71,6 +73,7 @@ impl CoreGatewayConnection {
             plugins: None,
             translation_policy: None,
             frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
+            security: None,
             metrics: MySQLServerMetricsCollector,
         }
     }
@@ -83,6 +86,7 @@ impl CoreGatewayConnection {
         service_name: String,
         route_policy: CoreRoutePolicy,
         translation_policy: Option<TranslationPolicyConfig>,
+        security: Option<gateway_core::LocalPdp>,
     ) -> Self {
         let frontend_protocol = frontend.protocol();
         Self {
@@ -95,12 +99,18 @@ impl CoreGatewayConnection {
             plugins: None,
             translation_policy,
             frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
+            security,
             metrics: MySQLServerMetricsCollector,
         }
     }
 
     pub fn with_plugins(mut self, plugins: PluginPhase) -> Self {
         self.plugins = Some(plugins);
+        self
+    }
+
+    pub fn with_security(mut self, security: Option<gateway_core::LocalPdp>) -> Self {
+        self.security = security;
         self
     }
 
@@ -280,6 +290,64 @@ impl CoreGatewayConnection {
                             started_at,
                         );
                         finish_command_metrics(&self.metrics, &labels, started_at);
+                        continue;
+                    }
+                }
+            }
+
+            // S1: data-plane Local PDP (table/statement deny) before backend execute.
+            if let Some(pdp) = &self.security {
+                let subject = gateway_core::Subject::from_protocol_user(
+                    self.session.user.as_deref(),
+                    self.session.database.as_deref(),
+                );
+                match pdp.authorize_command(
+                    &subject,
+                    &self.service_name,
+                    &command,
+                    self.frontend_dialect.as_ref(),
+                ) {
+                    gateway_core::SecurityDecision::Allow => {}
+                    gateway_core::SecurityDecision::Deny { rule, message } => {
+                        info!(
+                            target: gateway_core::AUDIT_TARGET,
+                            action = gateway_core::AuditAction::Query.as_str(),
+                            listener = %self.listener_name,
+                            service = %self.service_name,
+                            frontend_protocol = %protocol_metric_name(&self.frontend.protocol()),
+                            backend_protocol = %protocol_metric_name(&self.backend.protocol()),
+                            command_type = %command_type,
+                            endpoint = %label_owned[5],
+                            subject_id = %subject.subject_id,
+                            db_user = ?self.session.user,
+                            database = ?self.session.database,
+                            decision = gateway_core::AuditDecision::Deny.as_str(),
+                            rule = %rule,
+                            message = %message,
+                            "gateway command denied by security policy"
+                        );
+                        let response = GatewayResponse::Error {
+                            code: "security_deny".into(),
+                            message,
+                        };
+                        command_span.record("outcome", "security_deny");
+                        packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        record_otel_command(
+                            &self.listener_name,
+                            &self.service_name,
+                            labels[2],
+                            labels[3],
+                            command_type,
+                            labels[5],
+                            "security_deny",
+                            started_at,
+                        );
+                        finish_command_metrics(&self.metrics, &labels, started_at);
+                        if let (Some(plugins), Some(idx)) =
+                            (self.plugins.as_mut(), concurrency_rule_idx)
+                        {
+                            plugins.release_concurrency(idx);
+                        }
                         continue;
                     }
                 }
@@ -490,6 +558,8 @@ pub struct CoreGatewayListenerPlan {
     auth_user: Option<(String, String)>,
     /// Enabled cross-protocol translation policy, if any.
     translation_policy: Option<TranslationPolicyConfig>,
+    /// Shared data-plane security PDP (from `GatewayConfig.security`).
+    security: Option<gateway_core::LocalPdp>,
 }
 
 impl PartialEq for CoreGatewayListenerPlan {
@@ -559,6 +629,7 @@ impl CoreGatewayListenerPlan {
         let auth_user = resolve_auth_user(config, listener.auth_policy.as_deref())?;
         let translation_policy =
             resolve_translation_policy(config, listener, service)?;
+        let security = gateway_core::LocalPdp::from_config(&config.security);
 
         Ok(Self {
             listener: listener.clone(),
@@ -569,6 +640,7 @@ impl CoreGatewayListenerPlan {
             plugin_config,
             auth_user,
             translation_policy,
+            security,
         })
     }
 
@@ -615,6 +687,7 @@ impl CoreGatewayListenerPlan {
             self.service.name.clone(),
             self.route_policy.clone(),
             self.translation_policy.clone(),
+            self.security.clone(),
         );
         if let Some(plugin_config) = &self.plugin_config {
             connection = connection.with_plugins(PluginPhase::new(plugin_config.clone()));
@@ -1114,6 +1187,64 @@ mod tests {
         let packets = connection.handle_frame(&frame).await.unwrap();
         assert!(!packets.is_empty());
         assert_eq!(packets[0].first(), Some(&0xff));
+    }
+
+    #[tokio::test]
+    async fn security_deny_returns_protocol_error_without_backend_execute() {
+        use gateway_core::{LocalPdp, SecurityPolicyConfig, SecurityRuleConfig};
+
+        let mut security = SecurityPolicyConfig::default();
+        security.enabled = true;
+        security.rules.push(SecurityRuleConfig {
+            name: "deny-secret".into(),
+            effect: "deny".into(),
+            actions: vec!["select".into()],
+            tables: vec!["secret_*".into()],
+            subjects: vec![],
+        });
+        let pdp = LocalPdp::from_config(&security).expect("enabled pdp");
+
+        let mut connection = CoreGatewayConnection::new(
+            Box::new(MySqlFrontendProtocol::new(
+                "app".into(),
+                "secret".into(),
+                "test".into(),
+                "8.0".into(),
+            )),
+            Arc::new(StaticBackendConnector {
+                protocol: ProtocolKind::MySql,
+                expected_command: GatewayCommand::Query { sql: "should not run".into() },
+                response: GatewayResponse::Pong,
+            }),
+            SessionState {
+                user: Some("app".into()),
+                database: Some("orders".into()),
+                ..SessionState::default()
+            },
+        )
+        .with_security(Some(pdp));
+
+        let mut frame = vec![COM_QUERY];
+        frame.extend_from_slice(b"SELECT * FROM secret_tokens");
+        let packets = connection.handle_frame(&frame).await.unwrap();
+        assert!(!packets.is_empty());
+        assert_eq!(packets[0].first(), Some(&0xff));
+    }
+
+    #[test]
+    fn security_enabled_plan_attaches_pdp() {
+        let mut config = mysql_config();
+        config.security.enabled = true;
+        config.security.rules.push(gateway_core::SecurityRuleConfig {
+            name: "deny-ddl".into(),
+            effect: "deny".into(),
+            actions: vec!["ddl".into()],
+            tables: vec![],
+            subjects: vec![],
+        });
+        let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
+        let connection = plan.build_connection("mysql-listener").unwrap();
+        assert!(connection.security.is_some());
     }
 
     fn postgresql_connection(response: GatewayResponse) -> CoreGatewayConnection {

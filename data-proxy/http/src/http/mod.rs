@@ -470,10 +470,31 @@ struct AdminReplaceRoutePolicyResponse {
     kind: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AdminSecurityPoliciesResponse {
+    enabled: bool,
+    fail_closed: bool,
+    default_audit_level: String,
+    pdp_backend: String,
+    rule_count: usize,
+    rules: Vec<AdminSecurityRuleSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminSecurityRuleSummary {
+    name: String,
+    effect: String,
+    actions: Vec<String>,
+    tables: Vec<String>,
+    subjects: Vec<String>,
+}
+
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
 struct GatewayConfigDiff {
     admin_changed: bool,
     version_changed: bool,
+    /// Data-plane security shell / rules changed (S1+ forces listener rebuild).
+    security_changed: bool,
     listeners: NamedSectionDiff,
     services: NamedSectionDiff,
     endpoints: NamedSectionDiff,
@@ -484,15 +505,31 @@ struct GatewayConfigDiff {
 
 impl GatewayConfigDiff {
     fn between(current: &GatewayConfigDocument, next: &GatewayConfigDocument) -> Self {
+        let security_changed = current.gateway.security != next.gateway.security;
+        let mut listeners = diff_named_section(
+            &current.gateway.listeners,
+            &next.gateway.listeners,
+            |item| item.name.as_str(),
+        );
+        // Security PDP is bound per connection at listener build time; when rules
+        // change, rebuild all listeners so new PDP snapshot is applied.
+        if security_changed {
+            for listener in &next.gateway.listeners {
+                let name = listener.name.clone();
+                if !listeners.added.contains(&name)
+                    && !listeners.removed.contains(&name)
+                    && !listeners.changed.contains(&name)
+                {
+                    listeners.changed.push(name);
+                }
+            }
+        }
         Self {
             admin_changed: serde_json::to_value(&current.admin).ok()
                 != serde_json::to_value(&next.admin).ok(),
             version_changed: current.version != next.version,
-            listeners: diff_named_section(
-                &current.gateway.listeners,
-                &next.gateway.listeners,
-                |item| item.name.as_str(),
-            ),
+            security_changed,
+            listeners,
             services: diff_named_section(
                 &current.gateway.services,
                 &next.gateway.services,
@@ -524,6 +561,7 @@ impl GatewayConfigDiff {
     fn has_changes(&self) -> bool {
         self.admin_changed
             || self.version_changed
+            || self.security_changed
             || self.listeners.has_changes()
             || self.services.has_changes()
             || self.endpoints.has_changes()
@@ -610,6 +648,7 @@ impl AxumServer {
             .route("/admin/route-policies/:name", put(Self::admin_replace_route_policy))
             .route("/admin/services", get(Self::admin_services))
             .route("/admin/endpoints", get(Self::admin_endpoints))
+            .route("/admin/security-policies", get(Self::admin_security_policies))
             .route("/admin/pools", get(Self::admin_pools))
             .route("/admin/pools/refresh", post(Self::admin_refresh_pools))
             .route("/admin/pools/:name/refresh", post(Self::admin_refresh_pool))
@@ -774,6 +813,42 @@ impl AxumServer {
         match &state.gateway_config {
             Some(config) => match gateway_config_snapshot(config) {
                 Ok(config) => json_response(&config.gateway.endpoints),
+                Err(response) => response,
+            },
+            None => gateway_config_not_available(),
+        }
+    }
+
+    async fn admin_security_policies(
+        State(state): State<Self>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/security-policies") {
+            return response;
+        }
+        match &state.gateway_config {
+            Some(config) => match gateway_config_snapshot(config) {
+                Ok(config) => {
+                    let security = &config.gateway.security;
+                    json_response(&AdminSecurityPoliciesResponse {
+                        enabled: security.enabled,
+                        fail_closed: security.fail_closed,
+                        default_audit_level: security.default_audit_level.clone(),
+                        pdp_backend: security.pdp.backend.clone(),
+                        rule_count: security.rules.len(),
+                        rules: security
+                            .rules
+                            .iter()
+                            .map(|rule| AdminSecurityRuleSummary {
+                                name: rule.name.clone(),
+                                effect: rule.effect.clone(),
+                                actions: rule.actions.clone(),
+                                tables: rule.tables.clone(),
+                                subjects: rule.subjects.clone(),
+                            })
+                            .collect(),
+                    })
+                }
                 Err(response) => response,
             },
             None => gateway_config_not_available(),

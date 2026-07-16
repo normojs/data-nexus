@@ -10,6 +10,7 @@ mod config;
 mod dialect;
 mod error;
 mod model;
+mod pdp;
 mod plugin;
 mod route;
 mod security;
@@ -28,6 +29,10 @@ pub use audit::{
 pub use config::{
     AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
     PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,
+};
+pub use pdp::{
+    action_from_command, extract_table_names, sql_from_command, AccessRequest, LocalPdp,
+    SecurityDecision, StatementAction, Subject,
 };
 pub use security::{
     SecurityAuditConfig, SecurityPdpConfig, SecurityPolicyConfig, SecurityRuleConfig,

@@ -21,7 +21,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 | 版本 | 一句话 | 状态 |
 |------|--------|:----:|
 | **v1** | 客户端 ↔ 网关 ↔ MySQL/PG；路由/池/跨协议/Admin | **完成** |
-| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **未开工** |
+| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **进行中（S0–S1 完成）** |
 
 **原则**
 
@@ -47,7 +47,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 ### 1.2 v2 总状态
 
 - [x] **S0** — 边界 + 审计模型 + security 配置空壳
-- [ ] **S1** — Subject + 语句/表级 Deny MVP
+- [x] **S1** — Subject + 语句/表级 Deny MVP
 - [ ] **S2** — AST 对象抽取 + 表/列 ACL
 - [ ] **S3** — 流式结果钩子 + 动态脱敏 + 行级雏形
 - [ ] **S4** — 持久化审计 + 查询 API/UI
@@ -109,13 +109,11 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 > 完成后改为 `- [x]`；细节勾选以第 4 节阶段任务为准。
 
-- [x] **F01** 统一 AuditEvent 字段 + 异步管道骨架 — 操作审计 — S0 — P0（schema + tracing 字段；异步管道 S4）
-- [x] **F02** `SecurityPolicyConfig`（default off） — 配置面 — S0 — P0
-- [x] **F03** Admin 写操作审计带 `sub` — 管理审计 — S0 — P0
-- [ ] **F04** 数据面 Subject 绑定 — 身份 — S1 — P0
-- [ ] **F05** 语句类管控 DQL/DML/TCL/DDL — 数据访问 — S1 — P0
-- [ ] **F06** 表级 Allow/Deny — 权限 — S1 — P0
-- [ ] **F07** Local PDP + Decision — 策略引擎 — S1 — P0
+- [x] **F04** 数据面 Subject 绑定 — 身份 — S1 — P0
+- [x] **F05** 语句类管控 DQL/DML/TCL/DDL — 数据访问 — S1 — P0
+- [x] **F06** 表级 Allow/Deny — 权限 — S1 — P0
+- [x] **F07** Local PDP + Decision — 策略引擎 — S1 — P0
+- [x] **F28** 策略热更（失败 keep-old） — 运维 — S1（security 变更重建 listener）
 - [ ] **F08** AST → ObjectSet（表/列/操作） — 细粒度前置 — S2 — P0
 - [ ] **F09** 列级 ACL（投影剔除/拒绝） — 字段权限 — S2 — P0
 - [ ] **F10** SQL 改写义务（LIMIT/列/行谓词） — 权限执行 — S2–S3 — P0
@@ -124,7 +122,7 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 - [ ] **F13** 敏感列标签 / 规则识别 MVP — 敏感识别 — S3 — P1
 - [ ] **F14** 水印雏形 — 防泄漏 — S3–S4 — P2
 - [ ] **F15** 审计持久化 + 查询 API + UI — 合规审计 — S4 — P0
-- [ ] **F16** 审计分级 L0/L1/L2 + 背压 — 高性能审计 — S0/S4 — P0
+- [ ] **F16** 审计分级 L0/L1/L2 + 背压 — 高性能审计 — S4 — P0
 - [ ] **F17** 高危规则 + 审批票据 — 工单 — S5 — P1
 - [ ] **F18** 金库（双人/限时/限次） — 金库 — S5 — P2
 - [ ] **F19** 通道标签（协议/导出/作业） — 通道管控 — S5 — P1
@@ -136,7 +134,6 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 - [ ] **F25** Backend/Frontend 流式窗口 — 性能 — A1–A2 — P0
 - [ ] **F26** Cedar PDP（可选 feature） — 高级策略 — S2+ — P2
 - [ ] **F27** 时间维策略 — 高级策略 — S5 — P2
-- [ ] **F28** 策略热更（失败 keep-old） — 运维 — S1–S2 — P0
 
 ---
 
@@ -159,31 +156,7 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 ---
 
-### S0 — 边界 + 审计模型 + 配置空壳  ✅
-
-| 项 | 内容 |
-|----|------|
-| **目标** | 立规矩、不改默认行为；后续阶段有挂载点 |
-| **退出** | default off 下 v1 smoke 全绿；配置可校验；审计字段统一 |
-
-**功能 / 任务**
-
-- [x] 文档与看板边界已对齐（本文件 + roadmap）
-- [x] `SecurityPolicyConfig` 空壳（`enabled=false`）+ `GatewayConfig` validate
-- [x] 配置示例：`examples/gateway-config.toml` 增加 `[security]` 默认 off
-- [x] 统一 `AuditEvent` / `data_nexus::audit` 字段 schema（`gateway/core/src/audit.rs`）
-- [x] `core_engine` 审计字段对齐 schema（`action`/`decision`/`db_user` 等）
-- [x] Admin 写路径 audit 带 JWT `sub`（`audit_admin_write`）
-- [ ] 指标占位：`audit_events_total`（可选，延后）
-- [x] 单测：security shell 解析 / invalid reject（gateway_core + config）
-
-**代码触点**：`gateway/core/src/{security,audit,config,lib}.rs`、`core_engine.rs`、`http/src/http/mod.rs`、`examples/gateway-config.toml`
-
-**不做**：真正 Deny 策略、脱敏、Subject 映射表
-
----
-
-### S1 — Subject + 语句/表级 Deny（MVP PEP）
+### S1 — Subject + 语句/表级 Deny（MVP PEP） ✅
 
 | 项 | 内容 |
 |----|------|
@@ -192,17 +165,19 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 **功能 / 任务**
 
-- [ ] `Subject` / `SecurityContext` 绑定（协议用户 → subject，可扩展 proxy_protocol）
-- [ ] 语句分类：DQL / DML / TCL / DDL（基于现有 dialect）
-- [ ] best-effort 表名抽取（可先于完整 AST visitor）
-- [ ] Local PDP：规则 `subject/role × service × action × table_glob → allow|deny`
-- [ ] `core_engine` pre-execute 挂载；Deny 不访问后端
-- [ ] `fail_closed` / `fail_open` 可配 + 指标
-- [ ] `GET /admin/security-policies`（只读列表/状态）
-- [ ] `smoke-security-deny.sh` + 示例 config
-- [ ] 策略热更接入 reload（校验失败 keep-old）
+- [x] `Subject` 绑定（`protocol_user` → `subject_id`）
+- [x] 语句分类：select/insert/update/delete/ddl/tcl/other
+- [x] best-effort 表名抽取 + glob
+- [x] Local PDP：`LocalPdp` + `SecurityDecision`
+- [x] `core_engine` pre-execute Deny（`security_deny`，不访问后端）
+- [x] `fail_closed` 用于空 SQL / EXECUTE 未分类
+- [x] `GET /admin/security-policies`
+- [x] `smoke-security-deny.sh` + `security-deny-gateway-config.toml`
+- [x] reload：`security_changed` 时重建 listener（校验失败 keep-old 沿用既有）
 
-**不做**：列/行、脱敏、审批、门户
+**代码**：`gateway/core/src/pdp.rs`、`runtime/gateway/src/core_engine.rs`、`http` Admin API、`examples/smoke-security-deny.sh`
+
+**不做**：列/行、脱敏、审批、门户、完整 AST ObjectSet（S2）
 
 ---
 
@@ -374,11 +349,12 @@ data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 
 ## 9. 当前下一动作（唯一焦点）
 
-**>>> 开始 S1 <<<**
+**>>> 开始 S2 <<<**
 
-- [ ] `Subject` / `SecurityContext` 绑定（协议用户 → subject）
-- [ ] 语句分类 DQL/DML/TCL/DDL + best-effort 表名
-- [ ] Local PDP：表/语句级 allow|deny
-- [ ] `core_engine` pre-execute 挂载；`smoke-security-deny.sh`
+- [ ] MySQL/PG AST visitor → `ObjectSet` / `ObjectAccess[]`
+- [ ] 列级 allow/deny + `SELECT *` 策略
+- [ ] SQL 改写剔除无权限列（无法改写则 Deny）
+- [ ] 解析失败路径：指标 + fail_closed
+- [ ] 单测矩阵：JOIN / 别名 / schema
 
-S0 已完成：security 配置空壳、AuditEvent schema、Admin 写审计带 `subject_id`。
+S0–S1 已完成：配置壳、审计字段、Local PDP 表/语句 Deny、Admin security-policies、smoke-security-deny。
