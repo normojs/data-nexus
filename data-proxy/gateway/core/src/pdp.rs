@@ -12,7 +12,7 @@ use crate::ticket::{
 use crate::{
     CommandSummary, DialectParser, GatewayCommand, SecurityColumnTagConfig,
     SecurityHighRiskRuleConfig, SecurityMaskRuleConfig, SecurityPolicyConfig, SecurityRuleConfig,
-    SecurityWatermarkConfig,
+    SecurityTimeRuleConfig, SecurityWatermarkConfig,
 };
 
 /// Data-plane identity (not Admin JWT).
@@ -142,6 +142,7 @@ pub struct LocalPdp {
     mask_rules: Vec<SecurityMaskRuleConfig>,
     column_tags: Vec<SecurityColumnTagConfig>,
     high_risk_rules: Vec<SecurityHighRiskRuleConfig>,
+    time_rules: Vec<SecurityTimeRuleConfig>,
     default_max_rows: Option<u64>,
     watermark: SecurityWatermarkConfig,
 }
@@ -159,6 +160,7 @@ impl LocalPdp {
             mask_rules: config.mask_rules.clone(),
             column_tags: config.column_tags.clone(),
             high_risk_rules: config.high_risk_rules.clone(),
+            time_rules: config.time_rules.clone(),
             default_max_rows: config.streaming.max_rows,
             watermark: config.watermark.clone(),
         })
@@ -328,6 +330,13 @@ impl LocalPdp {
                 let table_decision = self.evaluate(&request);
                 if table_decision.is_deny() {
                     return table_decision;
+                }
+
+                // F27: time-window gates (business hours / freeze windows).
+                if let Some(decision) =
+                    self.evaluate_time_rules(subject, action, sql, objects, &tables)
+                {
+                    return decision;
                 }
 
                 // S5: high-risk gates (ticket required) before rewrite/mask.
@@ -619,6 +628,122 @@ impl LocalPdp {
             },
             token,
         })
+    }
+
+    /// F27: first matching time rule that is currently active.
+    fn evaluate_time_rules(
+        &self,
+        subject: &Subject,
+        action: StatementAction,
+        sql: &str,
+        objects: Option<&ObjectSet>,
+        tables: &[String],
+    ) -> Option<SecurityDecision> {
+        if self.time_rules.is_empty() {
+            return None;
+        }
+        let now = crate::security_now_unix_secs();
+        for tr in &self.time_rules {
+            if !tr.subjects.is_empty() {
+                let sid = subject.subject_id.as_str();
+                if !tr.subjects.iter().any(|p| glob_match(p, sid)) {
+                    continue;
+                }
+            }
+            let actions = if tr.actions.is_empty() {
+                // Default: writes only (not SELECT).
+                vec![
+                    "insert".into(),
+                    "update".into(),
+                    "delete".into(),
+                    "ddl".into(),
+                ]
+            } else {
+                tr.actions.clone()
+            };
+            if !action_matches_actions(&actions, action) {
+                continue;
+            }
+            if !tr.tables.is_empty() {
+                let table_hit = if let Some(set) = objects {
+                    set.objects.iter().any(|obj| {
+                        tr.tables.iter().any(|p| {
+                            table_glob_match(p, &obj.qualified_table())
+                                || table_glob_match(p, &obj.table)
+                        })
+                    })
+                } else {
+                    tables
+                        .iter()
+                        .any(|t| tr.tables.iter().any(|p| table_glob_match(p, t)))
+                };
+                if !table_hit {
+                    continue;
+                }
+            }
+            if !tr.matches_now(now) {
+                continue;
+            }
+            let msg = if tr.message.trim().is_empty() {
+                format!(
+                    "security time policy '{}' blocked {} outside allowed window ({}–{} {})",
+                    tr.name,
+                    action.as_str(),
+                    tr.start,
+                    tr.end,
+                    tr.timezone
+                )
+            } else {
+                format!("security time policy '{}': {}", tr.name, tr.message)
+            };
+            return Some(match tr.effect.to_ascii_lowercase().as_str() {
+                "require_ticket" => {
+                    // Reuse ticket path: require an embedded ticket for this SQL.
+                    match self.try_consume_time_ticket(subject, sql, tr) {
+                        Ok(_) => return None, // ticket OK — continue allow path
+                        Err(message) => SecurityDecision::RequireTicket {
+                            rule: tr.name.clone(),
+                            ticket_type: tr.ticket_type.clone(),
+                            message,
+                        },
+                    }
+                }
+                _ => SecurityDecision::Deny {
+                    rule: tr.name.clone(),
+                    message: msg,
+                },
+            });
+        }
+        None
+    }
+
+    fn try_consume_time_ticket(
+        &self,
+        subject: &Subject,
+        sql: &str,
+        tr: &SecurityTimeRuleConfig,
+    ) -> Result<String, String> {
+        let Some(ticket_id) = extract_ticket_id(sql) else {
+            return Err(format!(
+                "security time policy '{}': {} (ticket type '{}'; prefix SQL with /*dn_ticket:<id>*/)",
+                tr.name,
+                if tr.message.trim().is_empty() {
+                    "outside allowed time window; ticket required"
+                } else {
+                    tr.message.as_str()
+                },
+                tr.ticket_type
+            ));
+        };
+        global_ticket_store()
+            .consume(
+                &ticket_id,
+                &subject.subject_id,
+                sql,
+                Some(tr.ticket_type.as_str()),
+            )
+            .map(|t| t.id)
+            .map_err(|e| format!("security time policy '{}' ticket rejected: {e}", tr.name))
     }
 
     fn match_high_risk(
@@ -1368,6 +1493,7 @@ mod tests {
             mask_rules: Vec::new(),
             column_tags: Vec::new(),
             high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
             default_max_rows: None,
             watermark: SecurityWatermarkConfig::default(),
         }
@@ -1588,6 +1714,7 @@ mod tests {
             mask_rules: Vec::new(),
             column_tags: Vec::new(),
             high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
             default_max_rows: None,
             watermark: SecurityWatermarkConfig::default(),
         };
@@ -1631,6 +1758,7 @@ mod tests {
                 label: "PII".into(),
             }],
             high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
             default_max_rows: None,
             watermark: SecurityWatermarkConfig::default(),
         };
@@ -1670,6 +1798,7 @@ mod tests {
                 subjects: vec![],
                 message: "DDL needs approval".into(),
             }],
+            time_rules: Vec::new(),
             default_max_rows: None,
             watermark: SecurityWatermarkConfig::default(),
         };
@@ -1700,4 +1829,88 @@ mod tests {
                 .is_deny()
         );
     }
+
+    #[test]
+    fn time_rule_denies_writes_outside_window() {
+        use crate::SecurityTimeRuleConfig;
+        use std::sync::Mutex;
+        // Serialize env mutation for this test process.
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let ts_out = chrono::DateTime::parse_from_rfc3339("2026-07-17T20:00:00Z")
+            .unwrap()
+            .timestamp();
+        let ts_in = chrono::DateTime::parse_from_rfc3339("2026-07-17T10:00:00Z")
+            .unwrap()
+            .timestamp();
+        std::env::set_var("DATA_NEXUS_SECURITY_NOW_UNIX", ts_out.to_string());
+
+        let pdp = LocalPdp {
+            fail_closed: true,
+            star_policy: StarPolicy::Allow,
+            rules: Vec::new(),
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
+            time_rules: vec![SecurityTimeRuleConfig {
+                name: "work-hours-writes".into(),
+                effect: "deny".into(),
+                outside: true,
+                days: vec![
+                    "mon".into(),
+                    "tue".into(),
+                    "wed".into(),
+                    "thu".into(),
+                    "fri".into(),
+                ],
+                start: "09:00".into(),
+                end: "18:00".into(),
+                timezone: "UTC".into(),
+                actions: vec![
+                    "insert".into(),
+                    "update".into(),
+                    "delete".into(),
+                    "ddl".into(),
+                ],
+                subjects: vec![],
+                tables: vec![],
+                ticket_type: "high_risk".into(),
+                message: "writes only during business hours".into(),
+            }],
+            default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
+        };
+        let sub = subject("root");
+        let dialect = HeuristicDialectParser::mysql();
+        let sel = GatewayCommand::Query {
+            sql: "SELECT 1".into(),
+        };
+        assert!(
+            !pdp
+                .authorize_command(&sub, "orders", &sel, &dialect)
+                .is_deny()
+        );
+        let ins = GatewayCommand::Query {
+            sql: "INSERT INTO t VALUES (1)".into(),
+        };
+        match pdp.authorize_command(&sub, "orders", &ins, &dialect) {
+            SecurityDecision::Deny { rule, message } => {
+                assert_eq!(rule, "work-hours-writes");
+                assert!(
+                    message.to_ascii_lowercase().contains("business")
+                        || message.contains("work-hours"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+        std::env::set_var("DATA_NEXUS_SECURITY_NOW_UNIX", ts_in.to_string());
+        assert!(
+            !pdp
+                .authorize_command(&sub, "orders", &ins, &dialect)
+                .is_deny()
+        );
+        std::env::remove_var("DATA_NEXUS_SECURITY_NOW_UNIX");
+    }
+
 }

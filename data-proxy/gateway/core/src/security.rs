@@ -42,6 +42,9 @@ pub struct SecurityPolicyConfig {
     /// High-risk rules that require a ticket (S5).
     #[serde(default)]
     pub high_risk_rules: Vec<SecurityHighRiskRuleConfig>,
+    /// Time-window rules (F27): e.g. writes only during business hours.
+    #[serde(default)]
+    pub time_rules: Vec<crate::time_rules::SecurityTimeRuleConfig>,
     /// Visible result watermark (F14).
     #[serde(default)]
     pub watermark: SecurityWatermarkConfig,
@@ -74,6 +77,7 @@ impl Default for SecurityPolicyConfig {
             mask_rules: Vec::new(),
             column_tags: Vec::new(),
             high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
             watermark: SecurityWatermarkConfig::default(),
         }
     }
@@ -201,6 +205,10 @@ impl SecurityPolicyConfig {
                     )));
                 }
             }
+        }
+
+        for (idx, tr) in self.time_rules.iter().enumerate() {
+            tr.validate(idx)?;
         }
 
         match self.watermark.mode.to_ascii_lowercase().as_str() {

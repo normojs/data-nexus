@@ -19,6 +19,7 @@ mod route;
 mod security;
 mod sharding;
 mod ticket;
+mod time_rules;
 mod translation;
 mod transport;
 mod types;
@@ -52,6 +53,9 @@ pub use security::{
     SecurityAuditConfig, SecurityColumnTagConfig, SecurityHighRiskRuleConfig,
     SecurityMaskRuleConfig, SecurityPdpConfig, SecurityPolicyConfig, SecurityRuleConfig,
     SecurityStreamingConfig, SecuritySubjectConfig, SecurityWatermarkConfig,
+};
+pub use time_rules::{
+    is_inside_window, parse_hhmm, security_now_unix_secs, SecurityTimeRuleConfig,
 };
 pub use ticket::{
     extract_ticket_id, global_ticket_store, is_write_without_where, sql_fingerprint,

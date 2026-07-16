@@ -1,0 +1,79 @@
+# F27 time-window policy smoke.
+# Pair with docker-compose.dev.yml
+# Run: DATA_NEXUS_SECURITY_NOW_UNIX=<outside> ./examples/smoke-security-time.sh
+#
+# Default test pins "now" via env in the smoke script so writes are outside
+# Mon–Fri 09:00–18:00 UTC.
+
+version = "2"
+
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+
+[security]
+enabled = true
+fail_closed = true
+star_policy = "allow"
+default_audit_level = "L0"
+
+[security.subject]
+sources = ["protocol_user"]
+
+[security.pdp]
+backend = "local"
+
+[security.streaming]
+window_rows = 256
+passthrough = true
+
+[security.audit]
+queue_capacity = 65536
+overflow = "drop_new"
+sinks = ["tracing"]
+
+# F27: deny writes outside business hours (UTC).
+[[security.time_rules]]
+name = "work-hours-writes"
+effect = "deny"
+outside = true
+days = ["mon", "tue", "wed", "thu", "fri"]
+start = "09:00"
+end = "18:00"
+timezone = "UTC"
+actions = ["insert", "update", "delete", "ddl"]
+message = "writes only allowed Mon–Fri 09:00–18:00 UTC"
+
+[[listeners]]
+name = "orders-mysql"
+listen_addr = "0.0.0.0:9088"
+protocol = "mysql"
+service = "orders"
+auth_policy = "local-users"
+
+[[services]]
+name = "orders"
+backend_protocol = "mysql"
+endpoints = ["orders-primary"]
+route_policy = "orders-balance"
+plugin_policies = []
+
+[[endpoints]]
+name = "orders-primary"
+protocol = "mysql"
+address = "127.0.0.1:13306"
+database = "orders"
+username = "root"
+password = "root"
+weight = 1
+
+[[route_policies]]
+name = "orders-balance"
+kind = "simple_load_balance"
+
+[[auth_policies]]
+name = "local-users"
+kind = "static"
+username = "root"
+password = "root"

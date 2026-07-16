@@ -43,7 +43,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 
 ### 1.2 关键 smoke
 
-`smoke-security-deny` / `column` / `mask` / `audit` / `ticket` / `dual-control` / `stream` / `passthrough` / `portal` / `watermark` / `cross-protocol` / `cross-protocol-stream` / `smoke-dual-listener` / `smoke-admin-auth`
+`smoke-security-deny` / `column` / `mask` / `audit` / `ticket` / `dual-control` / `time` / `stream` / `passthrough` / `portal` / `watermark` / `cross-protocol` / `cross-protocol-stream` / `smoke-dual-listener` / `smoke-admin-auth`
 
 ### 1.3 代码落点（摘要）
 
@@ -71,7 +71,7 @@ data-ui        运维台 + SQL Portal + Audit
 | ID | 项 | 说明 | 状态 |
 |----|----|------|:----:|
 | **F18** | 双人金库 | 票据需第二审批人确认后再生效 | **完成** |
-| **F27** | 时间维策略 | 仅工作时间可写等高危规则 | 待做 |
+| **F27** | 时间维策略 | 仅工作时间可写等高危规则 | **完成** |
 | **F26** | Cedar PDP feature | 可选 feature，与 Local 对照 | 延后 |
 | **B03** | OTel 自定义 attributes / 采样 | 可观测加深 | 延后 |
 | **B04** | 审计保留清理 / OpenDAL L2 | 冷归档 | 延后 |
@@ -81,14 +81,14 @@ data-ui        运维台 + SQL Portal + Audit
 
 ## 3. 当前下一动作（唯一焦点）
 
-**>>> F27 时间维策略 / 或 B05 portal 导出 <<<**
+**>>> B05 portal 导出 / 或 F26 Cedar PDP <<<**
 
-B02 已完成：Admin API 401→登录、403→`/forbidden` 友好页；`asAdminApiAuthError` 分类；login 会话过期提示。
+F27 已完成：`security.time_rules`（工作时间窗 / 维护冻结）；`DATA_NEXUS_SECURITY_NOW_UNIX` 可测时钟；`smoke-security-time` 全绿。
 
 建议下一任务：
 
-1. **F27** — 时间维策略（仅工作时间可写等）  
-2. **B05** — portal 导出 / 流式 JSON  
+1. **B05** — portal 导出 / 流式 JSON  
+2. **F26** — Cedar PDP feature  
 
 ---
 
