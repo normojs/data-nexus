@@ -43,7 +43,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 
 ### 1.2 关键 smoke
 
-`smoke-security-deny` / `column` / `mask` / `audit` / `ticket` / `stream` / `passthrough` / `portal` / `watermark` / `cross-protocol` / `cross-protocol-stream` / `smoke-dual-listener` / `smoke-admin-auth`
+`smoke-security-deny` / `column` / `mask` / `audit` / `ticket` / `dual-control` / `stream` / `passthrough` / `portal` / `watermark` / `cross-protocol` / `cross-protocol-stream` / `smoke-dual-listener` / `smoke-admin-auth`
 
 ### 1.3 代码落点（摘要）
 
@@ -70,7 +70,7 @@ data-ui        运维台 + SQL Portal + Audit
 
 | ID | 项 | 说明 | 状态 |
 |----|----|------|:----:|
-| **F18** | 双人金库 | 票据需第二审批人确认后再生效 | 待做 |
+| **F18** | 双人金库 | 票据需第二审批人确认后再生效 | **完成** |
 | **F27** | 时间维策略 | 仅工作时间可写等高危规则 | 待做 |
 | **F26** | Cedar PDP feature | 可选 feature，与 Local 对照 | 延后 |
 | **B03** | OTel 自定义 attributes / 采样 | 可观测加深 | 延后 |
@@ -81,14 +81,14 @@ data-ui        运维台 + SQL Portal + Audit
 
 ## 3. 当前下一动作（唯一焦点）
 
-**>>> F18 双人金库 / 或 B02 data-ui 403 友好页 <<<**
+**>>> B02 data-ui 403 友好页 / 或 F27 时间维策略 <<<**
 
-B01 已完成：`smoke-admin-auth` / `dual-listener` / `cross-protocol` / `cross-protocol-pg-to-mysql` 在 security default off 下全绿；L0 smoke 增加残留 proxy 清理与 `CARGO_TARGET_DIR` 默认。
+F18 已完成：`dual_control` 票据 `pending → active/rejected`；`POST /admin/tickets/:id/approve|reject`；审批人 ≠ 签发人；`smoke-security-dual-control` + S5 ticket 回归。
 
 建议下一任务：
 
-1. **F18** — 双人金库（第二审批人确认）  
-2. **B02** — data-ui 403 友好页  
+1. **B02** — data-ui 403 友好页  
+2. **F27** — 时间维策略  
 
 ---
 

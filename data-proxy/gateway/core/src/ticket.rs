@@ -1,8 +1,11 @@
-//! Approval tickets for high-risk SQL (S5 MVP).
+//! Approval tickets for high-risk SQL (S5) + dual-control vault (F18).
 //!
 //! Tickets are **not** a full BPM. External systems (or Admin API) mint a short-lived
 //! ticket bound to subject + SQL fingerprint; the data-plane embeds
 //! `/*dn_ticket:<id>*/` (or `/* data_nexus_ticket: <id> */`) in the SQL text.
+//!
+//! **F18 dual control**: when `dual_control=true`, issue creates a **pending** ticket.
+//! A second person (≠ issuer) must `approve` before the data plane can `consume` it.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -17,6 +20,29 @@ pub fn global_ticket_store() -> Arc<TicketStore> {
     GLOBAL
         .get_or_init(|| Arc::new(TicketStore::new()))
         .clone()
+}
+
+/// Lifecycle status for dual-control tickets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketStatus {
+    /// Waiting for a second approver (dual_control only).
+    Pending,
+    /// Usable by the data plane (default for non-dual tickets).
+    #[default]
+    Active,
+    /// Explicitly rejected; never consumable.
+    Rejected,
+}
+
+impl TicketStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Rejected => "rejected",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +63,19 @@ pub struct Ticket {
     pub issued_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// When true, ticket starts as [`TicketStatus::Pending`] until a second person approves.
+    #[serde(default)]
+    pub dual_control: bool,
+    #[serde(default)]
+    pub status: TicketStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_reason: Option<String>,
 }
 
 impl Ticket {
@@ -46,6 +85,28 @@ impl Ticket {
 
     pub fn remaining_uses(&self) -> u32 {
         self.max_uses.saturating_sub(self.uses)
+    }
+
+    pub fn is_consumable(&self, now_ms: u64) -> Result<(), String> {
+        if self.is_expired(now_ms) {
+            return Err(format!("ticket '{}' expired", self.id));
+        }
+        match self.status {
+            TicketStatus::Active => {}
+            TicketStatus::Pending => {
+                return Err(format!(
+                    "ticket '{}' is pending dual-control approval (POST /admin/tickets/{}/approve)",
+                    self.id, self.id
+                ));
+            }
+            TicketStatus::Rejected => {
+                return Err(format!("ticket '{}' was rejected", self.id));
+            }
+        }
+        if self.remaining_uses() == 0 {
+            return Err(format!("ticket '{}' has no remaining uses", self.id));
+        }
+        Ok(())
     }
 }
 
@@ -64,6 +125,26 @@ pub struct IssueTicketRequest {
     pub note: Option<String>,
     #[serde(default)]
     pub issued_by: Option<String>,
+    /// F18: require a second person to approve before the ticket is consumable.
+    #[serde(default)]
+    pub dual_control: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApproveTicketRequest {
+    /// Approver identity (admin subject). Must differ from issuer.
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RejectTicketRequest {
+    #[serde(default)]
+    pub rejected_by: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 fn default_ticket_type() -> String {
@@ -98,6 +179,7 @@ impl TicketStore {
             self.seq.fetch_add(1, Ordering::Relaxed)
         );
         let fp = sql_fingerprint(&req.sql);
+        let dual = req.dual_control;
         let ticket = Ticket {
             id: id.clone(),
             ticket_type: if req.ticket_type.trim().is_empty() {
@@ -114,6 +196,16 @@ impl TicketStore {
             uses: 0,
             issued_by: req.issued_by,
             note: req.note,
+            dual_control: dual,
+            status: if dual {
+                TicketStatus::Pending
+            } else {
+                TicketStatus::Active
+            },
+            approved_by: None,
+            approved_at_unix_ms: None,
+            rejected_by: None,
+            reject_reason: None,
         };
         self.inner
             .lock()
@@ -134,7 +226,86 @@ impl TicketStore {
         v
     }
 
-    /// Validate and consume one use. Returns Ok(ticket_id) or Err(reason).
+    /// Second-person approval for dual-control tickets.
+    ///
+    /// Rules:
+    /// - ticket must exist, not expired, status = pending, dual_control = true
+    /// - approver must be non-empty
+    /// - approver must not equal issuer (case-insensitive)
+    pub fn approve(&self, ticket_id: &str, approved_by: &str) -> Result<Ticket, String> {
+        let approver = approved_by.trim();
+        if approver.is_empty() {
+            return Err("approved_by is required".into());
+        }
+        let now = now_unix_ms();
+        let mut guard = self.inner.lock().expect("ticket lock");
+        let ticket = guard
+            .get_mut(ticket_id)
+            .ok_or_else(|| format!("ticket '{ticket_id}' not found"))?;
+        if ticket.is_expired(now) {
+            return Err(format!("ticket '{ticket_id}' expired"));
+        }
+        if !ticket.dual_control {
+            return Err(format!(
+                "ticket '{ticket_id}' is not dual-control (already active on issue)"
+            ));
+        }
+        match ticket.status {
+            TicketStatus::Pending => {}
+            TicketStatus::Active => {
+                return Err(format!("ticket '{ticket_id}' is already active"));
+            }
+            TicketStatus::Rejected => {
+                return Err(format!("ticket '{ticket_id}' was rejected"));
+            }
+        }
+        if let Some(issuer) = ticket.issued_by.as_deref() {
+            if issuer.eq_ignore_ascii_case(approver) {
+                return Err(format!(
+                    "ticket '{ticket_id}' dual-control: approver must differ from issuer '{issuer}'"
+                ));
+            }
+        }
+        ticket.status = TicketStatus::Active;
+        ticket.approved_by = Some(approver.to_owned());
+        ticket.approved_at_unix_ms = Some(now);
+        Ok(ticket.clone())
+    }
+
+    /// Reject a pending dual-control ticket (or any unused ticket).
+    pub fn reject(
+        &self,
+        ticket_id: &str,
+        rejected_by: &str,
+        reason: Option<String>,
+    ) -> Result<Ticket, String> {
+        let rejector = rejected_by.trim();
+        if rejector.is_empty() {
+            return Err("rejected_by is required".into());
+        }
+        let mut guard = self.inner.lock().expect("ticket lock");
+        let ticket = guard
+            .get_mut(ticket_id)
+            .ok_or_else(|| format!("ticket '{ticket_id}' not found"))?;
+        if ticket.uses > 0 {
+            return Err(format!(
+                "ticket '{ticket_id}' already consumed and cannot be rejected"
+            ));
+        }
+        match ticket.status {
+            TicketStatus::Rejected => {
+                return Err(format!("ticket '{ticket_id}' already rejected"));
+            }
+            TicketStatus::Pending | TicketStatus::Active => {}
+        }
+        ticket.status = TicketStatus::Rejected;
+        ticket.rejected_by = Some(rejector.to_owned());
+        ticket.reject_reason = reason;
+        Ok(ticket.clone())
+    }
+
+    /// Validate and consume one use. Returns Ok(ticket) or Err(reason).
+    /// Dual-control tickets must be **active** (approved) before consume succeeds.
     pub fn consume(
         &self,
         ticket_id: &str,
@@ -148,12 +319,7 @@ impl TicketStore {
         let ticket = guard
             .get_mut(ticket_id)
             .ok_or_else(|| format!("ticket '{ticket_id}' not found"))?;
-        if ticket.is_expired(now) {
-            return Err(format!("ticket '{ticket_id}' expired"));
-        }
-        if ticket.remaining_uses() == 0 {
-            return Err(format!("ticket '{ticket_id}' has no remaining uses"));
-        }
+        ticket.is_consumable(now)?;
         if !ticket.subject_id.eq_ignore_ascii_case(subject_id) {
             return Err(format!(
                 "ticket '{ticket_id}' subject mismatch (expected {}, got {subject_id})",
@@ -338,11 +504,82 @@ mod tests {
             max_uses: 1,
             note: None,
             issued_by: Some("admin".into()),
+            dual_control: false,
         });
+        assert_eq!(t.status, TicketStatus::Active);
+        assert!(!t.dual_control);
         let sql = format!("/*dn_ticket:{}*/ DROP TABLE smoke_t", t.id);
         store
             .consume(&t.id, "root", &sql, Some("ddl"))
             .expect("consume");
         assert!(store.consume(&t.id, "root", &sql, Some("ddl")).is_err());
+    }
+
+    #[test]
+    fn dual_control_requires_second_approver() {
+        let store = TicketStore::new();
+        let t = store.issue(IssueTicketRequest {
+            subject_id: "root".into(),
+            sql: "DROP TABLE vault_t".into(),
+            ticket_type: "ddl".into(),
+            ttl_secs: 120,
+            max_uses: 1,
+            note: Some("dual".into()),
+            issued_by: Some("issuer-alice".into()),
+            dual_control: true,
+        });
+        assert_eq!(t.status, TicketStatus::Pending);
+        assert!(t.dual_control);
+
+        let sql = format!("/*dn_ticket:{}*/ DROP TABLE vault_t", t.id);
+        let err = store
+            .consume(&t.id, "root", &sql, Some("ddl"))
+            .expect_err("pending must not consume");
+        assert!(
+            err.to_ascii_lowercase().contains("pending")
+                || err.to_ascii_lowercase().contains("dual"),
+            "err={err}"
+        );
+
+        // Self-approve blocked.
+        let self_err = store
+            .approve(&t.id, "issuer-alice")
+            .expect_err("self-approve");
+        assert!(
+            self_err.to_ascii_lowercase().contains("differ")
+                || self_err.to_ascii_lowercase().contains("issuer"),
+            "err={self_err}"
+        );
+
+        let approved = store.approve(&t.id, "approver-bob").expect("approve");
+        assert_eq!(approved.status, TicketStatus::Active);
+        assert_eq!(approved.approved_by.as_deref(), Some("approver-bob"));
+
+        store
+            .consume(&t.id, "root", &sql, Some("ddl"))
+            .expect("consume after approve");
+    }
+
+    #[test]
+    fn dual_control_reject_blocks_consume() {
+        let store = TicketStore::new();
+        let t = store.issue(IssueTicketRequest {
+            subject_id: "root".into(),
+            sql: "TRUNCATE TABLE t".into(),
+            ticket_type: "ddl".into(),
+            ttl_secs: 60,
+            max_uses: 1,
+            note: None,
+            issued_by: Some("alice".into()),
+            dual_control: true,
+        });
+        store
+            .reject(&t.id, "bob", Some("too risky".into()))
+            .expect("reject");
+        let sql = format!("/*dn_ticket:{}*/ TRUNCATE TABLE t", t.id);
+        let err = store
+            .consume(&t.id, "root", &sql, Some("ddl"))
+            .expect_err("rejected");
+        assert!(err.to_ascii_lowercase().contains("reject"), "err={err}");
     }
 }

@@ -55,7 +55,8 @@ pub use security::{
 };
 pub use ticket::{
     extract_ticket_id, global_ticket_store, is_write_without_where, sql_fingerprint,
-    strip_ticket_comment, IssueTicketRequest, Ticket, TicketStore,
+    strip_ticket_comment, ApproveTicketRequest, IssueTicketRequest, RejectTicketRequest, Ticket,
+    TicketStatus, TicketStore,
 };
 pub use vault::{
     global_vault_store, IssueVaultLeaseRequest, ProjectEnv, VaultLease, VaultStore,

@@ -378,6 +378,14 @@ pub fn required_permission(method: &str, path: &str) -> Option<AdminPermission> 
         ("GET", "/admin/audit/stats") => Some(AdminPermission::RuntimeRead),
         ("GET", "/admin/tickets") => Some(AdminPermission::RuntimeRead),
         ("POST", "/admin/tickets") => Some(AdminPermission::PolicyWrite),
+        // F18 dual-control: approve/reject second person
+        ("POST", p)
+            if p.starts_with("/admin/tickets/")
+                && (p.ends_with("/approve") || p.ends_with("/reject")) =>
+        {
+            Some(AdminPermission::PolicyWrite)
+        }
+        ("GET", p) if p.starts_with("/admin/tickets/") => Some(AdminPermission::RuntimeRead),
         ("GET", "/admin/projects") => Some(AdminPermission::TopologyRead),
         ("GET", "/admin/vault/leases") => Some(AdminPermission::RuntimeRead),
         ("POST", "/admin/vault/leases") => Some(AdminPermission::PolicyWrite),

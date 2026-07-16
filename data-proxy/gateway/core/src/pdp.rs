@@ -1691,6 +1691,7 @@ mod tests {
             max_uses: 1,
             note: None,
             issued_by: Some("test".into()),
+            dual_control: false,
         });
         let tagged = format!("/*dn_ticket:{}*/ {sql}", tkt.id);
         let cmd2 = GatewayCommand::Query { sql: tagged };

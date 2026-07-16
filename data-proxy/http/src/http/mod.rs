@@ -713,6 +713,14 @@ impl AxumServer {
                 "/admin/tickets",
                 get(Self::admin_list_tickets).post(Self::admin_issue_ticket),
             )
+            .route(
+                "/admin/tickets/:id/approve",
+                post(Self::admin_approve_ticket),
+            )
+            .route(
+                "/admin/tickets/:id/reject",
+                post(Self::admin_reject_ticket),
+            )
             .route("/admin/projects", get(Self::admin_list_projects))
             .route(
                 "/admin/vault/leases",
@@ -1020,14 +1028,25 @@ impl AxumServer {
             ticket_id = %ticket.id,
             subject_id = %ticket.subject_id,
             ticket_type = %ticket.ticket_type,
+            dual_control = ticket.dual_control,
+            status = ticket.status.as_str(),
             "admin issued security ticket"
         );
         gateway_core::try_audit(gateway_core::AuditEvent {
             action: Some(AuditAction::AdminWrite.as_str().into()),
             decision: Some(AuditDecision::Allow.as_str().into()),
             subject_id: ticket.issued_by.clone(),
-            outcome: Some("ticket_issued".into()),
-            message: Some(format!("issued {} for {}", ticket.id, ticket.subject_id)),
+            outcome: Some(if ticket.dual_control {
+                "ticket_pending".into()
+            } else {
+                "ticket_issued".into()
+            }),
+            message: Some(format!(
+                "issued {} for {} status={}",
+                ticket.id,
+                ticket.subject_id,
+                ticket.status.as_str()
+            )),
             rule: Some(ticket.ticket_type.clone()),
             audit_level: Some("L0".into()),
             ..gateway_core::AuditEvent::default()
@@ -1035,6 +1054,111 @@ impl AxumServer {
         json_response(&ticket)
     }
 
+    async fn admin_approve_ticket(
+        State(state): State<Self>,
+        headers: HeaderMap,
+        Path(id): Path<String>,
+        body: Option<Json<gateway_core::ApproveTicketRequest>>,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(&headers, "POST", &format!("/admin/tickets/{id}/approve"))
+        {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        let mut req = body.map(|Json(b)| b).unwrap_or_default();
+        if req.approved_by.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if let Some(ctx) = auth_ctx.as_ref() {
+                req.approved_by = Some(ctx.subject.clone());
+            }
+        }
+        let approver = match req.approved_by.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => s.to_owned(),
+            None => {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_approve_request",
+                    "approved_by is required (or authenticate so subject is inferred)",
+                );
+            }
+        };
+        match gateway_core::global_ticket_store().approve(&id, &approver) {
+            Ok(ticket) => {
+                info!(
+                    target: AUDIT_TARGET,
+                    action = AuditAction::AdminWrite.as_str(),
+                    decision = AuditDecision::Allow.as_str(),
+                    ticket_id = %ticket.id,
+                    approved_by = %approver,
+                    "admin approved dual-control ticket"
+                );
+                gateway_core::try_audit(gateway_core::AuditEvent {
+                    action: Some(AuditAction::AdminWrite.as_str().into()),
+                    decision: Some(AuditDecision::Allow.as_str().into()),
+                    subject_id: Some(approver),
+                    outcome: Some("ticket_approved".into()),
+                    message: Some(format!("approved {}", ticket.id)),
+                    rule: Some(ticket.ticket_type.clone()),
+                    audit_level: Some("L0".into()),
+                    ..gateway_core::AuditEvent::default()
+                });
+                json_response(&ticket)
+            }
+            Err(msg) => admin_json_error(StatusCode::BAD_REQUEST, "ticket_approve_failed", msg),
+        }
+    }
+
+    async fn admin_reject_ticket(
+        State(state): State<Self>,
+        headers: HeaderMap,
+        Path(id): Path<String>,
+        body: Option<Json<gateway_core::RejectTicketRequest>>,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(&headers, "POST", &format!("/admin/tickets/{id}/reject"))
+        {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        let mut req = body.map(|Json(b)| b).unwrap_or_default();
+        if req.rejected_by.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if let Some(ctx) = auth_ctx.as_ref() {
+                req.rejected_by = Some(ctx.subject.clone());
+            }
+        }
+        let rejector = match req.rejected_by.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => s.to_owned(),
+            None => {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_reject_request",
+                    "rejected_by is required (or authenticate so subject is inferred)",
+                );
+            }
+        };
+        match gateway_core::global_ticket_store().reject(&id, &rejector, req.reason) {
+            Ok(ticket) => {
+                info!(
+                    target: AUDIT_TARGET,
+                    action = AuditAction::AdminWrite.as_str(),
+                    decision = AuditDecision::Allow.as_str(),
+                    ticket_id = %ticket.id,
+                    rejected_by = %rejector,
+                    "admin rejected dual-control ticket"
+                );
+                gateway_core::try_audit(gateway_core::AuditEvent {
+                    action: Some(AuditAction::AdminWrite.as_str().into()),
+                    decision: Some(AuditDecision::Allow.as_str().into()),
+                    subject_id: Some(rejector),
+                    outcome: Some("ticket_rejected".into()),
+                    message: Some(format!("rejected {}", ticket.id)),
+                    rule: Some(ticket.ticket_type.clone()),
+                    audit_level: Some("L0".into()),
+                    ..gateway_core::AuditEvent::default()
+                });
+                json_response(&ticket)
+            }
+            Err(msg) => admin_json_error(StatusCode::BAD_REQUEST, "ticket_reject_failed", msg),
+        }
+    }
 
     async fn admin_list_projects(
         State(state): State<Self>,
