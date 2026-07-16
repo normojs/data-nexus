@@ -19,6 +19,17 @@ const busy = ref(false)
 
 const { refreshApiAuthFlags } = useAdminAuth()
 
+const reasonBanner = computed(() => {
+  const reason = String(route.query.reason || '')
+  if (reason === 'session_expired') {
+    return 'Your Admin session expired or the token was rejected. Sign in again.'
+  }
+  if (reason === 'reauth') {
+    return 'Sign in with an account that has the required Admin role.'
+  }
+  return ''
+})
+
 onMounted(async () => {
   await refreshApiAuthFlags()
   hydrateFromStorage()
@@ -69,6 +80,12 @@ async function sso() {
       <h1>Data Nexus Admin</h1>
       <p class="meta">
         Sign in to manage the gateway.
+      </p>
+      <p
+        v-if="reasonBanner"
+        class="status-line error"
+      >
+        {{ reasonBanner }}
       </p>
 
       <template v-if="passwordEnabled">

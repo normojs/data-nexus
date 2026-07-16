@@ -1,3 +1,8 @@
+import { asAdminApiAuthError, type AdminApiAuthError } from '~/utils/adminApiAuth'
+
+export type { AdminApiAuthError }
+export { asAdminApiAuthError }
+
 export type AdminListener = {
   name: string
   listen_addr: string
@@ -66,7 +71,6 @@ export type AdminLoginResponse = {
   roles: string[]
 }
 
-
 export type AdminAuditEvent = {
   event_id?: string
   decision?: string
@@ -134,16 +138,76 @@ function authHeaders(): Record<string, string> {
   return headers
 }
 
-async function getJson<T>(path: string, base?: string): Promise<T> {
-  return await $fetch<T>(`${normalizeBase(base)}${path}`, {
-    headers: authHeaders(),
+/**
+ * Client-side navigation for Admin API 401/403.
+ * - 401 → clear session and send to login
+ * - 403 → forbidden page with human-readable reason
+ */
+export function handleAdminApiAuthError(err: unknown, path?: string): boolean {
+  const authErr = asAdminApiAuthError(err, path)
+  if (!authErr) return false
+  if (!import.meta.client) return true
+
+  if (authErr.kind === 'unauthorized') {
+    try {
+      localStorage.removeItem(AUTH_KEY)
+    }
+    catch {
+      // ignore
+    }
+    const next = typeof window !== 'undefined'
+      ? window.location.pathname + window.location.search
+      : '/'
+    navigateTo({
+      path: '/login',
+      query: {
+        next,
+        reason: 'session_expired',
+      },
+    })
+    return true
+  }
+
+  navigateTo({
+    path: '/forbidden',
+    query: {
+      reason: authErr.code || 'forbidden',
+      message: authErr.message,
+      path: path || '',
+    },
   })
+  return true
+}
+
+async function adminFetch<T>(path: string, opts: Record<string, unknown> = {}, base?: string): Promise<T> {
+  try {
+    return await $fetch<T>(`${normalizeBase(base)}${path}`, {
+      ...opts,
+      headers: {
+        ...authHeaders(),
+        ...((opts.headers as Record<string, string> | undefined) || {}),
+      },
+    })
+  }
+  catch (err) {
+    // Login itself should not bounce to login/forbidden loops.
+    if (path !== '/admin/auth/login' && path !== '/admin/auth/config') {
+      handleAdminApiAuthError(err, path)
+    }
+    throw err
+  }
+}
+
+async function getJson<T>(path: string, base?: string): Promise<T> {
+  return adminFetch<T>(path, {}, base)
 }
 
 export function useAdminApi() {
   return {
     normalizeBase,
     authHeaders,
+    asAdminApiAuthError,
+    handleAdminApiAuthError,
     version: (base?: string) =>
       $fetch<string>(`${normalizeBase(base)}/version`, { responseType: 'text' }),
     healthz: (base?: string) =>
@@ -173,22 +237,21 @@ export function useAdminApi() {
     projects: (base?: string) => getJson<AdminProject[]>('/admin/projects', base),
     vaultLeases: (base?: string) => getJson<AdminVaultLease[]>('/admin/vault/leases', base),
     issueVaultLease: (body: { project: string, environment: string, ttl_secs?: number }, base?: string) =>
-      $fetch<AdminVaultLease>(`${normalizeBase(base)}/admin/vault/leases`, {
+      adminFetch<AdminVaultLease>('/admin/vault/leases', {
         method: 'POST',
-        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body,
-      }),
+      }, base),
     portalQuery: (body: { service: string, sql: string, lease_id?: string, subject_id?: string, max_rows?: number }, base?: string) =>
-      $fetch<AdminPortalQueryResult>(`${normalizeBase(base)}/admin/portal/query`, {
+      adminFetch<AdminPortalQueryResult>('/admin/portal/query', {
         method: 'POST',
-        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body,
-      }),
+      }, base),
     reload: (base?: string) =>
-      $fetch(`${normalizeBase(base)}/admin/reload`, {
+      adminFetch('/admin/reload', {
         method: 'POST',
-        headers: authHeaders(),
-      }),
+      }, base),
     login: (password: string, base?: string) =>
       $fetch<AdminLoginResponse>(`${normalizeBase(base)}/admin/auth/login`, {
         method: 'POST',

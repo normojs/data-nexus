@@ -24,7 +24,7 @@ export default defineNuxtConfig({
   },
   nitro: {
     prerender: {
-      routes: ['/', '/topology', '/sessions', '/settings', '/login', '/auth/callback'],
+      routes: ['/', '/topology', '/sessions', '/settings', '/login', '/auth/callback', '/forbidden', '/audit', '/portal'],
     },
   },
   app: {

@@ -64,7 +64,7 @@ data-ui        运维台 + SQL Portal + Audit
 |----|----|------|:----:|
 | **F14** | 结果水印雏形 | Allow 结果嵌入可追溯 token（列/后缀） | **完成** |
 | **B01** | v1 smoke 回归确认 | security default off 下四条 L0 smoke 全绿 | **完成** |
-| **B02** | data-ui 403 友好页 | Admin API 鉴权失败可理解 | 待做 |
+| **B02** | data-ui 403 友好页 | Admin API 鉴权失败可理解 | **完成** |
 
 ### P2 — 可选增强
 
@@ -81,14 +81,14 @@ data-ui        运维台 + SQL Portal + Audit
 
 ## 3. 当前下一动作（唯一焦点）
 
-**>>> B02 data-ui 403 友好页 / 或 F27 时间维策略 <<<**
+**>>> F27 时间维策略 / 或 B05 portal 导出 <<<**
 
-F18 已完成：`dual_control` 票据 `pending → active/rejected`；`POST /admin/tickets/:id/approve|reject`；审批人 ≠ 签发人；`smoke-security-dual-control` + S5 ticket 回归。
+B02 已完成：Admin API 401→登录、403→`/forbidden` 友好页；`asAdminApiAuthError` 分类；login 会话过期提示。
 
 建议下一任务：
 
-1. **B02** — data-ui 403 友好页  
-2. **F27** — 时间维策略  
+1. **F27** — 时间维策略（仅工作时间可写等）  
+2. **B05** — portal 导出 / 流式 JSON  
 
 ---
 

@@ -18,8 +18,17 @@ onMounted(async () => {
       canReload.value = me.permissions.includes('config:reload')
     }
   }
-  catch {
-    // API auth off or token missing; pages will surface errors.
+  catch (err: any) {
+    // 401/403 already routed by useAdminApi; keep shell usable for other errors.
+    const auth = api.asAdminApiAuthError(err, '/admin/me')
+    if (auth?.kind === 'unauthorized') {
+      meLabel.value = 'session expired'
+      canReload.value = false
+    }
+    else if (auth?.kind === 'forbidden') {
+      meLabel.value = 'limited access'
+      canReload.value = false
+    }
   }
 })
 
