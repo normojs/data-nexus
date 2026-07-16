@@ -5,13 +5,14 @@
 //! runtime extractor.
 
 use crate::object_set::{ColumnAclOutcome, ObjectSet, StarPolicy};
-use crate::obligations::{inject_row_filter, MaskAlgorithm, MaskSpec, Obligations};
+use crate::obligations::{inject_row_filter, MaskAlgorithm, MaskSpec, Obligations, WatermarkMode, WatermarkSpec};
 use crate::ticket::{
     extract_ticket_id, global_ticket_store, is_write_without_where, strip_ticket_comment,
 };
 use crate::{
     CommandSummary, DialectParser, GatewayCommand, SecurityColumnTagConfig,
     SecurityHighRiskRuleConfig, SecurityMaskRuleConfig, SecurityPolicyConfig, SecurityRuleConfig,
+    SecurityWatermarkConfig,
 };
 
 /// Data-plane identity (not Admin JWT).
@@ -142,6 +143,7 @@ pub struct LocalPdp {
     column_tags: Vec<SecurityColumnTagConfig>,
     high_risk_rules: Vec<SecurityHighRiskRuleConfig>,
     default_max_rows: Option<u64>,
+    watermark: SecurityWatermarkConfig,
 }
 
 impl LocalPdp {
@@ -158,6 +160,7 @@ impl LocalPdp {
             column_tags: config.column_tags.clone(),
             high_risk_rules: config.high_risk_rules.clone(),
             default_max_rows: config.streaming.max_rows,
+            watermark: config.watermark.clone(),
         })
     }
 
@@ -412,6 +415,13 @@ impl LocalPdp {
                     }
                 }
 
+                // F14: visible watermark on SELECT allows.
+                if action == StatementAction::Select {
+                    if let Some(wm) = self.build_watermark(subject, service) {
+                        obligations.watermark = Some(wm);
+                    }
+                }
+
                 if let Some(sql) = rewritten_sql {
                     SecurityDecision::AllowRewrite { sql, obligations }
                 } else {
@@ -584,6 +594,32 @@ impl LocalPdp {
         out
     }
 
+
+
+    fn build_watermark(&self, subject: &Subject, service: &str) -> Option<WatermarkSpec> {
+        if !self.watermark.enabled {
+            return None;
+        }
+        let token = if self.watermark.token.trim().is_empty() {
+            // subject|service|millis — demo trace id (not crypto).
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            format!("{}|{}|{:x}", subject.subject_id, service, ms)
+        } else {
+            self.watermark.token.clone()
+        };
+        Some(WatermarkSpec {
+            mode: WatermarkMode::parse(&self.watermark.mode),
+            column: if self.watermark.column.trim().is_empty() {
+                "_dn_wm".into()
+            } else {
+                self.watermark.column.clone()
+            },
+            token,
+        })
+    }
 
     fn match_high_risk(
         &self,
@@ -1333,6 +1369,7 @@ mod tests {
             column_tags: Vec::new(),
             high_risk_rules: Vec::new(),
             default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
         }
     }
 
@@ -1552,6 +1589,7 @@ mod tests {
             column_tags: Vec::new(),
             high_risk_rules: Vec::new(),
             default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
         };
         let mut set = ObjectSet::empty();
         let mut obj = ObjectAccess::new("employees", StatementAction::Select);
@@ -1594,6 +1632,7 @@ mod tests {
             }],
             high_risk_rules: Vec::new(),
             default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
         };
         let mut set = ObjectSet::empty();
         let mut obj = ObjectAccess::new("employees", StatementAction::Select);
@@ -1632,6 +1671,7 @@ mod tests {
                 message: "DDL needs approval".into(),
             }],
             default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
         };
         let sub = subject("root");
         let dialect = HeuristicDialectParser::mysql();

@@ -87,6 +87,53 @@ impl MaskSpec {
     }
 }
 
+
+/// Visible result watermark for leak tracing (F14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WatermarkMode {
+    /// Append a synthetic result column holding the token.
+    #[default]
+    Column,
+    /// Append ` |wm=<token>` to the first string-like cell in each row.
+    Suffix,
+}
+
+impl WatermarkMode {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "suffix" => Self::Suffix,
+            _ => Self::Column,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Column => "column",
+            Self::Suffix => "suffix",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatermarkSpec {
+    pub mode: WatermarkMode,
+    /// Column name when mode=column (default `_dn_wm`).
+    pub column: String,
+    /// Trace token embedded in the result.
+    pub token: String,
+}
+
+impl WatermarkSpec {
+    pub fn column_token(column: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            mode: WatermarkMode::Column,
+            column: column.into(),
+            token: token.into(),
+        }
+    }
+}
+
 /// Obligations attached to an Allow decision.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Obligations {
@@ -98,6 +145,8 @@ pub struct Obligations {
     pub max_rows: Option<u64>,
     /// Audit level override (L0/L1/L2); empty keeps policy default.
     pub audit_level: Option<String>,
+    /// Optional visible watermark (F14).
+    pub watermark: Option<WatermarkSpec>,
 }
 
 impl Obligations {
@@ -106,6 +155,7 @@ impl Obligations {
             && self.row_filter.is_none()
             && self.max_rows.is_none()
             && self.audit_level.is_none()
+            && self.watermark.is_none()
     }
 
     pub fn merge(&mut self, other: Obligations) {
@@ -133,10 +183,13 @@ impl Obligations {
         if self.audit_level.is_none() {
             self.audit_level = other.audit_level;
         }
+        if self.watermark.is_none() {
+            self.watermark = other.watermark;
+        }
     }
 
     pub fn has_result_obligations(&self) -> bool {
-        !self.column_masks.is_empty() || self.max_rows.is_some()
+        !self.column_masks.is_empty() || self.max_rows.is_some() || self.watermark.is_some()
     }
 }
 
@@ -370,7 +423,7 @@ pub fn apply_obligations_to_response(
         return response;
     }
     match response {
-        GatewayResponse::ResultSet { columns, mut rows } => {
+        GatewayResponse::ResultSet { mut columns, mut rows } => {
             let mask_idx = build_mask_index(&columns, &obligations.column_masks);
             if !mask_idx.is_empty() {
                 for row in &mut rows {
@@ -387,11 +440,71 @@ pub fn apply_obligations_to_response(
                     rows.truncate(max);
                 }
             }
+            if let Some(wm) = &obligations.watermark {
+                apply_watermark_to_resultset(&mut columns, &mut rows, wm);
+            }
             GatewayResponse::ResultSet { columns, rows }
         }
         other => other,
     }
 }
+
+fn apply_watermark_to_resultset(
+    columns: &mut Vec<Column>,
+    rows: &mut Vec<Vec<GatewayValue>>,
+    wm: &WatermarkSpec,
+) {
+    match wm.mode {
+        WatermarkMode::Column => {
+            let name = if wm.column.trim().is_empty() {
+                "_dn_wm".to_owned()
+            } else {
+                wm.column.clone()
+            };
+            // Avoid duplicate column if re-applied.
+            if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+                columns.push(Column {
+                    name,
+                    data_type: "varchar".into(),
+                });
+                for row in rows.iter_mut() {
+                    row.push(GatewayValue::String(wm.token.clone()));
+                }
+            }
+        }
+        WatermarkMode::Suffix => {
+            let marker = format!(" |wm={}", wm.token);
+            for row in rows.iter_mut() {
+                let mut applied = false;
+                for cell in row.iter_mut() {
+                    match cell {
+                        GatewayValue::String(s) => {
+                            if !s.contains(" |wm=") {
+                                s.push_str(&marker);
+                            }
+                            applied = true;
+                            break;
+                        }
+                        GatewayValue::Decimal(s) => {
+                            // leave decimals alone
+                            let _ = s;
+                        }
+                        _ => {}
+                    }
+                }
+                if !applied {
+                    // No string cell: append a synthetic string cell if columns allow growth.
+                    // Prefer mutating last cell display via new string value only when empty row.
+                    if let Some(last) = row.last_mut() {
+                        let base = value_as_display(last);
+                        *last = GatewayValue::String(format!("{base}{marker}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 fn build_mask_index<'a>(
     columns: &[Column],
@@ -487,6 +600,53 @@ mod tests {
                 assert_eq!(rows[0][0], GatewayValue::Integer(1));
                 assert_eq!(rows[0][1], GatewayValue::Null);
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn watermark_column_appended() {
+        let mut obl = Obligations::default();
+        obl.watermark = Some(WatermarkSpec::column_token("_dn_wm", "abc123"));
+        let resp = GatewayResponse::ResultSet {
+            columns: vec![Column {
+                name: "id".into(),
+                data_type: "int".into(),
+            }],
+            rows: vec![vec![GatewayValue::Integer(1)]],
+        };
+        let out = apply_obligations_to_response(resp, &obl);
+        match out {
+            GatewayResponse::ResultSet { columns, rows } => {
+                assert_eq!(columns.len(), 2);
+                assert_eq!(columns[1].name, "_dn_wm");
+                assert_eq!(rows[0][1], GatewayValue::String("abc123".into()));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn watermark_suffix_appended() {
+        let mut obl = Obligations::default();
+        obl.watermark = Some(WatermarkSpec {
+            mode: WatermarkMode::Suffix,
+            column: String::new(),
+            token: "t9".into(),
+        });
+        let resp = GatewayResponse::ResultSet {
+            columns: vec![Column {
+                name: "name".into(),
+                data_type: "varchar".into(),
+            }],
+            rows: vec![vec![GatewayValue::String("alice".into())]],
+        };
+        let out = apply_obligations_to_response(resp, &obl);
+        match out {
+            GatewayResponse::ResultSet { rows, .. } => match &rows[0][0] {
+                GatewayValue::String(s) => assert!(s.contains("|wm=t9"), "{s}"),
+                other => panic!("{other:?}"),
+            },
             other => panic!("{other:?}"),
         }
     }

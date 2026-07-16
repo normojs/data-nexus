@@ -42,7 +42,7 @@ pub use config::{
 pub use object_set::{ColumnAclOutcome, ObjectAccess, ObjectSet, StarPolicy};
 pub use obligations::{
     apply_obligations_to_response, inject_row_filter, mask_gateway_value, MaskAlgorithm, MaskSpec,
-    Obligations,
+    Obligations, WatermarkMode, WatermarkSpec,
 };
 pub use pdp::{
     action_from_command, extract_table_names, sql_from_command, AccessRequest, LocalPdp,
@@ -51,7 +51,7 @@ pub use pdp::{
 pub use security::{
     SecurityAuditConfig, SecurityColumnTagConfig, SecurityHighRiskRuleConfig,
     SecurityMaskRuleConfig, SecurityPdpConfig, SecurityPolicyConfig, SecurityRuleConfig,
-    SecurityStreamingConfig, SecuritySubjectConfig,
+    SecurityStreamingConfig, SecuritySubjectConfig, SecurityWatermarkConfig,
 };
 pub use ticket::{
     extract_ticket_id, global_ticket_store, is_write_without_where, sql_fingerprint,

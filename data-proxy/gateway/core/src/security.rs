@@ -42,6 +42,9 @@ pub struct SecurityPolicyConfig {
     /// High-risk rules that require a ticket (S5).
     #[serde(default)]
     pub high_risk_rules: Vec<SecurityHighRiskRuleConfig>,
+    /// Visible result watermark (F14).
+    #[serde(default)]
+    pub watermark: SecurityWatermarkConfig,
 }
 
 fn default_star_policy() -> String {
@@ -71,6 +74,7 @@ impl Default for SecurityPolicyConfig {
             mask_rules: Vec::new(),
             column_tags: Vec::new(),
             high_risk_rules: Vec::new(),
+            watermark: SecurityWatermarkConfig::default(),
         }
     }
 }
@@ -196,6 +200,15 @@ impl SecurityPolicyConfig {
                         "security.high_risk_rules[{idx}].kind must be ddl|write_no_where|action|table_write|export, got '{other}'"
                     )));
                 }
+            }
+        }
+
+        match self.watermark.mode.to_ascii_lowercase().as_str() {
+            "column" | "suffix" | "" => {}
+            other => {
+                return Err(GatewayError::Configuration(format!(
+                    "security.watermark.mode must be column or suffix, got '{other}'"
+                )));
             }
         }
 
@@ -371,6 +384,41 @@ pub struct SecurityColumnTagConfig {
     /// Optional label for audit (e.g. PII, phone).
     #[serde(default)]
     pub label: String,
+}
+
+/// Visible watermark applied on Allow result sets (F14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityWatermarkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// column | suffix
+    #[serde(default = "default_wm_mode")]
+    pub mode: String,
+    /// Column name for mode=column (default `_dn_wm`).
+    #[serde(default = "default_wm_column")]
+    pub column: String,
+    /// Optional static token; empty → per-query auto token from subject+time.
+    #[serde(default)]
+    pub token: String,
+}
+
+fn default_wm_mode() -> String {
+    "column".into()
+}
+
+fn default_wm_column() -> String {
+    "_dn_wm".into()
+}
+
+impl Default for SecurityWatermarkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_wm_mode(),
+            column: default_wm_column(),
+            token: String::new(),
+        }
+    }
 }
 
 /// High-risk gate requiring a short-lived ticket (S5).
