@@ -167,6 +167,32 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
             )),
         }
     }
+
+    fn encode_resultset_header(
+        &mut self,
+        columns: &[GatewayColumn],
+        _session: &SessionState,
+    ) -> GatewayResult<Vec<Vec<u8>>> {
+        encode_mysql_resultset_header(columns)
+    }
+
+    fn encode_resultset_rows(
+        &mut self,
+        columns: &[GatewayColumn],
+        rows: &[Vec<GatewayValue>],
+        _session: &SessionState,
+    ) -> GatewayResult<Vec<Vec<u8>>> {
+        encode_mysql_resultset_rows(columns, rows)
+    }
+
+    fn encode_resultset_footer(
+        &mut self,
+        _columns: &[GatewayColumn],
+        _total_rows: usize,
+        _session: &SessionState,
+    ) -> GatewayResult<Vec<Vec<u8>>> {
+        Ok(vec![make_eof_packet()[4..].to_vec()])
+    }
 }
 
 fn decode_query_command(
@@ -209,28 +235,38 @@ fn decode_statement_id(payload: &[u8]) -> GatewayResult<String> {
     Ok(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]).to_string())
 }
 
-fn encode_text_resultset(
-    columns: Vec<GatewayColumn>,
-    rows: Vec<Vec<GatewayValue>>,
-) -> GatewayResult<Vec<Vec<u8>>> {
-    let mut packets = Vec::with_capacity(columns.len() + rows.len() + 3);
 
+fn encode_mysql_resultset_header(columns: &[GatewayColumn]) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut packets = Vec::with_capacity(columns.len() + 2);
     let mut column_count = Vec::new();
     column_count.put_lenc_int(columns.len() as u64, true);
     packets.push(column_count);
-
-    for column in &columns {
+    for column in columns {
         let mut packet = Vec::new();
         gateway_column_to_mysql_column(column).encode(&mut packet);
         packets.push(packet);
     }
-
     packets.push(make_eof_packet()[4..].to_vec());
+    Ok(packets)
+}
 
+fn encode_mysql_resultset_rows(
+    columns: &[GatewayColumn],
+    rows: &[Vec<GatewayValue>],
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut packets = Vec::with_capacity(rows.len());
     for row in rows {
-        packets.push(encode_text_row(&row, columns.len())?);
+        packets.push(encode_text_row(row, columns.len())?);
     }
+    Ok(packets)
+}
 
+fn encode_text_resultset(
+    columns: Vec<GatewayColumn>,
+    rows: Vec<Vec<GatewayValue>>,
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut packets = encode_mysql_resultset_header(&columns)?;
+    packets.extend(encode_mysql_resultset_rows(&columns, &rows)?);
     packets.push(make_eof_packet()[4..].to_vec());
     Ok(packets)
 }
@@ -599,4 +635,53 @@ mod tests {
         assert_eq!(packets[5], b"\x0243\xfb".to_vec());
         assert_eq!(packets[6], make_eof_packet()[4..].to_vec());
     }
+
+    #[test]
+    fn windowed_encode_matches_full_resultset() {
+        use gateway_core::{write_resultset_windowed, CollectingWriter};
+        let mut adapter = MySqlFrontendProtocol::new(
+            "u".into(),
+            "p".into(),
+            "db".into(),
+            "8.0".into(),
+        );
+        let session = SessionState::default();
+        let columns = vec![
+            GatewayColumn { name: "id".into(), data_type: "int".into() },
+            GatewayColumn { name: "name".into(), data_type: "varchar".into() },
+        ];
+        let rows = vec![
+            vec![GatewayValue::Integer(1), GatewayValue::String("a".into())],
+            vec![GatewayValue::Integer(2), GatewayValue::String("b".into())],
+            vec![GatewayValue::Integer(3), GatewayValue::String("c".into())],
+        ];
+        let full = adapter
+            .encode(
+                GatewayResponse::ResultSet {
+                    columns: columns.clone(),
+                    rows: rows.clone(),
+                },
+                &session,
+            )
+            .unwrap();
+        let mut writer = CollectingWriter::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            write_resultset_windowed(
+                &mut adapter,
+                &session,
+                columns,
+                rows,
+                2,
+                &mut writer,
+            )
+            .await
+            .unwrap();
+        });
+        assert_eq!(writer.into_packets(), full);
+    }
+
 }

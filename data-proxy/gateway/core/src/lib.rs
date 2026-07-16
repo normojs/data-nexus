@@ -70,5 +70,8 @@ pub use translation::{
     prepare_cross_protocol_command, rewrite_sql_for_backend, TranslationPolicyConfig,
     TranslationStatementKind,
 };
-pub use transport::{BackendConnector, FrontendProtocolAdapter};
+pub use transport::{
+    write_resultset_windowed, BackendConnector, CollectingWriter, FrontendProtocolAdapter,
+    ResponseWriter,
+};
 pub use types::{map_column_type, parse_backend_type, CanonicalDataType};

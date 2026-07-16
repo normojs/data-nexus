@@ -15,7 +15,7 @@
 use std::{sync::Arc, time::Instant};
 
 use endpoint::endpoint::Endpoint;
-use gateway_core::{
+use gateway_core::{write_resultset_windowed, CollectingWriter, 
     map_response_types, prepare_cross_protocol_command, BackendConnector, CommandSummary,
     DialectParser, EndpointConfig, EndpointRef, EndpointRole, FrontendProtocolAdapter,
     ExecuteMode, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse, GatewayResult, ListenerConfig,
@@ -124,6 +124,43 @@ impl CoreGatewayConnection {
         self
     }
 
+    async fn encode_response_packets(
+        &mut self,
+        response: GatewayResponse,
+    ) -> GatewayResult<Vec<Vec<u8>>> {
+        match response {
+            GatewayResponse::ResultSet { columns, rows } => {
+                let window = self
+                    .stream_mode
+                    .window_rows()
+                    .unwrap_or(usize::MAX)
+                    .max(1);
+                // Always use windowed encoder when Streaming mode is active so
+                // row memory can be drained; Materialized uses a single encode.
+                if matches!(self.stream_mode, ExecuteMode::Streaming { .. }) {
+                    let mut writer = CollectingWriter::new();
+                    write_resultset_windowed(
+                        self.frontend.as_mut(),
+                        &self.session,
+                        columns,
+                        rows,
+                        window,
+                        &mut writer,
+                    )
+                    .await?;
+                    Ok(writer.into_packets())
+                } else {
+                    self.frontend.encode(
+                        GatewayResponse::ResultSet { columns, rows },
+                        &self.session,
+                    )
+                }
+            }
+            other => self.frontend.encode(other, &self.session),
+        }
+    }
+
+
     pub fn frontend_protocol(&self) -> ProtocolKind {
         self.frontend.protocol()
     }
@@ -231,7 +268,7 @@ impl CoreGatewayConnection {
                             "gateway command rejected by plugin"
                         );
                         let response = GatewayResponse::Error { code, message };
-                        packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        packets.extend(self.encode_response_packets(response).await?);
                         record_otel_command(
                             &self.listener_name,
                             &self.service_name,
@@ -288,7 +325,7 @@ impl CoreGatewayConnection {
                             "gateway command rejected by translation policy"
                         );
                         command_span.record("outcome", "translation_reject");
-                        packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        packets.extend(self.encode_response_packets(response).await?);
                         record_otel_command(
                             &self.listener_name,
                             &self.service_name,
@@ -411,7 +448,7 @@ impl CoreGatewayConnection {
                             message,
                         };
                         command_span.record("outcome", "security_require_ticket");
-                        packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        packets.extend(self.encode_response_packets(response).await?);
                         record_otel_command(
                             &self.listener_name,
                             &self.service_name,
@@ -476,7 +513,7 @@ impl CoreGatewayConnection {
                             message,
                         };
                         command_span.record("outcome", "security_deny");
-                        packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        packets.extend(self.encode_response_packets(response).await?);
                         record_otel_command(
                             &self.listener_name,
                             &self.service_name,
@@ -582,7 +619,7 @@ impl CoreGatewayConnection {
                 plugins.release_concurrency(idx);
             }
 
-            packets.extend(self.frontend.encode(response, &mut self.session)?);
+            packets.extend(self.encode_response_packets(response).await?);
             record_otel_command(
                 &self.listener_name,
                 &self.service_name,
@@ -678,7 +715,22 @@ pub async fn handle_gateway_frame(
             }
         };
 
-        packets.extend(frontend.encode(response, session)?);
+        match response {
+            GatewayResponse::ResultSet { columns, rows } => {
+                let mut writer = CollectingWriter::new();
+                write_resultset_windowed(
+                    frontend,
+                    session,
+                    columns,
+                    rows,
+                    256,
+                    &mut writer,
+                )
+                .await?;
+                packets.extend(writer.into_packets());
+            }
+            other => packets.extend(frontend.encode(other, session)?),
+        }
     }
 
     Ok(packets)
@@ -1299,7 +1351,7 @@ fn build_backend_connector(
 
 #[cfg(test)]
 mod tests {
-    use gateway_core::{Column as GatewayColumn, GatewayCommand, GatewayValue};
+    use gateway_core::{write_resultset_windowed, CollectingWriter, Column as GatewayColumn, GatewayCommand, GatewayValue};
     use mysql_protocol::{
         mysql_const::{COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT},
         server::codec::ok_packet,
@@ -1384,7 +1436,7 @@ mod tests {
 
     #[tokio::test]
     async fn security_deny_returns_protocol_error_without_backend_execute() {
-        use gateway_core::{LocalPdp, SecurityPolicyConfig, SecurityRuleConfig};
+        use gateway_core::{write_resultset_windowed, CollectingWriter, LocalPdp, SecurityPolicyConfig, SecurityRuleConfig};
 
         let mut security = SecurityPolicyConfig::default();
         security.enabled = true;

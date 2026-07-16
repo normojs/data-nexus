@@ -111,6 +111,36 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             )),
         }
     }
+
+    fn encode_resultset_header(
+        &mut self,
+        columns: &[GatewayColumn],
+        _session: &SessionState,
+    ) -> GatewayResult<Vec<Vec<u8>>> {
+        encode_pg_resultset_header(columns)
+    }
+
+    fn encode_resultset_rows(
+        &mut self,
+        columns: &[GatewayColumn],
+        rows: &[Vec<GatewayValue>],
+        _session: &SessionState,
+    ) -> GatewayResult<Vec<Vec<u8>>> {
+        encode_pg_resultset_rows(columns, rows)
+    }
+
+    fn encode_resultset_footer(
+        &mut self,
+        _columns: &[GatewayColumn],
+        total_rows: usize,
+        session: &SessionState,
+    ) -> GatewayResult<Vec<Vec<u8>>> {
+        let ready = encode_ready_for_query(transaction_status(session));
+        Ok(vec![
+            encode_command_complete(&format!("SELECT {total_rows}")),
+            ready,
+        ])
+    }
 }
 
 pub struct PostgreSqlHandshake<S> {
@@ -265,16 +295,20 @@ fn unquote(value: &str, quote: char) -> Option<&str> {
     Some(&value[..end])
 }
 
-fn encode_resultset(
-    columns: Vec<GatewayColumn>,
-    rows: Vec<Vec<GatewayValue>>,
-    ready: Vec<u8>,
-) -> GatewayResult<Vec<Vec<u8>>> {
-    let fields = columns.iter().map(gateway_column_to_postgresql_field).collect::<Vec<_>>();
-    let mut messages = Vec::with_capacity(rows.len() + 3);
-    messages.push(encode_row_description(&fields).map_err(postgresql_protocol_error)?);
 
-    for row in &rows {
+fn encode_pg_resultset_header(columns: &[GatewayColumn]) -> GatewayResult<Vec<Vec<u8>>> {
+    let fields = columns.iter().map(gateway_column_to_postgresql_field).collect::<Vec<_>>();
+    Ok(vec![
+        encode_row_description(&fields).map_err(postgresql_protocol_error)?,
+    ])
+}
+
+fn encode_pg_resultset_rows(
+    columns: &[GatewayColumn],
+    rows: &[Vec<GatewayValue>],
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut messages = Vec::with_capacity(rows.len());
+    for row in rows {
         if row.len() != columns.len() {
             return Err(GatewayError::Protocol(format!(
                 "postgresql resultset row has {} values for {} columns",
@@ -282,11 +316,19 @@ fn encode_resultset(
                 columns.len()
             )));
         }
-
         let values = row.iter().map(gateway_value_to_text).collect::<Vec<_>>();
         messages.push(encode_data_row(&values).map_err(postgresql_protocol_error)?);
     }
+    Ok(messages)
+}
 
+fn encode_resultset(
+    columns: Vec<GatewayColumn>,
+    rows: Vec<Vec<GatewayValue>>,
+    ready: Vec<u8>,
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut messages = encode_pg_resultset_header(&columns)?;
+    messages.extend(encode_pg_resultset_rows(&columns, &rows)?);
     messages.push(encode_command_complete(&format!("SELECT {}", rows.len())));
     messages.push(ready);
     Ok(messages)
