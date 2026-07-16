@@ -7,6 +7,8 @@ edition = "2021"
 default = []
 # Optional OpenTelemetry business metrics on the command path.
 otel = ["dep:opentelemetry"]
+# Optional Cedar PDP (propagates to gateway_core).
+security-cedar = ["gateway_core/security-cedar"]
 
 [dependencies]
 async-trait = "0.1"

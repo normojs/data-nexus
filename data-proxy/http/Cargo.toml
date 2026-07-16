@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+security-cedar = ["gateway_core/security-cedar", "runtime_gateway/security-cedar"]
+
 [dependencies]
 async-trait = "0.1"
 config = { path = "../app/config" }

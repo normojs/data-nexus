@@ -7,6 +7,8 @@
 mod admin_auth;
 mod audit;
 mod audit_pipeline;
+#[cfg(feature = "security-cedar")]
+mod cedar_pdp;
 mod config;
 mod dialect;
 mod error;
@@ -36,6 +38,8 @@ pub use audit_pipeline::{
     data_plane_event, global_audit_pipeline, install_audit_pipeline, try_audit, AuditPipeline,
     AuditPipelineStats,
 };
+#[cfg(feature = "security-cedar")]
+pub use cedar_pdp::CedarEngine;
 pub use config::{
     AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
     PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,

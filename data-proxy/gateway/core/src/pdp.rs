@@ -145,6 +145,12 @@ pub struct LocalPdp {
     time_rules: Vec<SecurityTimeRuleConfig>,
     default_max_rows: Option<u64>,
     watermark: SecurityWatermarkConfig,
+    /// Optional Cedar table/action engine (F26, feature `security-cedar`).
+    #[cfg(feature = "security-cedar")]
+    cedar: Option<crate::CedarEngine>,
+    /// True when config asked for cedar backend (even if load failed).
+    #[cfg(feature = "security-cedar")]
+    cedar_required: bool,
 }
 
 impl LocalPdp {
@@ -153,6 +159,23 @@ impl LocalPdp {
         if !config.enabled {
             return None;
         }
+        #[cfg(feature = "security-cedar")]
+        let (cedar, cedar_required) = if config.pdp.backend.eq_ignore_ascii_case("cedar") {
+            match crate::cedar_pdp::try_load_from_config(&config.pdp.policy_dir) {
+                Ok(eng) => (eng, true),
+                Err(e) => {
+                    tracing::error!(
+                        target: "data_nexus::security",
+                        error = %e,
+                        "failed to load Cedar PDP; authorize will deny (fail closed)"
+                    );
+                    (None, true)
+                }
+            }
+        } else {
+            (None, false)
+        };
+
         Some(Self {
             fail_closed: config.fail_closed,
             star_policy: StarPolicy::from_config(&config.star_policy),
@@ -163,6 +186,10 @@ impl LocalPdp {
             time_rules: config.time_rules.clone(),
             default_max_rows: config.streaming.max_rows,
             watermark: config.watermark.clone(),
+            #[cfg(feature = "security-cedar")]
+            cedar,
+            #[cfg(feature = "security-cedar")]
+            cedar_required,
         })
     }
 
@@ -330,6 +357,11 @@ impl LocalPdp {
                 let table_decision = self.evaluate(&request);
                 if table_decision.is_deny() {
                     return table_decision;
+                }
+
+                // F26: optional Cedar table/action gate (feature security-cedar).
+                if let Some(deny) = self.evaluate_cedar(subject, action, &tables) {
+                    return deny;
                 }
 
                 // F27: time-window gates (business hours / freeze windows).
@@ -628,6 +660,39 @@ impl LocalPdp {
             },
             token,
         })
+    }
+
+    /// F26: Cedar table/action authorization when engine is loaded.
+    fn evaluate_cedar(
+        &self,
+        subject: &Subject,
+        action: StatementAction,
+        tables: &[String],
+    ) -> Option<SecurityDecision> {
+        #[cfg(feature = "security-cedar")]
+        {
+            if !self.cedar_required {
+                return None;
+            }
+            let Some(engine) = self.cedar.as_ref() else {
+                return Some(SecurityDecision::Deny {
+                    rule: "cedar".into(),
+                    message: "cedar PDP failed to load; deny (fail closed)".into(),
+                });
+            };
+            match engine.authorize_tables(&subject.subject_id, action, tables) {
+                Ok(()) => None,
+                Err(message) => Some(SecurityDecision::Deny {
+                    rule: "cedar".into(),
+                    message,
+                }),
+            }
+        }
+        #[cfg(not(feature = "security-cedar"))]
+        {
+            let _ = (subject, action, tables);
+            None
+        }
     }
 
     /// F27: first matching time rule that is currently active.
@@ -1496,6 +1561,11 @@ mod tests {
             time_rules: Vec::new(),
             default_max_rows: None,
             watermark: SecurityWatermarkConfig::default(),
+
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
         }
     }
 
@@ -1717,6 +1787,11 @@ mod tests {
             time_rules: Vec::new(),
             default_max_rows: None,
             watermark: SecurityWatermarkConfig::default(),
+
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
         };
         let mut set = ObjectSet::empty();
         let mut obj = ObjectAccess::new("employees", StatementAction::Select);
@@ -1761,6 +1836,11 @@ mod tests {
             time_rules: Vec::new(),
             default_max_rows: None,
             watermark: SecurityWatermarkConfig::default(),
+
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
         };
         let mut set = ObjectSet::empty();
         let mut obj = ObjectAccess::new("employees", StatementAction::Select);
@@ -1801,6 +1881,11 @@ mod tests {
             time_rules: Vec::new(),
             default_max_rows: None,
             watermark: SecurityWatermarkConfig::default(),
+
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
         };
         let sub = subject("root");
         let dialect = HeuristicDialectParser::mysql();
@@ -1879,6 +1964,11 @@ mod tests {
             }],
             default_max_rows: None,
             watermark: SecurityWatermarkConfig::default(),
+
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
         };
         let sub = subject("root");
         let dialect = HeuristicDialectParser::mysql();

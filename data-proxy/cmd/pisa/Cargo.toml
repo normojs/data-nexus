@@ -20,6 +20,11 @@ otel = [
   "dep:tracing-opentelemetry",
   "runtime_gateway/otel",
 ]
+# Optional Cedar data-plane PDP (F26). Prefer rustc ≥1.88 (smoke uses 1.94.1).
+security-cedar = [
+  "runtime_gateway/security-cedar",
+  "http/security-cedar",
+]
 
 #[build-dependencies]
 #anyhow = { version = "1.0", default-features = false }

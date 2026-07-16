@@ -43,7 +43,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 
 ### 1.2 关键 smoke
 
-`smoke-security-deny` / `column` / `mask` / `audit` / `ticket` / `dual-control` / `time` / `stream` / `passthrough` / `portal` / `watermark` / `cross-protocol` / `cross-protocol-stream` / `smoke-dual-listener` / `smoke-admin-auth`
+`smoke-security-deny` / `column` / `mask` / `audit` / `ticket` / `dual-control` / `time` / `cedar` / `stream` / `passthrough` / `portal` / `watermark` / `cross-protocol` / `cross-protocol-stream` / `smoke-dual-listener` / `smoke-admin-auth`
 
 ### 1.3 代码落点（摘要）
 
@@ -72,7 +72,7 @@ data-ui        运维台 + SQL Portal + Audit
 |----|----|------|:----:|
 | **F18** | 双人金库 | 票据需第二审批人确认后再生效 | **完成** |
 | **F27** | 时间维策略 | 仅工作时间可写等高危规则 | **完成** |
-| **F26** | Cedar PDP feature | 可选 feature，与 Local 对照 | 延后 |
+| **F26** | Cedar PDP feature | 可选 feature，与 Local 对照 | **完成** |
 | **B03** | OTel 自定义 attributes / 采样 | 可观测加深 | 延后 |
 | **B04** | 审计保留清理 / OpenDAL L2 | 冷归档 | 延后 |
 | **B05** | portal 导出按钮 / 流式 JSON | 门户体验 | **完成** |
@@ -81,15 +81,14 @@ data-ui        运维台 + SQL Portal + Audit
 
 ## 3. 当前下一动作（唯一焦点）
 
-**>>> F26 Cedar PDP / 或 B03 OTel / B04 审计归档 <<<**
+**>>> B03 OTel 加深 / 或 B04 审计归档 <<<**
 
-B05 已完成：`POST /admin/portal/query` 支持 `format=json|csv|ndjson` + `download`；CSV/NDJSON 经同一 PEP；data-ui 导出按钮；`smoke-security-portal` 覆盖导出。
+F26 已完成：`security-cedar` feature + `cedar-policy` 表/动作评估；`policy_dir` 加载 `*.cedar`；默认构建不依赖 Cedar；smoke 需 rustc ≥1.88（示例用 1.94.1）。
 
 建议下一任务：
 
-1. **F26** — Cedar PDP feature  
-2. **B03** — OTel 自定义 attributes / 采样  
-3. **B04** — 审计保留清理 / OpenDAL L2  
+1. **B03** — OTel 自定义 attributes / 采样  
+2. **B04** — 审计保留清理 / OpenDAL L2  
 
 ---
 

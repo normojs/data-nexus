@@ -104,7 +104,25 @@ impl SecurityPolicyConfig {
         }
 
         match self.pdp.backend.as_str() {
-            "local" | "cedar" | "remote" => {}
+            "local" | "remote" => {}
+            "cedar" => {
+                #[cfg(not(feature = "security-cedar"))]
+                {
+                    return Err(GatewayError::Configuration(
+                        "security.pdp.backend=cedar requires building with --features security-cedar (and rustc ≥1.88)"
+                            .into(),
+                    ));
+                }
+                #[cfg(feature = "security-cedar")]
+                {
+                    if self.pdp.policy_dir.trim().is_empty() {
+                        return Err(GatewayError::Configuration(
+                            "security.pdp.backend=cedar requires non-empty security.pdp.policy_dir"
+                                .into(),
+                        ));
+                    }
+                }
+            }
             other => {
                 return Err(GatewayError::Configuration(format!(
                     "security.pdp.backend must be local, cedar, or remote, got '{other}'"
@@ -519,4 +537,17 @@ mod tests {
         cfg.star_policy = "expand".into();
         assert!(cfg.validate().is_err());
     }
+
+    #[test]
+    fn cedar_backend_requires_feature_or_policy_dir() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.pdp.backend = "cedar".into();
+        cfg.pdp.policy_dir = String::new();
+        let err = cfg.validate().unwrap_err().to_string();
+        #[cfg(feature = "security-cedar")]
+        assert!(err.contains("policy_dir"), "{err}");
+        #[cfg(not(feature = "security-cedar"))]
+        assert!(err.contains("security-cedar") || err.contains("feature"), "{err}");
+    }
+
 }

@@ -3,6 +3,12 @@ name = "gateway_core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Optional Cedar PDP (F26). Requires rustc ≥1.88 (project smoke uses 1.94.1).
+# Enable: cargo test -p gateway_core --features security-cedar
+security-cedar = ["dep:cedar-policy"]
+
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -10,6 +16,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
+# Pinned major line; 4.4+ works with rustc 1.94 (MSRV of latest transitive deps).
+cedar-policy = { version = "4.4", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

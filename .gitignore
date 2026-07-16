@@ -7,3 +7,4 @@ target
 *.p12
 .cargo-target/
 .cargo-target-a1/
+.cargo-target-cedar/
