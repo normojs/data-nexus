@@ -350,7 +350,11 @@ impl MySqlBackendConnection {
             .send_query(sql.as_bytes())
             .await
             .map_err(|error| GatewayError::Backend(format!("write mysql query: {}", error)))?;
-        read_mysql_query_response(&mut stream, mode).await
+        if matches!(mode, ExecuteMode::Passthrough) {
+            read_mysql_query_passthrough(&mut stream).await
+        } else {
+            read_mysql_query_response(&mut stream, mode).await
+        }
     }
 
     fn client_ref(&self) -> GatewayResult<&ClientConn> {
@@ -538,6 +542,61 @@ fn parse_endpoint_address(address: &str) -> GatewayResult<(String, u16)> {
     }
 
     Ok((host.to_string(), port))
+}
+
+
+/// Collect backend packets as frontend-ready payloads (no logical decode).
+///
+/// `ResultsetStream` yields full MySQL packets (4-byte header + body). Frontend
+/// `PacketSend::Encode` re-wraps **body only**, so we strip the header here.
+async fn read_mysql_query_passthrough(
+    stream: &mut ResultsetStream<'_>,
+) -> GatewayResult<GatewayResponse> {
+    let mut packets = Vec::new();
+    // Header packet
+    let header = read_mysql_result_packet(stream, "mysql query header").await?;
+    packets.push(packet_payload("mysql query header", &header)?.to_vec());
+    let payload = packet_payload("mysql query header", &header)?;
+    match payload.first().copied() {
+        Some(OK_HEADER) | Some(ERR_HEADER) => {
+            return Ok(GatewayResponse::Wire { packets });
+        }
+        Some(_) => {
+            let (column_count, is_null, _) = decode_lenc_int(payload, "mysql column count")?;
+            if is_null {
+                return Err(GatewayError::Protocol(
+                    "mysql result set column count cannot be NULL".into(),
+                ));
+            }
+            for _ in 0..column_count {
+                let column_packet =
+                    read_mysql_result_packet(stream, "mysql column definition").await?;
+                packets.push(packet_payload("mysql column definition", &column_packet)?.to_vec());
+            }
+            // EOF after columns
+            let eof1 = read_mysql_result_packet(stream, "mysql column eof").await?;
+            packets.push(packet_payload("mysql column eof", &eof1)?.to_vec());
+            // Rows + final EOF (stream ends after EOF)
+            while let Some(row_packet) = read_optional_mysql_result_packet(stream).await? {
+                packets.push(packet_payload("mysql row/eof", &row_packet)?.to_vec());
+            }
+            // ResultsetStream swallows the final EOF (returns None). Frontend clients
+            // still need that EOF packet to finish the text resultset.
+            // ResultsetStream does not yield the terminal EOF payload; always append.
+            // Payload-only EOF packet body (header re-applied by frontend Encode).
+            let last_is_eof = packets
+                .last()
+                .map(|p| p.first() == Some(&EOF_HEADER))
+                .unwrap_or(false);
+            if !last_is_eof {
+                packets.push(vec![EOF_HEADER, 0, 0, 0, 0]);
+            }
+            Ok(GatewayResponse::Wire { packets })
+        }
+        None => Err(GatewayError::Protocol(
+            "mysql query header packet has empty payload".into(),
+        )),
+    }
 }
 
 pub(crate) async fn read_mysql_query_response(

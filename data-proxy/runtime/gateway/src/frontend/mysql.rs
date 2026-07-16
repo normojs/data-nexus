@@ -161,6 +161,7 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
                     .to_vec()])
             }
             GatewayResponse::ResultSet { columns, rows } => encode_text_resultset(columns, rows),
+            GatewayResponse::Wire { packets } => Ok(packets),
             GatewayResponse::Prepared { .. } => Err(GatewayError::Unsupported(
                 "mysql prepared response encoding is still handled by the legacy packet stream"
                     .into(),

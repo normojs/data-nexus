@@ -53,7 +53,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 - [x] **S4** — 持久化审计 + 查询 API（Admin；UI 后置）
 - [x] **S5** — 审批票据门闩（高危 DDL / 无 WHERE 写）
 - [ ] **S6** — Web SQL 门户 + Vault + 导出运营
-- [ ] **A 轨** — 性能：流式窗口 + 同协议透传（A1/A2 完成；A3–A4 待做）
+- [ ] **A 轨** — 性能：流式窗口 + 同协议透传（A1–A3 完成；A4 待做）
 
 ### 1.3 v1 可选增强（不挡 v2）
 
@@ -130,7 +130,7 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 - [ ] **F21** Web SQL 门户（经 PEP） — SQLDEV 体验 — S6 — P2
 - [ ] **F22** 项目/环境权限 — 多租户运营 — S6 — P2
 - [ ] **F23** 账号保险箱 / Vault — 凭据 — S6 — P2
-- [ ] **F24** 同协议结果透传 — 性能 — A3 — P0
+- [x] **F24** 同协议结果透传（MySQL Wire）— 性能 — A3 — P0
 - [x] **F25** Backend 窗口读 + Frontend 分阶段窗口 encode（A1/A2）— 性能 — P0
 - [ ] **F26** Cedar PDP（可选 feature） — 高级策略 — S2+ — P2
 - [ ] **F27** 时间维策略 — 高级策略 — S5 — P2
@@ -210,10 +210,10 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 - [x] **A1** Backend 窗口化读取 + `ExecuteMode` + `max_rows` 早截断（MySQL 窗口解码；PG max_rows）
 - [x] **A2** Frontend 分阶段 encode + 窗口写出（header/rows/footer；窗口间可 await write）
-- [ ] **A3** 同协议结果透传（无义务）
+- [x] **A3** 同协议结果透传（无义务；MySQL wire；PG 降级物化）
 - [ ] **A4** 跨协议流式
 
-**A1/A2 代码**：`ExecuteMode`、`write_resultset_windowed`、`encode_resultset_{header,rows,footer}`；`smoke-security-stream.sh`
+**A1–A3 代码**：`ExecuteMode::{Streaming,Passthrough}`、`GatewayResponse::Wire`、`write_resultset_windowed`；smoke-stream / smoke-passthrough
 
 ---
 
@@ -367,12 +367,7 @@ data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 
 ## 9. 当前下一动作（唯一焦点）
 
-**>>> A3 同协议透传 / 或 S6 门户 <<<**
-
-**A3 — 同协议结果透传（无义务）**
-
-- [ ] 检测无 mask/改写义务时走帧透传
-- [ ] 与 Streaming 路径对比延迟
+**>>> S6 门户 / 或 A4 跨协议流式 <<<**
 
 **S6 — SQLDEV 向门户 + Vault（可选）**
 
@@ -380,4 +375,8 @@ data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 - [ ] Web SQL 经 PEP
 - [ ] 账号保险箱
 
-S0–S5 + **A1/A2** 已完成。smoke：deny / column / mask / audit / ticket / stream。
+**A4 — 跨协议流式（可选）**
+
+- [ ] 翻译路径窗口化
+
+S0–S5 + **A1–A3** 已完成。smoke 另加 `smoke-security-passthrough`。

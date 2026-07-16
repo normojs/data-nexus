@@ -55,6 +55,8 @@ pub struct CoreGatewayConnection {
     security: Option<gateway_core::LocalPdp>,
     /// Result read mode from security.streaming (A1).
     stream_mode: ExecuteMode,
+    /// When true and same-protocol + no obligations, prefer wire passthrough (A3).
+    passthrough_enabled: bool,
     metrics: MySQLServerMetricsCollector,
 }
 
@@ -77,6 +79,7 @@ impl CoreGatewayConnection {
             frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
             security: None,
             stream_mode: ExecuteMode::Materialized,
+            passthrough_enabled: false,
             metrics: MySQLServerMetricsCollector,
         }
     }
@@ -91,6 +94,7 @@ impl CoreGatewayConnection {
         translation_policy: Option<TranslationPolicyConfig>,
         security: Option<gateway_core::LocalPdp>,
         stream_mode: ExecuteMode,
+        passthrough_enabled: bool,
     ) -> Self {
         let frontend_protocol = frontend.protocol();
         Self {
@@ -105,6 +109,7 @@ impl CoreGatewayConnection {
             frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
             security,
             stream_mode,
+            passthrough_enabled,
             metrics: MySQLServerMetricsCollector,
         }
     }
@@ -156,6 +161,7 @@ impl CoreGatewayConnection {
                     )
                 }
             }
+            GatewayResponse::Wire { packets } => Ok(packets),
             other => self.frontend.encode(other, &self.session),
         }
     }
@@ -535,18 +541,34 @@ impl CoreGatewayConnection {
                 }
             }
 
+            let same_protocol = self.frontend.protocol() == self.backend.protocol();
+            let want_passthrough = self.passthrough_enabled
+                && same_protocol
+                && !pending_obligations.has_result_obligations()
+                && matches!(command, GatewayCommand::Query { .. })
+                && self.translation_policy.is_none();
+            let exec_mode = if want_passthrough {
+                ExecuteMode::Passthrough
+            } else {
+                self.stream_mode
+            };
+
             let response = match self
                 .backend
-                .execute_with_mode(command, &mut self.session, self.stream_mode)
+                .execute_with_mode(command, &mut self.session, exec_mode)
                 .instrument(command_span.clone())
                 .await
             {
                 Ok(response) => {
-                    let response = map_response_types(
-                        response,
-                        &self.backend.protocol(),
-                        &self.frontend.protocol(),
-                    );
+                    // Wire packets must not be type-mapped; logical results still may.
+                    let response = match response {
+                        GatewayResponse::Wire { .. } => response,
+                        other => map_response_types(
+                            other,
+                            &self.backend.protocol(),
+                            &self.frontend.protocol(),
+                        ),
+                    };
                     if pending_obligations.has_result_obligations() {
                         info!(
                             target: gateway_core::AUDIT_TARGET,
@@ -571,6 +593,7 @@ impl CoreGatewayConnection {
             let outcome = match &response {
                 GatewayResponse::Error { code, .. } => format!("error:{code}"),
                 GatewayResponse::ResultSet { .. } => "resultset".to_owned(),
+                GatewayResponse::Wire { .. } => "passthrough".to_owned(),
                 GatewayResponse::Ok { .. } => "ok".to_owned(),
                 GatewayResponse::Pong => "pong".to_owned(),
                 GatewayResponse::Bye => "bye".to_owned(),
@@ -716,6 +739,7 @@ pub async fn handle_gateway_frame(
         };
 
         match response {
+            GatewayResponse::Wire { packets: wire } => packets.extend(wire),
             GatewayResponse::ResultSet { columns, rows } => {
                 let mut writer = CollectingWriter::new();
                 write_resultset_windowed(
@@ -798,6 +822,7 @@ pub struct CoreGatewayListenerPlan {
     security: Option<gateway_core::LocalPdp>,
     /// Result read mode derived from security.streaming.
     stream_mode: ExecuteMode,
+    passthrough_enabled: bool,
 }
 
 impl PartialEq for CoreGatewayListenerPlan {
@@ -872,6 +897,10 @@ impl CoreGatewayListenerPlan {
             config.security.streaming.window_rows,
             config.security.streaming.max_rows,
         );
+        // Passthrough only meaningful when security shell present; default true
+        // mirrors security.streaming.passthrough default. When security disabled,
+        // still allow same-protocol wire relay for performance.
+        let passthrough_enabled = config.security.streaming.passthrough;
 
         Ok(Self {
             listener: listener.clone(),
@@ -884,6 +913,7 @@ impl CoreGatewayListenerPlan {
             translation_policy,
             security,
             stream_mode,
+            passthrough_enabled,
         })
     }
 
@@ -932,6 +962,7 @@ impl CoreGatewayListenerPlan {
             self.translation_policy.clone(),
             self.security.clone(),
             self.stream_mode,
+            self.passthrough_enabled,
         );
         if let Some(plugin_config) = &self.plugin_config {
             connection = connection.with_plugins(PluginPhase::new(plugin_config.clone()));

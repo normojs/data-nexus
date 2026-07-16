@@ -1,0 +1,55 @@
+# A3 same-protocol wire passthrough (no result obligations).
+version = "2"
+
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+
+[security]
+enabled = true
+fail_closed = false
+star_policy = "allow"
+default_audit_level = "L0"
+
+[security.streaming]
+window_rows = 256
+passthrough = true
+
+[security.audit]
+queue_capacity = 1024
+overflow = "drop_new"
+sinks = ["tracing"]
+
+[[listeners]]
+name = "orders-mysql"
+listen_addr = "0.0.0.0:9088"
+protocol = "mysql"
+service = "orders"
+auth_policy = "local-users"
+
+[[services]]
+name = "orders"
+backend_protocol = "mysql"
+endpoints = ["orders-primary"]
+route_policy = "orders-balance"
+plugin_policies = []
+
+[[endpoints]]
+name = "orders-primary"
+protocol = "mysql"
+address = "127.0.0.1:13306"
+database = "orders"
+username = "root"
+password = "root"
+weight = 1
+
+[[route_policies]]
+name = "orders-balance"
+kind = "simple_load_balance"
+
+[[auth_policies]]
+name = "local-users"
+kind = "static"
+username = "root"
+password = "root"

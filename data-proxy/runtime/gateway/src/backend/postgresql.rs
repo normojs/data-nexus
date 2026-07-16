@@ -217,7 +217,16 @@ impl BackendConnector for PostgreSqlBackendConnector {
             }
             GatewayCommand::Query { sql } => {
                 let endpoint = self.select_endpoint(session)?;
-                self.execute_simple_query(endpoint, &sql, session, mode).await
+                {
+                    // tokio-postgres does not expose raw backend frames; fall back
+                    // to logical materialization for Passthrough (MySQL has true wire).
+                    let mode = if matches!(mode, ExecuteMode::Passthrough) {
+                        ExecuteMode::Materialized
+                    } else {
+                        mode
+                    };
+                    self.execute_simple_query(endpoint, &sql, session, mode).await
+                }
             }
             command => Err(GatewayError::Unsupported(format!(
                 "postgresql backend connector cannot execute {:?} yet",

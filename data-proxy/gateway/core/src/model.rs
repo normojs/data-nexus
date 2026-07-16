@@ -155,12 +155,17 @@ pub enum GatewayResponse {
     Ok { affected_rows: u64, last_insert_id: Option<u64> },
     Error { code: String, message: String },
     ResultSet { columns: Vec<Column>, rows: Vec<Vec<GatewayValue>> },
+    /// Same-protocol wire payloads ready for the frontend writer (A3).
+    ///
+    /// MySQL: packet payloads **without** the 4-byte frame header (as
+    /// `PacketSend::Encode` expects). PostgreSQL: full backend messages.
+    Wire { packets: Vec<Vec<u8>> },
     Prepared { statement_id: String, parameter_count: u16 },
     Pong,
     Bye,
 }
 
-/// How backend connectors should return large query results (A1).
+/// How backend connectors should return large query results (A1/A3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecuteMode {
@@ -168,6 +173,8 @@ pub enum ExecuteMode {
     Materialized,
     /// Decode rows in windows of `window_rows`, optionally stop at `max_rows`.
     Streaming { window_rows: usize, max_rows: Option<u64> },
+    /// Same-protocol raw packet relay without logical decode (A3).
+    Passthrough,
 }
 
 impl Default for ExecuteMode {
@@ -187,16 +194,20 @@ impl ExecuteMode {
 
     pub fn effective_max_rows(self) -> Option<u64> {
         match self {
-            Self::Materialized => None,
+            Self::Materialized | Self::Passthrough => None,
             Self::Streaming { max_rows, .. } => max_rows,
         }
     }
 
     pub fn window_rows(self) -> Option<usize> {
         match self {
-            Self::Materialized => None,
+            Self::Materialized | Self::Passthrough => None,
             Self::Streaming { window_rows, .. } => Some(window_rows),
         }
+    }
+
+    pub fn is_passthrough(self) -> bool {
+        matches!(self, Self::Passthrough)
     }
 }
 

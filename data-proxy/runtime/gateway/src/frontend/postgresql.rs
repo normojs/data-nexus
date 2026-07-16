@@ -106,6 +106,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 ready,
             ]),
             GatewayResponse::ResultSet { columns, rows } => encode_resultset(columns, rows, ready),
+            GatewayResponse::Wire { packets } => Ok(packets),
             GatewayResponse::Prepared { .. } => Err(GatewayError::Unsupported(
                 "postgresql prepared response encoding is not implemented yet".into(),
             )),
