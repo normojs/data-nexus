@@ -6,8 +6,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use gateway_core::{
-    required_permission, AdminAuthConfig, AdminAuthContext, AdminAuthMode, AdminPermission,
-    AdminRole,
+    required_permission, AdminAuthConfig, AdminAuthContext, AdminAuthMode, AdminRole,
 };
 use jsonwebtoken::{
     decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
@@ -391,7 +390,7 @@ pub fn me_response(ctx: Option<&AdminAuthContext>, auth_enabled: bool) -> AdminM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_core::AdminAuthMode;
+    use gateway_core::{AdminAuthMode, AdminPermission};
 
     fn enabled_hmac() -> AdminAuthConfig {
         AdminAuthConfig {

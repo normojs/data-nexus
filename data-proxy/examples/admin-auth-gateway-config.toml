@@ -1,0 +1,64 @@
+# Minimal v2 config for Admin API auth smoke (no DB clients required).
+# Smoke: ./examples/smoke-admin-auth.sh
+# Docs: docs/admin-auth-password.md
+
+version = "2"
+
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+
+[admin_auth]
+enabled = true
+mode = "jwt_hmac"
+jwt_secret = "smoke-admin-auth-secret"
+issuer = "data-nexus-smoke"
+audience = "data-nexus-admin"
+leeway_secs = 60
+public_metrics = true
+break_glass_password = "smoke-break-glass"
+break_glass_role = "admin"
+token_ttl_secs = 3600
+role_claim_paths = ["roles", "groups", "realm_access.roles"]
+
+[admin_auth.role_bindings]
+"data-nexus-viewers" = "viewer"
+"data-nexus-operators" = "operator"
+"data-nexus-admins" = "admin"
+"viewer" = "viewer"
+"operator" = "operator"
+"admin" = "admin"
+
+[[listeners]]
+name = "smoke-mysql"
+listen_addr = "0.0.0.0:9088"
+protocol = "mysql"
+service = "smoke"
+auth_policy = "local-users"
+
+[[services]]
+name = "smoke"
+backend_protocol = "mysql"
+endpoints = ["smoke-primary"]
+route_policy = "smoke-balance"
+plugin_policies = []
+
+[[endpoints]]
+name = "smoke-primary"
+protocol = "mysql"
+address = "127.0.0.1:13306"
+database = "orders"
+username = "root"
+password = "root"
+weight = 1
+
+[[route_policies]]
+name = "smoke-balance"
+kind = "simple_load_balance"
+
+[[auth_policies]]
+name = "local-users"
+kind = "static"
+username = "root"
+password = "root"
