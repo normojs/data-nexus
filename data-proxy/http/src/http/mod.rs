@@ -29,7 +29,10 @@ use axum::{
 };
 use tower_http::cors::{Any, CorsLayer};
 use config::config::{GatewayConfigDocument, GatewayConfigLoadError, PisaProxyConfig};
-use gateway_core::{AdminAuthConfig, ListenerConfig, RoutePolicyConfig};
+use gateway_core::{
+    AdminAuthConfig, AdminAuthContext, AuditAction, AuditDecision, ListenerConfig,
+    RoutePolicyConfig, AUDIT_TARGET,
+};
 use pisa_error::error::*;
 use pisa_metrics::metrics::MetricsManager;
 use proxy::factory::{
@@ -626,13 +629,18 @@ impl AxumServer {
             .unwrap_or_default()
     }
 
-    fn authorize(&self, headers: &HeaderMap, method: &str, path: &str) -> Result<(), Response<Body>> {
+    fn authorize(
+        &self,
+        headers: &HeaderMap,
+        method: &str,
+        path: &str,
+    ) -> Result<Option<AdminAuthContext>, Response<Body>> {
         let auth = self.admin_auth_config_snapshot();
         let authorization = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
         match authenticate_request(&auth, authorization, method, path) {
-            Ok(_) => Ok(()),
+            Ok(ctx) => Ok(ctx),
             Err(err) => Err(admin_auth_error_response(err)),
         }
     }
@@ -684,7 +692,16 @@ impl AxumServer {
         let auth = state.admin_auth_config_snapshot();
         match break_glass_login(&auth, &body.password) {
             Ok(token) => {
-                info!(target: "data_nexus::audit", auth_method = "break_glass", "admin break-glass login");
+                info!(
+                    target: AUDIT_TARGET,
+                    action = AuditAction::AdminLogin.as_str(),
+                    decision = AuditDecision::Allow.as_str(),
+                    subject_id = "break-glass",
+                    auth_method = "break_glass",
+                    method = "POST",
+                    path = "/admin/auth/login",
+                    "admin break-glass login"
+                );
                 json_response(&token)
             }
             Err(err) => admin_auth_error_response(err),
@@ -768,9 +785,10 @@ impl AxumServer {
         headers: HeaderMap,
         Json(listener): Json<ListenerConfig>,
     ) -> Response<Body> {
-        if let Err(response) = state.authorize(&headers, "POST", "/admin/listeners") {
-            return response;
-        }
+        let auth_ctx = match state.authorize(&headers, "POST", "/admin/listeners") {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
         let gateway_config = match &state.gateway_config {
             Some(gateway_config) => gateway_config.clone(),
             None => return gateway_config_not_available(),
@@ -837,6 +855,13 @@ impl AxumServer {
 
         tokio::spawn(start_gateway_server(listener_runtime.proxy));
 
+        audit_admin_write(
+            auth_ctx.as_ref(),
+            "POST",
+            "/admin/listeners",
+            "ok",
+            Some(listener_name.as_str()),
+        );
         json_response(&AdminAddListenerResponse {
             status: "started",
             name: listener_name,
@@ -851,9 +876,10 @@ impl AxumServer {
         Json(route_policy): Json<RoutePolicyConfig>,
     ) -> Response<Body> {
         let policy_path = format!("/admin/route-policies/{}", name);
-        if let Err(response) = state.authorize(&headers, "PUT", &policy_path) {
-            return response;
-        }
+        let auth_ctx = match state.authorize(&headers, "PUT", &policy_path) {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
         let gateway_config = match &state.gateway_config {
             Some(gateway_config) => gateway_config.clone(),
             None => return gateway_config_not_available(),
@@ -919,6 +945,13 @@ impl AxumServer {
             }
         };
 
+        audit_admin_write(
+            auth_ctx.as_ref(),
+            "PUT",
+            &policy_path,
+            "ok",
+            Some(response.name.as_str()),
+        );
         json_response(&response)
     }
 
@@ -938,12 +971,16 @@ impl AxumServer {
         headers: HeaderMap,
     ) -> Response<Body> {
         let path = format!("/admin/pools/{}/refresh", name);
-        if let Err(response) = state.authorize(&headers, "POST", &path) {
-            return response;
-        }
+        let auth_ctx = match state.authorize(&headers, "POST", &path) {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
         match &state.runtime_state {
             Some(runtime_state) => match runtime_state.refresh_pool(&name) {
-                Some(status) => json_response(&status),
+                Some(status) => {
+                    audit_admin_write(auth_ctx.as_ref(), "POST", &path, "ok", Some(name.as_str()));
+                    json_response(&status)
+                }
                 None => admin_runtime_not_found("listener pool refresher is not available"),
             },
             None => admin_runtime_not_found("admin runtime state is not available"),
@@ -951,11 +988,22 @@ impl AxumServer {
     }
 
     async fn admin_refresh_pools(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
-        if let Err(response) = state.authorize(&headers, "POST", "/admin/pools/refresh") {
-            return response;
-        }
+        let auth_ctx = match state.authorize(&headers, "POST", "/admin/pools/refresh") {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
         match &state.runtime_state {
-            Some(runtime_state) => json_response(&runtime_state.refresh_pools()),
+            Some(runtime_state) => {
+                let status = runtime_state.refresh_pools();
+                audit_admin_write(
+                    auth_ctx.as_ref(),
+                    "POST",
+                    "/admin/pools/refresh",
+                    "ok",
+                    None,
+                );
+                json_response(&status)
+            }
             None => admin_runtime_not_found("admin runtime state is not available"),
         }
     }
@@ -971,9 +1019,10 @@ impl AxumServer {
     }
 
     async fn admin_reload(State(state): State<Self>, headers: HeaderMap) -> Response<Body> {
-        if let Err(response) = state.authorize(&headers, "POST", "/admin/reload") {
-            return response;
-        }
+        let auth_ctx = match state.authorize(&headers, "POST", "/admin/reload") {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
         let shared_config = match &state.gateway_config {
             Some(config) => config.clone(),
             None => return gateway_config_not_available(),
@@ -995,6 +1044,13 @@ impl AxumServer {
         let diff = GatewayConfigDiff::between(&current_config, &next_config);
         let changed = diff.has_changes();
         if !changed {
+            audit_admin_write(
+                auth_ctx.as_ref(),
+                "POST",
+                "/admin/reload",
+                "validated",
+                None,
+            );
             return json_response(&GatewayReloadResponse {
                 status: "validated",
                 source: config_source.description(),
@@ -1080,6 +1136,7 @@ impl AxumServer {
             }
         }
 
+        audit_admin_write(auth_ctx.as_ref(), "POST", "/admin/reload", "applied", None);
         json_response(&GatewayReloadResponse {
             status: "applied",
             source: config_source.description(),
@@ -1095,17 +1152,44 @@ impl AxumServer {
         headers: HeaderMap,
     ) -> Response<Body> {
         let path = format!("/admin/listeners/{}/stop", name);
-        if let Err(response) = state.authorize(&headers, "POST", &path) {
-            return response;
-        }
+        let auth_ctx = match state.authorize(&headers, "POST", &path) {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
         match &state.runtime_state {
             Some(runtime_state) => match runtime_state.stop_listener(&name) {
-                Some(status) => json_response(&status),
+                Some(status) => {
+                    audit_admin_write(auth_ctx.as_ref(), "POST", &path, "ok", Some(name.as_str()));
+                    json_response(&status)
+                }
                 None => admin_runtime_not_found("listener runtime control is not available"),
             },
             None => admin_runtime_not_found("admin runtime state is not available"),
         }
     }
+}
+
+fn audit_admin_write(
+    ctx: Option<&AdminAuthContext>,
+    method: &str,
+    path: &str,
+    outcome: &str,
+    resource: Option<&str>,
+) {
+    let subject_id = ctx.map(|c| c.subject.as_str()).unwrap_or("anonymous");
+    let auth_method = ctx.map(|c| c.auth_method.as_str()).unwrap_or("none");
+    info!(
+        target: AUDIT_TARGET,
+        action = AuditAction::AdminWrite.as_str(),
+        decision = AuditDecision::Allow.as_str(),
+        subject_id = %subject_id,
+        auth_method = %auth_method,
+        method = %method,
+        path = %path,
+        outcome = %outcome,
+        resource = resource,
+        "admin write audited"
+    );
 }
 
 fn admin_auth_error_response(error: AdminAuthError) -> Response<Body> {

@@ -5,12 +5,14 @@
 //! connectors meet at these types instead.
 
 mod admin_auth;
+mod audit;
 mod config;
 mod dialect;
 mod error;
 mod model;
 mod plugin;
 mod route;
+mod security;
 mod sharding;
 mod translation;
 mod transport;
@@ -20,9 +22,16 @@ pub use admin_auth::{
     required_permission, AdminAuthConfig, AdminAuthContext, AdminAuthMode, AdminPermission,
     AdminRole,
 };
+pub use audit::{
+    fields as audit_fields, AuditAction, AuditDecision, AuditEvent, AuditLevel, AUDIT_TARGET,
+};
 pub use config::{
     AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
     PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,
+};
+pub use security::{
+    SecurityAuditConfig, SecurityPdpConfig, SecurityPolicyConfig, SecurityRuleConfig,
+    SecurityStreamingConfig, SecuritySubjectConfig,
 };
 pub use dialect::{default_dialect_parser, DialectParser, HeuristicDialectParser};
 pub use error::{GatewayError, GatewayResult};

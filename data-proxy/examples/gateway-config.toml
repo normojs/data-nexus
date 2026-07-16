@@ -9,6 +9,28 @@ host = "0.0.0.0"
 port = 8082
 log_level = "INFO"
 
+# Data-plane security shell (S0). Default off — L0 behaviour unchanged.
+# See docs/data-nexus-tech-architecture-2026.md and todo.md S0–S6.
+[security]
+enabled = false
+fail_closed = true
+default_audit_level = "L0"
+
+[security.subject]
+sources = ["protocol_user"]
+
+[security.pdp]
+backend = "local"
+
+[security.streaming]
+window_rows = 256
+passthrough = true
+
+[security.audit]
+queue_capacity = 65536
+overflow = "drop_new"
+sinks = ["tracing"]
+
 [[listeners]]
 name = "orders-mysql"
 listen_addr = "0.0.0.0:9088"

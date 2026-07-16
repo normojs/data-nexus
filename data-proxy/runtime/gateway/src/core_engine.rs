@@ -195,16 +195,17 @@ impl CoreGatewayConnection {
                     }
                     Ok(PluginDecision::Reject { code, message }) => {
                         info!(
-                            target: "data_nexus::audit",
+                            target: gateway_core::AUDIT_TARGET,
+                            action = gateway_core::AuditAction::Query.as_str(),
                             listener = %self.listener_name,
                             service = %self.service_name,
                             frontend_protocol = %protocol_metric_name(&self.frontend.protocol()),
                             backend_protocol = %protocol_metric_name(&self.backend.protocol()),
                             command_type = %command_type,
                             endpoint = %label_owned[5],
-                            user = ?self.session.user,
+                            db_user = ?self.session.user,
                             database = ?self.session.database,
-                            decision = "reject",
+                            decision = gateway_core::AuditDecision::Reject.as_str(),
                             code = %code,
                             message = %message,
                             "gateway command rejected by plugin"
@@ -252,14 +253,17 @@ impl CoreGatewayConnection {
                             message: error.to_string(),
                         };
                         info!(
-                            target: "data_nexus::audit",
+                            target: gateway_core::AUDIT_TARGET,
+                            action = gateway_core::AuditAction::Query.as_str(),
                             listener = %self.listener_name,
                             service = %self.service_name,
                             frontend_protocol = %protocol_metric_name(&self.frontend.protocol()),
                             backend_protocol = %protocol_metric_name(&self.backend.protocol()),
                             command_type = %command_type,
                             endpoint = %label_owned[5],
-                            decision = "translation_reject",
+                            db_user = ?self.session.user,
+                            database = ?self.session.database,
+                            decision = gateway_core::AuditDecision::TranslationReject.as_str(),
                             message = %error,
                             "gateway command rejected by translation policy"
                         );
@@ -308,16 +312,17 @@ impl CoreGatewayConnection {
             };
             command_span.record("outcome", tracing::field::display(&outcome));
             info!(
-                target: "data_nexus::audit",
+                target: gateway_core::AUDIT_TARGET,
+                action = gateway_core::AuditAction::Query.as_str(),
                 listener = %self.listener_name,
                 service = %self.service_name,
                 frontend_protocol = %protocol_metric_name(&self.frontend.protocol()),
                 backend_protocol = %protocol_metric_name(&self.backend.protocol()),
                 command_type = %command_type,
                 endpoint = %label_owned[5],
-                user = ?self.session.user,
+                db_user = ?self.session.user,
                 database = ?self.session.database,
-                decision = "execute",
+                decision = gateway_core::AuditDecision::Execute.as_str(),
                 outcome = %outcome,
                 latency_ms = started_at.elapsed().as_millis() as u64,
                 "gateway command audited"

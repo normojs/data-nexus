@@ -1,62 +1,154 @@
-# Data Nexus 后续开发计划
+# Data Nexus 开发看板
 
-详细架构见：`docs/data-nexus-protocol-gateway-plan.md`  
-数据安全升级见：`docs/data-security-roadmap.md`
+**架构文档**（细节以文档为准，本文件只排期与勾选）：
 
-## 产品定位
-
-Data Nexus = **数据库协议中转站** + 规划中的 **数据访问安全能力**（PEP）。
-
-- L0：前端/后端协议、方言、路由、治理、观测（M0–M10 已完成）
-- L1：数据面身份、表/列/行授权、脱敏、审批、通道管控（S0–S6，见路线图）
-- 管理面鉴权（Admin RBAC）与数据面授权 **分离**
-- 对标参考：美创数据防水坝、数安 SQLDev（竞争 + 差异化：协议原生 PEP）
+| 文档 | 用途 |
+|------|------|
+| `docs/data-nexus-protocol-gateway-plan.md` | L0 / v1 协议网关底座 |
+| `docs/data-security-roadmap.md` | 产品对标（防水坝 / 树安 SQLDEV）+ S0–S6 定义 |
+| `docs/data-nexus-tech-architecture-2026.md` | **v2 技术主文档**（术语、选型、双路径、实现切片） |
+| `docs/data-audit-architecture.md` | 审计/流式专项 |
 
 ---
 
-## 现状快照（2026-07）
-
-### 已完成（L0 + 管理面）
-
-- 同/跨协议 E2E、方言 AST、Admin API、data-ui、OTel
-- Admin：`jwt_hmac` / `jwt_jwks`、break-glass、UI Bearer、`smoke-admin-auth.sh`
-
-### 数据安全（L1）— 按路线图推进
-
-| 阶段 | 主题 | 状态 |
-|------|------|------|
-| S0 | 边界修订 + 审计模型 + security 配置空壳 | 待办 |
-| S1 | Subject + 语句/表级 Deny MVP | 待办 |
-| S2 | AST 对象抽取 + 表/列 ACL | 待办 |
-| S3 | ResultSet 钩子 + 动态脱敏（+ 行/水印雏形） | 待办 |
-| S4 | 持久化审计 + 查询 API/UI | 待办 |
-| S5 | 审批/金库 + 通道高危门闩 | 待办 |
-| S6 | 门户/环境/Vault/导出运营 | 待办 |
-
-### 开放缺口（L0 运维增强，可选）
-
-1. OTel span 自定义 attributes 与按 service 采样  
-2. data-ui 403 友好页  
-
-### 早期非目标（S0–S2）
-
-- 一次做齐防水坝全家桶  
-- 任意方言全量互转  
-- Admin JWT 直接当数据面身份  
-- 默认 fail-open 且无指标  
-
----
-
-## 路线总览
+## 0. 版本划分
 
 ```text
-M0–M10  协议网关 + 管理面鉴权 + UI + 观测     ✓
-S0–S6   数据安全（对标防水坝/SQLDev 的升级）  规划中
+v1 = L0   数据库协议中转站 + 管理面鉴权 + 运维 UI + 观测     ✅ 已完成（M0–M10）
+v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   ⏳ 待开发（S0–S6）
 ```
+
+| 版本 | 一句话 | 状态 |
+|------|--------|:----:|
+| **v1** | 客户端 ↔ 网关 ↔ MySQL/PG；路由/池/跨协议/Admin | **完成** |
+| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **未开工** |
+
+**原则**
+
+- v2 默认 `security.enabled=false`，不破坏 v1 行为
+- 管理面鉴权 ≠ 数据面 Subject
+- 验收顺序对齐竞品话术：`审计 → 表权 → 列/脱敏 → 行 → 敏感识别 → 工单 → 门户`
+- 非目标：主机堡垒、操作录屏、一次 30+ 库、热路径 Arrow、Admin JWT 当数据身份
+
+**术语**：见 `docs/data-nexus-tech-architecture-2026.md` §0.2
 
 ---
 
-## 验收跑法（L0）
+## 1. 现状快照
+
+### 1.1 v1 已完成
+
+- [x] 同/跨协议 E2E（MySQL / PostgreSQL）
+- [x] 方言 AST、路由/连接池、治理插件
+- [x] Admin JWT（HMAC/JWKS）、break-glass、data-ui
+- [x] Prometheus + 可选 OTel
+- [x] smoke：`smoke-dual-listener` / `smoke-cross-protocol` / `smoke-cross-protocol-pg-to-mysql` / `smoke-admin-auth`
+
+### 1.2 v2 总状态
+
+- [x] **S0** — 边界 + 审计模型 + security 配置空壳
+- [ ] **S1** — Subject + 语句/表级 Deny MVP
+- [ ] **S2** — AST 对象抽取 + 表/列 ACL
+- [ ] **S3** — 流式结果钩子 + 动态脱敏 + 行级雏形
+- [ ] **S4** — 持久化审计 + 查询 API/UI
+- [ ] **S5** — 审批/金库 + 通道高危门闩
+- [ ] **S6** — Web SQL 门户 + Vault + 导出运营
+- [ ] **A 轨** — 性能：流式窗口 + 同协议透传（与 S 并行）
+
+### 1.3 v1 可选增强（不挡 v2）
+
+- [ ] OTel span 自定义 attributes / 按 service 采样
+- [ ] data-ui 403 友好页
+
+---
+
+## 2. v2 开发总顺序（强制依赖）
+
+```text
+        ┌──────────── A 轨：性能底座（可并行）────────────┐
+        │  A1 窗口流式  →  A2 边写  →  A3 透传  →  A4…   │
+        └───────────────────┬────────────────────────────┘
+                            │ 建议 A1 不晚于 S3
+S0 壳子+审计字段
+ │
+ ▼
+S1 Subject + 表/语句 Deny          ◄── 第一个「能卖」的安全能力
+ │
+ ▼
+S2 列 ACL + 对象抽取
+ │
+ ├──────────────────────────────┐
+ ▼                              ▼
+S3 脱敏+行级（依赖流式更佳）    S4 持久审计（可与 S3 后半并行）
+ │                              │
+ └──────────┬───────────────────┘
+            ▼
+         S5 审批/通道
+            ▼
+         S6 门户/Vault
+```
+
+**推荐串行主线**（产品验收）：
+
+```text
+S0 → S1 → S2 → S3 → S4 → S5 → S6
+```
+
+**推荐并行**
+
+- [ ] S0 ∥ A1 设计（配置壳 + 流式 API 设计）
+- [ ] S2 ∥ A1 落地（列权限设计时后端已能窗口读）
+- [ ] S3 ∥ 审计 sink 增强（脱敏与文件/OTLP 可并行）
+- [ ] S4 ∥ S5 前期（审计 UI 与工单模型可错开人力）
+
+**不要并行**：S1 未完成就做 S3 脱敏（没有 Subject/决策语义）。
+
+---
+
+## 3. v2 功能清单（按能力域）
+
+> 完成后改为 `- [x]`；细节勾选以第 4 节阶段任务为准。
+
+- [x] **F01** 统一 AuditEvent 字段 + 异步管道骨架 — 操作审计 — S0 — P0（schema + tracing 字段；异步管道 S4）
+- [x] **F02** `SecurityPolicyConfig`（default off） — 配置面 — S0 — P0
+- [x] **F03** Admin 写操作审计带 `sub` — 管理审计 — S0 — P0
+- [ ] **F04** 数据面 Subject 绑定 — 身份 — S1 — P0
+- [ ] **F05** 语句类管控 DQL/DML/TCL/DDL — 数据访问 — S1 — P0
+- [ ] **F06** 表级 Allow/Deny — 权限 — S1 — P0
+- [ ] **F07** Local PDP + Decision — 策略引擎 — S1 — P0
+- [ ] **F08** AST → ObjectSet（表/列/操作） — 细粒度前置 — S2 — P0
+- [ ] **F09** 列级 ACL（投影剔除/拒绝） — 字段权限 — S2 — P0
+- [ ] **F10** SQL 改写义务（LIMIT/列/行谓词） — 权限执行 — S2–S3 — P0
+- [ ] **F11** 结果流钩子 + 动态脱敏 Mask — 数据脱敏 — S3 — P0
+- [ ] **F12** 行级过滤（改写优先，结果回退） — 行级管控 — S3 — P0
+- [ ] **F13** 敏感列标签 / 规则识别 MVP — 敏感识别 — S3 — P1
+- [ ] **F14** 水印雏形 — 防泄漏 — S3–S4 — P2
+- [ ] **F15** 审计持久化 + 查询 API + UI — 合规审计 — S4 — P0
+- [ ] **F16** 审计分级 L0/L1/L2 + 背压 — 高性能审计 — S0/S4 — P0
+- [ ] **F17** 高危规则 + 审批票据 — 工单 — S5 — P1
+- [ ] **F18** 金库（双人/限时/限次） — 金库 — S5 — P2
+- [ ] **F19** 通道标签（协议/导出/作业） — 通道管控 — S5 — P1
+- [ ] **F20** 导出/大结果门闩 — 外发 — S5–S6 — P1
+- [ ] **F21** Web SQL 门户（经 PEP） — SQLDEV 体验 — S6 — P2
+- [ ] **F22** 项目/环境权限 — 多租户运营 — S6 — P2
+- [ ] **F23** 账号保险箱 / Vault — 凭据 — S6 — P2
+- [ ] **F24** 同协议结果透传 — 性能 — A3 — P0
+- [ ] **F25** Backend/Frontend 流式窗口 — 性能 — A1–A2 — P0
+- [ ] **F26** Cedar PDP（可选 feature） — 高级策略 — S2+ — P2
+- [ ] **F27** 时间维策略 — 高级策略 — S5 — P2
+- [ ] **F28** 策略热更（失败 keep-old） — 运维 — S1–S2 — P0
+
+---
+
+## 4. 分阶段开发计划（详细勾选）
+
+### 4.0 进入 v2 的门槛（开工前）
+
+- [ ] 四条 v1 smoke 本地/CI 再确认全绿
+- [ ] 团队确认：v2 default off、fail-closed 默认、非目标列表
+- [ ] 读过术语表 §0.2 与 roadmap §3
+
+**L0 验收命令**
 
 | 场景 | 命令 |
 |------|------|
@@ -64,45 +156,229 @@ S0–S6   数据安全（对标防水坝/SQLDev 的升级）  规划中
 | MySQL → PG | `./data-proxy/examples/smoke-cross-protocol.sh` |
 | PG → MySQL | `./data-proxy/examples/smoke-cross-protocol-pg-to-mysql.sh` |
 | Admin 鉴权 | `./data-proxy/examples/smoke-admin-auth.sh` |
-| Nuxt / Docker UI | 见 `data-ui/README.md` |
 
 ---
 
-## M10：管理面鉴权（完成）
+### S0 — 边界 + 审计模型 + 配置空壳  ✅
 
-- [x] HMAC / JWKS、break-glass、UI Bearer、`/admin/me`  
-- [x] `smoke-admin-auth.sh`  
-- 文档：`docs/admin-rbac-design.md`、`docs/admin-auth-password.md`  
+| 项 | 内容 |
+|----|------|
+| **目标** | 立规矩、不改默认行为；后续阶段有挂载点 |
+| **退出** | default off 下 v1 smoke 全绿；配置可校验；审计字段统一 |
+
+**功能 / 任务**
+
+- [x] 文档与看板边界已对齐（本文件 + roadmap）
+- [x] `SecurityPolicyConfig` 空壳（`enabled=false`）+ `GatewayConfig` validate
+- [x] 配置示例：`examples/gateway-config.toml` 增加 `[security]` 默认 off
+- [x] 统一 `AuditEvent` / `data_nexus::audit` 字段 schema（`gateway/core/src/audit.rs`）
+- [x] `core_engine` 审计字段对齐 schema（`action`/`decision`/`db_user` 等）
+- [x] Admin 写路径 audit 带 JWT `sub`（`audit_admin_write`）
+- [ ] 指标占位：`audit_events_total`（可选，延后）
+- [x] 单测：security shell 解析 / invalid reject（gateway_core + config）
+
+**代码触点**：`gateway/core/src/{security,audit,config,lib}.rs`、`core_engine.rs`、`http/src/http/mod.rs`、`examples/gateway-config.toml`
+
+**不做**：真正 Deny 策略、脱敏、Subject 映射表
 
 ---
 
-## S0：数据安全启动（下一工程里程碑）
+### S1 — Subject + 语句/表级 Deny（MVP PEP）
 
-详见 `docs/data-security-roadmap.md` §6–§7。
+| 项 | 内容 |
+|----|------|
+| **目标** | 「谁在哪个 service 对哪些表做哪类操作，是否允许」 |
+| **退出** | 指定用户/表/语句可拒绝；协议错误可理解；有 smoke |
 
-- [ ] `todo` / 路线图边界与团队对齐  
-- [ ] `SecurityPolicyConfig` 空壳 + validate（default off）  
-- [ ] 统一 `data_nexus::audit` 字段 schema  
-- [ ] Admin 写操作 audit 带 `sub`  
-- [ ] 现有 smoke 在 default off 下全绿  
+**功能 / 任务**
+
+- [ ] `Subject` / `SecurityContext` 绑定（协议用户 → subject，可扩展 proxy_protocol）
+- [ ] 语句分类：DQL / DML / TCL / DDL（基于现有 dialect）
+- [ ] best-effort 表名抽取（可先于完整 AST visitor）
+- [ ] Local PDP：规则 `subject/role × service × action × table_glob → allow|deny`
+- [ ] `core_engine` pre-execute 挂载；Deny 不访问后端
+- [ ] `fail_closed` / `fail_open` 可配 + 指标
+- [ ] `GET /admin/security-policies`（只读列表/状态）
+- [ ] `smoke-security-deny.sh` + 示例 config
+- [ ] 策略热更接入 reload（校验失败 keep-old）
+
+**不做**：列/行、脱敏、审批、门户
 
 ---
 
-## 模块边界
+### S2 — 对象抽取 + 表/列 ACL
+
+| 项 | 内容 |
+|----|------|
+| **目标** | 库表列权限最小集（对齐 SQLDEV 细粒度前置） |
+| **退出** | 列级拒绝 E2E；复杂 SQL 有单测；解析失败可观测 |
+
+**功能 / 任务**
+
+- [ ] MySQL/PG AST visitor → `ObjectAccess[]` / `ObjectSet`
+- [ ] 列级 allow/deny；`SELECT *` 策略（拒绝或依赖 schema 展开，可分期）
+- [ ] SQL 改写：剔除无权限列（优先）/ 无法改写则 Deny
+- [ ] 多表 JOIN / 别名 / schema 限定单测矩阵
+- [ ] 解析失败路径：指标 + fail_closed 行为
+- [ ] Admin：策略 CRUD 雏形或文件加载（二选一，先文件可接受）
+- [ ] （可选 P2）Cedar feature 开关，与 Local 决策对照测试
+
+---
+
+### A 轨 — 性能底座（与 S1–S3 并行）
+
+**验收**：大结果 RSS 不随全表线性爆炸；无义务路径延迟接近 v1 或不显著回退。
+
+- [ ] **A1** Backend 窗口化读取（先单协议）+ `ExecuteMode`（S0 后可开）
+- [ ] **A2** Frontend 边编码边写 + 背压（依赖 A1）
+- [ ] **A3** 同协议结果透传（无义务）（依赖 A1–A2、义务检测）
+- [ ] **A4** 跨协议流式（后置，S3 后）
+
+---
+
+### S3 — 动态脱敏 + 行级 + 敏感识别 MVP
+
+| 项 | 内容 |
+|----|------|
+| **目标** | 同查询不同可见性；结果侧 mask（SQLDEV 动态脱敏） |
+| **退出** | 角色 A 脱敏 / B 明文；行级隔离可证；优先走流式 |
+
+**功能 / 任务**
+
+- [ ] Decision → `Obligations`（mask / row_filter / max_rows / audit_level）
+- [ ] 结果钩子：物化路径 MVP → 切换 SecureStream（依赖 A1/A2）
+- [ ] Mask 算法：`nullify` / `partial` / `hash` / `replace` / `keep_prefix`
+- [ ] 列标签绑定脱敏规则
+- [ ] 行级：SQL 谓词注入优先；不能改写时结果过滤
+- [ ] 敏感识别 MVP：静态标签 + 列名/正则规则（非 ML）
+- [ ] （P2）水印 ID 雏形
+- [ ] `smoke-security-mask.sh` / 行级 smoke
+- [ ] 跨协议路径义务一致（或明确降级策略）
+
+---
+
+### S4 — 持久化审计 + 查询
+
+| 项 | 内容 |
+|----|------|
+| **目标** | 可追溯、可检索、可出简单合规报告 |
+| **退出** | 放行/拒绝均可按 subject/table/decision 查 |
+
+**功能 / 任务**
+
+- [ ] 有界队列 AuditPipeline + worker（S0 骨架产品化）
+- [ ] overflow 策略：`drop_new` 默认；Deny 高优队列
+- [ ] Sink：JSONL 文件 → OTLP Logs → DB（SQLite/PG）分期
+- [ ] （P2）OpenDAL 样本（L2）
+- [ ] Admin `GET /admin/audit/events` 过滤分页
+- [ ] data-ui Audit 页
+- [ ] 保留周期 / 简单清理任务
+- [ ] 压测：审计不堵主路径（指标 `audit_dropped_total`）
+
+---
+
+### S5 — 审批 / 金库 + 通道门闩
+
+| 项 | 内容 |
+|----|------|
+| **目标** | 高危操作可控；网关不自建完整 BPM |
+| **退出** | 无票拒绝、有票放行并记审计 |
+
+**功能 / 任务**
+
+- [ ] 高危规则：DDL、无 WHERE 更新、大导出、敏感表写…
+- [ ] `RequireApproval` / `RequireTicket` 决策
+- [ ] Ticket 校验：subject + SQL 指纹 + 时间窗（接口可外置）
+- [ ] （P2）金库：双人、限时、限次
+- [ ] 通道标签：`protocol` / `portal_export` / `batch`
+- [ ] 导出/COPY/OUTFILE/大结果门闩
+- [ ] （P2）时间维策略（仅工作时间可写等）
+- [ ] smoke：无票/有票
+
+---
+
+### S6 — SQLDEV 向门户 + Vault + 导出运营
+
+| 项 | 内容 |
+|----|------|
+| **目标** | 浏览器安全访问体验；**流量仍过 PEP** |
+| **退出** | 环境隔离；客户端无生产明文库密 |
+
+**功能 / 任务**
+
+- [ ] 项目 / 环境模型
+- [ ] Web SQL 门户（查询走网关或门户专用 listener，禁止直连库）
+- [ ] 账号保险箱 / Vault 发短时凭据
+- [ ] 导出限制与审计联动
+- [ ] 水印运营化
+- [ ] 与 data-ui / Admin 整合导航
+
+**明确不做**：主机堡垒、操作录屏（可集成第三方）
+
+---
+
+## 5. 建议排期（可按人力压缩/拉长）
+
+| 波次 | 阶段 | 建议产出（可对外演示） |
+|------|------|------------------------|
+| **W1** | S0 + A1 设计 | 配置壳、审计字段、文档一致 |
+| **W2** | S1 | **表/语句级拦截** 演示 |
+| **W3** | S2 + A1 落地 | 列权限 + 大结果不爆内存雏形 |
+| **W4** | S3 + A2/A3 | **动态脱敏** + 透传对比 |
+| **W5** | S4 | 审计可查 UI |
+| **W6** | S5 | 高危工单门闩 |
+| **W7+** | S6 | 门户与保险箱 |
+
+「周」为相对单位，非日历承诺。
+
+---
+
+## 6. 模块边界（v2 落点）
 
 ```text
-gateway/core     协议无关类型 + AdminAuth +（规划）Security 类型
-runtime/gateway  PEP：编排 + dialect + 策略执行 + 结果改写
-policy / workflow（规划）  PDP / 工单（可进程内后拆分）
-http             Admin API（管理面）
-data-ui          运维台 → 逐步扩展策略/审计/工单
+gateway/core      IR、配置、AdminAuth、Security 类型、Decision/Obligations
+runtime/gateway   PEP：core_engine、Subject 绑定、路径选择、流式/透传、义务执行
+security/ / policy/（可新建）  Local/Cedar PDP、规则编译缓存
+parser / dialect  ObjectSet 抽取
+audit/            AuditEvent、Pipeline、Sinks
+http/             Admin：策略只读/CRUD、审计查询、ticket 校验回调
+data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 ```
 
 ---
 
-## 完成定义
+## 7. 每阶段完成定义（DoD）
 
-1. 示例 config 或 smoke  
-2. 相关 `cargo test` / `cargo check` 通过  
-3. 无新主路径 panic；数据安全 default off 兼容  
-4. 更新本文件与 `docs/data-security-roadmap.md`  
+每个 Sx / Ax 合并前必须满足：
+
+- [ ] 有示例 config 或 `examples/smoke-*.sh`（安全类 default 可单独脚本）
+- [ ] `cargo test` / `cargo check` 相关包通过
+- [ ] **v1 smoke 在 security default off 下仍全绿**
+- [ ] 无新的主路径 panic；Deny/解析失败路径有指标或日志
+- [ ] 更新本文件勾选 + 必要时改 roadmap/tech-architecture
+
+---
+
+## 8. 风险与纪律
+
+| 纪律 | 说明 |
+|------|------|
+| 先壳后肉 | S0 不做真拦截也要有配置与审计字段 |
+| 先表后列再脱敏 | 禁止一上来只做 mask 无 Subject |
+| 流式先于大数据脱敏 | 全量物化上做 mask 仅作过渡 |
+| 审计不堵查询 | 有界队列 + 可观测丢弃 |
+| 门户不直连 | S6 铁律 |
+| 文档同步 | 行为变更同 PR 改文档 |
+
+---
+
+## 9. 当前下一动作（唯一焦点）
+
+**>>> 开始 S1 <<<**
+
+- [ ] `Subject` / `SecurityContext` 绑定（协议用户 → subject）
+- [ ] 语句分类 DQL/DML/TCL/DDL + best-effort 表名
+- [ ] Local PDP：表/语句级 allow|deny
+- [ ] `core_engine` pre-execute 挂载；`smoke-security-deny.sh`
+
+S0 已完成：security 配置空壳、AuditEvent schema、Admin 写审计带 `subject_id`。

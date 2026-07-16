@@ -426,6 +426,82 @@ mod test {
         assert_eq!(config.gateway.listeners[0].protocol, ProtocolKind::MySql);
         assert_eq!(config.gateway.services[0].backend_protocol, ProtocolKind::MySql);
         assert_eq!(config.gateway.endpoints.len(), 2);
+        // S0: omitted [security] defaults to disabled shell.
+        assert!(!config.gateway.security.enabled);
+        assert!(config.gateway.security.fail_closed);
+    }
+
+    #[test]
+    fn parses_security_shell_section() {
+        let toml = r#"
+version = "2"
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+[security]
+enabled = false
+fail_closed = true
+default_audit_level = "L0"
+[security.pdp]
+backend = "local"
+[security.streaming]
+window_rows = 64
+[[security.rules]]
+name = "deny-secret"
+effect = "deny"
+actions = ["select"]
+tables = ["*.*.secret_*"]
+[[listeners]]
+name = "l1"
+listen_addr = "0.0.0.0:1"
+protocol = "mysql"
+service = "s1"
+[[services]]
+name = "s1"
+backend_protocol = "mysql"
+endpoints = ["e1"]
+plugin_policies = []
+[[endpoints]]
+name = "e1"
+protocol = "mysql"
+address = "127.0.0.1:3306"
+weight = 1
+"#;
+        let config = GatewayConfigDocument::from_toml(toml).unwrap();
+        assert!(!config.gateway.security.enabled);
+        assert_eq!(config.gateway.security.streaming.window_rows, 64);
+        assert_eq!(config.gateway.security.rules.len(), 1);
+        assert_eq!(config.gateway.security.rules[0].name, "deny-secret");
+    }
+
+    #[test]
+    fn rejects_invalid_security_shell() {
+        let toml = r#"
+version = "2"
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+[security]
+default_audit_level = "full"
+[[listeners]]
+name = "l1"
+listen_addr = "0.0.0.0:1"
+protocol = "mysql"
+service = "s1"
+[[services]]
+name = "s1"
+backend_protocol = "mysql"
+endpoints = ["e1"]
+plugin_policies = []
+[[endpoints]]
+name = "e1"
+protocol = "mysql"
+address = "127.0.0.1:3306"
+weight = 1
+"#;
+        assert!(GatewayConfigDocument::from_toml(toml).is_err());
     }
 
     #[test]

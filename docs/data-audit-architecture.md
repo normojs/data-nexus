@@ -1,7 +1,7 @@
 # Data Nexus：数据审计与安全改写技术架构
 
-**状态**：技术规划  
-**关联**：`docs/data-security-roadmap.md`（产品分期）、`docs/data-nexus-protocol-gateway-plan.md`（协议底座）  
+**状态**：技术规划（专项）  
+**关联**：`docs/data-nexus-tech-architecture-2026.md`（**技术主文档，冲突时以之为准**）、`docs/data-security-roadmap.md`（产品分期）、`docs/data-nexus-protocol-gateway-plan.md`（协议底座）  
 **目标场景**：按安全规则对 **表 / 字段 / 行** 做筛选、去除、打码、替换，并完成可追溯审计；同时满足 **高并发、低延迟、大结果集、低内存**。
 
 ---

@@ -136,6 +136,9 @@ pub struct GatewayConfig {
     pub plugin_policies: Vec<PluginPolicyConfig>,
     #[serde(default)]
     pub translation_policies: Vec<crate::TranslationPolicyConfig>,
+    /// Data-plane security shell (S0). Default disabled; does not change L0 behaviour.
+    #[serde(default)]
+    pub security: crate::SecurityPolicyConfig,
 }
 
 impl GatewayConfig {
@@ -302,6 +305,8 @@ impl GatewayConfig {
             require_non_empty("endpoint address", &endpoint.address)?;
         }
 
+        self.security.validate()?;
+
         Ok(())
     }
 }
@@ -375,7 +380,45 @@ mod tests {
                 duration_secs: None,
             }],
             translation_policies: vec![],
+            security: crate::SecurityPolicyConfig::default(),
         }
+    }
+
+    #[test]
+    fn default_security_section_validates() {
+        let config = config();
+        assert!(!config.security.enabled);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_invalid_security_shell() {
+        let mut config = config();
+        config.security.default_audit_level = "full".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parses_security_section_from_json_shape() {
+        let security: crate::SecurityPolicyConfig = serde_json::from_str(
+            r#"{
+              "enabled": false,
+              "fail_closed": true,
+              "default_audit_level": "L0",
+              "subject": { "sources": ["protocol_user"] },
+              "pdp": { "backend": "local" },
+              "streaming": { "window_rows": 128, "passthrough": true },
+              "audit": {
+                "queue_capacity": 1024,
+                "overflow": "drop_new",
+                "sinks": ["tracing"]
+              }
+            }"#,
+        )
+        .unwrap();
+        assert!(!security.enabled);
+        assert_eq!(security.streaming.window_rows, 128);
+        assert_eq!(security.validate(), Ok(()));
     }
 
     #[test]
