@@ -21,7 +21,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 | 版本 | 一句话 | 状态 |
 |------|--------|:----:|
 | **v1** | 客户端 ↔ 网关 ↔ MySQL/PG；路由/池/跨协议/Admin | **完成** |
-| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **进行中（S0–S4 完成）** |
+| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **进行中（S0–S5 完成）** |
 
 **原则**
 
@@ -51,7 +51,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 - [x] **S2** — AST 对象抽取 + 表/列 ACL
 - [x] **S3** — 动态脱敏 + 行级雏形（物化路径 MVP）
 - [x] **S4** — 持久化审计 + 查询 API（Admin；UI 后置）
-- [ ] **S5** — 审批/金库 + 通道高危门闩
+- [x] **S5** — 审批票据门闩（高危 DDL / 无 WHERE 写）
 - [ ] **S6** — Web SQL 门户 + Vault + 导出运营
 - [ ] **A 轨** — 性能：流式窗口 + 同协议透传（与 S 并行）
 
@@ -123,10 +123,10 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 - [ ] **F14** 水印雏形 — 防泄漏 — S3–S4 — P2
 - [x] **F15** 审计持久化 + 查询 API（Admin）— 合规审计 — S4 — P0（data-ui 页后置）
 - [x] **F16** 审计分级 L0 默认 + 有界队列背压 — 高性能审计 — S4 — P0
-- [ ] **F17** 高危规则 + 审批票据 — 工单 — S5 — P1
-- [ ] **F18** 金库（双人/限时/限次） — 金库 — S5 — P2
-- [ ] **F19** 通道标签（协议/导出/作业） — 通道管控 — S5 — P1
-- [ ] **F20** 导出/大结果门闩 — 外发 — S5–S6 — P1
+- [x] **F17** 高危规则 + 审批票据 — 工单 — S5 — P1
+- [ ] **F18** 金库（双人/限时/限次增强） — 金库 — S5 — P2（MVP 已有 ttl/max_uses）
+- [x] **F19** 通道标签雏形（protocol 默认；export 规则 kind） — 通道管控 — S5 — P1
+- [x] **F20** 导出/OUTFILE/COPY 门闩 kind=export — 外发 — S5 — P1
 - [ ] **F21** Web SQL 门户（经 PEP） — SQLDEV 体验 — S6 — P2
 - [ ] **F22** 项目/环境权限 — 多租户运营 — S6 — P2
 - [ ] **F23** 账号保险箱 / Vault — 凭据 — S6 — P2
@@ -264,7 +264,7 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 ---
 
-### S5 — 审批 / 金库 + 通道门闩
+### S5 — 审批 / 金库 + 通道门闩 ✅
 
 | 项 | 内容 |
 |----|------|
@@ -273,14 +273,18 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 **功能 / 任务**
 
-- [ ] 高危规则：DDL、无 WHERE 更新、大导出、敏感表写…
-- [ ] `RequireApproval` / `RequireTicket` 决策
-- [ ] Ticket 校验：subject + SQL 指纹 + 时间窗（接口可外置）
-- [ ] （P2）金库：双人、限时、限次
-- [ ] 通道标签：`protocol` / `portal_export` / `batch`
-- [ ] 导出/COPY/OUTFILE/大结果门闩
-- [ ] （P2）时间维策略（仅工作时间可写等）
-- [ ] smoke：无票/有票
+- [x] 高危规则：`ddl` / `write_no_where` / `action` / `table_write` / `export`
+- [x] `RequireTicket` 决策（客户端错误码 `security_require_ticket`）
+- [x] Ticket：subject + SQL 指纹 + TTL + max_uses；`/*dn_ticket:<id>*/` 前缀
+- [x] Admin `POST/GET /admin/tickets` 签发/列表
+- [ ] （P2）双人金库、外置 BPM 回调 — **延后**
+- [x] export 语句启发式门闩（OUTFILE/COPY）
+- [ ] （P2）时间维策略 — **延后**
+- [x] `smoke-security-ticket.sh`
+
+**代码**：`gateway/core/src/ticket.rs`、`pdp` high_risk、`core_engine` RequireTicket 臂、`http` tickets API
+
+**不做**：完整工单 UI、外置审批流、双人授权
 
 ---
 
@@ -361,17 +365,18 @@ data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 
 ## 9. 当前下一动作（唯一焦点）
 
-**>>> 开始 S5 或 A1（可并行） <<<**
+**>>> S6 门户 / 或 A1 性能 <<<**
 
-**S5 — 审批 / 通道门闩**
+**S6 — SQLDEV 向门户 + Vault（可选）**
 
-- [ ] 高危规则 + `RequireTicket` 决策
-- [ ] Ticket 校验接口（可外置）
-- [ ] 导出/大结果门闩雏形
+- [ ] 项目/环境模型
+- [ ] Web SQL 经 PEP（禁止直连）
+- [ ] 账号保险箱 / 短时凭据
 
-**A1 — 性能（SecureStream 前置）**
+**A1 — 性能（SecureStream）**
 
-- [ ] Backend 窗口化读取 + `ExecuteMode`
-- [ ] 替换物化 mask 的大数据路径
+- [ ] Backend 窗口化读取
+- [ ] 物化 mask 升级为流式义务路径
 
-S0–S4 已完成：访问控制 + 脱敏/行级 + 审计管道/Admin 查询；smoke-security-deny / column / mask / audit。
+S0–S5 已完成：访问控制、脱敏/行级、审计管道、高危票据门闩。  
+smoke：deny / column / mask / audit / ticket。

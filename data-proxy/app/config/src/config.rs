@@ -516,6 +516,21 @@ weight = 1
     }
 
     #[test]
+    fn parses_security_ticket_example_config() {
+        let config = GatewayConfigDocument::from_toml(include_str!(
+            "../../../examples/security-ticket-gateway-config.toml"
+        ))
+        .unwrap();
+        assert!(config.gateway.security.enabled);
+        assert!(config
+            .gateway
+            .security
+            .high_risk_rules
+            .iter()
+            .any(|r| r.kind == "ddl" && r.ticket_type == "ddl"));
+    }
+
+    #[test]
     fn rejects_invalid_security_shell() {
         let toml = r#"
 version = "2"

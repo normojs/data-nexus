@@ -507,6 +507,17 @@ struct AdminAuditEventsResponse {
     note: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct AdminTicketsQuery {
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminTicketsResponse {
+    tickets: Vec<gateway_core::Ticket>,
+}
+
+
 
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
 struct GatewayConfigDiff {
@@ -670,6 +681,10 @@ impl AxumServer {
             .route("/admin/security-policies", get(Self::admin_security_policies))
             .route("/admin/audit/events", get(Self::admin_audit_events))
             .route("/admin/audit/stats", get(Self::admin_audit_stats))
+            .route(
+                "/admin/tickets",
+                get(Self::admin_list_tickets).post(Self::admin_issue_ticket),
+            )
             .route("/admin/pools", get(Self::admin_pools))
             .route("/admin/pools/refresh", post(Self::admin_refresh_pools))
             .route("/admin/pools/:name/refresh", post(Self::admin_refresh_pool))
@@ -926,6 +941,64 @@ impl AxumServer {
                 "installed": false
             })),
         }
+    }
+
+
+    async fn admin_list_tickets(
+        State(state): State<Self>,
+        headers: HeaderMap,
+        Query(query): Query<AdminTicketsQuery>,
+    ) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/tickets") {
+            return response;
+        }
+        let limit = query.limit.unwrap_or(50).clamp(1, 500) as usize;
+        let tickets = gateway_core::global_ticket_store().list(limit);
+        json_response(&AdminTicketsResponse { tickets })
+    }
+
+    async fn admin_issue_ticket(
+        State(state): State<Self>,
+        headers: HeaderMap,
+        Json(mut body): Json<gateway_core::IssueTicketRequest>,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(&headers, "POST", "/admin/tickets") {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        if body.issued_by.is_none() {
+            if let Some(ctx) = auth_ctx.as_ref() {
+                body.issued_by = Some(ctx.subject.clone());
+            }
+        }
+        if body.subject_id.trim().is_empty() || body.sql.trim().is_empty() {
+            return admin_json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_ticket_request",
+                "subject_id and sql are required",
+            );
+        }
+        let ticket = gateway_core::global_ticket_store().issue(body);
+        info!(
+            target: AUDIT_TARGET,
+            action = AuditAction::AdminWrite.as_str(),
+            decision = AuditDecision::Allow.as_str(),
+            ticket_id = %ticket.id,
+            subject_id = %ticket.subject_id,
+            ticket_type = %ticket.ticket_type,
+            "admin issued security ticket"
+        );
+        gateway_core::try_audit(gateway_core::AuditEvent {
+            action: Some(AuditAction::AdminWrite.as_str().into()),
+            decision: Some(AuditDecision::Allow.as_str().into()),
+            subject_id: ticket.issued_by.clone(),
+            outcome: Some("ticket_issued".into()),
+            message: Some(format!("issued {} for {}", ticket.id, ticket.subject_id)),
+            rule: Some(ticket.ticket_type.clone()),
+            audit_level: Some("L0".into()),
+            ..gateway_core::AuditEvent::default()
+        });
+        json_response(&ticket)
     }
 
 

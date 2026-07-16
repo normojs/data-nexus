@@ -5,12 +5,13 @@
 //! runtime extractor.
 
 use crate::object_set::{ColumnAclOutcome, ObjectSet, StarPolicy};
-use crate::obligations::{
-    inject_row_filter, MaskAlgorithm, MaskSpec, Obligations,
+use crate::obligations::{inject_row_filter, MaskAlgorithm, MaskSpec, Obligations};
+use crate::ticket::{
+    extract_ticket_id, global_ticket_store, is_write_without_where, strip_ticket_comment,
 };
 use crate::{
-    CommandSummary, DialectParser, GatewayCommand, SecurityColumnTagConfig, SecurityMaskRuleConfig,
-    SecurityPolicyConfig, SecurityRuleConfig,
+    CommandSummary, DialectParser, GatewayCommand, SecurityColumnTagConfig,
+    SecurityHighRiskRuleConfig, SecurityMaskRuleConfig, SecurityPolicyConfig, SecurityRuleConfig,
 };
 
 /// Data-plane identity (not Admin JWT).
@@ -101,12 +102,18 @@ pub enum SecurityDecision {
         sql: String,
         obligations: Obligations,
     },
+    /// High-risk SQL requires a ticket; message tells client how to attach one.
+    RequireTicket {
+        rule: String,
+        ticket_type: String,
+        message: String,
+    },
     Deny { rule: String, message: String },
 }
 
 impl SecurityDecision {
     pub fn is_deny(&self) -> bool {
-        matches!(self, Self::Deny { .. })
+        matches!(self, Self::Deny { .. } | Self::RequireTicket { .. })
     }
 
     pub fn obligations(&self) -> Obligations {
@@ -114,7 +121,7 @@ impl SecurityDecision {
             Self::Allow { obligations } | Self::AllowRewrite { obligations, .. } => {
                 obligations.clone()
             }
-            Self::Deny { .. } => Obligations::default(),
+            Self::Deny { .. } | Self::RequireTicket { .. } => Obligations::default(),
         }
     }
 
@@ -133,6 +140,7 @@ pub struct LocalPdp {
     rules: Vec<SecurityRuleConfig>,
     mask_rules: Vec<SecurityMaskRuleConfig>,
     column_tags: Vec<SecurityColumnTagConfig>,
+    high_risk_rules: Vec<SecurityHighRiskRuleConfig>,
     default_max_rows: Option<u64>,
 }
 
@@ -148,6 +156,7 @@ impl LocalPdp {
             rules: config.rules.clone(),
             mask_rules: config.mask_rules.clone(),
             column_tags: config.column_tags.clone(),
+            high_risk_rules: config.high_risk_rules.clone(),
             default_max_rows: config.streaming.max_rows,
         })
     }
@@ -316,6 +325,23 @@ impl LocalPdp {
                 let table_decision = self.evaluate(&request);
                 if table_decision.is_deny() {
                     return table_decision;
+                }
+
+                // S5: high-risk gates (ticket required) before rewrite/mask.
+                if let Some(hr) = self.match_high_risk(subject, action, sql, objects, &tables)
+                {
+                    match self.try_consume_ticket(subject, sql, &hr) {
+                        Ok(_ticket_id) => {
+                            // Ticket OK — continue with allow path.
+                        }
+                        Err(message) => {
+                            return SecurityDecision::RequireTicket {
+                                rule: hr.name.clone(),
+                                ticket_type: hr.ticket_type.clone(),
+                                message,
+                            };
+                        }
+                    }
                 }
 
                 let mut rewritten_sql: Option<String> = None;
@@ -558,6 +584,110 @@ impl LocalPdp {
         out
     }
 
+
+    fn match_high_risk(
+        &self,
+        subject: &Subject,
+        action: StatementAction,
+        sql: &str,
+        objects: Option<&ObjectSet>,
+        tables: &[String],
+    ) -> Option<SecurityHighRiskRuleConfig> {
+        for hr in &self.high_risk_rules {
+            if !hr.subjects.is_empty() {
+                let sid = subject.subject_id.as_str();
+                if !hr.subjects.iter().any(|p| glob_match(p, sid)) {
+                    continue;
+                }
+            }
+            let kind = hr.kind.to_ascii_lowercase();
+            let hit = match kind.as_str() {
+                "ddl" => action == StatementAction::Ddl,
+                "write_no_where" => is_write_without_where(sql),
+                "export" => {
+                    let u = strip_ticket_comment(sql).to_ascii_uppercase();
+                    u.contains(" INTO OUTFILE")
+                        || u.contains("DUMPFILE")
+                        || u.starts_with("COPY ")
+                        || u.contains(" COPY ")
+                }
+                "action" => {
+                    if hr.actions.is_empty() {
+                        false
+                    } else {
+                        action_matches_actions(&hr.actions, action)
+                    }
+                }
+                "table_write" => {
+                    let write = matches!(
+                        action,
+                        StatementAction::Insert
+                            | StatementAction::Update
+                            | StatementAction::Delete
+                            | StatementAction::Ddl
+                    );
+                    if !write {
+                        false
+                    } else if hr.tables.is_empty() {
+                        true
+                    } else if let Some(set) = objects {
+                        set.objects.iter().any(|obj| {
+                            hr.tables.iter().any(|p| {
+                                table_glob_match(p, &obj.qualified_table())
+                                    || table_glob_match(p, &obj.table)
+                            })
+                        })
+                    } else {
+                        tables.iter().any(|t| {
+                            hr.tables.iter().any(|p| table_glob_match(p, t))
+                        })
+                    }
+                }
+                _ => false,
+            };
+            if hit {
+                return Some(hr.clone());
+            }
+        }
+        None
+    }
+
+    fn try_consume_ticket(
+        &self,
+        subject: &Subject,
+        sql: &str,
+        hr: &SecurityHighRiskRuleConfig,
+    ) -> Result<String, String> {
+        let Some(ticket_id) = extract_ticket_id(sql) else {
+            let hint = if hr.message.trim().is_empty() {
+                format!(
+                    "security policy '{}' requires ticket type '{}'; re-issue via POST /admin/tickets and prefix SQL with /*dn_ticket:<id>*/",
+                    hr.name, hr.ticket_type
+                )
+            } else {
+                format!(
+                    "security policy '{}': {} (ticket type '{}'; prefix SQL with /*dn_ticket:<id>*/)",
+                    hr.name, hr.message, hr.ticket_type
+                )
+            };
+            return Err(hint);
+        };
+        global_ticket_store()
+            .consume(
+                &ticket_id,
+                &subject.subject_id,
+                sql,
+                Some(hr.ticket_type.as_str()),
+            )
+            .map(|t| t.id)
+            .map_err(|e| {
+                format!(
+                    "security policy '{}' ticket rejected: {e}",
+                    hr.name
+                )
+            })
+    }
+
     /// Apply column deny rules: strip columns from SELECT when possible, else deny.
     pub fn evaluate_column_acl(
         &self,
@@ -676,6 +806,32 @@ fn subject_matches(rule: &SecurityRuleConfig, subject: &Subject) -> bool {
     rule.subjects
         .iter()
         .any(|pattern| glob_match(pattern, sid))
+}
+
+fn action_matches_actions(actions: &[String], action: StatementAction) -> bool {
+    if actions.is_empty() {
+        return true;
+    }
+    let action_s = action.as_str();
+    actions.iter().any(|a| {
+        let a = a.to_ascii_lowercase();
+        a == action_s
+            || a == "*"
+            || (a == "write"
+                && matches!(
+                    action,
+                    StatementAction::Insert
+                        | StatementAction::Update
+                        | StatementAction::Delete
+                        | StatementAction::Ddl
+                ))
+            || (a == "read" && action == StatementAction::Select)
+            || (a == "dml"
+                && matches!(
+                    action,
+                    StatementAction::Insert | StatementAction::Update | StatementAction::Delete
+                ))
+    })
 }
 
 fn action_matches(rule: &SecurityRuleConfig, action: StatementAction) -> bool {
@@ -1175,6 +1331,7 @@ mod tests {
             rules,
             mask_rules: Vec::new(),
             column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
             default_max_rows: None,
         }
     }
@@ -1393,6 +1550,7 @@ mod tests {
             }],
             mask_rules: Vec::new(),
             column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
             default_max_rows: None,
         };
         let mut set = ObjectSet::empty();
@@ -1434,6 +1592,7 @@ mod tests {
                 mask_rule: "phone-partial".into(),
                 label: "PII".into(),
             }],
+            high_risk_rules: Vec::new(),
             default_max_rows: None,
         };
         let mut set = ObjectSet::empty();
@@ -1452,5 +1611,52 @@ mod tests {
             }
             other => panic!("expected allow with masks, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn high_risk_requires_ticket_then_allows() {
+        use crate::{global_ticket_store, IssueTicketRequest, SecurityHighRiskRuleConfig};
+        let pdp = LocalPdp {
+            fail_closed: true,
+            star_policy: StarPolicy::Deny,
+            rules: Vec::new(),
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            high_risk_rules: vec![SecurityHighRiskRuleConfig {
+                name: "require-ddl-ticket".into(),
+                kind: "ddl".into(),
+                ticket_type: "ddl".into(),
+                actions: vec![],
+                tables: vec![],
+                subjects: vec![],
+                message: "DDL needs approval".into(),
+            }],
+            default_max_rows: None,
+        };
+        let sub = subject("root");
+        let dialect = HeuristicDialectParser::mysql();
+        let sql = "DROP TABLE smoke_t";
+        let cmd = GatewayCommand::Query { sql: sql.into() };
+        match pdp.authorize_command(&sub, "orders", &cmd, &dialect) {
+            SecurityDecision::RequireTicket { ticket_type, .. } => {
+                assert_eq!(ticket_type, "ddl");
+            }
+            other => panic!("expected RequireTicket, got {other:?}"),
+        }
+        let tkt = global_ticket_store().issue(IssueTicketRequest {
+            subject_id: "root".into(),
+            sql: sql.into(),
+            ticket_type: "ddl".into(),
+            ttl_secs: 120,
+            max_uses: 1,
+            note: None,
+            issued_by: Some("test".into()),
+        });
+        let tagged = format!("/*dn_ticket:{}*/ {sql}", tkt.id);
+        let cmd2 = GatewayCommand::Query { sql: tagged };
+        assert!(
+            !pdp.authorize_command(&sub, "orders", &cmd2, &dialect)
+                .is_deny()
+        );
     }
 }

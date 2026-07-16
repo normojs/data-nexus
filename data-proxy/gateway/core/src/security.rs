@@ -39,6 +39,9 @@ pub struct SecurityPolicyConfig {
     /// Column sensitivity labels → mask rule name (S3).
     #[serde(default)]
     pub column_tags: Vec<SecurityColumnTagConfig>,
+    /// High-risk rules that require a ticket (S5).
+    #[serde(default)]
+    pub high_risk_rules: Vec<SecurityHighRiskRuleConfig>,
 }
 
 fn default_star_policy() -> String {
@@ -67,6 +70,7 @@ impl Default for SecurityPolicyConfig {
             rules: Vec::new(),
             mask_rules: Vec::new(),
             column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
         }
     }
 }
@@ -171,6 +175,27 @@ impl SecurityPolicyConfig {
                     "security.column_tags[{idx}].mask_rule '{}' not found in mask_rules",
                     tag.mask_rule
                 )));
+            }
+        }
+
+        for (idx, hr) in self.high_risk_rules.iter().enumerate() {
+            if hr.name.trim().is_empty() {
+                return Err(GatewayError::Configuration(format!(
+                    "security.high_risk_rules[{idx}].name must not be empty"
+                )));
+            }
+            if hr.ticket_type.trim().is_empty() {
+                return Err(GatewayError::Configuration(format!(
+                    "security.high_risk_rules[{idx}].ticket_type must not be empty"
+                )));
+            }
+            match hr.kind.to_ascii_lowercase().as_str() {
+                "ddl" | "write_no_where" | "action" | "table_write" | "export" => {}
+                other => {
+                    return Err(GatewayError::Configuration(format!(
+                        "security.high_risk_rules[{idx}].kind must be ddl|write_no_where|action|table_write|export, got '{other}'"
+                    )));
+                }
             }
         }
 
@@ -346,6 +371,33 @@ pub struct SecurityColumnTagConfig {
     /// Optional label for audit (e.g. PII, phone).
     #[serde(default)]
     pub label: String,
+}
+
+/// High-risk gate requiring a short-lived ticket (S5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityHighRiskRuleConfig {
+    pub name: String,
+    /// ddl | write_no_where | action | table_write | export
+    pub kind: String,
+    /// Ticket type required (e.g. ddl, high_risk).
+    #[serde(default = "default_ticket_type")]
+    pub ticket_type: String,
+    /// For kind=action: statement actions (ddl, delete, update, …).
+    #[serde(default)]
+    pub actions: Vec<String>,
+    /// For kind=table_write: table globs.
+    #[serde(default)]
+    pub tables: Vec<String>,
+    /// Optional subject globs; empty = all.
+    #[serde(default)]
+    pub subjects: Vec<String>,
+    /// Human message fragment.
+    #[serde(default)]
+    pub message: String,
+}
+
+fn default_ticket_type() -> String {
+    "high_risk".into()
 }
 
 #[cfg(test)]

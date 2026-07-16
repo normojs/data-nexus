@@ -18,6 +18,7 @@ mod plugin;
 mod route;
 mod security;
 mod sharding;
+mod ticket;
 mod translation;
 mod transport;
 mod types;
@@ -47,8 +48,13 @@ pub use pdp::{
     SecurityDecision, StatementAction, Subject,
 };
 pub use security::{
-    SecurityAuditConfig, SecurityColumnTagConfig, SecurityMaskRuleConfig, SecurityPdpConfig,
-    SecurityPolicyConfig, SecurityRuleConfig, SecurityStreamingConfig, SecuritySubjectConfig,
+    SecurityAuditConfig, SecurityColumnTagConfig, SecurityHighRiskRuleConfig,
+    SecurityMaskRuleConfig, SecurityPdpConfig, SecurityPolicyConfig, SecurityRuleConfig,
+    SecurityStreamingConfig, SecuritySubjectConfig,
+};
+pub use ticket::{
+    extract_ticket_id, global_ticket_store, is_write_without_where, sql_fingerprint,
+    strip_ticket_comment, IssueTicketRequest, Ticket, TicketStore,
 };
 pub use dialect::{default_dialect_parser, DialectParser, HeuristicDialectParser};
 pub use error::{GatewayError, GatewayResult};

@@ -354,6 +354,72 @@ impl CoreGatewayConnection {
                             _ => {}
                         }
                     }
+                    gateway_core::SecurityDecision::RequireTicket {
+                        rule,
+                        ticket_type,
+                        message,
+                    } => {
+                        info!(
+                            target: gateway_core::AUDIT_TARGET,
+                            action = gateway_core::AuditAction::Query.as_str(),
+                            listener = %self.listener_name,
+                            service = %self.service_name,
+                            subject_id = %subject.subject_id,
+                            decision = gateway_core::AuditDecision::RequireApproval.as_str(),
+                            rule = %rule,
+                            ticket_type = %ticket_type,
+                            message = %message,
+                            "gateway command requires approval ticket"
+                        );
+                        gateway_core::try_audit(gateway_core::AuditEvent {
+                            action: Some(gateway_core::AuditAction::Query.as_str().into()),
+                            decision: Some(
+                                gateway_core::AuditDecision::RequireApproval.as_str().into(),
+                            ),
+                            subject_id: Some(subject.subject_id.clone()),
+                            db_user: self.session.user.clone(),
+                            listener: Some(self.listener_name.clone()),
+                            service: Some(self.service_name.clone()),
+                            frontend_protocol: Some(
+                                protocol_metric_name(&self.frontend.protocol()).to_owned(),
+                            ),
+                            backend_protocol: Some(
+                                protocol_metric_name(&self.backend.protocol()).to_owned(),
+                            ),
+                            command_type: Some(command_type.to_owned()),
+                            endpoint: Some(label_owned[5].clone()),
+                            database: self.session.database.clone(),
+                            outcome: Some("require_ticket".into()),
+                            code: Some("security_require_ticket".into()),
+                            message: Some(message.clone()),
+                            rule: Some(rule.clone()),
+                            audit_level: Some("L0".into()),
+                            ..gateway_core::AuditEvent::default()
+                        });
+                        let response = GatewayResponse::Error {
+                            code: "security_require_ticket".into(),
+                            message,
+                        };
+                        command_span.record("outcome", "security_require_ticket");
+                        packets.extend(self.frontend.encode(response, &mut self.session)?);
+                        record_otel_command(
+                            &self.listener_name,
+                            &self.service_name,
+                            labels[2],
+                            labels[3],
+                            command_type,
+                            labels[5],
+                            "security_require_ticket",
+                            started_at,
+                        );
+                        finish_command_metrics(&self.metrics, &labels, started_at);
+                        if let (Some(plugins), Some(idx)) =
+                            (self.plugins.as_mut(), concurrency_rule_idx)
+                        {
+                            plugins.release_concurrency(idx);
+                        }
+                        continue;
+                    }
                     gateway_core::SecurityDecision::Deny { rule, message } => {
                         info!(
                             target: gateway_core::AUDIT_TARGET,
