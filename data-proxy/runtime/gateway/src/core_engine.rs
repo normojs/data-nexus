@@ -18,7 +18,7 @@ use endpoint::endpoint::Endpoint;
 use gateway_core::{
     map_response_types, prepare_cross_protocol_command, BackendConnector, CommandSummary,
     DialectParser, EndpointConfig, EndpointRef, EndpointRole, FrontendProtocolAdapter,
-    GatewayCommand, GatewayConfig, GatewayError, GatewayResponse, GatewayResult, ListenerConfig,
+    ExecuteMode, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse, GatewayResult, ListenerConfig,
     PluginContext, PluginDecision, ProtocolKind, RoutePlan, ServiceConfig, SessionState,
     TransactionState, TranslationPolicyConfig,
 };
@@ -53,6 +53,8 @@ pub struct CoreGatewayConnection {
     frontend_dialect: Arc<dyn DialectParser>,
     /// Data-plane Local PDP when `security.enabled` (S1+).
     security: Option<gateway_core::LocalPdp>,
+    /// Result read mode from security.streaming (A1).
+    stream_mode: ExecuteMode,
     metrics: MySQLServerMetricsCollector,
 }
 
@@ -74,6 +76,7 @@ impl CoreGatewayConnection {
             translation_policy: None,
             frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
             security: None,
+            stream_mode: ExecuteMode::Materialized,
             metrics: MySQLServerMetricsCollector,
         }
     }
@@ -87,6 +90,7 @@ impl CoreGatewayConnection {
         route_policy: CoreRoutePolicy,
         translation_policy: Option<TranslationPolicyConfig>,
         security: Option<gateway_core::LocalPdp>,
+        stream_mode: ExecuteMode,
     ) -> Self {
         let frontend_protocol = frontend.protocol();
         Self {
@@ -100,6 +104,7 @@ impl CoreGatewayConnection {
             translation_policy,
             frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
             security,
+            stream_mode,
             metrics: MySQLServerMetricsCollector,
         }
     }
@@ -111,6 +116,11 @@ impl CoreGatewayConnection {
 
     pub fn with_security(mut self, security: Option<gateway_core::LocalPdp>) -> Self {
         self.security = security;
+        self
+    }
+
+    pub fn with_stream_mode(mut self, stream_mode: ExecuteMode) -> Self {
+        self.stream_mode = stream_mode;
         self
     }
 
@@ -490,7 +500,7 @@ impl CoreGatewayConnection {
 
             let response = match self
                 .backend
-                .execute(command, &mut self.session)
+                .execute_with_mode(command, &mut self.session, self.stream_mode)
                 .instrument(command_span.clone())
                 .await
             {
@@ -734,6 +744,8 @@ pub struct CoreGatewayListenerPlan {
     translation_policy: Option<TranslationPolicyConfig>,
     /// Shared data-plane security PDP (from `GatewayConfig.security`).
     security: Option<gateway_core::LocalPdp>,
+    /// Result read mode derived from security.streaming.
+    stream_mode: ExecuteMode,
 }
 
 impl PartialEq for CoreGatewayListenerPlan {
@@ -804,6 +816,10 @@ impl CoreGatewayListenerPlan {
         let translation_policy =
             resolve_translation_policy(config, listener, service)?;
         let security = gateway_core::LocalPdp::from_config(&config.security);
+        let stream_mode = ExecuteMode::from_streaming_config(
+            config.security.streaming.window_rows,
+            config.security.streaming.max_rows,
+        );
 
         Ok(Self {
             listener: listener.clone(),
@@ -815,6 +831,7 @@ impl CoreGatewayListenerPlan {
             auth_user,
             translation_policy,
             security,
+            stream_mode,
         })
     }
 
@@ -862,6 +879,7 @@ impl CoreGatewayListenerPlan {
             self.route_policy.clone(),
             self.translation_policy.clone(),
             self.security.clone(),
+            self.stream_mode,
         );
         if let Some(plugin_config) = &self.plugin_config {
             connection = connection.with_plugins(PluginPhase::new(plugin_config.clone()));
@@ -1303,10 +1321,11 @@ mod tests {
             self.protocol.clone()
         }
 
-        async fn execute(
+        async fn execute_with_mode(
             &self,
             command: GatewayCommand,
             _session: &mut SessionState,
+            _mode: ExecuteMode,
         ) -> GatewayResult<GatewayResponse> {
             assert_eq!(command, self.expected_command);
             Ok(self.response.clone())

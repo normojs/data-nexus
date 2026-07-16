@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 
-use crate::{GatewayCommand, GatewayResponse, GatewayResult, ProtocolKind, SessionState};
+use crate::{
+    ExecuteMode, GatewayCommand, GatewayResponse, GatewayResult, ProtocolKind, SessionState,
+};
 
 /// Translates one client wire protocol into protocol-neutral gateway messages.
 pub trait FrontendProtocolAdapter: Send {
@@ -24,9 +26,20 @@ pub trait FrontendProtocolAdapter: Send {
 pub trait BackendConnector: Send + Sync {
     fn protocol(&self) -> ProtocolKind;
 
+    /// Execute with an explicit result-read mode (A1 streaming windows).
+    async fn execute_with_mode(
+        &self,
+        command: GatewayCommand,
+        session: &mut SessionState,
+        mode: ExecuteMode,
+    ) -> GatewayResult<GatewayResponse>;
+
     async fn execute(
         &self,
         command: GatewayCommand,
         session: &mut SessionState,
-    ) -> GatewayResult<GatewayResponse>;
+    ) -> GatewayResult<GatewayResponse> {
+        self.execute_with_mode(command, session, ExecuteMode::Materialized)
+            .await
+    }
 }

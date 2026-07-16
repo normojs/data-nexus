@@ -53,7 +53,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 - [x] **S4** — 持久化审计 + 查询 API（Admin；UI 后置）
 - [x] **S5** — 审批票据门闩（高危 DDL / 无 WHERE 写）
 - [ ] **S6** — Web SQL 门户 + Vault + 导出运营
-- [ ] **A 轨** — 性能：流式窗口 + 同协议透传（与 S 并行）
+- [ ] **A 轨** — 性能：流式窗口 + 同协议透传（A1 完成；A2–A4 待做）
 
 ### 1.3 v1 可选增强（不挡 v2）
 
@@ -131,7 +131,7 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 - [ ] **F22** 项目/环境权限 — 多租户运营 — S6 — P2
 - [ ] **F23** 账号保险箱 / Vault — 凭据 — S6 — P2
 - [ ] **F24** 同协议结果透传 — 性能 — A3 — P0
-- [ ] **F25** Backend/Frontend 流式窗口 — 性能 — A1–A2 — P0
+- [x] **F25** Backend 流式窗口/`max_rows`（A1；Frontend 边写仍 A2）— 性能 — A1 — P0
 - [ ] **F26** Cedar PDP（可选 feature） — 高级策略 — S2+ — P2
 - [ ] **F27** 时间维策略 — 高级策略 — S5 — P2
 
@@ -204,14 +204,16 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 ---
 
-### A 轨 — 性能底座（与 S1–S3 并行）
+### A 轨 — 性能底座（与 S 并行）
 
 **验收**：大结果 RSS 不随全表线性爆炸；无义务路径延迟接近 v1 或不显著回退。
 
-- [ ] **A1** Backend 窗口化读取（先单协议）+ `ExecuteMode`（S0 后可开）
-- [ ] **A2** Frontend 边编码边写 + 背压（依赖 A1）
-- [ ] **A3** 同协议结果透传（无义务）（依赖 A1–A2、义务检测）
-- [ ] **A4** 跨协议流式（后置，S3 后）
+- [x] **A1** Backend 窗口化读取 + `ExecuteMode` + `max_rows` 早截断（MySQL 窗口解码；PG max_rows）
+- [ ] **A2** Frontend 边编码边写 + 背压（依赖 A1）— 仍整包 encode ResultSet
+- [ ] **A3** 同协议结果透传（无义务）
+- [ ] **A4** 跨协议流式
+
+**A1 代码**：`ExecuteMode`（`gateway/core`）、`execute_with_mode`、`security.streaming` → connection `stream_mode`；`smoke-security-stream.sh`
 
 ---
 
@@ -365,18 +367,17 @@ data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 
 ## 9. 当前下一动作（唯一焦点）
 
-**>>> S6 门户 / 或 A1 性能 <<<**
+**>>> A2 边写背压 / 或 S6 门户 <<<**
+
+**A2 — Frontend 边编码边写**
+
+- [ ] 窗口 ResultSet 分批 encode + 背压
+- [ ] 与 mask 义务组合（SecureStream 雏形）
 
 **S6 — SQLDEV 向门户 + Vault（可选）**
 
 - [ ] 项目/环境模型
-- [ ] Web SQL 经 PEP（禁止直连）
-- [ ] 账号保险箱 / 短时凭据
+- [ ] Web SQL 经 PEP
+- [ ] 账号保险箱
 
-**A1 — 性能（SecureStream）**
-
-- [ ] Backend 窗口化读取
-- [ ] 物化 mask 升级为流式义务路径
-
-S0–S5 已完成：访问控制、脱敏/行级、审计管道、高危票据门闩。  
-smoke：deny / column / mask / audit / ticket。
+S0–S5 + **A1** 已完成。smoke 另加 `smoke-security-stream`。

@@ -22,7 +22,8 @@ sources = ["protocol_user"]
 backend = "local"
 
 [security.streaming]
-window_rows = 256
+window_rows = 2
+max_rows = 1000
 passthrough = true
 
 [security.audit]

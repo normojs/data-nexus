@@ -3,9 +3,9 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool, PoolConn};
 use gateway_core::{
-    BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, GatewayCommand,
-    GatewayError, GatewayResponse, GatewayResult, GatewayValue, ProtocolKind, SessionState,
-    TransactionState,
+    BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, ExecuteMode,
+    GatewayCommand, GatewayError, GatewayResponse, GatewayResult, GatewayValue, ProtocolKind,
+    SessionState, TransactionState,
 };
 use parking_lot::Mutex;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
@@ -94,9 +94,10 @@ impl PostgreSqlBackendConnector {
     async fn execute_on_conn(
         conn: &PoolConn<PostgreSqlBackendConnection>,
         sql: &str,
+        mode: ExecuteMode,
     ) -> GatewayResult<GatewayResponse> {
         let messages = conn.simple_query(sql).await?;
-        simple_query_messages_to_gateway_response(messages)
+        simple_query_messages_to_gateway_response(messages, mode)
     }
 
     async fn take_or_acquire_lease(
@@ -119,31 +120,32 @@ impl PostgreSqlBackendConnector {
         endpoint: EndpointConfig,
         sql: &str,
         session: &SessionState,
+        mode: ExecuteMode,
     ) -> GatewayResult<GatewayResponse> {
         if session.transaction_state == TransactionState::Active {
             let need_begin = self.txn_lease.lock().is_none();
             let conn = self.take_or_acquire_lease(&endpoint, session).await?;
             if need_begin {
-                let begin = Self::execute_on_conn(&conn, "BEGIN").await?;
+                let begin = Self::execute_on_conn(&conn, "BEGIN", ExecuteMode::Materialized).await?;
                 if !matches!(begin, GatewayResponse::Ok { .. }) {
                     self.store_lease(conn);
                     return Ok(begin);
                 }
             }
-            let response = Self::execute_on_conn(&conn, sql).await;
+            let response = Self::execute_on_conn(&conn, sql, mode).await;
             self.store_lease(conn);
             return response;
         }
 
         let conn = self.acquire_conn(&endpoint, session).await?;
-        Self::execute_on_conn(&conn, sql).await
+        Self::execute_on_conn(&conn, sql, mode).await
     }
 
     async fn finish_transaction(&self, sql: &str) -> GatewayResult<GatewayResponse> {
         let Some(conn) = self.txn_lease.lock().take() else {
             return Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None });
         };
-        let response = Self::execute_on_conn(&conn, sql).await;
+        let response = Self::execute_on_conn(&conn, sql, ExecuteMode::Materialized).await;
         drop(conn);
         match response {
             Ok(response @ GatewayResponse::Ok { .. })
@@ -182,10 +184,11 @@ impl BackendConnector for PostgreSqlBackendConnector {
         ProtocolKind::PostgreSql
     }
 
-    async fn execute(
+    async fn execute_with_mode(
         &self,
         command: GatewayCommand,
         session: &mut SessionState,
+        mode: ExecuteMode,
     ) -> GatewayResult<GatewayResponse> {
         match command {
             GatewayCommand::Ping => Ok(GatewayResponse::Pong),
@@ -214,7 +217,7 @@ impl BackendConnector for PostgreSqlBackendConnector {
             }
             GatewayCommand::Query { sql } => {
                 let endpoint = self.select_endpoint(session)?;
-                self.execute_simple_query(endpoint, &sql, session).await
+                self.execute_simple_query(endpoint, &sql, session, mode).await
             }
             command => Err(GatewayError::Unsupported(format!(
                 "postgresql backend connector cannot execute {:?} yet",
@@ -471,14 +474,21 @@ fn postgresql_client_encoding_statement(client_encoding: &str) -> String {
 
 fn simple_query_messages_to_gateway_response(
     messages: Vec<SimpleQueryMessage>,
+    mode: ExecuteMode,
 ) -> GatewayResult<GatewayResponse> {
     let mut columns: Vec<GatewayColumn> = Vec::new();
     let mut rows = Vec::new();
     let mut affected_rows = 0;
+    let max_rows = mode.effective_max_rows();
 
     for message in messages {
         match message {
             SimpleQueryMessage::Row(row) => {
+                if let Some(max) = max_rows {
+                    if rows.len() as u64 >= max {
+                        continue;
+                    }
+                }
                 if columns.is_empty() {
                     columns = row
                         .columns()

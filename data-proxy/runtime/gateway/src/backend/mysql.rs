@@ -6,9 +6,9 @@ use bytes::BytesMut;
 use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool, PoolConn};
 use futures::StreamExt;
 use gateway_core::{
-    BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, GatewayCommand,
-    GatewayError, GatewayResponse, GatewayResult, GatewayValue, ProtocolKind, SessionState,
-    TransactionState,
+    BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, ExecuteMode,
+    GatewayCommand, GatewayError, GatewayResponse, GatewayResult, GatewayValue, ProtocolKind,
+    SessionState, TransactionState,
 };
 use mysql_protocol::{
     client::{
@@ -103,8 +103,9 @@ impl MySqlBackendConnector {
     async fn execute_on_conn(
         conn: &mut PoolConn<MySqlBackendConnection>,
         sql: &str,
+        mode: ExecuteMode,
     ) -> GatewayResult<GatewayResponse> {
-        conn.simple_query(sql).await
+        conn.simple_query(sql, mode).await
     }
 
     async fn take_or_acquire_lease(
@@ -127,24 +128,26 @@ impl MySqlBackendConnector {
         endpoint: EndpointConfig,
         sql: &str,
         session: &SessionState,
+        mode: ExecuteMode,
     ) -> GatewayResult<GatewayResponse> {
         if session.transaction_state == TransactionState::Active {
             let need_begin = self.txn_lease.lock().is_none();
             let mut conn = self.take_or_acquire_lease(&endpoint, session).await?;
             if need_begin {
-                let begin = Self::execute_on_conn(&mut conn, "BEGIN").await?;
+                let begin =
+                    Self::execute_on_conn(&mut conn, "BEGIN", ExecuteMode::Materialized).await?;
                 if !matches!(begin, GatewayResponse::Ok { .. }) {
                     self.store_lease(conn);
                     return Ok(begin);
                 }
             }
-            let response = Self::execute_on_conn(&mut conn, sql).await;
+            let response = Self::execute_on_conn(&mut conn, sql, mode).await;
             self.store_lease(conn);
             return response;
         }
 
         let mut conn = self.acquire_conn(&endpoint, session).await?;
-        Self::execute_on_conn(&mut conn, sql).await
+        Self::execute_on_conn(&mut conn, sql, mode).await
     }
 
     async fn finish_transaction(
@@ -157,7 +160,7 @@ impl MySqlBackendConnector {
             return Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None });
         };
         let _ = session;
-        let response = Self::execute_on_conn(&mut conn, sql).await;
+        let response = Self::execute_on_conn(&mut conn, sql, ExecuteMode::Materialized).await;
         drop(conn);
         match response {
             Ok(response @ GatewayResponse::Ok { .. }) => Ok(response),
@@ -183,7 +186,7 @@ impl MySqlBackendConnector {
         let use_lease = keep_lease || self.txn_lease.lock().is_some();
         let response = if use_lease {
             let mut conn = self.take_or_acquire_lease(&endpoint, session).await?;
-            let response = Self::execute_on_conn(&mut conn, sql).await;
+            let response = Self::execute_on_conn(&mut conn, sql, ExecuteMode::Materialized).await;
             if release_lease {
                 drop(conn);
             } else {
@@ -191,7 +194,7 @@ impl MySqlBackendConnector {
             }
             response?
         } else {
-            self.execute_simple_query(endpoint, sql, session).await?
+            self.execute_simple_query(endpoint, sql, session, ExecuteMode::Materialized).await?
         };
 
         if release_lease {
@@ -233,10 +236,11 @@ impl BackendConnector for MySqlBackendConnector {
         ProtocolKind::MySql
     }
 
-    async fn execute(
+    async fn execute_with_mode(
         &self,
         command: GatewayCommand,
         session: &mut SessionState,
+        mode: ExecuteMode,
     ) -> GatewayResult<GatewayResponse> {
         match command {
             GatewayCommand::Ping => Ok(GatewayResponse::Pong),
@@ -280,7 +284,7 @@ impl BackendConnector for MySqlBackendConnector {
             }
             GatewayCommand::Query { sql } => {
                 let endpoint = self.select_endpoint(session)?;
-                self.execute_simple_query(endpoint, &sql, session).await
+                self.execute_simple_query(endpoint, &sql, session, mode).await
             }
             command => Err(GatewayError::Unsupported(format!(
                 "mysql backend connector cannot execute {:?} yet",
@@ -334,7 +338,11 @@ impl MySqlBackendConnection {
         Self { endpoint, pool_key, database, client: None }
     }
 
-    async fn simple_query(&mut self, sql: &str) -> GatewayResult<GatewayResponse> {
+    async fn simple_query(
+        &mut self,
+        sql: &str,
+        mode: ExecuteMode,
+    ) -> GatewayResult<GatewayResponse> {
         let client = self.client.as_mut().ok_or_else(|| {
             GatewayError::Backend("mysql backend connection is not open".into())
         })?;
@@ -342,7 +350,7 @@ impl MySqlBackendConnection {
             .send_query(sql.as_bytes())
             .await
             .map_err(|error| GatewayError::Backend(format!("write mysql query: {}", error)))?;
-        read_mysql_query_response(&mut stream).await
+        read_mysql_query_response(&mut stream, mode).await
     }
 
     fn client_ref(&self) -> GatewayResult<&ClientConn> {
@@ -534,14 +542,16 @@ fn parse_endpoint_address(address: &str) -> GatewayResult<(String, u16)> {
 
 pub(crate) async fn read_mysql_query_response(
     stream: &mut ResultsetStream<'_>,
+    mode: ExecuteMode,
 ) -> GatewayResult<GatewayResponse> {
     let header = read_mysql_result_packet(stream, "mysql query header").await?;
-    mysql_response_from_header_and_stream(header, stream).await
+    mysql_response_from_header_and_stream(header, stream, mode).await
 }
 
 async fn mysql_response_from_header_and_stream(
     header: BytesMut,
     stream: &mut ResultsetStream<'_>,
+    mode: ExecuteMode,
 ) -> GatewayResult<GatewayResponse> {
     let payload = packet_payload("mysql query header", &header)?;
     match payload.first().copied() {
@@ -565,10 +575,41 @@ async fn mysql_response_from_header_and_stream(
 
             let _ = read_mysql_result_packet(stream, "mysql column eof").await?;
 
+            let max_rows = mode.effective_max_rows();
+            // Window size is used for progressive decode; we still assemble the
+            // final ResultSet for the current wire encode path, but never keep
+            // more than max_rows and free each window after append.
+            let window = mode.window_rows().unwrap_or(usize::MAX).max(1);
             let mut rows = Vec::new();
+            let mut window_buf: Vec<Vec<GatewayValue>> = Vec::with_capacity(window.min(256));
+            let mut total: u64 = 0;
+            let mut truncated = false;
+
             while let Some(row_packet) = read_optional_mysql_result_packet(stream).await? {
+                if truncated {
+                    // Drain remaining packets so the connection stays usable.
+                    continue;
+                }
                 let row_payload = packet_payload("mysql row", &row_packet)?;
-                rows.push(text_row_to_gateway_values(row_payload, &column_infos)?);
+                if let Some(max) = max_rows {
+                    if total >= max {
+                        truncated = true;
+                        continue;
+                    }
+                }
+                window_buf.push(text_row_to_gateway_values(row_payload, &column_infos)?);
+                total += 1;
+                if window_buf.len() >= window {
+                    rows.extend(window_buf.drain(..));
+                }
+            }
+            if !window_buf.is_empty() {
+                rows.extend(window_buf.drain(..));
+            }
+            if let Some(max) = max_rows {
+                if rows.len() as u64 > max {
+                    rows.truncate(max as usize);
+                }
             }
 
             Ok(GatewayResponse::ResultSet {

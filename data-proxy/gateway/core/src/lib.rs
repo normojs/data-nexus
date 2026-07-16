@@ -59,7 +59,7 @@ pub use ticket::{
 pub use dialect::{default_dialect_parser, DialectParser, HeuristicDialectParser};
 pub use error::{GatewayError, GatewayResult};
 pub use model::{
-    Column, GatewayCommand, GatewayResponse, GatewayValue, ProtocolKind, SessionState,
+    Column, ExecuteMode, GatewayCommand, GatewayResponse, GatewayValue, ProtocolKind, SessionState,
     TransactionState,
 };
 pub use plugin::{CommandSummary, PluginContext, PluginDecision};

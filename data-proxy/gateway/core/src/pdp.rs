@@ -10,8 +10,8 @@ use crate::ticket::{
     extract_ticket_id, global_ticket_store, is_write_without_where, strip_ticket_comment,
 };
 use crate::{
-    CommandSummary, DialectParser, GatewayCommand, SecurityColumnTagConfig,
-    SecurityHighRiskRuleConfig, SecurityMaskRuleConfig, SecurityPolicyConfig, SecurityRuleConfig,
+    DialectParser, GatewayCommand, SecurityColumnTagConfig, SecurityHighRiskRuleConfig,
+    SecurityMaskRuleConfig, SecurityPolicyConfig, SecurityRuleConfig,
 };
 
 /// Data-plane identity (not Admin JWT).

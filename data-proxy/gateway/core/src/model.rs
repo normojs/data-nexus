@@ -159,3 +159,55 @@ pub enum GatewayResponse {
     Pong,
     Bye,
 }
+
+/// How backend connectors should return large query results (A1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecuteMode {
+    /// Full result materialization (default, pre-A1 behavior).
+    Materialized,
+    /// Decode rows in windows of `window_rows`, optionally stop at `max_rows`.
+    Streaming { window_rows: usize, max_rows: Option<u64> },
+}
+
+impl Default for ExecuteMode {
+    fn default() -> Self {
+        Self::Materialized
+    }
+}
+
+impl ExecuteMode {
+    pub fn from_streaming_config(window_rows: u32, max_rows: Option<u64>) -> Self {
+        let window = window_rows.max(1) as usize;
+        Self::Streaming {
+            window_rows: window,
+            max_rows,
+        }
+    }
+
+    pub fn effective_max_rows(self) -> Option<u64> {
+        match self {
+            Self::Materialized => None,
+            Self::Streaming { max_rows, .. } => max_rows,
+        }
+    }
+
+    pub fn window_rows(self) -> Option<usize> {
+        match self {
+            Self::Materialized => None,
+            Self::Streaming { window_rows, .. } => Some(window_rows),
+        }
+    }
+}
+
+#[cfg(test)]
+mod execute_mode_tests {
+    use super::*;
+
+    #[test]
+    fn execute_mode_from_streaming() {
+        let m = ExecuteMode::from_streaming_config(0, Some(10));
+        assert_eq!(m.window_rows(), Some(1));
+        assert_eq!(m.effective_max_rows(), Some(10));
+    }
+}
