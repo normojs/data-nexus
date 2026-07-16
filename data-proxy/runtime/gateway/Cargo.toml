@@ -9,6 +9,8 @@ default = []
 otel = ["dep:opentelemetry"]
 # Optional Cedar PDP (propagates to gateway_core).
 security-cedar = ["gateway_core/security-cedar"]
+# Optional OpenDAL audit archive (propagates to gateway_core).
+audit-opendal = ["gateway_core/audit-opendal"]
 
 [dependencies]
 async-trait = "0.1"

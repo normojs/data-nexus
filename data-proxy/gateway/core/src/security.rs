@@ -335,6 +335,15 @@ pub struct SecurityAuditConfig {
     /// Directory to move/copy rotated files into (empty = same dir as file_path). B04.
     #[serde(default)]
     pub archive_dir: String,
+    /// OpenDAL scheme when feature `audit-opendal` is enabled: `fs` | `memory` | empty=off. B04b.
+    #[serde(default)]
+    pub opendal_scheme: String,
+    /// OpenDAL root (fs path). Empty → use `archive_dir` or parent of `file_path`.
+    #[serde(default)]
+    pub opendal_root: String,
+    /// Object key prefix for archived files (e.g. `audit/`).
+    #[serde(default)]
+    pub opendal_prefix: String,
 }
 
 fn default_queue_capacity() -> u32 {
@@ -368,6 +377,9 @@ impl Default for SecurityAuditConfig {
             retain_days: default_retain_days(),
             rotate_keep: default_rotate_keep(),
             archive_dir: String::new(),
+            opendal_scheme: String::new(),
+            opendal_root: String::new(),
+            opendal_prefix: String::new(),
         }
     }
 }

@@ -6,6 +6,8 @@
 
 mod admin_auth;
 mod audit;
+#[cfg(feature = "audit-opendal")]
+mod audit_opendal;
 mod audit_pipeline;
 #[cfg(feature = "security-cedar")]
 mod cedar_pdp;
@@ -34,6 +36,8 @@ pub use admin_auth::{
 pub use audit::{
     fields as audit_fields, AuditAction, AuditDecision, AuditEvent, AuditLevel, AUDIT_TARGET,
 };
+#[cfg(feature = "audit-opendal")]
+pub use audit_opendal::OpendalArchive;
 pub use audit_pipeline::{
     data_plane_event, global_audit_pipeline, install_audit_pipeline, try_audit, AuditPipeline,
     AuditPipelineStats,

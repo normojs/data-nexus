@@ -25,6 +25,11 @@ security-cedar = [
   "runtime_gateway/security-cedar",
   "http/security-cedar",
 ]
+# Optional OpenDAL cold archive for rotated audit JSONL (B04b).
+audit-opendal = [
+  "runtime_gateway/audit-opendal",
+  "http/audit-opendal",
+]
 
 #[build-dependencies]
 #anyhow = { version = "1.0", default-features = false }

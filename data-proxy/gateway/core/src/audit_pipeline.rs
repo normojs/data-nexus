@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 static GLOBAL: OnceLock<Arc<AuditPipeline>> = OnceLock::new();
 
 pub fn install_audit_pipeline(config: &SecurityAuditConfig) -> Arc<AuditPipeline> {
+    configure_opendal_archive(config);
     if let Some(existing) = GLOBAL.get() {
         existing.reconfigure(config);
         return existing.clone();
@@ -27,6 +28,34 @@ pub fn install_audit_pipeline(config: &SecurityAuditConfig) -> Arc<AuditPipeline
     pipe.spawn_worker();
     let _ = GLOBAL.set(pipe.clone());
     pipe
+}
+
+fn configure_opendal_archive(config: &SecurityAuditConfig) {
+    #[cfg(feature = "audit-opendal")]
+    {
+        match crate::audit_opendal::OpendalArchive::from_config(config) {
+            Ok(arch) => crate::audit_opendal::set_global_archive(arch),
+            Err(e) => {
+                tracing::error!(
+                    target: "data_nexus::audit",
+                    error = %e,
+                    "failed to configure OpenDAL audit archive"
+                );
+                crate::audit_opendal::set_global_archive(None);
+            }
+        }
+    }
+    #[cfg(not(feature = "audit-opendal"))]
+    {
+        let _ = config;
+        if !config.opendal_scheme.trim().is_empty() {
+            tracing::warn!(
+                target: "data_nexus::audit",
+                scheme = %config.opendal_scheme,
+                "opendal_scheme set but binary built without audit-opendal feature"
+            );
+        }
+    }
 }
 
 pub fn global_audit_pipeline() -> Option<Arc<AuditPipeline>> {
@@ -165,6 +194,7 @@ impl AuditPipeline {
         if let Ok(mut pol) = self.file_policy.lock() {
             *pol = FileSinkPolicy::from_config(config);
         }
+        configure_opendal_archive(config);
     }
 
     pub fn spawn_worker(self: &Arc<Self>) {
@@ -424,6 +454,10 @@ fn rotate_active_file(path: &Path, policy: &FileSinkPolicy) -> std::io::Result<(
     if fs::rename(path, &dest).is_err() {
         fs::copy(path, &dest)?;
         let _ = fs::remove_file(path);
+    }
+    #[cfg(feature = "audit-opendal")]
+    {
+        let _ = crate::audit_opendal::try_archive_rotated_file(&dest);
     }
     Ok(())
 }

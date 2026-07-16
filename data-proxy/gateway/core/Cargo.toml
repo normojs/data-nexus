@@ -8,6 +8,10 @@ default = []
 # Optional Cedar PDP (F26). Requires rustc ≥1.88 (project smoke uses 1.94.1).
 # Enable: cargo test -p gateway_core --features security-cedar
 security-cedar = ["dep:cedar-policy"]
+# Optional OpenDAL cold archive for rotated audit JSONL (B04b).
+# Enable: cargo test -p gateway_core --features audit-opendal
+# Prefer rustc ≥1.88 when combined with cedar; OpenDAL 0.54 alone is MSRV 1.82.
+audit-opendal = ["dep:opendal", "dep:tokio"]
 
 [dependencies]
 async-trait = "0.1"
@@ -18,6 +22,9 @@ thiserror = "1.0"
 tracing = "0.1"
 # Pinned major line; 4.4+ works with rustc 1.94 (MSRV of latest transitive deps).
 cedar-policy = { version = "4.4", optional = true }
+# Minimal services only — keep feature surface small (fs + memory for tests).
+opendal = { version = "0.54", optional = true, default-features = false, features = ["services-fs", "services-memory"] }
+tokio = { version = "1", optional = true, features = ["rt", "macros"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
