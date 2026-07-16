@@ -63,7 +63,7 @@ data-ui        运维台 + SQL Portal + Audit
 | ID | 项 | 说明 | 状态 |
 |----|----|------|:----:|
 | **F14** | 结果水印雏形 | Allow 结果嵌入可追溯 token（列/后缀） | **完成** |
-| **B01** | v1 smoke 回归确认 | security default off 下四条 L0 smoke 全绿 | 待做 |
+| **B01** | v1 smoke 回归确认 | security default off 下四条 L0 smoke 全绿 | **完成** |
 | **B02** | data-ui 403 友好页 | Admin API 鉴权失败可理解 | 待做 |
 
 ### P2 — 可选增强
@@ -81,15 +81,14 @@ data-ui        运维台 + SQL Portal + Audit
 
 ## 3. 当前下一动作（唯一焦点）
 
-**>>> B01 v1 smoke 回归 / 或 F18 双人金库 <<<**
+**>>> F18 双人金库 / 或 B02 data-ui 403 友好页 <<<**
 
-F14 水印已完成：`security.watermark` + `Obligations.watermark` + `smoke-security-watermark`。
+B01 已完成：`smoke-admin-auth` / `dual-listener` / `cross-protocol` / `cross-protocol-pg-to-mysql` 在 security default off 下全绿；L0 smoke 增加残留 proxy 清理与 `CARGO_TARGET_DIR` 默认。
 
 建议下一任务：
 
-1. **B01** — security default off 下跑通四条 L0 smoke  
-2. **F18** — 双人金库（第二审批人确认）  
-3. **B02** — data-ui 403 友好页  
+1. **F18** — 双人金库（第二审批人确认）  
+2. **B02** — data-ui 403 友好页  
 
 ---
 

@@ -8,6 +8,10 @@ host = "0.0.0.0"
 port = 8082
 log_level = "INFO"
 
+# Data-plane security off — L0 dual-listener behaviour must stay unchanged (B01).
+[security]
+enabled = false
+
 [[listeners]]
 name = "orders-mysql"
 listen_addr = "0.0.0.0:9088"

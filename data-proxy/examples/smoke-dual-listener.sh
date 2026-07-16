@@ -4,7 +4,11 @@
 # Clients: uses docker exec mysql/psql when host clients are missing.
 set -euo pipefail
 
-export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${PATH:-}"
+export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${HOME}/.cargo/bin:/Volumes/fushilu/.rustup/toolchains/nightly-2025-01-07-aarch64-apple-darwin/bin:${PATH:-}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+# Prefer local disk when external cargo target volume is full / unset.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Users/fushilu/workspace/revocloud/data-nexus/.cargo-target}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE_FILE="$ROOT/examples/docker-compose.dev.yml"
@@ -31,6 +35,10 @@ need docker
 need cargo
 need curl
 
+# Avoid leftover proxy (e.g. admin-auth smoke) holding :8082 with JWT enabled.
+pkill -f '/debug/proxy' 2>/dev/null || true
+sleep 1
+
 echo "==> starting backend containers"
 "${COMPOSE[@]}" up -d
 
@@ -54,11 +62,11 @@ for _ in $(seq 1 90); do
 done
 "${COMPOSE[@]}" exec -T postgres-primary pg_isready -U postgres -d analytics >/dev/null
 
-echo "==> building and starting gateway"
-# Prefer prebuilt binary when available (shared cargo target).
+echo "==> building and starting gateway (security default off)"
 PROXY_BIN=""
 for candidate in \
-  "${CARGO_TARGET_DIR:-}/debug/proxy" \
+  "${CARGO_TARGET_DIR}/debug/proxy" \
+  /Users/fushilu/workspace/revocloud/data-nexus/.cargo-target/debug/proxy \
   /Volumes/fushilu/.caches/data-nexus-target/debug/proxy \
   "$ROOT/target/debug/proxy"
 do
@@ -69,12 +77,12 @@ do
 done
 (
   cd "$ROOT"
-  if [[ -n "$PROXY_BIN" ]]; then
-    echo "using binary: $PROXY_BIN" >>"$PROXY_LOG"
-    "$PROXY_BIN" daemon -c "$CONFIG_FILE"
-  else
-    cargo run -p data-proxy --bin proxy -- daemon -c "$CONFIG_FILE"
+  if [[ -z "$PROXY_BIN" ]]; then
+    cargo build -p data-proxy --bin proxy
+    PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
   fi
+  echo "using binary: $PROXY_BIN" >>"$PROXY_LOG"
+  "$PROXY_BIN" daemon -c "$CONFIG_FILE"
 ) >"$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 
