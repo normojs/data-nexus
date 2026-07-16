@@ -499,6 +499,23 @@ weight = 1
     }
 
     #[test]
+    fn parses_security_mask_example_config() {
+        let config = GatewayConfigDocument::from_toml(include_str!(
+            "../../../examples/security-mask-gateway-config.toml"
+        ))
+        .unwrap();
+        assert!(config.gateway.security.enabled);
+        assert!(!config.gateway.security.mask_rules.is_empty());
+        assert!(!config.gateway.security.column_tags.is_empty());
+        assert!(config
+            .gateway
+            .security
+            .rules
+            .iter()
+            .any(|r| r.row_filter.as_deref() == Some("tenant_id = 1")));
+    }
+
+    #[test]
     fn rejects_invalid_security_shell() {
         let toml = r#"
 version = "2"

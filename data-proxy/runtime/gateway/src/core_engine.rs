@@ -295,8 +295,9 @@ impl CoreGatewayConnection {
                 }
             }
 
-            // S1/S2: data-plane Local PDP (table/statement/column) before backend execute.
+            // S1/S2/S3: data-plane Local PDP (table/statement/column/mask/row) before backend execute.
             let mut command = command;
+            let mut pending_obligations = gateway_core::Obligations::default();
             if let Some(pdp) = &self.security {
                 let subject = gateway_core::Subject::from_protocol_user(
                     self.session.user.as_deref(),
@@ -329,8 +330,10 @@ impl CoreGatewayConnection {
                     self.frontend_dialect.as_ref(),
                     objects.as_ref(),
                 ) {
-                    gateway_core::SecurityDecision::Allow => {}
-                    gateway_core::SecurityDecision::AllowRewrite { sql } => {
+                    gateway_core::SecurityDecision::Allow { obligations } => {
+                        pending_obligations = obligations;
+                    }
+                    gateway_core::SecurityDecision::AllowRewrite { sql, obligations } => {
                         info!(
                             target: gateway_core::AUDIT_TARGET,
                             action = gateway_core::AuditAction::Query.as_str(),
@@ -338,8 +341,11 @@ impl CoreGatewayConnection {
                             service = %self.service_name,
                             subject_id = %subject.subject_id,
                             decision = gateway_core::AuditDecision::Allow.as_str(),
-                            "security policy rewrote SQL (column ACL)"
+                            row_filter = obligations.row_filter.as_deref().unwrap_or(""),
+                            mask_count = obligations.column_masks.len(),
+                            "security policy rewrote SQL / attached obligations"
                         );
+                        pending_obligations = obligations;
                         match &mut command {
                             GatewayCommand::Query { sql: original }
                             | GatewayCommand::Prepare { sql: original } => {
@@ -399,11 +405,27 @@ impl CoreGatewayConnection {
                 .instrument(command_span.clone())
                 .await
             {
-                Ok(response) => map_response_types(
-                    response,
-                    &self.backend.protocol(),
-                    &self.frontend.protocol(),
-                ),
+                Ok(response) => {
+                    let response = map_response_types(
+                        response,
+                        &self.backend.protocol(),
+                        &self.frontend.protocol(),
+                    );
+                    if pending_obligations.has_result_obligations() {
+                        info!(
+                            target: gateway_core::AUDIT_TARGET,
+                            action = gateway_core::AuditAction::Query.as_str(),
+                            listener = %self.listener_name,
+                            service = %self.service_name,
+                            mask_count = pending_obligations.column_masks.len(),
+                            max_rows = ?pending_obligations.max_rows,
+                            "security applied result obligations"
+                        );
+                        gateway_core::apply_obligations_to_response(response, &pending_obligations)
+                    } else {
+                        response
+                    }
+                }
                 Err(error) => GatewayResponse::Error {
                     code: "gateway_error".into(),
                     message: error.to_string(),
@@ -1242,6 +1264,7 @@ mod tests {
             tables: vec!["secret_*".into()],
             columns: vec![],
             subjects: vec![],
+            row_filter: None,
         });
         let pdp = LocalPdp::from_config(&security).expect("enabled pdp");
 
@@ -1283,6 +1306,7 @@ mod tests {
             tables: vec![],
             columns: vec![],
             subjects: vec![],
+            row_filter: None,
         });
         let plan = CoreGatewayRuntimePlan::from_config(&config).unwrap();
         let connection = plan.build_connection("mysql-listener").unwrap();

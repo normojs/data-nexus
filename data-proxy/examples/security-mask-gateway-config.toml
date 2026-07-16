@@ -1,0 +1,123 @@
+# S3 security mask + row filter smoke.
+# Pair with: docker compose -f examples/docker-compose.dev.yml up -d
+# Run: ./examples/smoke-security-mask.sh
+
+version = "2"
+
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+
+[security]
+enabled = true
+fail_closed = true
+star_policy = "allow"
+default_audit_level = "L0"
+
+[security.subject]
+sources = ["protocol_user"]
+
+[security.pdp]
+backend = "local"
+
+[security.streaming]
+window_rows = 256
+passthrough = true
+
+[security.audit]
+queue_capacity = 65536
+overflow = "drop_new"
+sinks = ["tracing"]
+
+# Row-level isolation for employees (static predicate injection).
+[[security.rules]]
+name = "employees-tenant-row"
+effect = "allow"
+actions = ["select"]
+tables = ["employees"]
+row_filter = "tenant_id = 1"
+
+# Named mask algorithms.
+[[security.mask_rules]]
+name = "phone-partial"
+algorithm = "partial"
+prefix_len = 3
+suffix_len = 2
+
+[[security.mask_rules]]
+name = "salary-nullify"
+algorithm = "nullify"
+
+# Column tags bind columns → mask rules (all subjects for smoke).
+[[security.column_tags]]
+column = "phone"
+tables = ["employees"]
+mask_rule = "phone-partial"
+label = "PII"
+
+[[security.column_tags]]
+column = "salary"
+tables = ["employees"]
+mask_rule = "salary-nullify"
+label = "salary"
+
+[[listeners]]
+name = "orders-mysql"
+listen_addr = "0.0.0.0:9088"
+protocol = "mysql"
+service = "orders"
+auth_policy = "local-users"
+
+[[listeners]]
+name = "analytics-postgresql"
+listen_addr = "0.0.0.0:9089"
+protocol = "postgresql"
+service = "analytics"
+auth_policy = "local-users"
+
+[[services]]
+name = "orders"
+backend_protocol = "mysql"
+endpoints = ["orders-primary"]
+route_policy = "orders-balance"
+plugin_policies = []
+
+[[services]]
+name = "analytics"
+backend_protocol = "postgresql"
+endpoints = ["analytics-primary"]
+route_policy = "analytics-balance"
+plugin_policies = []
+
+[[endpoints]]
+name = "orders-primary"
+protocol = "mysql"
+address = "127.0.0.1:13306"
+database = "orders"
+username = "root"
+password = "root"
+weight = 1
+
+[[endpoints]]
+name = "analytics-primary"
+protocol = "postgresql"
+address = "127.0.0.1:15433"
+database = "analytics"
+username = "postgres"
+password = "postgres"
+weight = 1
+
+[[route_policies]]
+name = "orders-balance"
+kind = "simple_load_balance"
+
+[[route_policies]]
+name = "analytics-balance"
+kind = "simple_load_balance"
+
+[[auth_policies]]
+name = "local-users"
+kind = "static"
+username = "root"
+password = "root"

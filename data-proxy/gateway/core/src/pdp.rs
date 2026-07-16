@@ -5,8 +5,12 @@
 //! runtime extractor.
 
 use crate::object_set::{ColumnAclOutcome, ObjectSet, StarPolicy};
+use crate::obligations::{
+    inject_row_filter, MaskAlgorithm, MaskSpec, Obligations,
+};
 use crate::{
-    CommandSummary, DialectParser, GatewayCommand, SecurityPolicyConfig, SecurityRuleConfig,
+    CommandSummary, DialectParser, GatewayCommand, SecurityColumnTagConfig, SecurityMaskRuleConfig,
+    SecurityPolicyConfig, SecurityRuleConfig,
 };
 
 /// Data-plane identity (not Admin JWT).
@@ -90,15 +94,34 @@ pub struct AccessRequest<'a> {
 /// Local policy decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecurityDecision {
-    Allow,
-    /// Allow with SQL rewrite obligation (column strip).
-    AllowRewrite { sql: String },
+    /// Allow without rewrite; may still carry result-path obligations (mask).
+    Allow { obligations: Obligations },
+    /// Allow with SQL rewrite (column strip and/or row filter) + optional result obligations.
+    AllowRewrite {
+        sql: String,
+        obligations: Obligations,
+    },
     Deny { rule: String, message: String },
 }
 
 impl SecurityDecision {
     pub fn is_deny(&self) -> bool {
         matches!(self, Self::Deny { .. })
+    }
+
+    pub fn obligations(&self) -> Obligations {
+        match self {
+            Self::Allow { obligations } | Self::AllowRewrite { obligations, .. } => {
+                obligations.clone()
+            }
+            Self::Deny { .. } => Obligations::default(),
+        }
+    }
+
+    pub fn allow_empty() -> Self {
+        Self::Allow {
+            obligations: Obligations::default(),
+        }
     }
 }
 
@@ -108,6 +131,9 @@ pub struct LocalPdp {
     fail_closed: bool,
     star_policy: StarPolicy,
     rules: Vec<SecurityRuleConfig>,
+    mask_rules: Vec<SecurityMaskRuleConfig>,
+    column_tags: Vec<SecurityColumnTagConfig>,
+    default_max_rows: Option<u64>,
 }
 
 impl LocalPdp {
@@ -120,6 +146,9 @@ impl LocalPdp {
             fail_closed: config.fail_closed,
             star_policy: StarPolicy::from_config(&config.star_policy),
             rules: config.rules.clone(),
+            mask_rules: config.mask_rules.clone(),
+            column_tags: config.column_tags.clone(),
+            default_max_rows: config.streaming.max_rows,
         })
     }
 
@@ -137,6 +166,10 @@ impl LocalPdp {
 
     pub fn has_column_rules(&self) -> bool {
         self.rules.iter().any(|r| !r.columns.is_empty())
+    }
+
+    pub fn has_mask_config(&self) -> bool {
+        !self.column_tags.is_empty() && !self.mask_rules.is_empty()
     }
 
     pub fn evaluate(&self, request: &AccessRequest<'_>) -> SecurityDecision {
@@ -160,11 +193,17 @@ impl LocalPdp {
                         ),
                     };
                 }
-                "allow" => return SecurityDecision::Allow,
+                "allow" => {
+                    return SecurityDecision::Allow {
+                        obligations: Obligations::default(),
+                    };
+                }
                 _ => continue,
             }
         }
-        SecurityDecision::Allow
+        SecurityDecision::Allow {
+            obligations: Obligations::default(),
+        }
     }
 
     /// Table/statement authorize using heuristic table extraction (S1 path).
@@ -178,10 +217,7 @@ impl LocalPdp {
         self.authorize_command_with_objects(subject, service, command, dialect, None)
     }
 
-    /// Authorize with optional AST-derived [`ObjectSet`] (S2).
-    ///
-    /// When `objects` is `Some`, table names and column ACL use that set.
-    /// When `None`, falls back to S1 heuristic table extraction.
+    /// Authorize with optional AST-derived [`ObjectSet`] (S2/S3).
     pub fn authorize_command_with_objects(
         &self,
         subject: &Subject,
@@ -192,7 +228,7 @@ impl LocalPdp {
     ) -> SecurityDecision {
         match command {
             GatewayCommand::Ping | GatewayCommand::Quit | GatewayCommand::CloseStatement { .. } => {
-                SecurityDecision::Allow
+                SecurityDecision::allow_empty()
             }
             GatewayCommand::Begin | GatewayCommand::Commit | GatewayCommand::Rollback => {
                 let request = AccessRequest {
@@ -225,12 +261,10 @@ impl LocalPdp {
                                 .into(),
                     }
                 } else {
-                    SecurityDecision::Allow
+                    SecurityDecision::allow_empty()
                 }
             }
             GatewayCommand::Query { sql } | GatewayCommand::Prepare { sql } => {
-                // Hard-deny only when extraction failed *and* produced no usable objects.
-                // Heuristic recoveries may set `parse_failed` with tables still present.
                 if let Some(set) = objects {
                     if set.parse_failed && set.objects.is_empty() && self.fail_closed {
                         return SecurityDecision::Deny {
@@ -260,7 +294,6 @@ impl LocalPdp {
 
                 let (tables, columns) = if let Some(set) = objects {
                     if set.parse_failed && !set.objects.is_empty() {
-                        // partial — still use objects
                         (set.tables(), collect_bare_columns(set))
                     } else if set.parse_failed {
                         (extract_table_names(sql), Vec::new())
@@ -275,7 +308,7 @@ impl LocalPdp {
                     subject,
                     service,
                     action,
-                    tables,
+                    tables: tables.clone(),
                     columns: columns.clone(),
                     sql: Some(sql.as_str()),
                 };
@@ -285,14 +318,24 @@ impl LocalPdp {
                     return table_decision;
                 }
 
+                let mut rewritten_sql: Option<String> = None;
+                let mut working_sql = sql.clone();
+
                 // Column ACL only when rules mention columns and we have an object set.
                 if self.has_column_rules() {
                     if let Some(set) = objects {
                         if !set.parse_failed || !set.objects.is_empty() {
-                            match self.evaluate_column_acl(subject, service, action, set, sql) {
+                            match self.evaluate_column_acl(
+                                subject,
+                                service,
+                                action,
+                                set,
+                                &working_sql,
+                            ) {
                                 ColumnAclOutcome::Unchanged => {}
                                 ColumnAclOutcome::Rewrite { sql: rewritten } => {
-                                    return SecurityDecision::AllowRewrite { sql: rewritten };
+                                    working_sql = rewritten.clone();
+                                    rewritten_sql = Some(rewritten);
                                 }
                                 ColumnAclOutcome::Deny { rule, message } => {
                                     return SecurityDecision::Deny { rule, message };
@@ -308,9 +351,211 @@ impl LocalPdp {
                     }
                 }
 
-                SecurityDecision::Allow
+                let mut obligations = Obligations::default();
+                if let Some(max) = self.default_max_rows {
+                    obligations.max_rows = Some(max);
+                }
+
+                // S3: row_filter from matching allow/deny-adjacent table rules.
+                if action == StatementAction::Select {
+                    if let Some(filter) = self.collect_row_filter(subject, action, objects, &tables)
+                    {
+                        match inject_row_filter(&working_sql, &filter) {
+                            Some(next) => {
+                                rewritten_sql = Some(next);
+                                obligations.row_filter = Some(filter);
+                            }
+                            None if self.fail_closed => {
+                                return SecurityDecision::Deny {
+                                    rule: "row_filter".into(),
+                                    message: format!(
+                                        "security policy deny: cannot inject row_filter '{filter}' into SQL"
+                                    ),
+                                };
+                            }
+                            None => {}
+                        }
+                    }
+                }
+
+                // S3: column tags → mask obligations (result path).
+                if action == StatementAction::Select {
+                    let masks = self.collect_mask_specs(subject, objects, &tables, &columns);
+                    for m in masks {
+                        obligations.column_masks.push(m);
+                    }
+                }
+
+                if let Some(sql) = rewritten_sql {
+                    SecurityDecision::AllowRewrite { sql, obligations }
+                } else {
+                    SecurityDecision::Allow { obligations }
+                }
             }
         }
+    }
+
+    fn collect_row_filter(
+        &self,
+        subject: &Subject,
+        action: StatementAction,
+        objects: Option<&ObjectSet>,
+        tables: &[String],
+    ) -> Option<String> {
+        let mut filters: Vec<String> = Vec::new();
+        for rule in &self.rules {
+            let Some(filter) = rule.row_filter.as_ref() else {
+                continue;
+            };
+            if filter.trim().is_empty() {
+                continue;
+            }
+            // Row filters apply on allow-path; skip pure deny column rules.
+            if !rule.columns.is_empty() && rule.effect.eq_ignore_ascii_case("deny") {
+                continue;
+            }
+            if !subject_matches(rule, subject) {
+                continue;
+            }
+            if !action_matches(rule, action) {
+                continue;
+            }
+            if !rule.tables.is_empty() {
+                let matched = if let Some(set) = objects {
+                    set.objects.iter().any(|obj| table_matches_rule(rule, obj))
+                } else {
+                    tables.iter().any(|t| {
+                        rule.tables
+                            .iter()
+                            .any(|p| table_glob_match(p, t))
+                    })
+                };
+                if !matched {
+                    continue;
+                }
+            }
+            if !filters.iter().any(|f| f == filter) {
+                filters.push(filter.clone());
+            }
+        }
+        if filters.is_empty() {
+            None
+        } else if filters.len() == 1 {
+            Some(filters.remove(0))
+        } else {
+            Some(
+                filters
+                    .into_iter()
+                    .map(|f| format!("({f})"))
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+            )
+        }
+    }
+
+    fn collect_mask_specs(
+        &self,
+        subject: &Subject,
+        objects: Option<&ObjectSet>,
+        tables: &[String],
+        columns: &[String],
+    ) -> Vec<MaskSpec> {
+        if self.column_tags.is_empty() || self.mask_rules.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mask_by_name: std::collections::BTreeMap<String, &SecurityMaskRuleConfig> = self
+            .mask_rules
+            .iter()
+            .map(|m| (m.name.to_ascii_lowercase(), m))
+            .collect();
+
+        let candidate_columns: Vec<(String, String)> = if let Some(set) = objects {
+            let mut pairs = Vec::new();
+            for obj in &set.objects {
+                for col in obj.bare_columns() {
+                    pairs.push((obj.table.clone(), col));
+                }
+                // Wildcard: still apply tags by configured column names (result meta will match).
+                if obj.has_wildcard {
+                    for tag in &self.column_tags {
+                        let bare = tag
+                            .column
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(tag.column.as_str())
+                            .to_ascii_lowercase();
+                        pairs.push((obj.table.clone(), bare));
+                    }
+                }
+            }
+            if pairs.is_empty() {
+                // No projection columns known — still emit tags for result-meta matching.
+                for tag in &self.column_tags {
+                    let bare = tag
+                        .column
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(tag.column.as_str())
+                        .to_ascii_lowercase();
+                    let table = tables.first().cloned().unwrap_or_default();
+                    pairs.push((table, bare));
+                }
+            }
+            pairs
+        } else {
+            columns
+                .iter()
+                .map(|c| {
+                    (
+                        tables.first().cloned().unwrap_or_default(),
+                        c.to_ascii_lowercase(),
+                    )
+                })
+                .collect()
+        };
+
+        for (table, col) in candidate_columns {
+            for tag in &self.column_tags {
+                if !tag.subjects.is_empty() {
+                    let sid = subject.subject_id.as_str();
+                    if !tag.subjects.iter().any(|p| glob_match(p, sid)) {
+                        continue;
+                    }
+                }
+                if !tag.tables.is_empty()
+                    && !tag
+                        .tables
+                        .iter()
+                        .any(|p| table_glob_match(p, &table) || table.is_empty())
+                {
+                    continue;
+                }
+                if !column_tag_matches(tag, &col, &table) {
+                    continue;
+                }
+                let Some(mask_cfg) = mask_by_name.get(&tag.mask_rule.to_ascii_lowercase()) else {
+                    continue;
+                };
+                let Some(algo) = MaskAlgorithm::parse(&mask_cfg.algorithm) else {
+                    continue;
+                };
+                if out
+                    .iter()
+                    .any(|m: &MaskSpec| m.column.eq_ignore_ascii_case(&col))
+                {
+                    continue;
+                }
+                let mut spec = MaskSpec::new(col.clone(), algo, tag.mask_rule.clone());
+                if !mask_cfg.replace_with.is_empty() {
+                    spec.replace_with = mask_cfg.replace_with.clone();
+                }
+                spec.prefix_len = mask_cfg.prefix_len;
+                spec.suffix_len = mask_cfg.suffix_len;
+                out.push(spec);
+            }
+        }
+        out
     }
 
     /// Apply column deny rules: strip columns from SELECT when possible, else deny.
@@ -486,6 +731,18 @@ fn column_matches_rule(rule: &SecurityRuleConfig, bare_col: &str, table: &str) -
             glob_match(p, bare_col)
         }
     })
+}
+
+fn column_tag_matches(tag: &SecurityColumnTagConfig, bare_col: &str, table: &str) -> bool {
+    let p = tag.column.trim();
+    if p.contains('.') {
+        let mut parts = p.rsplitn(2, '.');
+        let col_pat = parts.next().unwrap_or("");
+        let tbl_pat = parts.next().unwrap_or("*");
+        glob_match(col_pat, bare_col) && (tbl_pat == "*" || glob_match(tbl_pat, table))
+    } else {
+        glob_match(p, bare_col)
+    }
 }
 
 fn rule_matches(rule: &SecurityRuleConfig, request: &AccessRequest<'_>) -> bool {
@@ -916,6 +1173,9 @@ mod tests {
             fail_closed: true,
             star_policy: StarPolicy::Deny,
             rules,
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            default_max_rows: None,
         }
     }
 
@@ -938,6 +1198,7 @@ mod tests {
             tables: vec!["secret_*".into()],
             columns: vec![],
             subjects: vec![],
+            row_filter: None,
         }]);
         let sub = subject("app");
         let dialect = HeuristicDialectParser::new(ProtocolKind::MySql);
@@ -958,16 +1219,16 @@ mod tests {
             tables: vec!["secret_*".into()],
             columns: vec![],
             subjects: vec![],
+            row_filter: None,
         }]);
         let sub = subject("app");
         let dialect = HeuristicDialectParser::new(ProtocolKind::MySql);
         let cmd = GatewayCommand::Query {
             sql: "SELECT 1".into(),
         };
-        assert_eq!(
-            pdp.authorize_command(&sub, "orders", &cmd, &dialect),
-            SecurityDecision::Allow
-        );
+        assert!(!pdp
+            .authorize_command(&sub, "orders", &cmd, &dialect)
+            .is_deny());
     }
 
     #[test]
@@ -979,6 +1240,7 @@ mod tests {
             tables: vec![],
             columns: vec![],
             subjects: vec!["analyst".into()],
+            row_filter: None,
         }]);
         let sub = subject("analyst");
         let dialect = HeuristicDialectParser::new(ProtocolKind::PostgreSql);
@@ -989,10 +1251,9 @@ mod tests {
             .authorize_command(&sub, "analytics", &cmd, &dialect)
             .is_deny());
         let app = subject("app");
-        assert_eq!(
-            pdp.authorize_command(&app, "analytics", &cmd, &dialect),
-            SecurityDecision::Allow
-        );
+        assert!(!pdp
+            .authorize_command(&app, "analytics", &cmd, &dialect)
+            .is_deny());
     }
 
     #[test]
@@ -1031,6 +1292,7 @@ mod tests {
             tables: vec!["employees".into()],
             columns: vec!["salary".into(), "ssn".into()],
             subjects: vec![],
+            row_filter: None,
         }]);
         let mut set = ObjectSet::empty();
         let mut obj = ObjectAccess::new("employees", StatementAction::Select);
@@ -1043,7 +1305,7 @@ mod tests {
             sql: "SELECT id, name, salary FROM employees".into(),
         };
         match pdp.authorize_command_with_objects(&sub, "hr", &cmd, &dialect, Some(&set)) {
-            SecurityDecision::AllowRewrite { sql } => {
+            SecurityDecision::AllowRewrite { sql, .. } => {
                 assert!(sql.to_ascii_lowercase().contains("id"));
                 assert!(sql.to_ascii_lowercase().contains("name"));
                 assert!(!sql.to_ascii_lowercase().contains("salary"));
@@ -1061,6 +1323,7 @@ mod tests {
             tables: vec!["employees".into()],
             columns: vec!["salary".into()],
             subjects: vec![],
+            row_filter: None,
         }]);
         let mut set = ObjectSet::empty();
         let mut obj = ObjectAccess::new("employees", StatementAction::Select);
@@ -1085,6 +1348,7 @@ mod tests {
             tables: vec!["secret_*".into()],
             columns: vec![],
             subjects: vec![],
+            row_filter: None,
         }]);
         let set = ObjectSet::parse_failed();
         let sub = subject("app");
@@ -1111,5 +1375,82 @@ mod tests {
         assert!(!lower.contains("salary"));
         assert!(!lower.contains("ssn"));
         assert!(lower.contains("from employees"));
+    }
+
+    #[test]
+    fn row_filter_injects_where() {
+        let pdp = LocalPdp {
+            fail_closed: true,
+            star_policy: StarPolicy::Deny,
+            rules: vec![SecurityRuleConfig {
+                name: "tenant-row".into(),
+                effect: "allow".into(),
+                actions: vec!["select".into()],
+                tables: vec!["employees".into()],
+                columns: vec![],
+                subjects: vec![],
+                row_filter: Some("tenant_id = 1".into()),
+            }],
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            default_max_rows: None,
+        };
+        let mut set = ObjectSet::empty();
+        let mut obj = ObjectAccess::new("employees", StatementAction::Select);
+        obj.columns = vec!["id".into(), "name".into()];
+        set.objects.push(obj);
+        let sub = subject("app");
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT id, name FROM employees".into(),
+        };
+        match pdp.authorize_command_with_objects(&sub, "hr", &cmd, &dialect, Some(&set)) {
+            SecurityDecision::AllowRewrite { sql, obligations } => {
+                assert!(sql.to_ascii_lowercase().contains("tenant_id = 1"));
+                assert_eq!(obligations.row_filter.as_deref(), Some("tenant_id = 1"));
+            }
+            other => panic!("expected rewrite with row filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mask_tags_produce_obligations() {
+        use crate::{SecurityColumnTagConfig, SecurityMaskRuleConfig};
+        let pdp = LocalPdp {
+            fail_closed: true,
+            star_policy: StarPolicy::Allow,
+            rules: Vec::new(),
+            mask_rules: vec![SecurityMaskRuleConfig {
+                name: "phone-partial".into(),
+                algorithm: "partial".into(),
+                replace_with: String::new(),
+                prefix_len: 3,
+                suffix_len: 2,
+            }],
+            column_tags: vec![SecurityColumnTagConfig {
+                column: "phone".into(),
+                tables: vec!["employees".into()],
+                subjects: vec![],
+                mask_rule: "phone-partial".into(),
+                label: "PII".into(),
+            }],
+            default_max_rows: None,
+        };
+        let mut set = ObjectSet::empty();
+        let mut obj = ObjectAccess::new("employees", StatementAction::Select);
+        obj.columns = vec!["id".into(), "phone".into()];
+        set.objects.push(obj);
+        let sub = subject("app");
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT id, phone FROM employees".into(),
+        };
+        match pdp.authorize_command_with_objects(&sub, "hr", &cmd, &dialect, Some(&set)) {
+            SecurityDecision::Allow { obligations } => {
+                assert_eq!(obligations.column_masks.len(), 1);
+                assert_eq!(obligations.column_masks[0].column.to_ascii_lowercase(), "phone");
+            }
+            other => panic!("expected allow with masks, got {other:?}"),
+        }
     }
 }

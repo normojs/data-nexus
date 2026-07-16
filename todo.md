@@ -21,7 +21,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 | 版本 | 一句话 | 状态 |
 |------|--------|:----:|
 | **v1** | 客户端 ↔ 网关 ↔ MySQL/PG；路由/池/跨协议/Admin | **完成** |
-| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **进行中（S0–S2 完成）** |
+| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **进行中（S0–S3 完成）** |
 
 **原则**
 
@@ -49,7 +49,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 - [x] **S0** — 边界 + 审计模型 + security 配置空壳
 - [x] **S1** — Subject + 语句/表级 Deny MVP
 - [x] **S2** — AST 对象抽取 + 表/列 ACL
-- [ ] **S3** — 流式结果钩子 + 动态脱敏 + 行级雏形
+- [x] **S3** — 动态脱敏 + 行级雏形（物化路径 MVP）
 - [ ] **S4** — 持久化审计 + 查询 API/UI
 - [ ] **S5** — 审批/金库 + 通道高危门闩
 - [ ] **S6** — Web SQL 门户 + Vault + 导出运营
@@ -116,10 +116,10 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 - [x] **F28** 策略热更（失败 keep-old） — 运维 — S1（security 变更重建 listener）
 - [x] **F08** AST → ObjectSet（表/列/操作） — 细粒度前置 — S2 — P0
 - [x] **F09** 列级 ACL（投影剔除/拒绝） — 字段权限 — S2 — P0
-- [x] **F10** SQL 改写义务（列剔除；LIMIT/行谓词 → S3） — 权限执行 — S2–S3 — P0
-- [ ] **F11** 结果流钩子 + 动态脱敏 Mask — 数据脱敏 — S3 — P0
-- [ ] **F12** 行级过滤（改写优先，结果回退） — 行级管控 — S3 — P0
-- [ ] **F13** 敏感列标签 / 规则识别 MVP — 敏感识别 — S3 — P1
+- [x] **F10** SQL 改写义务（列剔除 + 行谓词注入） — 权限执行 — S2–S3 — P0
+- [x] **F11** 结果侧动态脱敏 Mask（物化路径） — 数据脱敏 — S3 — P0
+- [x] **F12** 行级过滤（SQL 谓词注入优先） — 行级管控 — S3 — P0
+- [x] **F13** 敏感列标签 / 规则绑定 MVP — 敏感识别 — S3 — P1
 - [ ] **F14** 水印雏形 — 防泄漏 — S3–S4 — P2
 - [ ] **F15** 审计持久化 + 查询 API + UI — 合规审计 — S4 — P0
 - [ ] **F16** 审计分级 L0/L1/L2 + 背压 — 高性能审计 — S4 — P0
@@ -215,24 +215,28 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 ---
 
-### S3 — 动态脱敏 + 行级 + 敏感识别 MVP
+### S3 — 动态脱敏 + 行级 + 敏感识别 MVP ✅
 
 | 项 | 内容 |
 |----|------|
 | **目标** | 同查询不同可见性；结果侧 mask（SQLDEV 动态脱敏） |
-| **退出** | 角色 A 脱敏 / B 明文；行级隔离可证；优先走流式 |
+| **退出** | 脱敏 + 行级隔离可证；物化路径 MVP（流式 → A1/A2） |
 
 **功能 / 任务**
 
-- [ ] Decision → `Obligations`（mask / row_filter / max_rows / audit_level）
-- [ ] 结果钩子：物化路径 MVP → 切换 SecureStream（依赖 A1/A2）
-- [ ] Mask 算法：`nullify` / `partial` / `hash` / `replace` / `keep_prefix`
-- [ ] 列标签绑定脱敏规则
-- [ ] 行级：SQL 谓词注入优先；不能改写时结果过滤
-- [ ] 敏感识别 MVP：静态标签 + 列名/正则规则（非 ML）
-- [ ] （P2）水印 ID 雏形
-- [ ] `smoke-security-mask.sh` / 行级 smoke
-- [ ] 跨协议路径义务一致（或明确降级策略）
+- [x] Decision → `Obligations`（mask / row_filter / max_rows）
+- [x] 结果钩子：物化 `GatewayResponse::ResultSet` 路径（SecureStream 依赖 A1/A2，后置）
+- [x] Mask 算法：`nullify` / `partial` / `hash` / `replace` / `keep_prefix`
+- [x] 列标签 `column_tags` 绑定 `mask_rules`
+- [x] 行级：规则 `row_filter` SQL 谓词注入（失败 fail_closed 可拒）
+- [x] 敏感识别 MVP：静态 column_tags（非 ML）
+- [ ] （P2）水印 ID 雏形 — **延后**
+- [x] `smoke-security-mask.sh` + `security-mask-gateway-config.toml`
+- [x] 跨协议：义务在 IR 层执行（mask 在 map_response_types 后），同路径
+
+**代码**：`gateway/core/src/obligations.rs`、`pdp.rs`、`security.rs`；`runtime/gateway/src/core_engine.rs` 结果义务执行
+
+**不做**：SecureStream 窗口流式（A1）、结果侧行回退过滤、水印、按 subject 差异化角色 smoke（配置已支持 subjects glob）
 
 ---
 
@@ -353,14 +357,17 @@ data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 
 ## 9. 当前下一动作（唯一焦点）
 
-**>>> 开始 S3（可并行 A1） <<<**
+**>>> 开始 S4 或 A1（二选一/可并行） <<<**
 
-- [ ] Decision → `Obligations`（mask / row_filter / max_rows / audit_level）
-- [ ] 结果钩子：物化路径 MVP → 后续 SecureStream（依赖 A1/A2）
-- [ ] Mask 算法：`nullify` / `partial` / `hash` / `replace` / `keep_prefix`
-- [ ] 行级：SQL 谓词注入优先；不能改写时结果过滤
-- [ ] `smoke-security-mask.sh`
+**S4 — 持久化审计**
 
-S0–S2 已完成：配置壳、审计字段、Local PDP 表/语句/列 ACL、AST ObjectSet、列改写、Admin security-policies、smoke-security-deny / smoke-security-column。
+- [ ] AuditPipeline 有界队列 + worker
+- [ ] Sink：JSONL 文件 →（后）OTLP / DB
+- [ ] `GET /admin/audit/events` + data-ui Audit 页雏形
 
-**建议并行**：A1 Backend 窗口化读取（S3 大数据脱敏前置）。
+**A1 — 性能（S3 大数据脱敏前置）**
+
+- [ ] Backend 窗口化读取 + `ExecuteMode`
+- [ ] 为 SecureStream 替换物化 mask 做准备
+
+S0–S3 已完成：表/语句/列 ACL、ObjectSet、列改写、Obligations 脱敏/行谓词、smoke-security-deny / column / mask。

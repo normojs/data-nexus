@@ -33,6 +33,12 @@ pub struct SecurityPolicyConfig {
     /// Rule list for Local PDP (ignored while `enabled` is false).
     #[serde(default)]
     pub rules: Vec<SecurityRuleConfig>,
+    /// Named mask algorithms bound by column label or name (S3).
+    #[serde(default)]
+    pub mask_rules: Vec<SecurityMaskRuleConfig>,
+    /// Column sensitivity labels → mask rule name (S3).
+    #[serde(default)]
+    pub column_tags: Vec<SecurityColumnTagConfig>,
 }
 
 fn default_star_policy() -> String {
@@ -59,6 +65,8 @@ impl Default for SecurityPolicyConfig {
             streaming: SecurityStreamingConfig::default(),
             audit: SecurityAuditConfig::default(),
             rules: Vec::new(),
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
         }
     }
 }
@@ -129,8 +137,44 @@ impl SecurityPolicyConfig {
             }
         }
 
-        // S0: enabled=true is allowed only as a config shell; no PDP yet.
-        // Keep validate permissive so operators can pre-stage configs.
+        for (idx, mask) in self.mask_rules.iter().enumerate() {
+            if mask.name.trim().is_empty() {
+                return Err(GatewayError::Configuration(format!(
+                    "security.mask_rules[{idx}].name must not be empty"
+                )));
+            }
+            if crate::obligations::MaskAlgorithm::parse(&mask.algorithm).is_none() {
+                return Err(GatewayError::Configuration(format!(
+                    "security.mask_rules[{idx}].algorithm must be nullify|partial|hash|replace|keep_prefix, got '{}'",
+                    mask.algorithm
+                )));
+            }
+        }
+
+        for (idx, tag) in self.column_tags.iter().enumerate() {
+            if tag.column.trim().is_empty() {
+                return Err(GatewayError::Configuration(format!(
+                    "security.column_tags[{idx}].column must not be empty"
+                )));
+            }
+            if tag.mask_rule.trim().is_empty() {
+                return Err(GatewayError::Configuration(format!(
+                    "security.column_tags[{idx}].mask_rule must not be empty"
+                )));
+            }
+            if !self
+                .mask_rules
+                .iter()
+                .any(|m| m.name.eq_ignore_ascii_case(&tag.mask_rule))
+            {
+                return Err(GatewayError::Configuration(format!(
+                    "security.column_tags[{idx}].mask_rule '{}' not found in mask_rules",
+                    tag.mask_rule
+                )));
+            }
+        }
+
+        // enabled=true is a pre-staged shell; PDP stages validate at runtime.
         Ok(())
     }
 }
@@ -240,7 +284,7 @@ impl Default for SecurityAuditConfig {
     }
 }
 
-/// Rule entry consumed by Local PDP (S1 table/statement, S2 columns).
+/// Rule entry consumed by Local PDP (S1 table/statement, S2 columns, S3 row filter).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityRuleConfig {
     pub name: String,
@@ -255,10 +299,53 @@ pub struct SecurityRuleConfig {
     pub columns: Vec<String>,
     #[serde(default)]
     pub subjects: Vec<String>,
+    /// Optional static SQL predicate injected on Allow for matching SELECTs (S3).
+    #[serde(default)]
+    pub row_filter: Option<String>,
 }
 
 fn default_rule_effect() -> String {
     "deny".into()
+}
+
+/// Named mask algorithm definition (S3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityMaskRuleConfig {
+    pub name: String,
+    /// nullify | partial | hash | replace | keep_prefix
+    pub algorithm: String,
+    #[serde(default)]
+    pub replace_with: String,
+    #[serde(default = "default_mask_prefix")]
+    pub prefix_len: usize,
+    #[serde(default = "default_mask_suffix")]
+    pub suffix_len: usize,
+}
+
+fn default_mask_prefix() -> usize {
+    3
+}
+
+fn default_mask_suffix() -> usize {
+    2
+}
+
+/// Bind a column name/glob to a mask rule (S3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityColumnTagConfig {
+    /// Column name glob (bare or `table.col`).
+    pub column: String,
+    /// Optional table glob; empty = any table.
+    #[serde(default)]
+    pub tables: Vec<String>,
+    /// Optional subject glob list; empty = all subjects.
+    #[serde(default)]
+    pub subjects: Vec<String>,
+    /// Reference to [`SecurityMaskRuleConfig::name`].
+    pub mask_rule: String,
+    /// Optional label for audit (e.g. PII, phone).
+    #[serde(default)]
+    pub label: String,
 }
 
 #[cfg(test)]
@@ -297,6 +384,7 @@ mod tests {
             tables: vec![],
             columns: vec![],
             subjects: vec![],
+            row_filter: None,
         });
         assert!(cfg.validate().is_err());
     }
@@ -312,6 +400,7 @@ mod tests {
             tables: vec!["*.*.secret_*".into()],
             columns: vec![],
             subjects: vec![],
+            row_filter: None,
         });
         assert_eq!(cfg.validate(), Ok(()));
     }

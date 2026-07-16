@@ -11,6 +11,7 @@ mod dialect;
 mod error;
 mod model;
 mod object_set;
+mod obligations;
 mod pdp;
 mod plugin;
 mod route;
@@ -32,13 +33,17 @@ pub use config::{
     PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,
 };
 pub use object_set::{ColumnAclOutcome, ObjectAccess, ObjectSet, StarPolicy};
+pub use obligations::{
+    apply_obligations_to_response, inject_row_filter, mask_gateway_value, MaskAlgorithm, MaskSpec,
+    Obligations,
+};
 pub use pdp::{
     action_from_command, extract_table_names, sql_from_command, AccessRequest, LocalPdp,
     SecurityDecision, StatementAction, Subject,
 };
 pub use security::{
-    SecurityAuditConfig, SecurityPdpConfig, SecurityPolicyConfig, SecurityRuleConfig,
-    SecurityStreamingConfig, SecuritySubjectConfig,
+    SecurityAuditConfig, SecurityColumnTagConfig, SecurityMaskRuleConfig, SecurityPdpConfig,
+    SecurityPolicyConfig, SecurityRuleConfig, SecurityStreamingConfig, SecuritySubjectConfig,
 };
 pub use dialect::{default_dialect_parser, DialectParser, HeuristicDialectParser};
 pub use error::{GatewayError, GatewayResult};
