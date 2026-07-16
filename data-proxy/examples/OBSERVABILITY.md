@@ -24,7 +24,9 @@ DATA_NEXUS_LOG_FORMAT=json \
 | Span | Fields |
 |------|--------|
 | `gateway.handle_frame` | `listener`, `service`, `frontend_protocol`, `backend_protocol` |
-| `gateway.command` | `command_type`, `endpoint`, `outcome` |
+| `gateway.command` | `command_type`, `endpoint`, `outcome`, `security_decision`, `security_rule_class`, `execute_path` |
+
+`security_*` / `execute_path` are **low-cardinality** (B03). Rule names are mapped to classes (`table` / `column` / `cedar` / `time` / `ticket` / …), not raw policy ids.
 
 Audit events also go to target `data_nexus::audit` with decision/latency fields.
 
@@ -58,6 +60,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
 | Traces | spans `gateway.handle_frame`, `gateway.command` |
 | Metrics | default on; disable with `DATA_NEXUS_OTEL_METRICS=0` |
 | Logs | default on (tracing → OTLP logs); disable with `DATA_NEXUS_OTEL_LOGS=0` |
+| Security attrs | default on; disable with `DATA_NEXUS_OTEL_ATTR_SECURITY=0` |
 
 ### Trace sampling
 
@@ -82,9 +85,18 @@ When `otel` is built and metrics are enabled:
 | Metric | Type | Labels |
 |--------|------|--------|
 | `data_nexus.otel.up` | counter | (startup) |
-| `data_nexus.gateway.commands` | counter | listener, service, frontend_protocol, backend_protocol, command_type, endpoint, outcome |
+| `data_nexus.gateway.commands` | counter | base labels + `security_decision`, `security_rule_class`, `execute_path` |
 | `data_nexus.gateway.command_duration_ms` | histogram | same |
-| `data_nexus.gateway.errors` | counter | same (outcome starts with `error` or `translation_reject`) |
+| `data_nexus.gateway.errors` | counter | same (`error:*`, `translation_reject`, `plugin_reject`) |
+| `data_nexus.gateway.security_denies` | counter | same (only `security_deny` / `security_require_ticket`) |
+
+Base labels: `listener`, `service`, `frontend_protocol`, `backend_protocol`, `command_type`, `endpoint`, `outcome`.
+
+| Attribute | Values (controlled) |
+|-----------|---------------------|
+| `security_decision` | `none` / `allow` / `allow_obligations` / `deny` / `require_ticket` |
+| `security_rule_class` | `none` / `table` / `column` / `row` / `cedar` / `time` / `ticket` / `fail_closed` / `other` |
+| `execute_path` | `n/a` / `passthrough` / `streaming` / `materialized` / `xproto_stream` |
 
 Prometheus text metrics on `/metrics` remain available regardless of OTel.
 

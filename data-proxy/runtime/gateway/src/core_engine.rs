@@ -215,6 +215,9 @@ impl CoreGatewayConnection {
                 command_type = %command_type,
                 endpoint = tracing::field::Empty,
                 outcome = tracing::field::Empty,
+                security_decision = tracing::field::Empty,
+                security_rule_class = tracing::field::Empty,
+                execute_path = tracing::field::Empty,
             );
 
             let route_plan = if let Some(route_policy) = &self.route_policy {
@@ -289,6 +292,7 @@ impl CoreGatewayConnection {
                             labels[5],
                             "plugin_reject",
                             started_at,
+                            &crate::otel_metrics::CommandOtelAttrs::none(),
                         );
                         finish_command_metrics(&self.metrics, &labels, started_at);
                         continue;
@@ -346,6 +350,7 @@ impl CoreGatewayConnection {
                             labels[5],
                             "translation_reject",
                             started_at,
+                            &crate::otel_metrics::CommandOtelAttrs::none(),
                         );
                         finish_command_metrics(&self.metrics, &labels, started_at);
                         continue;
@@ -459,6 +464,9 @@ impl CoreGatewayConnection {
                             message,
                         };
                         command_span.record("outcome", "security_require_ticket");
+                        let rule_class = crate::otel_metrics::classify_security_rule(&rule);
+                        command_span.record("security_decision", "require_ticket");
+                        command_span.record("security_rule_class", rule_class);
                         packets.extend(self.encode_response_packets(response).await?);
                         record_otel_command(
                             &self.listener_name,
@@ -469,6 +477,10 @@ impl CoreGatewayConnection {
                             labels[5],
                             "security_require_ticket",
                             started_at,
+                            &crate::otel_metrics::CommandOtelAttrs::security(
+                                "require_ticket",
+                                rule_class,
+                            ),
                         );
                         finish_command_metrics(&self.metrics, &labels, started_at);
                         if let (Some(plugins), Some(idx)) =
@@ -524,6 +536,9 @@ impl CoreGatewayConnection {
                             message,
                         };
                         command_span.record("outcome", "security_deny");
+                        let rule_class = crate::otel_metrics::classify_security_rule(&rule);
+                        command_span.record("security_decision", "deny");
+                        command_span.record("security_rule_class", rule_class);
                         packets.extend(self.encode_response_packets(response).await?);
                         record_otel_command(
                             &self.listener_name,
@@ -534,6 +549,7 @@ impl CoreGatewayConnection {
                             labels[5],
                             "security_deny",
                             started_at,
+                            &crate::otel_metrics::CommandOtelAttrs::security("deny", rule_class),
                         );
                         finish_command_metrics(&self.metrics, &labels, started_at);
                         if let (Some(plugins), Some(idx)) =
@@ -614,7 +630,27 @@ impl CoreGatewayConnection {
                 GatewayResponse::Bye => "bye".to_owned(),
                 GatewayResponse::Prepared { .. } => "prepared".to_owned(),
             };
+            let execute_path = match &response {
+                GatewayResponse::Wire { .. } => "passthrough",
+                GatewayResponse::ResultSet { .. } if self.translation_policy.is_some() => {
+                    "xproto_stream"
+                }
+                GatewayResponse::ResultSet { .. } => match self.stream_mode {
+                    gateway_core::ExecuteMode::Streaming { .. } => "streaming",
+                    gateway_core::ExecuteMode::Materialized => "materialized",
+                    gateway_core::ExecuteMode::Passthrough => "passthrough",
+                },
+                _ => "n/a",
+            };
+            let sec_decision = if pending_obligations.has_result_obligations() {
+                "allow_obligations"
+            } else {
+                "allow"
+            };
             command_span.record("outcome", tracing::field::display(&outcome));
+            command_span.record("security_decision", sec_decision);
+            command_span.record("security_rule_class", "none");
+            command_span.record("execute_path", execute_path);
             info!(
                 target: gateway_core::AUDIT_TARGET,
                 action = gateway_core::AuditAction::Query.as_str(),
@@ -667,6 +703,8 @@ impl CoreGatewayConnection {
                 labels[5],
                 &outcome,
                 started_at,
+                &crate::otel_metrics::CommandOtelAttrs::security(sec_decision, "none")
+                    .with_execute_path(execute_path),
             );
             finish_command_metrics(&self.metrics, &labels, started_at);
         }
@@ -694,6 +732,7 @@ fn record_otel_command(
     endpoint: &str,
     outcome: &str,
     started_at: Instant,
+    attrs: &crate::otel_metrics::CommandOtelAttrs,
 ) {
     crate::otel_metrics::record_command(
         listener,
@@ -704,6 +743,7 @@ fn record_otel_command(
         endpoint,
         outcome,
         started_at.elapsed(),
+        attrs,
     );
 }
 

@@ -50,4 +50,5 @@ rayon = "1.5"
 lexical = "6"
 lexical-core = "0.8.5"
 prometheus = "0.13.3"
-opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["metrics"] }
+# metrics + trace so opentelemetry 0.27 pulls thiserror for Error derive.
+opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["metrics", "trace"] }
