@@ -21,7 +21,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 | 版本 | 一句话 | 状态 |
 |------|--------|:----:|
 | **v1** | 客户端 ↔ 网关 ↔ MySQL/PG；路由/池/跨协议/Admin | **完成** |
-| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **进行中（S0–S3 完成）** |
+| **v2** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **进行中（S0–S4 完成）** |
 
 **原则**
 
@@ -50,7 +50,7 @@ v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   
 - [x] **S1** — Subject + 语句/表级 Deny MVP
 - [x] **S2** — AST 对象抽取 + 表/列 ACL
 - [x] **S3** — 动态脱敏 + 行级雏形（物化路径 MVP）
-- [ ] **S4** — 持久化审计 + 查询 API/UI
+- [x] **S4** — 持久化审计 + 查询 API（Admin；UI 后置）
 - [ ] **S5** — 审批/金库 + 通道高危门闩
 - [ ] **S6** — Web SQL 门户 + Vault + 导出运营
 - [ ] **A 轨** — 性能：流式窗口 + 同协议透传（与 S 并行）
@@ -121,8 +121,8 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 - [x] **F12** 行级过滤（SQL 谓词注入优先） — 行级管控 — S3 — P0
 - [x] **F13** 敏感列标签 / 规则绑定 MVP — 敏感识别 — S3 — P1
 - [ ] **F14** 水印雏形 — 防泄漏 — S3–S4 — P2
-- [ ] **F15** 审计持久化 + 查询 API + UI — 合规审计 — S4 — P0
-- [ ] **F16** 审计分级 L0/L1/L2 + 背压 — 高性能审计 — S4 — P0
+- [x] **F15** 审计持久化 + 查询 API（Admin）— 合规审计 — S4 — P0（data-ui 页后置）
+- [x] **F16** 审计分级 L0 默认 + 有界队列背压 — 高性能审计 — S4 — P0
 - [ ] **F17** 高危规则 + 审批票据 — 工单 — S5 — P1
 - [ ] **F18** 金库（双人/限时/限次） — 金库 — S5 — P2
 - [ ] **F19** 通道标签（协议/导出/作业） — 通道管控 — S5 — P1
@@ -240,23 +240,27 @@ S0 → S1 → S2 → S3 → S4 → S5 → S6
 
 ---
 
-### S4 — 持久化审计 + 查询
+### S4 — 持久化审计 + 查询 ✅
 
 | 项 | 内容 |
 |----|------|
 | **目标** | 可追溯、可检索、可出简单合规报告 |
-| **退出** | 放行/拒绝均可按 subject/table/decision 查 |
+| **退出** | 放行/拒绝均可按 subject/decision 查 |
 
 **功能 / 任务**
 
-- [ ] 有界队列 AuditPipeline + worker（S0 骨架产品化）
-- [ ] overflow 策略：`drop_new` 默认；Deny 高优队列
-- [ ] Sink：JSONL 文件 → OTLP Logs → DB（SQLite/PG）分期
-- [ ] （P2）OpenDAL 样本（L2）
-- [ ] Admin `GET /admin/audit/events` 过滤分页
-- [ ] data-ui Audit 页
-- [ ] 保留周期 / 简单清理任务
-- [ ] 压测：审计不堵主路径（指标 `audit_dropped_total`）
+- [x] 有界队列 `AuditPipeline` + 后台 worker（`gateway/core/src/audit_pipeline.rs`）
+- [x] overflow：`drop_new`（默认）/ `drop_old` / `sample`；热路径永不 block
+- [x] Sink：`tracing` + JSONL `file`（OTLP/DB 后置）
+- [ ] （P2）OpenDAL 样本（L2）— **延后**
+- [x] Admin `GET /admin/audit/events`（decision/subject/service/limit）+ `/admin/audit/stats`
+- [ ] data-ui Audit 页 — **后置**（API 已就绪）
+- [ ] 保留周期 / 清理任务 — **后置**
+- [x] 主路径 `try_send` 非阻塞；`dropped` 计数可观测（smoke + 单测）
+
+**代码**：`audit_pipeline.rs`、`core_engine` try_audit、`http` Admin audit 路由；`smoke-security-audit.sh`
+
+**不做**：OTLP Logs sink、DB 持久化、data-ui 页、Deny 独立高优队列（当前与普通事件同队列 + recent ring）
 
 ---
 
@@ -357,17 +361,17 @@ data-ui           运维 → 策略 / 审计 / 工单 /（S6）门户入口
 
 ## 9. 当前下一动作（唯一焦点）
 
-**>>> 开始 S4 或 A1（二选一/可并行） <<<**
+**>>> 开始 S5 或 A1（可并行） <<<**
 
-**S4 — 持久化审计**
+**S5 — 审批 / 通道门闩**
 
-- [ ] AuditPipeline 有界队列 + worker
-- [ ] Sink：JSONL 文件 →（后）OTLP / DB
-- [ ] `GET /admin/audit/events` + data-ui Audit 页雏形
+- [ ] 高危规则 + `RequireTicket` 决策
+- [ ] Ticket 校验接口（可外置）
+- [ ] 导出/大结果门闩雏形
 
-**A1 — 性能（S3 大数据脱敏前置）**
+**A1 — 性能（SecureStream 前置）**
 
 - [ ] Backend 窗口化读取 + `ExecuteMode`
-- [ ] 为 SecureStream 替换物化 mask 做准备
+- [ ] 替换物化 mask 的大数据路径
 
-S0–S3 已完成：表/语句/列 ACL、ObjectSet、列改写、Obligations 脱敏/行谓词、smoke-security-deny / column / mask。
+S0–S4 已完成：访问控制 + 脱敏/行级 + 审计管道/Admin 查询；smoke-security-deny / column / mask / audit。

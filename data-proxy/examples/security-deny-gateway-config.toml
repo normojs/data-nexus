@@ -27,7 +27,8 @@ passthrough = true
 [security.audit]
 queue_capacity = 65536
 overflow = "drop_new"
-sinks = ["tracing"]
+sinks = ["tracing", "file"]
+file_path = "/tmp/data-nexus-audit-events.jsonl"
 
 # Deny SELECT (and other listed actions) against secret_* tables.
 [[security.rules]]

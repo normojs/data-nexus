@@ -372,6 +372,29 @@ impl CoreGatewayConnection {
                             message = %message,
                             "gateway command denied by security policy"
                         );
+                        gateway_core::try_audit(gateway_core::AuditEvent {
+                            action: Some(gateway_core::AuditAction::Query.as_str().into()),
+                            decision: Some(gateway_core::AuditDecision::Deny.as_str().into()),
+                            subject_id: Some(subject.subject_id.clone()),
+                            db_user: self.session.user.clone(),
+                            listener: Some(self.listener_name.clone()),
+                            service: Some(self.service_name.clone()),
+                            frontend_protocol: Some(
+                                protocol_metric_name(&self.frontend.protocol()).to_owned(),
+                            ),
+                            backend_protocol: Some(
+                                protocol_metric_name(&self.backend.protocol()).to_owned(),
+                            ),
+                            command_type: Some(command_type.to_owned()),
+                            endpoint: Some(label_owned[5].clone()),
+                            database: self.session.database.clone(),
+                            outcome: Some("security_deny".into()),
+                            code: Some("security_deny".into()),
+                            message: Some(message.clone()),
+                            rule: Some(rule.clone()),
+                            audit_level: Some("L0".into()),
+                            ..gateway_core::AuditEvent::default()
+                        });
                         let response = GatewayResponse::Error {
                             code: "security_deny".into(),
                             message,
@@ -457,6 +480,27 @@ impl CoreGatewayConnection {
                 latency_ms = started_at.elapsed().as_millis() as u64,
                 "gateway command audited"
             );
+            gateway_core::try_audit(gateway_core::AuditEvent {
+                action: Some(gateway_core::AuditAction::Query.as_str().into()),
+                decision: Some(gateway_core::AuditDecision::Execute.as_str().into()),
+                subject_id: self.session.user.clone(),
+                db_user: self.session.user.clone(),
+                listener: Some(self.listener_name.clone()),
+                service: Some(self.service_name.clone()),
+                frontend_protocol: Some(
+                    protocol_metric_name(&self.frontend.protocol()).to_owned(),
+                ),
+                backend_protocol: Some(
+                    protocol_metric_name(&self.backend.protocol()).to_owned(),
+                ),
+                command_type: Some(command_type.to_owned()),
+                endpoint: Some(label_owned[5].clone()),
+                database: self.session.database.clone(),
+                outcome: Some(outcome.clone()),
+                latency_ms: Some(started_at.elapsed().as_millis() as u64),
+                audit_level: Some("L0".into()),
+                ..gateway_core::AuditEvent::default()
+            });
 
             if let (Some(plugins), Some(idx)) = (self.plugins.as_mut(), concurrency_rule_idx) {
                 plugins.release_concurrency(idx);
@@ -581,6 +625,8 @@ impl Eq for CoreGatewayRuntimePlan {}
 impl CoreGatewayRuntimePlan {
     pub fn from_config(config: &GatewayConfig) -> GatewayResult<Self> {
         config.validate()?;
+        // S4: install process-wide audit pipeline from security.audit (idempotent).
+        let _ = gateway_core::install_audit_pipeline(&config.security.audit);
 
         let listeners = config
             .listeners

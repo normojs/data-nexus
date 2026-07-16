@@ -6,6 +6,7 @@
 
 mod admin_auth;
 mod audit;
+mod audit_pipeline;
 mod config;
 mod dialect;
 mod error;
@@ -27,6 +28,10 @@ pub use admin_auth::{
 };
 pub use audit::{
     fields as audit_fields, AuditAction, AuditDecision, AuditEvent, AuditLevel, AUDIT_TARGET,
+};
+pub use audit_pipeline::{
+    data_plane_event, global_audit_pipeline, install_audit_pipeline, try_audit, AuditPipeline,
+    AuditPipelineStats,
 };
 pub use config::{
     AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,

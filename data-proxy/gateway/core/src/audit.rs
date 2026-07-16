@@ -127,6 +127,9 @@ impl AuditLevel {
 pub struct AuditEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
+    /// Unix epoch milliseconds (filled by pipeline if absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +170,12 @@ pub struct AuditEvent {
     pub audit_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sql_fingerprint: Option<String>,
+    /// Policy rule name when decision is deny/allow-with-obligation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// Tables involved (best-effort, S4 L0).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<String>,
 }
 
 #[cfg(test)]

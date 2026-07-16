@@ -21,7 +21,7 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{Json, Path, State},
+    extract::{Json, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::Response,
     routing::{get, post, put},
@@ -39,7 +39,7 @@ use proxy::factory::{
     PoolRefresh, PoolRefresher, PoolSnapshot, PoolSnapshotter, SessionEntrySnapshot,
     SessionSnapshotter, ShutdownHandle,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use server::server::{start_gateway_server, GatewayFactory};
 use tracing::info;
 use ver::version::get_version;
@@ -491,6 +491,23 @@ struct AdminSecurityRuleSummary {
     subjects: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct AdminAuditEventsQuery {
+    decision: Option<String>,
+    subject_id: Option<String>,
+    service: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminAuditEventsResponse {
+    events: Vec<gateway_core::AuditEvent>,
+    stats: Option<gateway_core::AuditPipelineStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
 struct GatewayConfigDiff {
     admin_changed: bool,
@@ -651,6 +668,8 @@ impl AxumServer {
             .route("/admin/services", get(Self::admin_services))
             .route("/admin/endpoints", get(Self::admin_endpoints))
             .route("/admin/security-policies", get(Self::admin_security_policies))
+            .route("/admin/audit/events", get(Self::admin_audit_events))
+            .route("/admin/audit/stats", get(Self::admin_audit_stats))
             .route("/admin/pools", get(Self::admin_pools))
             .route("/admin/pools/refresh", post(Self::admin_refresh_pools))
             .route("/admin/pools/:name/refresh", post(Self::admin_refresh_pool))
@@ -858,6 +877,57 @@ impl AxumServer {
             None => gateway_config_not_available(),
         }
     }
+
+    async fn admin_audit_events(
+        State(state): State<Self>,
+        headers: HeaderMap,
+        Query(query): Query<AdminAuditEventsQuery>,
+    ) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/audit/events") {
+            return response;
+        }
+        let Some(pipe) = gateway_core::global_audit_pipeline() else {
+            return json_response(&AdminAuditEventsResponse {
+                events: vec![],
+                stats: None,
+                note: Some("audit pipeline not installed (gateway not started with security.audit)".into()),
+            });
+        };
+        let limit = query.limit.unwrap_or(100).clamp(1, 1000) as usize;
+        let events = pipe.query(
+            query.decision.as_deref(),
+            query.subject_id.as_deref(),
+            query.service.as_deref(),
+            limit,
+        );
+        let stats = pipe.stats();
+        json_response(&AdminAuditEventsResponse {
+            events,
+            stats: Some(stats),
+            note: None,
+        })
+    }
+
+    async fn admin_audit_stats(
+        State(state): State<Self>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        if let Err(response) = state.authorize(&headers, "GET", "/admin/audit/stats") {
+            return response;
+        }
+        match gateway_core::global_audit_pipeline() {
+            Some(pipe) => json_response(&pipe.stats()),
+            None => json_response(&serde_json::json!({
+                "accepted": 0,
+                "written": 0,
+                "dropped": 0,
+                "queue_capacity": 0,
+                "recent_len": 0,
+                "installed": false
+            })),
+        }
+    }
+
 
     async fn admin_add_listener(
         State(state): State<Self>,
