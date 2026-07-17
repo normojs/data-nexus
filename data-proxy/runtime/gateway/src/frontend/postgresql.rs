@@ -7,8 +7,8 @@ use gateway_core::{
 use postgresql_protocol::{
     decode_frontend_message, decode_startup_packet, encode_authentication_ok,
     encode_backend_key_data, encode_bind_complete, encode_close_complete, encode_command_complete,
-    encode_data_row, encode_error_response, encode_no_data, encode_parameter_status,
-    encode_parse_complete, encode_ready_for_query, encode_row_description,
+    encode_data_row, encode_error_response, encode_no_data, encode_parameter_description,
+    encode_parameter_status, encode_parse_complete, encode_ready_for_query, encode_row_description,
     FieldDescription, FrontendMessage, StartupMessage, StartupPacket, TransactionStatus,
     MAX_STARTUP_PACKET_LEN,
 };
@@ -21,10 +21,14 @@ pub struct PostgreSqlFrontendProtocol {
     server_version: String,
     process_id: i32,
     secret_key: i32,
-    /// A10: named prepared statements (Parse).
+    /// A10: named prepared statements (Parse) → SQL text.
     prepared: HashMap<String, String>,
+    /// A10: statement name → parameter count (from `$n` in query).
+    prepared_params: HashMap<String, u16>,
     /// A10: portals (Bind) → bound SQL ready for Query rewrite.
     portals: HashMap<String, String>,
+    /// A10: portal → parameter count for Describe('P').
+    portal_params: HashMap<String, u16>,
 }
 
 impl PostgreSqlFrontendProtocol {
@@ -34,7 +38,9 @@ impl PostgreSqlFrontendProtocol {
             process_id: 0,
             secret_key: 0,
             prepared: HashMap::new(),
+            prepared_params: HashMap::new(),
             portals: HashMap::new(),
+            portal_params: HashMap::new(),
         }
     }
 
@@ -44,7 +50,9 @@ impl PostgreSqlFrontendProtocol {
             process_id,
             secret_key,
             prepared: HashMap::new(),
+            prepared_params: HashMap::new(),
             portals: HashMap::new(),
+            portal_params: HashMap::new(),
         }
     }
 
@@ -114,6 +122,8 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 query,
                 param_types: _,
             } => {
+                let nparams = count_pg_placeholders_frontend(&query);
+                self.prepared_params.insert(statement.clone(), nparams);
                 self.prepared.insert(statement, query);
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_parse_complete()],
@@ -129,6 +139,11 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                         "postgresql Bind: unknown statement '{statement}'"
                     ))
                 })?;
+                let nparams = self
+                    .prepared_params
+                    .get(&statement)
+                    .copied()
+                    .unwrap_or_else(|| count_pg_placeholders_frontend(&sql));
                 let params: Vec<GatewayValue> = parameters
                     .into_iter()
                     .map(|p| match p {
@@ -137,15 +152,30 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     })
                     .collect();
                 let bound = bind_pg_text_params(&sql, &params)?;
-                self.portals.insert(portal, bound);
+                self.portals.insert(portal.clone(), bound);
+                self.portal_params.insert(portal, nparams);
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_bind_complete()],
                 }])
             }
             FrontendMessage::Describe { target, name } => {
-                let _ = (target, name);
+                // Describe statement ('S') or portal ('P'):
+                // ParameterDescription + NoData (row metadata still unavailable without
+                // backend describe — honest A10 boundary).
+                let nparams = if target == b'S' {
+                    self.prepared_params.get(&name).copied().or_else(|| {
+                        self.prepared
+                            .get(&name)
+                            .map(|sql| count_pg_placeholders_frontend(sql))
+                    })
+                } else {
+                    self.portal_params.get(&name).copied()
+                };
+                let n = nparams.unwrap_or(0) as usize;
+                // unknown OIDs (0) — clients treat as unspecified / text.
+                let oids = vec![0i32; n];
                 Ok(vec![GatewayCommand::ClientWire {
-                    packets: vec![encode_no_data()],
+                    packets: vec![encode_parameter_description(&oids), encode_no_data()],
                 }])
             }
             FrontendMessage::Execute { portal, max_rows: _ } => {
@@ -159,8 +189,10 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             FrontendMessage::Close { target, name } => {
                 if target == b'S' {
                     self.prepared.remove(&name);
+                    self.prepared_params.remove(&name);
                 } else {
                     self.portals.remove(&name);
+                    self.portal_params.remove(&name);
                 }
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_close_complete()],
@@ -328,6 +360,32 @@ fn decode_query_command(sql: String, session: &mut SessionState) -> GatewayComma
         }
         _ => GatewayCommand::Query { sql },
     }
+}
+
+/// Count distinct `$n` placeholders for Describe ParameterDescription.
+fn count_pg_placeholders_frontend(sql: &str) -> u16 {
+    let mut max = 0u16;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            let mut n: u16 = 0;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n
+                    .saturating_mul(10)
+                    .saturating_add((bytes[j] - b'0') as u16);
+                j += 1;
+            }
+            if n > max {
+                max = n;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    max
 }
 
 /// Substitute `$n` placeholders with SQL literals (text-format Bind params).
@@ -697,6 +755,44 @@ mod tests {
             "{:?}",
             packets[0]
         );
+    }
+
+    #[test]
+    fn a10_describe_statement_sends_parameter_description() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let mut session = SessionState::default();
+
+        // Build Parse frame: statement "s1", query "SELECT $1, $2", 0 type oids.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(b"SELECT $1, $2\0");
+        body.extend_from_slice(&0i16.to_be_bytes());
+        let mut parse = vec![b'P'];
+        let len = (body.len() + 4) as i32;
+        parse.extend_from_slice(&len.to_be_bytes());
+        parse.extend_from_slice(&body);
+        let cmds = protocol.decode(&parse, &mut session).unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], GatewayCommand::ClientWire { .. }));
+
+        // Describe statement s1
+        let mut dbody = vec![b'S'];
+        dbody.extend_from_slice(b"s1\0");
+        let mut describe = vec![b'D'];
+        let dlen = (dbody.len() + 4) as i32;
+        describe.extend_from_slice(&dlen.to_be_bytes());
+        describe.extend_from_slice(&dbody);
+        let cmds = protocol.decode(&describe, &mut session).unwrap();
+        match &cmds[0] {
+            GatewayCommand::ClientWire { packets } => {
+                assert_eq!(packets.len(), 2);
+                assert_eq!(packets[0][0], b't'); // ParameterDescription
+                assert_eq!(packets[1][0], b'n'); // NoData
+                // nparams = 2 (after 1-byte tag + 4-byte length)
+                assert_eq!(i16::from_be_bytes([packets[0][5], packets[0][6]]), 2);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

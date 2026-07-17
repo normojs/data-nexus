@@ -128,6 +128,7 @@ examples/        smoke + gateway config 样例
 | A10 | 参数绑定 + PG 扩展协议解码（部分） | feat(a10) |
 | A06 | 事务内 Streaming 还 lease（部分） | feat(a06) |
 | H06 | origin 同步完成 | 223f2c0 |
+| A10 | prepare param defs + PG ParameterDescription（部分） | feat(a10) |
 
 ---
 
@@ -146,7 +147,7 @@ examples/        smoke + gateway config 样例
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | 同协议无义务时 `GatewayResponse::Wire` | 非 TCP 帧中继 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
-| **A10** | 预处理 / 事务透传矩阵 | 注册表 + MySQL prepare OK + Execute 参数绑定；PG Parse/Bind/Execute 文本路径 | binary 结果集/完整 Describe 元数据仍简化；参数启发式解码 | **部分** |
+| **A10** | 预处理 / 事务透传矩阵 | 注册表 + 参数绑定 + MySQL param defs + PG ParameterDescription | binary 结果集仍 text；Describe 无真列类型 OID | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
 
@@ -194,7 +195,7 @@ examples/        smoke + gateway config 样例
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：前端 wire 消息包（Wire），**非** backend TCP 帧中继 |
-| 预处理语句 | A10：MySQL `?` 绑定→text Query；PG Parse/Bind/Execute（text 参数）→Query；Describe=NoData；非完整 binary/extended 透传 |
+| 预处理语句 | A10：MySQL param ColumnDefinition + `?` 绑定；PG ParameterDescription + text Bind；**binary resultset / 真列 OID 未做** |
 | 多副本 | 票据/金库/SQLite 索引/LocalPdp **非**共享状态 |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
@@ -203,19 +204,22 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A10 binary resultset / Describe 元数据 或 A08 PG TCP 帧透传 <<<**
+**>>> A08 PG TCP 帧透传 或 A10 binary resultset 或 F32 审计裁剪 <<<**
 
-本轮（H06）：
+本轮（A10 Describe/param defs）：
 
-- smoke all **17/17** + cedar **2/2**
-- `git push origin HEAD` 成功：`e742643..223f2c0` → `origin/main`
-- `main` 与 origin 对齐
+- MySQL：`parameter_count>0` 时 COM_STMT_PREPARE 附带 param ColumnDefinition + EOF
+- PG：Describe → `ParameterDescription`（`$n` 计数，OID=0）+ `NoData`（无行元数据）
+
+```bash
+cargo test -p runtime_gateway --lib a10_
+```
 
 建议下一刀：
 
-1. **A10 续** — binary resultset / Describe 真元数据  
-2. **A08 续** — PG TCP 帧级透传  
-3. **F32 / H05** — 审计裁剪 / 多实例状态外置
+1. **A08 续** — PG TCP 帧级透传  
+2. **A10 续** — binary resultset / 真列 OID  
+3. **F32** — 审计 L0/L1 载荷裁剪
 
 ---
 

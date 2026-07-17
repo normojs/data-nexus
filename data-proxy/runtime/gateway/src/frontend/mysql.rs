@@ -159,13 +159,12 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
             }
             GatewayResponse::ResultSet { columns, rows } => encode_text_resultset(columns, rows),
             GatewayResponse::Wire { packets } => Ok(packets),
-            // A10: COM_STMT_PREPARE OK payload (no 4-byte frame header).
-            // parameter_count/column_count from backend registry; column defs omitted
-            // when both counts are 0 (matches MySQL wire for param-less prepare).
+            // A10: COM_STMT_PREPARE OK + optional parameter column definitions + EOF.
+            // Result column defs still omitted (num_columns=0); execute returns text resultset.
             GatewayResponse::Prepared {
                 statement_id,
                 parameter_count,
-            } => Ok(vec![encode_mysql_prepare_ok(&statement_id, parameter_count)?]),
+            } => encode_mysql_prepare_response(&statement_id, parameter_count),
         }
     }
 
@@ -480,6 +479,35 @@ fn encode_mysql_prepare_ok(statement_id: &str, parameter_count: u16) -> GatewayR
     payload.push(0); // filler
     payload.extend_from_slice(&0u16.to_le_bytes()); // warnings
     Ok(payload)
+}
+
+/// Full COM_STMT_PREPARE response payloads (no 4-byte headers):
+/// OK [ + param ColumnDefinition × n + EOF ] when parameter_count > 0.
+fn encode_mysql_prepare_response(
+    statement_id: &str,
+    parameter_count: u16,
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut packets = vec![encode_mysql_prepare_ok(statement_id, parameter_count)?];
+    if parameter_count > 0 {
+        for i in 0..parameter_count {
+            let mut packet = Vec::new();
+            // Placeholder metadata: VAR_STRING so clients can bind text/binary.
+            ColumnInfo {
+                schema: None,
+                table_name: None,
+                column_name: format!("?{}", i + 1),
+                charset: 33,
+                column_length: 1024,
+                column_type: ColumnType::MYSQL_TYPE_VAR_STRING,
+                column_flag: 0,
+                decimals: 0,
+            }
+            .encode(&mut packet);
+            packets.push(packet);
+        }
+        packets.push(make_eof_packet()[4..].to_vec());
+    }
+    Ok(packets)
 }
 
 
@@ -876,6 +904,29 @@ mod tests {
         assert_eq!(u16::from_le_bytes([p[7], p[8]]), 0); // params
         assert_eq!(p[9], 0); // filler
         assert_eq!(u16::from_le_bytes([p[10], p[11]]), 0); // warnings
+    }
+
+    #[test]
+    fn a10_encodes_prepare_with_param_defs() {
+        let mut adapter = adapter();
+        let session = SessionState::default();
+        let packets = adapter
+            .encode(
+                GatewayResponse::Prepared {
+                    statement_id: "7".into(),
+                    parameter_count: 2,
+                },
+                &session,
+            )
+            .unwrap();
+        // OK + 2 column defs + EOF
+        assert_eq!(packets.len(), 4);
+        assert_eq!(packets[0][0], 0);
+        assert_eq!(u16::from_le_bytes([packets[0][7], packets[0][8]]), 2);
+        assert_eq!(packets[3], make_eof_packet()[4..].to_vec());
+        // Column def packets are non-empty Protocol::ColumnDefinition41 bodies.
+        assert!(!packets[1].is_empty());
+        assert!(!packets[2].is_empty());
     }
 
     #[test]
