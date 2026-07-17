@@ -355,6 +355,17 @@ impl LocalPdp {
         install_local_pdp(config)
     }
 
+    /// Isolated PDP that does **not** touch the process-wide store.
+    /// Use in unit tests to avoid races with parallel `from_config` installs.
+    pub fn from_config_isolated(config: &SecurityPolicyConfig) -> Option<Self> {
+        if !config.enabled {
+            return None;
+        }
+        let store = Arc::new(LocalPdpStore::new());
+        let _ = store.swap(LocalPdpInner::from_config(config));
+        Some(Self { store })
+    }
+
     /// Private store for unit tests (does not touch the global process store).
     #[cfg(test)]
     fn from_inner(inner: LocalPdpInner) -> Self {

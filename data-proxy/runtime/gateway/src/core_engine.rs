@@ -15,13 +15,14 @@
 use std::{sync::Arc, time::Instant};
 
 use endpoint::endpoint::Endpoint;
-use gateway_core::{write_resultset_windowed, CollectingWriter, 
-    map_response_types, prepare_cross_protocol_command, BackendConnector, CommandSummary,
-    DialectParser, EndpointConfig, EndpointRef, EndpointRole, FrontendProtocolAdapter,
-    ExecuteMode, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse, GatewayResult, ListenerConfig,
-    PluginContext, PluginDecision, ProtocolKind, RoutePlan, ServiceConfig, SessionState,
-    TransactionState, TranslationPolicyConfig,
-};
+use gateway_core::{
+        write_resultset_windowed, write_resultset_windowed_with_obligations, CollectingWriter,
+        map_response_types, prepare_cross_protocol_command, BackendConnector, CommandSummary,
+        DialectParser, EndpointConfig, EndpointRef, EndpointRole, FrontendProtocolAdapter,
+        ExecuteMode, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse, GatewayResult,
+        ListenerConfig, Obligations, PluginContext, PluginDecision, ProtocolKind, RoutePlan,
+        ServiceConfig, SessionState, TransactionState, TranslationPolicyConfig,
+    };
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use parking_lot::Mutex;
 use plugin::build_phase::PluginPhase;
@@ -58,6 +59,8 @@ pub struct CoreGatewayConnection {
     /// When true and same-protocol + no obligations, prefer wire passthrough (A3).
     passthrough_enabled: bool,
     metrics: MySQLServerMetricsCollector,
+    /// Result-path obligations deferred to encode so mask can run per window (A06/A07).
+    pending_encode_obligations: Option<Obligations>,
 }
 
 impl CoreGatewayConnection {
@@ -81,6 +84,7 @@ impl CoreGatewayConnection {
             stream_mode: ExecuteMode::Materialized,
             passthrough_enabled: false,
             metrics: MySQLServerMetricsCollector,
+            pending_encode_obligations: None,
         }
     }
 
@@ -111,6 +115,7 @@ impl CoreGatewayConnection {
             stream_mode,
             passthrough_enabled,
             metrics: MySQLServerMetricsCollector,
+            pending_encode_obligations: None,
         }
     }
 
@@ -133,41 +138,61 @@ impl CoreGatewayConnection {
         &mut self,
         response: GatewayResponse,
     ) -> GatewayResult<Vec<Vec<u8>>> {
+        let deferred_obl = self.pending_encode_obligations.take();
         match response {
             GatewayResponse::ResultSet { columns, rows } => {
                 // A4: cross-protocol always window-encodes after type mapping so
                 // frontend dialect packets are produced without one giant encode.
                 // A2: same-protocol Streaming also window-encodes.
+                // A06/A07: result obligations force windowed encode with per-window mask.
                 let cross = self.translation_policy.is_some();
+                let has_obl = deferred_obl
+                    .as_ref()
+                    .map(|o| o.has_result_obligations())
+                    .unwrap_or(false);
                 let window = self
                     .stream_mode
                     .window_rows()
-                    .or(if cross { Some(256) } else { None })
+                    .or(if cross || has_obl { Some(256) } else { None })
                     .unwrap_or(usize::MAX)
                     .max(1);
                 let use_windowed = cross
+                    || has_obl
                     || matches!(self.stream_mode, ExecuteMode::Streaming { .. });
                 if use_windowed {
                     let mut writer = CollectingWriter::new();
-                    write_resultset_windowed(
+                    write_resultset_windowed_with_obligations(
                         self.frontend.as_mut(),
                         &self.session,
                         columns,
                         rows,
                         window,
+                        deferred_obl.as_ref(),
                         &mut writer,
                     )
                     .await?;
                     Ok(writer.into_packets())
                 } else {
-                    self.frontend.encode(
-                        GatewayResponse::ResultSet { columns, rows },
-                        &self.session,
-                    )
+                    let response = if let Some(obl) = deferred_obl.as_ref() {
+                        gateway_core::apply_obligations_to_response(
+                            GatewayResponse::ResultSet { columns, rows },
+                            obl,
+                        )
+                    } else {
+                        GatewayResponse::ResultSet { columns, rows }
+                    };
+                    self.frontend.encode(response, &self.session)
                 }
             }
             GatewayResponse::Wire { packets } => Ok(packets),
-            other => self.frontend.encode(other, &self.session),
+            other => {
+                let other = if let Some(obl) = deferred_obl.as_ref() {
+                    gateway_core::apply_obligations_to_response(other, obl)
+                } else {
+                    other
+                };
+                self.frontend.encode(other, &self.session)
+            }
         }
     }
 
@@ -204,6 +229,8 @@ impl CoreGatewayConnection {
     }
 
     async fn handle_frame_inner(&mut self, frame: &[u8]) -> GatewayResult<Vec<Vec<u8>>> {
+        // Drop any deferred obligations from a previous command that failed mid-path.
+        self.pending_encode_obligations = None;
         let commands = self.frontend.decode(frame, &mut self.session)?;
         let mut packets = Vec::with_capacity(commands.len());
 
@@ -623,28 +650,12 @@ impl CoreGatewayConnection {
                             service = %self.service_name,
                             mask_count = pending_obligations.column_masks.len(),
                             max_rows = ?pending_obligations.max_rows,
-                            "security applied result obligations"
+                            "security deferred result obligations to encode path"
                         );
-                        // A06: windowed mask/watermark; never keep a second full unmasked copy.
-                        match response {
-                            GatewayResponse::ResultSet { columns, rows } => {
-                                let window = self
-                                    .stream_mode
-                                    .window_rows()
-                                    .unwrap_or(256)
-                                    .max(1);
-                                gateway_core::apply_obligations_windowed(
-                                    columns,
-                                    rows,
-                                    &pending_obligations,
-                                    window,
-                                )
-                            }
-                            other => gateway_core::apply_obligations_to_response(
-                                other,
-                                &pending_obligations,
-                            ),
-                        }
+                        // A06/A07: defer mask to encode so each window is masked then
+                        // encoded without retaining a full unmasked+masked pair.
+                        self.pending_encode_obligations = Some(pending_obligations.clone());
+                        response
                     } else {
                         response
                     }
@@ -1596,7 +1607,7 @@ mod tests {
             subjects: vec![],
             row_filter: None,
         });
-        let pdp = LocalPdp::from_config(&security).expect("enabled pdp");
+        let pdp = LocalPdp::from_config_isolated(&security).expect("enabled pdp");
 
         let mut connection = CoreGatewayConnection::new(
             Box::new(MySqlFrontendProtocol::new(

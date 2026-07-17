@@ -485,7 +485,8 @@ pub fn apply_obligations_windowed(
     GatewayResponse::ResultSet { columns, rows }
 }
 
-fn apply_masks_to_rows(rows: &mut [Vec<GatewayValue>], mask_idx: &[(usize, &MaskSpec)]) {
+/// Apply masks to a row slice in place (A06/A07 encode path).
+pub fn apply_masks_to_rows(rows: &mut [Vec<GatewayValue>], mask_idx: &[(usize, &MaskSpec)]) {
     if mask_idx.is_empty() {
         return;
     }
@@ -498,7 +499,34 @@ fn apply_masks_to_rows(rows: &mut [Vec<GatewayValue>], mask_idx: &[(usize, &Mask
     }
 }
 
-fn apply_watermark_to_resultset(
+/// Build column-index → mask mapping for result metadata (A06/A07).
+pub fn build_mask_index<'a>(
+    columns: &[Column],
+    masks: &'a [MaskSpec],
+) -> Vec<(usize, &'a MaskSpec)> {
+    let mut by_name: BTreeMap<String, &MaskSpec> = BTreeMap::new();
+    for m in masks {
+        by_name.insert(m.column.to_ascii_lowercase(), m);
+    }
+    let mut out = Vec::new();
+    for (i, col) in columns.iter().enumerate() {
+        let bare = col
+            .name
+            .rsplit('.')
+            .next()
+            .unwrap_or(col.name.as_str())
+            .trim_matches('`')
+            .trim_matches('"')
+            .to_ascii_lowercase();
+        if let Some(spec) = by_name.get(&bare) {
+            out.push((i, *spec));
+        }
+    }
+    out
+}
+
+/// Apply watermark in place (A06/A07).
+pub fn apply_watermark_to_resultset(
     columns: &mut Vec<Column>,
     rows: &mut Vec<Vec<GatewayValue>>,
     wm: &WatermarkSpec,
@@ -552,32 +580,6 @@ fn apply_watermark_to_resultset(
             }
         }
     }
-}
-
-
-fn build_mask_index<'a>(
-    columns: &[Column],
-    masks: &'a [MaskSpec],
-) -> Vec<(usize, &'a MaskSpec)> {
-    let mut by_name: BTreeMap<String, &MaskSpec> = BTreeMap::new();
-    for m in masks {
-        by_name.insert(m.column.to_ascii_lowercase(), m);
-    }
-    let mut out = Vec::new();
-    for (i, col) in columns.iter().enumerate() {
-        let bare = col
-            .name
-            .rsplit('.')
-            .next()
-            .unwrap_or(col.name.as_str())
-            .trim_matches('`')
-            .trim_matches('"')
-            .to_ascii_lowercase();
-        if let Some(spec) = by_name.get(&bare) {
-            out.push((i, *spec));
-        }
-    }
-    out
 }
 
 #[cfg(test)]

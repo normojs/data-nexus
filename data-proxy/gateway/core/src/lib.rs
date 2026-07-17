@@ -55,7 +55,8 @@ pub use config::{
 };
 pub use object_set::{ColumnAclOutcome, ObjectAccess, ObjectSet, StarPolicy};
 pub use obligations::{
-    apply_obligations_to_response, apply_obligations_windowed, inject_row_filter, mask_gateway_value,
+    apply_masks_to_rows, apply_obligations_to_response, apply_obligations_windowed,
+    apply_watermark_to_resultset, build_mask_index, inject_row_filter, mask_gateway_value,
     MaskAlgorithm, MaskSpec, Obligations, WatermarkMode, WatermarkSpec,
 };
 pub use pdp::{
@@ -96,7 +97,7 @@ pub use translation::{
     TranslationStatementKind,
 };
 pub use transport::{
-    write_resultset_windowed, BackendConnector, CollectingWriter, FrontendProtocolAdapter,
-    ResponseWriter,
+    write_resultset_windowed, write_resultset_windowed_with_obligations, BackendConnector,
+    CollectingWriter, FrontendProtocolAdapter, ResponseWriter,
 };
 pub use types::{map_column_type, parse_backend_type, CanonicalDataType};

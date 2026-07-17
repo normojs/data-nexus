@@ -134,8 +134,8 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
-| **A06** | Backend→PEP 真行流 | `RowStream` / 窗口迭代 API；Secure 路径禁止「先全量 `ResultSet` 再 `apply_obligations`」 | 有义务时窗口化 mask（`apply_obligations_windowed`）；全量物化仍待 A06 续 | **部分** |
-| **A07** | 编码直写 socket | 减少 `handle_frame → Vec<Vec<u8>>` 二次缓冲；与 A06 对齐 | 编码结果先攒包再写 | **待做** |
+| **A06** | Backend→PEP 真行流 | 窗口 mask + encode 合一；有义务强制 Streaming | 边 encode 边 mask 已落地；backend 真行 yield 仍待续 | **部分** |
+| **A07** | 编码直写 socket | 减少 `handle_frame → Vec<Vec<u8>>` 二次缓冲 | 仍 CollectingWriter；encode 路径已窗口化可接 socket writer | **部分** |
 | **A08** | PostgreSQL 真 wire 透传 | 同协议无义务时对齐 MySQL wire 路径 | `GatewayResponse::Wire` 编码 PG 消息（非 TCP 帧中继） | **部分** |
 | **A09** | Portal 端到端流式 | B05b 仅 HTTP chunk；`portal_execute_logical` 仍先物化逻辑结果 | 注释已标明边界 | **待做**（依赖 A06 续） |
 | **A10** | 预处理 / 事务透传矩阵 | MySQL prepared encode 仍偏 legacy；**PG prepared encode not implemented** | 易把流量打进慢路径或直接报错 | **待做** |
@@ -195,25 +195,25 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A06 续：backend 真行迭代 / 或 A07 编码直写 socket <<<**
+**>>> A07 socket ResponseWriter 或 A06 续 backend 真行 yield <<<**
 
-本轮进度（A06/A08 部分）：
+本轮（A06/A07 续）：
 
-- `apply_obligations_windowed`：mask 按窗口应用，避免与未脱敏全量副本并存
-- 有结果义务时强制 Streaming，禁止误走 Passthrough
-- A08：PG Passthrough → `GatewayResponse::Wire`（RowDescription/DataRow/…），core 与 MySQL wire 同路径
-- 诚实边界：仍返回完整 ResultSet 给 encode；**非** TCP 帧中继；portal 仍物化
+- `write_resultset_windowed_with_obligations`：encode 时按窗口 mask，不保留未脱敏全量副本
+- 义务延迟到 encode（`pending_encode_obligations`）
+- 测试 PDP 用 `from_config_isolated` 避免全局 store 竞态
+- A08 PG Wire 仍为消息级（非 TCP 帧中继）
 
 ```bash
-cargo test -p gateway_core --lib obligations
-cargo test -p runtime_gateway --lib backend::postgresql
+cargo test -p gateway_core --lib transport
+cargo test -p runtime_gateway --lib core_engine
 ```
 
 建议下一刀：
 
-1. **A06 续** — backend 按窗口 yield，encode 边收边写（真峰值内存下降）  
-2. **A07** — socket ResponseWriter 替换 CollectingWriter  
-3. **A09** — portal 共用 A06 流
+1. **A07** — gateway 循环用 socket `ResponseWriter` 替换 `CollectingWriter`  
+2. **A06 续** — backend 按窗口 yield（真降峰值内存）  
+3. **A09** — portal 共用 encode 流式路径
 
 ---
 

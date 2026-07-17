@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 
+use crate::obligations::{
+    apply_masks_to_rows, apply_watermark_to_resultset, build_mask_index,
+};
 use crate::{
-    Column, ExecuteMode, GatewayCommand, GatewayResponse, GatewayResult, GatewayValue, ProtocolKind,
-    SessionState,
+    Column, ExecuteMode, GatewayCommand, GatewayResponse, GatewayResult, GatewayValue, Obligations,
+    ProtocolKind, SessionState,
 };
 
 /// Translates one client wire protocol into protocol-neutral gateway messages.
@@ -113,11 +116,57 @@ pub async fn write_resultset_windowed<W: ResponseWriter + ?Sized>(
     frontend: &mut dyn FrontendProtocolAdapter,
     session: &SessionState,
     columns: Vec<Column>,
-    mut rows: Vec<Vec<GatewayValue>>,
+    rows: Vec<Vec<GatewayValue>>,
     window_rows: usize,
     writer: &mut W,
 ) -> GatewayResult<()> {
+    write_resultset_windowed_with_obligations(
+        frontend,
+        session,
+        columns,
+        rows,
+        window_rows,
+        None,
+        writer,
+    )
+    .await
+}
+
+/// A06/A07: windowed encode with **in-place mask per window** before encoding.
+///
+/// When `obligations` is set:
+/// - `max_rows` truncates first
+/// - each window is masked then encoded (no second full unmasked copy)
+/// - watermark applied once before encoding (may add a column)
+///
+/// Peak temporary growth is ~window-sized for mask work, not 2× full result.
+pub async fn write_resultset_windowed_with_obligations<W: ResponseWriter + ?Sized>(
+    frontend: &mut dyn FrontendProtocolAdapter,
+    session: &SessionState,
+    mut columns: Vec<Column>,
+    mut rows: Vec<Vec<GatewayValue>>,
+    window_rows: usize,
+    obligations: Option<&Obligations>,
+    writer: &mut W,
+) -> GatewayResult<()> {
     let window = window_rows.max(1);
+
+    if let Some(obl) = obligations {
+        if let Some(max) = obl.max_rows {
+            let max = max as usize;
+            if rows.len() > max {
+                rows.truncate(max);
+            }
+        }
+        if let Some(wm) = &obl.watermark {
+            apply_watermark_to_resultset(&mut columns, &mut rows, wm);
+        }
+    }
+
+    let mask_idx = obligations
+        .map(|o| build_mask_index(&columns, &o.column_masks))
+        .unwrap_or_default();
+
     let total = rows.len();
     writer
         .write_packets(frontend.encode_resultset_header(&columns, session)?)
@@ -125,8 +174,13 @@ pub async fn write_resultset_windowed<W: ResponseWriter + ?Sized>(
 
     while !rows.is_empty() {
         let take = window.min(rows.len());
-        let chunk: Vec<Vec<GatewayValue>> = rows.drain(..take).collect();
+        let mut chunk: Vec<Vec<GatewayValue>> = rows.drain(..take).collect();
+        if !mask_idx.is_empty() {
+            apply_masks_to_rows(&mut chunk, &mask_idx);
+        }
         let packets = frontend.encode_resultset_rows(&columns, &chunk, session)?;
+        // Drop chunk after encode so peak is header+one window of packets.
+        drop(chunk);
         writer.write_packets(packets).await?;
     }
 
@@ -217,5 +271,54 @@ mod tests {
         assert_eq!(fe.footer_calls, 1);
         assert_eq!(writer.packets.len(), 5);
         assert_eq!(writer.packets.last().unwrap(), &vec![5u8]);
+    }
+
+    #[tokio::test]
+    async fn windowed_write_with_mask_obligation() {
+        use crate::{MaskAlgorithm, MaskSpec, Obligations};
+
+        let mut fe = FakeFrontend {
+            header_calls: 0,
+            row_calls: 0,
+            footer_calls: 0,
+        };
+        let session = SessionState::default();
+        let columns = vec![
+            Column {
+                name: "id".into(),
+                data_type: "int".into(),
+            },
+            Column {
+                name: "salary".into(),
+                data_type: "int".into(),
+            },
+        ];
+        let rows = vec![
+            vec![GatewayValue::Integer(1), GatewayValue::Integer(100)],
+            vec![GatewayValue::Integer(2), GatewayValue::Integer(200)],
+            vec![GatewayValue::Integer(3), GatewayValue::Integer(300)],
+        ];
+        let mut obl = Obligations::default();
+        obl.column_masks
+            .push(MaskSpec::new("salary", MaskAlgorithm::Nullify, "m"));
+        obl.max_rows = Some(2);
+        let mut writer = CollectingWriter::new();
+        write_resultset_windowed_with_obligations(
+            &mut fe,
+            &session,
+            columns,
+            rows,
+            1,
+            Some(&obl),
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fe.header_calls, 1);
+        // max_rows=2 → two row windows
+        assert_eq!(fe.row_calls, 2);
+        assert_eq!(fe.footer_calls, 1);
+        // footer carries total_rows after truncate
+        assert_eq!(writer.packets.last().unwrap(), &vec![2u8]);
     }
 }
