@@ -157,27 +157,32 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> P3 主线已交付；余项均为延后（F29/F30/F31/B08/P03）<<<**
+**>>> P3 主线 + 本机 smoke 全绿；余项均为延后（F29/F30/F31/B08/P03）<<<**
 
-生产联调（本机）：
+生产联调（本机，`ff88c73` + 本轮）：
 
-- `rust-toolchain.toml` 钉 **1.94.1**（`time` MSRV ≥1.88）
-- smoke scripts 优先 1.94.1 + `RUSTUP_TOOLCHAIN`
-- `security-core` **7/7 OK**；`l0` **4/4 OK**
-- column seed 改为 `DROP+CREATE` 防 schema 漂移
+| 组 | 结果 |
+|----|------|
+| `l0` | **4/4 OK** |
+| `security-core` | **7/7 OK** |
+| `security-extended` | **6/6 OK** |
+| `cedar`（`--features security-cedar`） | **2/2 OK** |
+
+- `rust-toolchain.toml` 钉 **1.94.1**
+- smoke 优先 1.94.1 + `RUSTUP_TOOLCHAIN`
+- column seed `DROP+CREATE`；启动前 `pkill` 防脏进程
 
 ```bash
 cd data-proxy
-./examples/run-smoke-matrix.sh security-core
-./examples/run-smoke-matrix.sh l0
-# optional: security-extended / cedar
+./examples/run-smoke-matrix.sh all          # l0 + core + extended
+./examples/run-smoke-matrix.sh cedar        # needs prebuild --features security-cedar
 ```
 
-建议下一任务：
+建议下一任务（均为延后 / 部署侧）：
 
-1. **security-extended** smoke 全量  
-2. **cedar** feature smoke  
-3. 延后项 F29 / B08 等
+1. **F29** Cedar 实体属性  
+2. **B08** L2 样本  
+3. 真 IdP OIDC 联调（H04 部署侧）
 
 ---
 
