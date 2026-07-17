@@ -292,21 +292,39 @@ impl MySqlBackendConnector {
         Self::execute_on_conn(&mut conn, sql, mode).await
     }
 
-    /// A06: stream logical rows in windows over a channel (non-txn path).
+    /// A06: stream logical rows in windows over a channel.
     ///
-    /// Producer task owns the pool connection, decodes row packets, and sends
-    /// windows to the consumer. Peak retained rows ≈ one window on each side
-    /// of the channel (capacity 2).
+    /// Producer task owns the connection while decoding. Peak retained rows ≈
+    /// one window on each side of the channel (capacity 2).
+    ///
+    /// When `in_transaction` is true, the connection is taken from / returned to
+    /// `txn_lease` after the resultset is drained (so COMMIT/ROLLBACK still work).
     async fn execute_simple_query_streaming(
         &self,
         endpoint: EndpointConfig,
         sql: &str,
         session: &SessionState,
         mode: ExecuteMode,
+        in_transaction: bool,
     ) -> GatewayResult<ExecuteOutcome> {
         let window = mode.window_rows().unwrap_or(256).max(1);
         let max_rows = mode.effective_max_rows();
-        let mut conn = self.acquire_conn(&endpoint, session).await?;
+
+        let mut conn = if in_transaction {
+            let need_begin = self.txn_lease.lock().is_none();
+            let mut conn = self.take_or_acquire_lease(&endpoint, session).await?;
+            if need_begin {
+                let begin =
+                    Self::execute_on_conn(&mut conn, "BEGIN", ExecuteMode::Materialized).await?;
+                if !matches!(begin, GatewayResponse::Ok { .. }) {
+                    self.store_lease(conn);
+                    return Ok(ExecuteOutcome::Complete(begin));
+                }
+            }
+            conn
+        } else {
+            self.acquire_conn(&endpoint, session).await?
+        };
 
         let client = conn.client.as_mut().ok_or_else(|| {
             GatewayError::Backend("mysql backend connection is not open".into())
@@ -322,18 +340,25 @@ impl MySqlBackendConnector {
         match payload.first().copied() {
             Some(OK_HEADER) => {
                 drop(stream);
-                return Ok(ExecuteOutcome::Complete(ok_packet_to_gateway_response(
-                    payload,
-                )?));
+                let response = ok_packet_to_gateway_response(payload)?;
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Ok(ExecuteOutcome::Complete(response));
             }
             Some(ERR_HEADER) => {
                 drop(stream);
-                return Ok(ExecuteOutcome::Complete(err_packet_to_gateway_response(
-                    payload,
-                )));
+                let response = err_packet_to_gateway_response(payload);
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Ok(ExecuteOutcome::Complete(response));
             }
             Some(_) => {}
             None => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
                 return Err(GatewayError::Protocol(
                     "mysql query header packet has empty payload".into(),
                 ));
@@ -342,6 +367,9 @@ impl MySqlBackendConnector {
 
         let (column_count, is_null, _) = decode_lenc_int(payload, "mysql column count")?;
         if is_null {
+            if in_transaction {
+                self.store_lease(conn);
+            }
             return Err(GatewayError::Protocol(
                 "mysql result set column count cannot be NULL".into(),
             ));
@@ -359,23 +387,21 @@ impl MySqlBackendConnector {
             .map(mysql_column_to_gateway_column)
             .collect();
 
-        // Drain remaining row packets into windows **before** returning, but only
-        // keep one window in flight via a bounded channel + background task that
-        // continues reading while the consumer encodes.
-        //
-        // Because ResultsetStream borrows client, we cannot split across tasks
-        // without moving the whole connection. Strategy: spawn a task that owns
-        // `conn` and re-opens a ResultsetStream on the same framed codec to read
-        // remaining packets (query already in flight).
+        // Spawn producer that owns `conn` and re-opens ResultsetStream for remaining
+        // packets (query already in flight).
         drop(stream);
 
+        let lease_slot = if in_transaction {
+            Some(self.txn_lease.clone())
+        } else {
+            None
+        };
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<Vec<GatewayValue>>>(2);
         tokio::spawn(async move {
             let run = async {
                 let client = conn.client.as_mut().ok_or_else(|| {
                     GatewayError::Backend("mysql backend connection is not open".into())
                 })?;
-                // Remaining packets for the current resultset are still on the wire.
                 let mut stream = ResultsetStream::new(client.framed.as_mut());
                 let mut window_buf: Vec<Vec<GatewayValue>> =
                     Vec::with_capacity(window.min(256));
@@ -418,7 +444,11 @@ impl MySqlBackendConnector {
                     "mysql streaming producer failed"
                 );
             }
-            // conn dropped → pool
+            if let Some(slot) = lease_slot {
+                // Return leased connection for subsequent txn statements.
+                *slot.lock() = Some(conn);
+            }
+            // else: conn dropped → pool
         });
 
         Ok(ExecuteOutcome::Streaming(StreamingQuery {
@@ -602,18 +632,19 @@ impl BackendConnector for MySqlBackendConnector {
         session: &mut SessionState,
         mode: ExecuteMode,
     ) -> GatewayResult<ExecuteOutcome> {
-        // A06: true windowed yield for Streaming SELECT outside an open txn lease.
-        // In-transaction queries keep the lease path and fall back to materialize.
+        // A06: windowed yield for Streaming SELECT (txn and non-txn).
+        // In-transaction: producer returns the leased connection to `txn_lease`
+        // after draining so COMMIT/ROLLBACK still share the same backend conn.
         let streaming = matches!(mode, ExecuteMode::Streaming { .. });
         let is_query = matches!(command, GatewayCommand::Query { .. });
         let in_txn = session.transaction_state == TransactionState::Active
             || self.txn_lease.lock().is_some();
 
-        if streaming && is_query && !in_txn {
+        if streaming && is_query {
             if let GatewayCommand::Query { sql } = command {
                 let endpoint = self.select_endpoint(session)?;
                 return self
-                    .execute_simple_query_streaming(endpoint, &sql, session, mode)
+                    .execute_simple_query_streaming(endpoint, &sql, session, mode, in_txn)
                     .await;
             }
         }

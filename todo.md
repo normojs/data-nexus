@@ -126,6 +126,7 @@ examples/        smoke + gateway config 样例
 | A06 | PG 非事务 Streaming yield（部分） | feat(a06) |
 | A10 | prepared 注册表 + encode（部分） | feat(a10) |
 | A10 | 参数绑定 + PG 扩展协议解码（部分） | feat(a10) |
+| A06 | 事务内 Streaming 还 lease（部分） | feat(a06) |
 
 ---
 
@@ -140,7 +141,7 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
-| **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 Streaming 真窗口 yield；**事务路径仍物化** | **部分** |
+| **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | 同协议无义务时 `GatewayResponse::Wire` | 非 TCP 帧中继 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
@@ -190,7 +191,7 @@ examples/        smoke + gateway config 样例
 | 主题 | 限制 |
 |------|------|
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
-| 脱敏大数据 | A06 MySQL/PG 非事务 Streaming 真窗口 yield + A07 socket 写出；**事务路径仍物化** |
+| 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：前端 wire 消息包（Wire），**非** backend TCP 帧中继 |
 | 预处理语句 | A10：MySQL `?` 绑定→text Query；PG Parse/Bind/Execute（text 参数）→Query；Describe=NoData；非完整 binary/extended 透传 |
 | 多副本 | 票据/金库/SQLite 索引/LocalPdp **非**共享状态 |
@@ -201,25 +202,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A06 事务路径流式 或 H06 发布同步 或 A10 binary 结果集 <<<**
+**>>> H06 发布同步 或 A10 binary 结果集 / Describe 元数据 <<<**
 
-本轮（A10 续）：
+本轮（A06 事务流式）：
 
-- MySQL：`?` 计数进 prepare OK；COM_STMT_EXECUTE 二进制参数解码 + 绑定改写 text Query
-- PG：Parse/Bind/Describe/Execute/Close/Sync 解码；前端 portal 绑定后 Execute→Query
-- `GatewayCommand::ClientWire` 回写 ParseComplete/BindComplete/Ready 等
+- MySQL/PG `execute_simple_query_streaming(..., in_transaction)`
+- 事务内：`take_or_acquire_lease` → stream → producer 结束后写回 `txn_lease`
+- 非事务：行为不变（conn drop → pool）
 
 ```bash
-cargo test -p runtime_gateway --lib a10_
-cargo test -p postgresql_protocol --lib
-# smoke：default
+cargo test -p runtime_gateway --lib backend::
+# smoke：security-extended
 ```
 
 建议下一刀：
 
-1. **A06 续** — 事务路径流式  
-2. **H06** — 发布与 origin 同步  
-3. **A10 续** — binary resultset / Describe 真元数据
+1. **H06** — 发布与 origin 同步  
+2. **A10 续** — binary resultset / Describe 真元数据  
+3. **A08 续** — PG TCP 帧级透传（若需要）
 
 ---
 

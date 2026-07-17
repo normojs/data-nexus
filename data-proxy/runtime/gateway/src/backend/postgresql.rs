@@ -278,21 +278,40 @@ impl PostgreSqlBackendConnector {
         logical_response_to_pg_wire(logical, session)
     }
 
-    /// A06: stream logical rows in windows (non-txn path).
+    /// A06: stream logical rows in windows.
     ///
     /// Uses `simple_query_raw` so RowDescription is available before the first
-    /// DataRow; a producer task owns the pool connection and pushes windows over
-    /// a bounded channel (capacity 2). Peak retained rows ≈ one window per side.
+    /// DataRow; a producer task owns the connection and pushes windows over a
+    /// bounded channel (capacity 2). Peak retained rows ≈ one window per side.
+    ///
+    /// When `in_transaction` is true, the connection is taken from / returned to
+    /// `txn_lease` after the stream ends.
     async fn execute_simple_query_streaming(
         &self,
         endpoint: EndpointConfig,
         sql: &str,
         session: &SessionState,
         mode: ExecuteMode,
+        in_transaction: bool,
     ) -> GatewayResult<ExecuteOutcome> {
         let window = mode.window_rows().unwrap_or(256).max(1);
         let max_rows = mode.effective_max_rows();
-        let conn = self.acquire_conn(&endpoint, session).await?;
+
+        let conn = if in_transaction {
+            let need_begin = self.txn_lease.lock().is_none();
+            let conn = self.take_or_acquire_lease(&endpoint, session).await?;
+            if need_begin {
+                let begin =
+                    Self::execute_on_conn(&conn, "BEGIN", ExecuteMode::Materialized).await?;
+                if !matches!(begin, GatewayResponse::Ok { .. }) {
+                    self.store_lease(conn);
+                    return Ok(ExecuteOutcome::Complete(begin));
+                }
+            }
+            conn
+        } else {
+            self.acquire_conn(&endpoint, session).await?
+        };
 
         let client = conn.client.as_ref().ok_or_else(|| {
             GatewayError::Backend("postgresql backend connection is not open".into())
@@ -307,12 +326,20 @@ impl PostgreSqlBackendConnector {
         let columns = loop {
             match stream.next().await {
                 None => {
+                    if in_transaction {
+                        self.store_lease(conn);
+                    }
                     return Ok(ExecuteOutcome::Complete(GatewayResponse::Ok {
                         affected_rows: 0,
                         last_insert_id: None,
                     }));
                 }
-                Some(Err(error)) => return Err(postgresql_backend_error(error)),
+                Some(Err(error)) => {
+                    if in_transaction {
+                        self.store_lease(conn);
+                    }
+                    return Err(postgresql_backend_error(error));
+                }
                 Some(Ok(SimpleQueryMessage::RowDescription(cols))) => {
                     break cols
                         .iter()
@@ -323,12 +350,18 @@ impl PostgreSqlBackendConnector {
                         .collect::<Vec<_>>();
                 }
                 Some(Ok(SimpleQueryMessage::CommandComplete(count))) => {
+                    if in_transaction {
+                        self.store_lease(conn);
+                    }
                     return Ok(ExecuteOutcome::Complete(GatewayResponse::Ok {
                         affected_rows: count,
                         last_insert_id: None,
                     }));
                 }
                 Some(Ok(SimpleQueryMessage::Row(_))) => {
+                    if in_transaction {
+                        self.store_lease(conn);
+                    }
                     return Err(GatewayError::Protocol(
                         "postgresql simple_query_raw delivered DataRow before RowDescription"
                             .into(),
@@ -338,6 +371,11 @@ impl PostgreSqlBackendConnector {
             }
         };
 
+        let lease_slot = if in_transaction {
+            Some(self.txn_lease.clone())
+        } else {
+            None
+        };
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<Vec<GatewayValue>>>(2);
         tokio::spawn(async move {
             let run = async {
@@ -363,7 +401,6 @@ impl PostgreSqlBackendConnector {
                             if window_buf.len() >= window {
                                 let chunk: Vec<_> = window_buf.drain(..).collect();
                                 if tx.send(chunk).await.is_err() {
-                                    // Consumer dropped — drain remaining messages.
                                     while stream.next().await.is_some() {}
                                     return Ok(());
                                 }
@@ -387,8 +424,11 @@ impl PostgreSqlBackendConnector {
                     "postgresql streaming producer failed"
                 );
             }
-            // conn dropped → pool
-            drop(conn);
+            if let Some(slot) = lease_slot {
+                *slot.lock() = Some(conn);
+            } else {
+                drop(conn);
+            }
         });
 
         Ok(ExecuteOutcome::Streaming(StreamingQuery {
@@ -532,18 +572,19 @@ impl BackendConnector for PostgreSqlBackendConnector {
         session: &mut SessionState,
         mode: ExecuteMode,
     ) -> GatewayResult<ExecuteOutcome> {
-        // A06: true windowed yield for Streaming SELECT outside an open txn lease.
-        // In-transaction queries keep the lease path and fall back to materialize.
+        // A06: windowed yield for Streaming SELECT (txn and non-txn).
+        // In-transaction: producer returns the leased connection to `txn_lease`
+        // after draining so COMMIT/ROLLBACK still share the same backend conn.
         let streaming = matches!(mode, ExecuteMode::Streaming { .. });
         let is_query = matches!(command, GatewayCommand::Query { .. });
         let in_txn = session.transaction_state == TransactionState::Active
             || self.txn_lease.lock().is_some();
 
-        if streaming && is_query && !in_txn {
+        if streaming && is_query {
             if let GatewayCommand::Query { sql } = command {
                 let endpoint = self.select_endpoint(session)?;
                 return self
-                    .execute_simple_query_streaming(endpoint, &sql, session, mode)
+                    .execute_simple_query_streaming(endpoint, &sql, session, mode, in_txn)
                     .await;
             }
         }
@@ -1063,8 +1104,8 @@ mod tests {
     }
 
     #[test]
-    fn a06_streaming_mode_is_selected_only_outside_txn() {
-        // execute_outcome branches on Streaming + !in_txn; this locks the mode helper.
+    fn a06_streaming_mode_covers_txn_and_non_txn() {
+        // Streaming mode is used regardless of transaction; lease return differs.
         let mode = ExecuteMode::from_streaming_config(64, Some(100));
         assert!(matches!(mode, ExecuteMode::Streaming { .. }));
         assert_eq!(mode.window_rows(), Some(64));
