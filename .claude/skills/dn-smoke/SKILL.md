@@ -1,11 +1,18 @@
 ---
 name: dn-smoke
-description: Run and debug Data Nexus smoke matrices with the correct rustc toolchain and external cargo target. Use when the user asks to run smoke, smoke matrix, regression, CI smoke, l0, security-core, security-extended, cedar smoke, or after security/runtime changes that need end-to-end verification.
+description: >
+  Use when running or debugging Data Nexus smoke matrices, regression, CI smoke, l0,
+  security-core, security-extended, cedar smoke, or after security/runtime changes need
+  end-to-end verification. Also when user says 跑 smoke, 回归, smoke 失败, or toolchain/rustc issues.
 ---
 
 # dn-smoke — Smoke 矩阵
 
-## 环境（必设）
+## Overview
+
+用钉死的 rustc 1.94.1 + 外置 target 跑 smoke；先清脏 proxy，再按组验证。
+
+## Env (required)
 
 ```bash
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/fushilu/.caches/data-nexus/cargo-target}"
@@ -21,7 +28,7 @@ export DN_SMOKE_TIMEOUT_SECS="${DN_SMOKE_TIMEOUT_SECS:-1200}"
 pkill -f '/debug/proxy' 2>/dev/null || true
 ```
 
-## 选组
+## Groups
 
 | 场景 | 命令 |
 |------|------|
@@ -37,22 +44,20 @@ cd data-proxy
 ./examples/run-smoke-matrix.sh <group>
 ```
 
-## 失败处理
+用户可传 `$ARGUMENTS` 作为组名（默认 `default`）。
 
-1. 读 `/tmp/dn-smoke-*.log` 或脚本输出中的 gateway log。  
-2. 常见：  
-   - rustc 过旧 → 检查 toolchain 1.94.1  
-   - 脏 proxy → pkill  
-   - schema 漂移 → seed 改为 DROP+CREATE  
-   - 端口占用 → 清理 8082 / 9088  
-3. 修代码后只重跑失败组，再视情况 `default`。  
-4. Cedar 跑完必须：`cargo build -p data-proxy --bin proxy`（无 feature）。
+## Failures
 
-## 单测捷径（改完先快测）
+1. 读 `/tmp/dn-smoke-*.log` 或脚本输出中的 gateway log
+2. 常见：rustc 过旧；脏 proxy；schema 漂移（DROP+CREATE）；端口 8082/9088 占用
+3. 修后只重跑失败组，再视情况 `default`
+4. Cedar 跑完必须：`cargo build -p data-proxy --bin proxy`（无 feature）
+
+## Fast unit path
 
 ```bash
 cargo test -p gateway_core --lib <filter>
 cargo test -p runtime_gateway --lib <filter>
 ```
 
-规则详见 [`.claude/rules/testing-smoke.md`](../../rules/testing-smoke.md)。
+规则：[`testing-smoke.md`](../../rules/testing-smoke.md)。

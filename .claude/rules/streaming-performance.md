@@ -1,3 +1,7 @@
+---
+paths: data-proxy/gateway/core/**/*.rs, data-proxy/runtime/gateway/**/*.rs, data-proxy/http/**/*.rs, **/transport.rs, **/core_engine.rs, **/obligations.rs, **/backend/**/*.rs, **/frontend/**/*.rs, **/portal*.rs
+---
+
 # 流式与热路径（强制补充）
 
 与 [`data-nexus-development.md`](data-nexus-development.md) 配套。改 PEP、backend、portal 结果路径时必读。
@@ -29,10 +33,10 @@ backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 
 
 改结果路径时自问：
 
-1. 会不会迫使 `Vec<Vec<GatewayValue>>` 全量？会 → 设计 `RowStream` / 窗口或明确 cap。  
-2. 有义务时是否仍 `apply_obligations_to_response` 整包？→ 优先 `write_streaming_query_with_obligations` / encode 窗口 mask。  
-3. 是否接到 socket writer，而不是只 `CollectingWriter`？  
-4. 失败/提前结束是否 drain 流并归还连接？  
+1. 会不会迫使 `Vec<Vec<GatewayValue>>` 全量？会 → 设计 `RowStream` / 窗口或明确 cap。
+2. 有义务时是否仍 `apply_obligations_to_response` 整包？→ 优先 `write_streaming_query_with_obligations` / encode 窗口 mask。
+3. 是否接到 socket writer，而不是只 `CollectingWriter`？
+4. 失败/提前结束是否 drain 流并归还连接？
 5. todo §3.6 与 OBSERVABILITY 是否需要更新诚实账？
 
 ## 落点
@@ -46,4 +50,4 @@ runtime/gateway  core_engine (execute_outcome, handle_frame_to_writer)
 http             portal_execute（A09 待对齐 Streaming）
 ```
 
-详细任务 ID：`todo.md` A06–A10。实现时用 skill **dn-stream**。
+详细任务 ID：`todo.md` A06–A10。实现时用 skill **dn-stream** 或 `/dn-stream`。

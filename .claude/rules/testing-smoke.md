@@ -1,3 +1,7 @@
+---
+paths: data-proxy/examples/**, **/*smoke*, **/*test*, **/*Test*, .github/workflows/**, data-proxy/**/Cargo.toml, data-proxy/rust-toolchain.toml, data-proxy/docs/build-cache.md
+---
+
 # 测试与 Smoke（强制补充）
 
 ## 工具链
@@ -35,15 +39,15 @@ cargo build -p data-proxy --bin proxy
 
 ## 纪律
 
-1. Smoke 启动前 **pkill** 残留 `/debug/proxy`。  
-2. DB seed 防 schema 漂移：必要时 **DROP+CREATE**。  
-3. `security.enabled=false` 行为不得被安全改动破坏。  
-4. Feature 任务在对应 feature 下测。  
+1. Smoke 启动前 **pkill** 残留 `/debug/proxy`。
+2. DB seed 防 schema 漂移：必要时 **DROP+CREATE**。
+3. `security.enabled=false` 行为不得被安全改动破坏。
+4. Feature 任务在对应 feature 下测。
 5. 单测优先 `gateway_core` / `runtime_gateway` 相关 lib filter，再 smoke。
 
 ## CI
 
-- `.github/workflows/smoke-matrix.yml`：PR 路径变更跑矩阵（默认组以 workflow 为准，目标 **default**）。  
+- `.github/workflows/smoke-matrix.yml`：PR 路径变更跑矩阵（默认组以 workflow 为准，目标 **default**）。
 - extended/cedar 可 `workflow_dispatch`。
 
-实现或修测时用 skill **dn-smoke**；提交前用 **dn-dod**。
+实现或修测时用 skill **dn-smoke** 或 `/dn-smoke`；提交前用 **dn-dod** / `/dn-dod`。
