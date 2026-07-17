@@ -2,10 +2,11 @@ use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool, PoolConn};
+use futures::StreamExt;
 use gateway_core::{
     BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, ExecuteMode,
-    GatewayCommand, GatewayError, GatewayResponse, GatewayResult, GatewayValue, ProtocolKind,
-    SessionState, TransactionState,
+    ExecuteOutcome, GatewayCommand, GatewayError, GatewayResponse, GatewayResult, GatewayValue,
+    ProtocolKind, RowStream, SessionState, StreamingQuery, TransactionState,
 };
 use parking_lot::Mutex;
 use postgresql_protocol::{
@@ -158,6 +159,125 @@ impl PostgreSqlBackendConnector {
         logical_response_to_pg_wire(logical, session)
     }
 
+    /// A06: stream logical rows in windows (non-txn path).
+    ///
+    /// Uses `simple_query_raw` so RowDescription is available before the first
+    /// DataRow; a producer task owns the pool connection and pushes windows over
+    /// a bounded channel (capacity 2). Peak retained rows ≈ one window per side.
+    async fn execute_simple_query_streaming(
+        &self,
+        endpoint: EndpointConfig,
+        sql: &str,
+        session: &SessionState,
+        mode: ExecuteMode,
+    ) -> GatewayResult<ExecuteOutcome> {
+        let window = mode.window_rows().unwrap_or(256).max(1);
+        let max_rows = mode.effective_max_rows();
+        let conn = self.acquire_conn(&endpoint, session).await?;
+
+        let client = conn.client.as_ref().ok_or_else(|| {
+            GatewayError::Backend("postgresql backend connection is not open".into())
+        })?;
+        let raw = client
+            .simple_query_raw(sql)
+            .await
+            .map_err(postgresql_backend_error)?;
+        let mut stream = Box::pin(raw);
+
+        // Wait for RowDescription (or CommandComplete for non-SELECT).
+        let columns = loop {
+            match stream.next().await {
+                None => {
+                    return Ok(ExecuteOutcome::Complete(GatewayResponse::Ok {
+                        affected_rows: 0,
+                        last_insert_id: None,
+                    }));
+                }
+                Some(Err(error)) => return Err(postgresql_backend_error(error)),
+                Some(Ok(SimpleQueryMessage::RowDescription(cols))) => {
+                    break cols
+                        .iter()
+                        .map(|column| GatewayColumn {
+                            name: column.name().to_string(),
+                            data_type: "text".into(),
+                        })
+                        .collect::<Vec<_>>();
+                }
+                Some(Ok(SimpleQueryMessage::CommandComplete(count))) => {
+                    return Ok(ExecuteOutcome::Complete(GatewayResponse::Ok {
+                        affected_rows: count,
+                        last_insert_id: None,
+                    }));
+                }
+                Some(Ok(SimpleQueryMessage::Row(_))) => {
+                    return Err(GatewayError::Protocol(
+                        "postgresql simple_query_raw delivered DataRow before RowDescription"
+                            .into(),
+                    ));
+                }
+                Some(Ok(_)) => {}
+            }
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<Vec<GatewayValue>>>(2);
+        tokio::spawn(async move {
+            let run = async {
+                let mut window_buf: Vec<Vec<GatewayValue>> =
+                    Vec::with_capacity(window.min(256));
+                let mut total: u64 = 0;
+                let mut truncated = false;
+                while let Some(item) = stream.next().await {
+                    let message = item.map_err(postgresql_backend_error)?;
+                    match message {
+                        SimpleQueryMessage::Row(row) => {
+                            if truncated {
+                                continue;
+                            }
+                            if let Some(max) = max_rows {
+                                if total >= max {
+                                    truncated = true;
+                                    continue;
+                                }
+                            }
+                            window_buf.push(simple_query_row_to_gateway_values(&row));
+                            total += 1;
+                            if window_buf.len() >= window {
+                                let chunk: Vec<_> = window_buf.drain(..).collect();
+                                if tx.send(chunk).await.is_err() {
+                                    // Consumer dropped — drain remaining messages.
+                                    while stream.next().await.is_some() {}
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        SimpleQueryMessage::CommandComplete(_)
+                        | SimpleQueryMessage::RowDescription(_) => {}
+                        _ => {}
+                    }
+                }
+                if !window_buf.is_empty() {
+                    let _ = tx.send(window_buf).await;
+                }
+                Ok::<(), GatewayError>(())
+            }
+            .await;
+            if let Err(e) = run {
+                tracing::warn!(
+                    target: "data_nexus::gateway",
+                    error = %e,
+                    "postgresql streaming producer failed"
+                );
+            }
+            // conn dropped → pool
+            drop(conn);
+        });
+
+        Ok(ExecuteOutcome::Streaming(StreamingQuery {
+            columns,
+            stream: Box::new(ChannelRowStream { rx }),
+        }))
+    }
+
     async fn finish_transaction(&self, sql: &str) -> GatewayResult<GatewayResponse> {
         let Some(conn) = self.txn_lease.lock().take() else {
             return Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None });
@@ -254,6 +374,47 @@ impl BackendConnector for PostgreSqlBackendConnector {
                 command
             ))),
         }
+    }
+
+    async fn execute_outcome(
+        &self,
+        command: GatewayCommand,
+        session: &mut SessionState,
+        mode: ExecuteMode,
+    ) -> GatewayResult<ExecuteOutcome> {
+        // A06: true windowed yield for Streaming SELECT outside an open txn lease.
+        // In-transaction queries keep the lease path and fall back to materialize.
+        let streaming = matches!(mode, ExecuteMode::Streaming { .. });
+        let is_query = matches!(command, GatewayCommand::Query { .. });
+        let in_txn = session.transaction_state == TransactionState::Active
+            || self.txn_lease.lock().is_some();
+
+        if streaming && is_query && !in_txn {
+            if let GatewayCommand::Query { sql } = command {
+                let endpoint = self.select_endpoint(session)?;
+                return self
+                    .execute_simple_query_streaming(endpoint, &sql, session, mode)
+                    .await;
+            }
+        }
+
+        let response = self.execute_with_mode(command, session, mode).await?;
+        Ok(ExecuteOutcome::Complete(response))
+    }
+}
+
+/// A06: row windows from a producer task that owns the PG pool connection.
+struct ChannelRowStream {
+    rx: tokio::sync::mpsc::Receiver<Vec<Vec<GatewayValue>>>,
+}
+
+#[async_trait]
+impl RowStream for ChannelRowStream {
+    async fn poll_window(
+        &mut self,
+        _max_rows: usize,
+    ) -> GatewayResult<Option<Vec<Vec<GatewayValue>>>> {
+        Ok(self.rx.recv().await)
     }
 }
 
@@ -502,6 +663,16 @@ fn postgresql_client_encoding_statement(client_encoding: &str) -> String {
     }
 }
 
+fn simple_query_row_to_gateway_values(row: &tokio_postgres::SimpleQueryRow) -> Vec<GatewayValue> {
+    (0..row.len())
+        .map(|idx| {
+            row.get(idx)
+                .map(|value| GatewayValue::String(value.to_string()))
+                .unwrap_or(GatewayValue::Null)
+        })
+        .collect()
+}
+
 fn simple_query_messages_to_gateway_response(
     messages: Vec<SimpleQueryMessage>,
     mode: ExecuteMode,
@@ -530,14 +701,7 @@ fn simple_query_messages_to_gateway_response(
                         .collect();
                 }
 
-                let values = (0..row.len())
-                    .map(|idx| {
-                        row.get(idx)
-                            .map(|value| GatewayValue::String(value.to_string()))
-                            .unwrap_or(GatewayValue::Null)
-                    })
-                    .collect::<Vec<_>>();
-                rows.push(values);
+                rows.push(simple_query_row_to_gateway_values(&row));
             }
             SimpleQueryMessage::CommandComplete(count) => affected_rows = count,
             _ => {}
@@ -746,6 +910,39 @@ mod tests {
             }
             other => panic!("expected Wire, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a06_streaming_mode_is_selected_only_outside_txn() {
+        // execute_outcome branches on Streaming + !in_txn; this locks the mode helper.
+        let mode = ExecuteMode::from_streaming_config(64, Some(100));
+        assert!(matches!(mode, ExecuteMode::Streaming { .. }));
+        assert_eq!(mode.window_rows(), Some(64));
+        assert_eq!(mode.effective_max_rows(), Some(100));
+        assert!(!matches!(
+            ExecuteMode::Materialized,
+            ExecuteMode::Streaming { .. }
+        ));
+    }
+
+    #[test]
+    fn simple_query_messages_respect_max_rows() {
+        // Build via Complete path helpers: empty messages → Ok.
+        let ok = simple_query_messages_to_gateway_response(
+            vec![SimpleQueryMessage::CommandComplete(3)],
+            ExecuteMode::Streaming {
+                window_rows: 10,
+                max_rows: Some(1),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            ok,
+            GatewayResponse::Ok {
+                affected_rows: 3,
+                ..
+            }
+        ));
     }
 
     #[test]

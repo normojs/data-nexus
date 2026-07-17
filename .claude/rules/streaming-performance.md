@@ -23,8 +23,9 @@ backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 
 
 ## 当前诚实边界（勿宣传为已完成）
 
-- MySQL **非事务** `Streaming`：channel `RowStream` 窗口 yield（A06 部分）。
-- 事务内查询、PostgreSQL Streaming：仍可能物化。
+- MySQL **非事务** `Streaming`：channel `RowStream` 窗口 yield（A06）。
+- PostgreSQL **非事务** `Streaming`：`simple_query_raw` + channel `RowStream`（A06 续）。
+- **事务内** 查询（MySQL/PG 有 lease）：仍物化（连接租约不能交给 producer 任务）。
 - Portal NDJSON（A09）：backend 返回 `Streaming` 时窗口 yield → HTTP chunk（`stream=backend_window`）；`Complete` 回退 B05b chunked；**json/csv 仍物化**有界 ResultSet。
 - PG Passthrough：前端 Wire 消息，非 backend TCP 帧中继（A08 部分）。
 - A07：`handle_frame_to_writer` + socket `ResponseWriter` 已接。
@@ -45,7 +46,7 @@ backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 
 gateway/core     transport (RowStream, ExecuteOutcome, write_*_windowed*)
                  obligations (mask 窗口)
 runtime/gateway  core_engine (execute_outcome, handle_frame_to_writer)
-                 backend/mysql (channel RowStream)
+                 backend/mysql + backend/postgresql (channel RowStream, non-txn)
                  gateway.rs (MySqlSocketWriter / PgSocketWriter)
 http             portal_execute_ndjson_streaming（A09）+ portal_execute_logical
 ```

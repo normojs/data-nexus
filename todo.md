@@ -123,6 +123,7 @@ examples/        smoke + gateway config 样例
 | chore | 开发规则 + 审计债小修 | `6ff8cef` |
 | chore | Claude skills/rules/commands | `91abab3` |
 | A09 | portal NDJSON backend 窗口流（部分） | feat(a09) |
+| A06 | PG 非事务 Streaming yield（部分） | feat(a06) |
 
 ---
 
@@ -137,7 +138,7 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
-| **A06** | Backend→PEP 真行流 | `RowStream` + MySQL channel yield；encode 边 mask 边写 | 非事务 Streaming 真窗口 yield；事务路径仍物化 | **部分** |
+| **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 Streaming 真窗口 yield；**事务路径仍物化** | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | 同协议无义务时 `GatewayResponse::Wire` | 非 TCP 帧中继 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
@@ -187,7 +188,7 @@ examples/        smoke + gateway config 样例
 | 主题 | 限制 |
 |------|------|
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
-| 脱敏大数据 | A06 MySQL 非事务 Streaming 真窗口 yield + A07 socket 写出；事务/PG Streaming 仍可能物化 |
+| 脱敏大数据 | A06 MySQL/PG 非事务 Streaming 真窗口 yield + A07 socket 写出；**事务路径仍物化** |
 | PG passthrough | A08：前端 wire 消息包（Wire），**非** backend TCP 帧中继 |
 | 预处理语句 | PG prepared encode 未实现；MySQL 部分仍偏 legacy |
 | 多副本 | 票据/金库/SQLite 索引/LocalPdp **非**共享状态 |
@@ -198,25 +199,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A06 事务路径 / PostgreSQL Streaming yield 或 A10 prepared <<<**
+**>>> A10 prepared 语句 或 A06 事务路径流式 <<<**
 
-本轮（A09 部分）：
+本轮（A06 PG Streaming）：
 
-- `portal_prepare` 共用 PEP + translation + connector
-- NDJSON：`portal_execute_ndjson_streaming` — Streaming 窗口 mask → HTTP channel body（`x-data-nexus-stream: backend_window`）
-- Complete 回退 `portal_ndjson_chunked_response`（B05b）
-- json/csv：`portal_execute_logical` 仍 drain 为有界 ResultSet（诚实）
+- PostgreSQL `execute_outcome`：非事务 `Streaming` → `simple_query_raw` + channel `RowStream`
+- 与 MySQL 对齐：事务 lease 路径仍 `Complete` 物化（诚实）
+- 单测：`backend::postgresql` 14 项
 
 ```bash
-cargo test -p http@0.1.0 --lib portal_ndjson
-# smoke：security-core（含 portal）
+cargo test -p runtime_gateway --lib backend::postgresql
+# smoke：security-extended（含 xproto-stream）
 ```
 
 建议下一刀：
 
-1. **A06 续** — 事务路径 / PostgreSQL Streaming yield  
-2. **A10** — prepared 语句  
-3. **A09 续** — portal json/csv 也走窗口（若产品需要）
+1. **A10** — prepared 语句（PG encode 未实现；MySQL legacy）  
+2. **A06 续** — 事务路径流式（需 redesign lease/producer 共享）  
+3. **A09 续** — portal json/csv 窗口（若产品需要）
 
 ---
 
