@@ -66,7 +66,20 @@ max_file_bytes = 268435456
 retain_days = 14
 rotate_keep = 32
 archive_dir = "/var/log/data-nexus/audit/archive"
-# Optional (feature audit-opendal): opendal_scheme = "fs", opendal_root = "/var/log/data-nexus/audit/od"
+# Optional cold archive via OpenDAL (binary must be built with --features audit-opendal).
+# Local:   opendal_scheme = "fs", opendal_root = "/var/log/data-nexus/audit/od"
+# S3/MinIO:
+#   opendal_scheme = "s3"
+#   opendal_bucket = "data-nexus-audit"
+#   opendal_region = "us-east-1"
+#   opendal_endpoint = "https://s3.amazonaws.com"   # or http://minio:9000
+#   opendal_prefix = "audit"
+#   # Prefer env DN_OPENDAL_ACCESS_KEY_ID / DN_OPENDAL_SECRET_ACCESS_KEY (or AWS_*)
+# Aliyun OSS:
+#   opendal_scheme = "oss"
+#   opendal_bucket = "data-nexus-audit"
+#   opendal_endpoint = "https://oss-cn-hangzhou.aliyuncs.com"
+#   opendal_prefix = "audit"
 
 # Baseline deny for obvious secrets / DDL (tune per environment).
 [[security.rules]]

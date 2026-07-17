@@ -35,6 +35,7 @@ cargo build -p data-proxy --bin proxy
 | Admin API | `admin_auth.enabled=true`, JWT HMAC + break-glass (swap to `jwt_jwks` for OIDC) |
 | Data plane | `security.enabled=true`, `fail_closed=true`, `star_policy=deny` |
 | Audit | file sink + rotation (`max_file_bytes`, `retain_days`, `rotate_keep`) |
+| OpenDAL archive | optional `audit-opendal` feature: `fs` / `s3` / `oss` after rotate; credentials via `DN_OPENDAL_*` |
 | High risk | DDL + write-without-WHERE require tickets |
 | Streaming | `window_rows=256`, `passthrough=true` |
 

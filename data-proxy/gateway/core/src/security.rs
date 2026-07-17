@@ -335,15 +335,34 @@ pub struct SecurityAuditConfig {
     /// Directory to move/copy rotated files into (empty = same dir as file_path). B04.
     #[serde(default)]
     pub archive_dir: String,
-    /// OpenDAL scheme when feature `audit-opendal` is enabled: `fs` | `memory` | empty=off. B04b.
+    /// OpenDAL scheme when feature `audit-opendal` is enabled: `fs` | `memory` | `s3` | `oss` | empty=off.
     #[serde(default)]
     pub opendal_scheme: String,
-    /// OpenDAL root (fs path). Empty → use `archive_dir` or parent of `file_path`.
+    /// OpenDAL root. For `fs`: local path (empty → `archive_dir` or parent of `file_path`).
+    /// For `s3`/`oss`/`memory`: object-key prefix root only (never inherits host paths).
     #[serde(default)]
     pub opendal_root: String,
     /// Object key prefix for archived files (e.g. `audit/`).
     #[serde(default)]
     pub opendal_prefix: String,
+    /// S3/OSS bucket (required when scheme is s3 or oss).
+    #[serde(default)]
+    pub opendal_bucket: String,
+    /// S3/OSS endpoint URL (optional for AWS default; required for OSS/minio).
+    #[serde(default)]
+    pub opendal_endpoint: String,
+    /// S3 region (e.g. `us-east-1`).
+    #[serde(default)]
+    pub opendal_region: String,
+    /// Access key id (or set env `DN_OPENDAL_ACCESS_KEY_ID` / `AWS_ACCESS_KEY_ID`).
+    #[serde(default)]
+    pub opendal_access_key_id: String,
+    /// Secret key (or env `DN_OPENDAL_SECRET_ACCESS_KEY` / `AWS_SECRET_ACCESS_KEY`). Never log.
+    #[serde(default)]
+    pub opendal_secret_access_key: String,
+    /// Optional session token (or env `DN_OPENDAL_SESSION_TOKEN` / `AWS_SESSION_TOKEN`).
+    #[serde(default)]
+    pub opendal_session_token: String,
 }
 
 fn default_queue_capacity() -> u32 {
@@ -380,6 +399,12 @@ impl Default for SecurityAuditConfig {
             opendal_scheme: String::new(),
             opendal_root: String::new(),
             opendal_prefix: String::new(),
+            opendal_bucket: String::new(),
+            opendal_endpoint: String::new(),
+            opendal_region: String::new(),
+            opendal_access_key_id: String::new(),
+            opendal_secret_access_key: String::new(),
+            opendal_session_token: String::new(),
         }
     }
 }

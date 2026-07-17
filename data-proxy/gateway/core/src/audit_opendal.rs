@@ -1,9 +1,12 @@
-//! Optional OpenDAL cold archive for rotated audit JSONL (B04b).
+//! Optional OpenDAL cold archive for rotated audit JSONL (B04b / B04c).
 //!
 //! Compiled only with `--features audit-opendal`. After local rotation, the
-//! rotated file is uploaded via OpenDAL (`fs` or `memory` in MVP). Hot path
-//! never blocks on network I/O — upload runs on the audit worker thread with a
-//! short-lived current-thread Tokio runtime.
+//! rotated file is uploaded via OpenDAL. Hot path never blocks on network I/O —
+//! upload runs on the audit worker thread with a short-lived current-thread
+//! Tokio runtime.
+//!
+//! Schemes: `fs` | `memory` | `s3` | `oss` (Aliyun). Credentials prefer config
+//! fields, then `DN_OPENDAL_*` / standard cloud env vars.
 
 #![cfg(feature = "audit-opendal")]
 
@@ -41,26 +44,15 @@ impl OpendalArchive {
         if scheme.is_empty() || scheme == "off" || scheme == "none" {
             return Ok(None);
         }
-        let root = if !config.opendal_root.trim().is_empty() {
-            config.opendal_root.trim().to_owned()
-        } else if !config.archive_dir.trim().is_empty() {
-            config.archive_dir.trim().to_owned()
-        } else if !config.file_path.trim().is_empty() {
-            Path::new(config.file_path.trim())
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| ".".into())
-        } else {
-            ".".into()
-        };
+        // Local schemes may fall back to archive_dir / file_path parent.
+        // Object stores only use opendal_root (object-key prefix root), never a host path.
+        let root = resolve_root(config, &scheme);
         let prefix = config.opendal_prefix.trim().trim_matches('/').to_owned();
         let op = match scheme.as_str() {
             "fs" => {
                 let builder = services::Fs::default().root(&root);
                 Operator::new(builder)
-                    .map_err(|e| {
-                        GatewayError::Configuration(format!("opendal fs operator: {e}"))
-                    })?
+                    .map_err(|e| GatewayError::Configuration(format!("opendal fs operator: {e}")))?
                     .finish()
             }
             "memory" => {
@@ -71,9 +63,11 @@ impl OpendalArchive {
                     })?
                     .finish()
             }
+            "s3" => build_s3(config, &root)?,
+            "oss" => build_oss(config, &root)?,
             other => {
                 return Err(GatewayError::Configuration(format!(
-                    "security.audit.opendal_scheme must be fs, memory, or empty (got '{other}')"
+                    "security.audit.opendal_scheme must be fs|memory|s3|oss|empty (got '{other}')"
                 )));
             }
         };
@@ -82,6 +76,7 @@ impl OpendalArchive {
             scheme = %scheme,
             root = %root,
             prefix = %prefix,
+            bucket = %config.opendal_bucket,
             "audit OpenDAL archive ready"
         );
         Ok(Some(Self {
@@ -106,21 +101,157 @@ impl OpendalArchive {
         } else {
             format!("{}/{}", self.prefix, name)
         };
-        let bytes = std::fs::read(local).map_err(|e| format!("read {}: {e}", local.display()))?;
-        // Worker thread: current-thread runtime for a single write.
+        let bytes =
+            std::fs::read(local).map_err(|e| format!("read {}: {e}", local.display()))?;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("tokio runtime: {e}"))?;
         let op = self.op.clone();
         let key_cl = key.clone();
-        rt.block_on(async move {
-            op.write(&key_cl, bytes)
-                .await
-                .map_err(|e| format!("opendal write {key_cl}: {e}"))
-        })?;
-        Ok(key)
+        // Simple retry for transient cloud errors (worker path only).
+        let mut last_err = String::new();
+        for attempt in 1..=3 {
+            let op = op.clone();
+            let key_cl = key_cl.clone();
+            let bytes = bytes.clone();
+            match rt.block_on(async move { op.write(&key_cl, bytes).await }) {
+                Ok(_) => return Ok(key),
+                Err(e) => {
+                    last_err = format!("opendal write {key} attempt {attempt}: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
+                }
+            }
+        }
+        Err(last_err)
     }
+}
+
+fn resolve_root(config: &SecurityAuditConfig, scheme: &str) -> String {
+    if !config.opendal_root.trim().is_empty() {
+        return config.opendal_root.trim().to_owned();
+    }
+    // Cloud object-key roots must not inherit local archive paths.
+    if matches!(scheme, "s3" | "oss" | "memory") {
+        return String::new();
+    }
+    if !config.archive_dir.trim().is_empty() {
+        return config.archive_dir.trim().to_owned();
+    }
+    if !config.file_path.trim().is_empty() {
+        return Path::new(config.file_path.trim())
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".into());
+    }
+    ".".into()
+}
+
+fn env_or(config_val: &str, keys: &[&str]) -> String {
+    let c = config_val.trim();
+    if !c.is_empty() {
+        return c.to_owned();
+    }
+    for k in keys {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                return v;
+            }
+        }
+    }
+    String::new()
+}
+
+fn build_s3(config: &SecurityAuditConfig, root: &str) -> GatewayResult<Operator> {
+    let bucket = config.opendal_bucket.trim();
+    if bucket.is_empty() {
+        return Err(GatewayError::Configuration(
+            "security.audit.opendal_bucket is required when opendal_scheme=s3".into(),
+        ));
+    }
+    let access = env_or(
+        &config.opendal_access_key_id,
+        &["DN_OPENDAL_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"],
+    );
+    let secret = env_or(
+        &config.opendal_secret_access_key,
+        &["DN_OPENDAL_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"],
+    );
+    let token = env_or(
+        &config.opendal_session_token,
+        &["DN_OPENDAL_SESSION_TOKEN", "AWS_SESSION_TOKEN"],
+    );
+    let region = env_or(&config.opendal_region, &["DN_OPENDAL_REGION", "AWS_REGION"]);
+    let endpoint = config.opendal_endpoint.trim();
+
+    let mut builder = services::S3::default().bucket(bucket);
+    if !root.is_empty() {
+        builder = builder.root(root);
+    }
+    if !region.is_empty() {
+        builder = builder.region(&region);
+    }
+    if !endpoint.is_empty() {
+        builder = builder.endpoint(endpoint);
+    }
+    if !access.is_empty() {
+        builder = builder.access_key_id(&access);
+    }
+    if !secret.is_empty() {
+        builder = builder.secret_access_key(&secret);
+    }
+    if !token.is_empty() {
+        builder = builder.session_token(&token);
+    }
+    Operator::new(builder)
+        .map_err(|e| GatewayError::Configuration(format!("opendal s3 operator: {e}")))
+        .map(|b| b.finish())
+}
+
+fn build_oss(config: &SecurityAuditConfig, root: &str) -> GatewayResult<Operator> {
+    let bucket = config.opendal_bucket.trim();
+    if bucket.is_empty() {
+        return Err(GatewayError::Configuration(
+            "security.audit.opendal_bucket is required when opendal_scheme=oss".into(),
+        ));
+    }
+    let endpoint = config.opendal_endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(GatewayError::Configuration(
+            "security.audit.opendal_endpoint is required when opendal_scheme=oss".into(),
+        ));
+    }
+    let access = env_or(
+        &config.opendal_access_key_id,
+        &[
+            "DN_OPENDAL_ACCESS_KEY_ID",
+            "ALIBABA_CLOUD_ACCESS_KEY_ID",
+            "OSS_ACCESS_KEY_ID",
+        ],
+    );
+    let secret = env_or(
+        &config.opendal_secret_access_key,
+        &[
+            "DN_OPENDAL_SECRET_ACCESS_KEY",
+            "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+            "OSS_ACCESS_KEY_SECRET",
+        ],
+    );
+    let mut builder = services::Oss::default()
+        .bucket(bucket)
+        .endpoint(endpoint);
+    if !root.is_empty() {
+        builder = builder.root(root);
+    }
+    if !access.is_empty() {
+        builder = builder.access_key_id(&access);
+    }
+    if !secret.is_empty() {
+        builder = builder.access_key_secret(&secret);
+    }
+    Operator::new(builder)
+        .map_err(|e| GatewayError::Configuration(format!("opendal oss operator: {e}")))
+        .map(|b| b.finish())
 }
 
 /// Process-wide optional archive (set from install/reconfigure).
@@ -194,5 +325,66 @@ mod tests {
     fn empty_scheme_is_off() {
         let cfg = SecurityAuditConfig::default();
         assert!(OpendalArchive::from_config(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn s3_requires_bucket() {
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.opendal_scheme = "s3".into();
+        let err = OpendalArchive::from_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("bucket"), "{err}");
+    }
+
+    #[test]
+    fn oss_requires_bucket_and_endpoint() {
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.opendal_scheme = "oss".into();
+        cfg.opendal_bucket = "b".into();
+        let err = OpendalArchive::from_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("endpoint"), "{err}");
+    }
+
+    #[test]
+    fn s3_builder_accepts_min_config() {
+        // Does not perform network I/O; only constructs Operator.
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.opendal_scheme = "s3".into();
+        cfg.opendal_bucket = "test-bucket".into();
+        cfg.opendal_region = "us-east-1".into();
+        cfg.opendal_endpoint = "http://127.0.0.1:9000".into();
+        cfg.opendal_access_key_id = "minio".into();
+        cfg.opendal_secret_access_key = "minio123".into();
+        cfg.opendal_root = "audit-root".into();
+        let arch = OpendalArchive::from_config(&cfg).unwrap().expect("s3 op");
+        assert_eq!(arch.scheme(), "s3");
+    }
+
+    #[test]
+    fn s3_ignores_local_archive_dir_for_root() {
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.opendal_scheme = "s3".into();
+        cfg.opendal_bucket = "b".into();
+        cfg.opendal_region = "us-east-1".into();
+        cfg.opendal_endpoint = "http://127.0.0.1:9000".into();
+        cfg.opendal_access_key_id = "k".into();
+        cfg.opendal_secret_access_key = "s".into();
+        cfg.archive_dir = "/var/log/data-nexus/audit/archive".into();
+        // Should succeed without treating archive_dir as object root.
+        let arch = OpendalArchive::from_config(&cfg).unwrap().expect("s3 op");
+        assert_eq!(arch.scheme(), "s3");
+        assert_eq!(resolve_root(&cfg, "s3"), "");
+    }
+
+    #[test]
+    fn oss_builder_accepts_min_config() {
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.opendal_scheme = "oss".into();
+        cfg.opendal_bucket = "test-bucket".into();
+        cfg.opendal_endpoint = "https://oss-cn-hangzhou.aliyuncs.com".into();
+        cfg.opendal_access_key_id = "ak".into();
+        cfg.opendal_secret_access_key = "sk".into();
+        cfg.opendal_prefix = "audit".into();
+        let arch = OpendalArchive::from_config(&cfg).unwrap().expect("oss op");
+        assert_eq!(arch.scheme(), "oss");
     }
 }
