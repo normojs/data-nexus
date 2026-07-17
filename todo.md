@@ -134,10 +134,10 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
-| **A06** | Backend→PEP 真行流 | `RowStream` / 窗口迭代 API；Secure 路径禁止「先全量 `ResultSet` 再 `apply_obligations`」 | 有义务时仍整包物化后改 | **待做** |
+| **A06** | Backend→PEP 真行流 | `RowStream` / 窗口迭代 API；Secure 路径禁止「先全量 `ResultSet` 再 `apply_obligations`」 | 有义务时窗口化 mask（`apply_obligations_windowed`）；全量物化仍待 A06 续 | **部分** |
 | **A07** | 编码直写 socket | 减少 `handle_frame → Vec<Vec<u8>>` 二次缓冲；与 A06 对齐 | 编码结果先攒包再写 | **待做** |
-| **A08** | PostgreSQL 真 wire 透传 | 同协议无义务时对齐 MySQL wire 路径 | 现将 Passthrough **降级 Materialized**（tokio-postgres 无 raw frame） | **待做** |
-| **A09** | Portal 端到端流式 | B05b 仅 HTTP chunk；`portal_execute_logical` 仍先物化逻辑结果 | 注释已标明边界 | **待做**（依赖 A06） |
+| **A08** | PostgreSQL 真 wire 透传 | 同协议无义务时对齐 MySQL wire 路径 | `GatewayResponse::Wire` 编码 PG 消息（非 TCP 帧中继） | **部分** |
+| **A09** | Portal 端到端流式 | B05b 仅 HTTP chunk；`portal_execute_logical` 仍先物化逻辑结果 | 注释已标明边界 | **待做**（依赖 A06 续） |
 | **A10** | 预处理 / 事务透传矩阵 | MySQL prepared encode 仍偏 legacy；**PG prepared encode not implemented** | 易把流量打进慢路径或直接报错 | **待做** |
 
 ### 3.2 P1 — 策略 / 合规深化
@@ -184,8 +184,8 @@ examples/        smoke + gateway config 样例
 | 主题 | 限制 |
 |------|------|
 | Portal「流式」 | B05b = **HTTP** 边写；backend 逻辑结果仍可能全量进内存 |
-| 脱敏大数据 | 有义务时峰值仍可能 ≈ 结果集大小 |
-| PG passthrough | 配置可开，实现降级为 Materialized（有 debug 日志） |
+| 脱敏大数据 | A06 窗口 mask 已落地；结果集整体仍在 encode 前组装（续 A06/A07） |
+| PG passthrough | A08：前端 wire 消息包（Wire），**非** backend TCP 帧中继 |
 | 预处理语句 | PG prepared encode 未实现；MySQL 部分仍偏 legacy |
 | 多副本 | 票据/金库/SQLite 索引/LocalPdp **非**共享状态 |
 | L2 样本合规 | **未实现**（B08） |
@@ -195,23 +195,25 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A06 Backend→PEP 真行流（或发布 H06 / 部署 H04b）<<<**
+**>>> A06 续：backend 真行迭代 / 或 A07 编码直写 socket <<<**
 
-开发规则：`.claude/rules/data-nexus-development.md`。
+本轮进度（A06/A08 部分）：
 
-建议下一刀（三选一，按目标）：
-
-| 目标 | 下一任务 |
-|------|----------|
-| **大数据脱敏代理** | **A06** → A07 → A08 → A09 |
-| **可上线发布** | **H06** origin 同步 + 发布 checklist；部署 **H04b** |
-| **企业 ABAC/合规** | **F29** → B08 → F31 |
+- `apply_obligations_windowed`：mask 按窗口应用，避免与未脱敏全量副本并存
+- 有结果义务时强制 Streaming，禁止误走 Passthrough
+- A08：PG Passthrough → `GatewayResponse::Wire`（RowDescription/DataRow/…），core 与 MySQL wire 同路径
+- 诚实边界：仍返回完整 ResultSet 给 encode；**非** TCP 帧中继；portal 仍物化
 
 ```bash
-# 回归基线
-cd data-proxy && ./examples/run-smoke-matrix.sh default
-cargo test -p gateway_core --lib
+cargo test -p gateway_core --lib obligations
+cargo test -p runtime_gateway --lib backend::postgresql
 ```
+
+建议下一刀：
+
+1. **A06 续** — backend 按窗口 yield，encode 边收边写（真峰值内存下降）  
+2. **A07** — socket ResponseWriter 替换 CollectingWriter  
+3. **A09** — portal 共用 A06 流
 
 ---
 

@@ -635,9 +635,10 @@ async fn mysql_response_from_header_and_stream(
             let _ = read_mysql_result_packet(stream, "mysql column eof").await?;
 
             let max_rows = mode.effective_max_rows();
-            // Window size is used for progressive decode; we still assemble the
-            // final ResultSet for the current wire encode path, but never keep
-            // more than max_rows and free each window after append.
+            // A06: progressive decode in windows. We still assemble a ResultSet for
+            // the current encode path, but never keep more than max_rows and drain
+            // windows into the final buffer so peak temporary growth is window-sized
+            // on top of the final rows (not 2× full result during decode).
             let window = mode.window_rows().unwrap_or(usize::MAX).max(1);
             let mut rows = Vec::new();
             let mut window_buf: Vec<Vec<GatewayValue>> = Vec::with_capacity(window.min(256));

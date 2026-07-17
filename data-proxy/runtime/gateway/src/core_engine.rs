@@ -563,22 +563,40 @@ impl CoreGatewayConnection {
             }
 
             let same_protocol = self.frontend.protocol() == self.backend.protocol();
+            // A06: result obligations force Streaming so backend applies max_rows/window
+            // and we never take the wire Passthrough path with masks.
+            let has_result_obl = pending_obligations.has_result_obligations();
             let want_passthrough = self.passthrough_enabled
                 && same_protocol
-                && !pending_obligations.has_result_obligations()
+                && !has_result_obl
                 && matches!(command, GatewayCommand::Query { .. })
                 && self.translation_policy.is_none();
             // A4: cross-protocol never uses wire passthrough; force Streaming so
             // backend max_rows/window apply and encode path is windowed.
             let exec_mode = if want_passthrough {
                 ExecuteMode::Passthrough
-            } else if self.translation_policy.is_some() {
+            } else if self.translation_policy.is_some() || has_result_obl {
                 match self.stream_mode {
                     ExecuteMode::Streaming { .. } => self.stream_mode,
-                    _ => ExecuteMode::from_streaming_config(256, None),
+                    _ => ExecuteMode::from_streaming_config(256, pending_obligations.max_rows),
                 }
             } else {
-                self.stream_mode
+                // Merge PDP max_rows into streaming mode when configured.
+                match self.stream_mode {
+                    ExecuteMode::Streaming {
+                        window_rows,
+                        max_rows,
+                    } => ExecuteMode::Streaming {
+                        window_rows,
+                        max_rows: match (max_rows, pending_obligations.max_rows) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (None, Some(b)) => Some(b),
+                            (Some(a), None) => Some(a),
+                            (None, None) => None,
+                        },
+                    },
+                    other => other,
+                }
             };
 
             let response = match self
@@ -607,7 +625,26 @@ impl CoreGatewayConnection {
                             max_rows = ?pending_obligations.max_rows,
                             "security applied result obligations"
                         );
-                        gateway_core::apply_obligations_to_response(response, &pending_obligations)
+                        // A06: windowed mask/watermark; never keep a second full unmasked copy.
+                        match response {
+                            GatewayResponse::ResultSet { columns, rows } => {
+                                let window = self
+                                    .stream_mode
+                                    .window_rows()
+                                    .unwrap_or(256)
+                                    .max(1);
+                                gateway_core::apply_obligations_windowed(
+                                    columns,
+                                    rows,
+                                    &pending_obligations,
+                                    window,
+                                )
+                            }
+                            other => gateway_core::apply_obligations_to_response(
+                                other,
+                                &pending_obligations,
+                            ),
+                        }
                     } else {
                         response
                     }

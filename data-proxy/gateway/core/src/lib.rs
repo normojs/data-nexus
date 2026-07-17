@@ -55,8 +55,8 @@ pub use config::{
 };
 pub use object_set::{ColumnAclOutcome, ObjectAccess, ObjectSet, StarPolicy};
 pub use obligations::{
-    apply_obligations_to_response, inject_row_filter, mask_gateway_value, MaskAlgorithm, MaskSpec,
-    Obligations, WatermarkMode, WatermarkSpec,
+    apply_obligations_to_response, apply_obligations_windowed, inject_row_filter, mask_gateway_value,
+    MaskAlgorithm, MaskSpec, Obligations, WatermarkMode, WatermarkSpec,
 };
 pub use pdp::{
     action_from_command, extract_table_names, global_local_pdp_store, install_local_pdp,

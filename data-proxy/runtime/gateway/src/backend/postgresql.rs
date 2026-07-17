@@ -8,6 +8,10 @@ use gateway_core::{
     SessionState, TransactionState,
 };
 use parking_lot::Mutex;
+use postgresql_protocol::{
+    encode_command_complete, encode_data_row, encode_ready_for_query, encode_row_description,
+    FieldDescription, TransactionStatus,
+};
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use tracing::error;
 
@@ -141,6 +145,19 @@ impl PostgreSqlBackendConnector {
         Self::execute_on_conn(&conn, sql, mode).await
     }
 
+    /// A08: run simple query and return frontend-ready PG wire messages.
+    async fn execute_simple_query_wire(
+        &self,
+        endpoint: EndpointConfig,
+        sql: &str,
+        session: &SessionState,
+    ) -> GatewayResult<GatewayResponse> {
+        let logical = self
+            .execute_simple_query(endpoint, sql, session, ExecuteMode::Materialized)
+            .await?;
+        logical_response_to_pg_wire(logical, session)
+    }
+
     async fn finish_transaction(&self, sql: &str) -> GatewayResult<GatewayResponse> {
         let Some(conn) = self.txn_lease.lock().take() else {
             return Ok(GatewayResponse::Ok { affected_rows: 0, last_insert_id: None });
@@ -218,17 +235,17 @@ impl BackendConnector for PostgreSqlBackendConnector {
             GatewayCommand::Query { sql } => {
                 let endpoint = self.select_endpoint(session)?;
                 {
-                    // tokio-postgres does not expose raw backend frames; fall back
-                    // to logical materialization for Passthrough (MySQL has true wire).
-                    let mode = if matches!(mode, ExecuteMode::Passthrough) {
-                        tracing::debug!(
-                            target: "data_nexus::gateway",
-                            "postgresql Passthrough degraded to Materialized (no wire frames)"
-                        );
-                        ExecuteMode::Materialized
-                    } else {
-                        mode
-                    };
+                    // A08: same-protocol "wire" path — encode logical rows as native
+                    // PG frontend messages (RowDescription/DataRow/CommandComplete/
+                    // ReadyForQuery) so core_engine can treat it like MySQL Wire
+                    // passthrough (GatewayResponse::Wire) without a second IR hop.
+                    // True TCP frame relay still requires a raw backend socket; this
+                    // is the supported wire-compatible path with tokio-postgres.
+                    if matches!(mode, ExecuteMode::Passthrough) {
+                        return self
+                            .execute_simple_query_wire(endpoint, &sql, session)
+                            .await;
+                    }
                     self.execute_simple_query(endpoint, &sql, session, mode).await
                 }
             }
@@ -530,7 +547,88 @@ fn simple_query_messages_to_gateway_response(
     if !columns.is_empty() {
         Ok(GatewayResponse::ResultSet { columns, rows })
     } else {
-        Ok(GatewayResponse::Ok { affected_rows, last_insert_id: None })
+        Ok(GatewayResponse::Ok {
+            affected_rows,
+            last_insert_id: None,
+        })
+    }
+}
+
+/// A08: encode a logical GatewayResponse as frontend-ready PostgreSQL messages.
+fn logical_response_to_pg_wire(
+    response: GatewayResponse,
+    session: &SessionState,
+) -> GatewayResult<GatewayResponse> {
+    let ready = encode_ready_for_query(pg_transaction_status(session));
+    match response {
+        GatewayResponse::ResultSet { columns, rows } => {
+            let fields = columns
+                .iter()
+                .map(|c| FieldDescription {
+                    name: c.name.clone(),
+                    type_oid: 25, // text
+                    type_size: -1,
+                    type_modifier: -1,
+                    format_code: 0,
+                })
+                .collect::<Vec<_>>();
+            let mut packets = Vec::with_capacity(rows.len() + 3);
+            packets.push(
+                encode_row_description(&fields)
+                    .map_err(|e| GatewayError::Protocol(e.to_string()))?,
+            );
+            for row in &rows {
+                if row.len() != columns.len() {
+                    return Err(GatewayError::Protocol(format!(
+                        "postgresql wire row has {} values for {} columns",
+                        row.len(),
+                        columns.len()
+                    )));
+                }
+                let values = row
+                    .iter()
+                    .map(|v| match v {
+                        GatewayValue::Null => None,
+                        GatewayValue::Boolean(b) => {
+                            Some(if *b { b"t".to_vec() } else { b"f".to_vec() })
+                        }
+                        GatewayValue::Integer(i) => Some(i.to_string().into_bytes()),
+                        GatewayValue::UnsignedInteger(i) => Some(i.to_string().into_bytes()),
+                        GatewayValue::Float(f) => Some(f.to_string().into_bytes()),
+                        GatewayValue::Decimal(s) | GatewayValue::String(s) => {
+                            Some(s.as_bytes().to_vec())
+                        }
+                        GatewayValue::Bytes(b) => Some(b.clone()),
+                    })
+                    .collect::<Vec<_>>();
+                packets.push(
+                    encode_data_row(&values).map_err(|e| GatewayError::Protocol(e.to_string()))?,
+                );
+            }
+            packets.push(encode_command_complete(&format!("SELECT {}", rows.len())));
+            packets.push(ready);
+            Ok(GatewayResponse::Wire { packets })
+        }
+        GatewayResponse::Ok { affected_rows, .. } => Ok(GatewayResponse::Wire {
+            packets: vec![
+                encode_command_complete(&format!("OK {affected_rows}")),
+                ready,
+            ],
+        }),
+        GatewayResponse::Error { code, message } => {
+            // Keep Error typed so PEP/audit can still read code/message; frontend encodes it.
+            Ok(GatewayResponse::Error { code, message })
+        }
+        GatewayResponse::Wire { packets } => Ok(GatewayResponse::Wire { packets }),
+        other => Ok(other),
+    }
+}
+
+fn pg_transaction_status(session: &SessionState) -> TransactionStatus {
+    match session.transaction_state {
+        TransactionState::Idle => TransactionStatus::Idle,
+        TransactionState::Active => TransactionStatus::InTransaction,
+        TransactionState::Failed => TransactionStatus::Failed,
     }
 }
 
@@ -620,6 +718,55 @@ mod tests {
         assert_eq!(map_charset_to_postgresql_encoding("utf8mb4_unicode_ci"), "UTF8");
         assert_eq!(map_charset_to_postgresql_encoding("latin1"), "LATIN1");
         assert_eq!(map_charset_to_postgresql_encoding("UTF8"), "UTF8");
+    }
+
+    #[test]
+    fn a08_logical_resultset_encodes_to_wire_packets() {
+        let session = SessionState::default();
+        let logical = GatewayResponse::ResultSet {
+            columns: vec![GatewayColumn {
+                name: "id".into(),
+                data_type: "int".into(),
+            }],
+            rows: vec![
+                vec![GatewayValue::Integer(1)],
+                vec![GatewayValue::Integer(2)],
+            ],
+        };
+        let wire = logical_response_to_pg_wire(logical, &session).unwrap();
+        match wire {
+            GatewayResponse::Wire { packets } => {
+                // RowDescription + 2 DataRow + CommandComplete + ReadyForQuery
+                assert_eq!(packets.len(), 5);
+                assert_eq!(packets[0][0], b'T'); // RowDescription
+                assert_eq!(packets[1][0], b'D'); // DataRow
+                assert_eq!(packets[2][0], b'D');
+                assert_eq!(packets[3][0], b'C'); // CommandComplete
+                assert_eq!(packets[4][0], b'Z'); // ReadyForQuery
+            }
+            other => panic!("expected Wire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a08_ok_encodes_to_wire() {
+        let session = SessionState::default();
+        let wire = logical_response_to_pg_wire(
+            GatewayResponse::Ok {
+                affected_rows: 3,
+                last_insert_id: None,
+            },
+            &session,
+        )
+        .unwrap();
+        match wire {
+            GatewayResponse::Wire { packets } => {
+                assert_eq!(packets.len(), 2);
+                assert_eq!(packets[0][0], b'C');
+                assert_eq!(packets[1][0], b'Z');
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

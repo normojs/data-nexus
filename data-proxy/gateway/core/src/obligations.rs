@@ -414,7 +414,12 @@ fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
     None
 }
 
-/// Apply result-path obligations to a gateway response (materialized MVP).
+/// Apply result-path obligations to a gateway response.
+///
+/// A06: when obligations are present, prefer windowed application via
+/// [`apply_obligations_windowed`] so callers can avoid keeping a second full copy
+/// longer than necessary. This full-response entry still exists for small results
+/// and Admin/portal paths.
 pub fn apply_obligations_to_response(
     response: GatewayResponse,
     obligations: &Obligations,
@@ -425,15 +430,7 @@ pub fn apply_obligations_to_response(
     match response {
         GatewayResponse::ResultSet { mut columns, mut rows } => {
             let mask_idx = build_mask_index(&columns, &obligations.column_masks);
-            if !mask_idx.is_empty() {
-                for row in &mut rows {
-                    for (col_i, spec) in &mask_idx {
-                        if let Some(cell) = row.get_mut(*col_i) {
-                            *cell = mask_gateway_value(cell, spec);
-                        }
-                    }
-                }
-            }
+            apply_masks_to_rows(&mut rows, &mask_idx);
             if let Some(max) = obligations.max_rows {
                 let max = max as usize;
                 if rows.len() > max {
@@ -446,6 +443,58 @@ pub fn apply_obligations_to_response(
             GatewayResponse::ResultSet { columns, rows }
         }
         other => other,
+    }
+}
+
+/// A06: apply mask / max_rows / watermark using only window-sized working sets
+/// for masking. Still returns a single ResultSet for the current encode path,
+/// but never keeps an unmasked full copy alongside the masked one.
+pub fn apply_obligations_windowed(
+    mut columns: Vec<Column>,
+    mut rows: Vec<Vec<GatewayValue>>,
+    obligations: &Obligations,
+    window_rows: usize,
+) -> GatewayResponse {
+    if !obligations.has_result_obligations() {
+        return GatewayResponse::ResultSet { columns, rows };
+    }
+
+    if let Some(max) = obligations.max_rows {
+        let max = max as usize;
+        if rows.len() > max {
+            rows.truncate(max);
+        }
+    }
+
+    let mask_idx = build_mask_index(&columns, &obligations.column_masks);
+    if !mask_idx.is_empty() {
+        let window = window_rows.max(1);
+        let mut out = Vec::with_capacity(rows.len());
+        while !rows.is_empty() {
+            let take = window.min(rows.len());
+            let mut chunk: Vec<Vec<GatewayValue>> = rows.drain(..take).collect();
+            apply_masks_to_rows(&mut chunk, &mask_idx);
+            out.append(&mut chunk);
+        }
+        rows = out;
+    }
+
+    if let Some(wm) = &obligations.watermark {
+        apply_watermark_to_resultset(&mut columns, &mut rows, wm);
+    }
+    GatewayResponse::ResultSet { columns, rows }
+}
+
+fn apply_masks_to_rows(rows: &mut [Vec<GatewayValue>], mask_idx: &[(usize, &MaskSpec)]) {
+    if mask_idx.is_empty() {
+        return;
+    }
+    for row in rows.iter_mut() {
+        for (col_i, spec) in mask_idx {
+            if let Some(cell) = row.get_mut(*col_i) {
+                *cell = mask_gateway_value(cell, spec);
+            }
+        }
     }
 }
 
@@ -599,6 +648,40 @@ mod tests {
             GatewayResponse::ResultSet { rows, .. } => {
                 assert_eq!(rows[0][0], GatewayValue::Integer(1));
                 assert_eq!(rows[0][1], GatewayValue::Null);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_obligations_windowed_masks_and_truncates() {
+        let mut obl = Obligations::default();
+        obl.column_masks
+            .push(MaskSpec::new("salary", MaskAlgorithm::Nullify, "m"));
+        obl.max_rows = Some(2);
+        let columns = vec![
+            Column {
+                name: "id".into(),
+                data_type: "int".into(),
+            },
+            Column {
+                name: "salary".into(),
+                data_type: "int".into(),
+            },
+        ];
+        let rows = vec![
+            vec![GatewayValue::Integer(1), GatewayValue::Integer(10)],
+            vec![GatewayValue::Integer(2), GatewayValue::Integer(20)],
+            vec![GatewayValue::Integer(3), GatewayValue::Integer(30)],
+        ];
+        let out = apply_obligations_windowed(columns, rows, &obl, 1);
+        match out {
+            GatewayResponse::ResultSet { rows, .. } => {
+                assert_eq!(rows.len(), 2, "max_rows=2");
+                assert_eq!(rows[0][1], GatewayValue::Null);
+                assert_eq!(rows[1][1], GatewayValue::Null);
+                assert_eq!(rows[0][0], GatewayValue::Integer(1));
+                assert_eq!(rows[1][0], GatewayValue::Integer(2));
             }
             other => panic!("{other:?}"),
         }
