@@ -1,0 +1,68 @@
+# Local smoke matrix for Data Nexus (H02)
+#
+# Runs on macOS/Linux agents with Docker. Cargo target defaults to the
+# external volume documented in data-proxy/docs/build-cache.md.
+#
+# Optional secrets: none (smokes use docker-compose.dev.yml local passwords).
+
+name: smoke-matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      group:
+        description: "Smoke group: l0 | security-core | default | all"
+        required: false
+        default: "l0"
+  push:
+    branches: [main, master]
+    paths:
+      - "data-proxy/**"
+      - ".github/workflows/smoke-matrix.yml"
+  pull_request:
+    paths:
+      - "data-proxy/**"
+      - ".github/workflows/smoke-matrix.yml"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: data-proxy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        # Prefer 1.94+ when available for cedar optional jobs; stable is enough for L0.
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ github.workspace }}/.ci-cargo-target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('data-proxy/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Docker availability
+        run: docker info
+
+      - name: Run smoke matrix
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-cargo-target
+          DN_SMOKE_KEEP_GOING: "0"
+          DN_SMOKE_TIMEOUT_SECS: "1200"
+        run: |
+          chmod +x examples/run-smoke-matrix.sh examples/smoke-*.sh
+          ./examples/run-smoke-matrix.sh "${{ github.event.inputs.group || 'l0' }}"

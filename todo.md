@@ -105,8 +105,8 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 依赖/备注 | 状态 |
 |----|----|------|-----------|:----:|
-| **H01** | 生产配置样例包 | `examples/prod-*.toml`：fail_closed、admin_auth 开、audit file+retain、streaming 合理默认；禁止明文口令示例进文档正文 | 无 | 待做 |
-| **H02** | CI smoke 矩阵 | GitHub/本地脚本：security off 四条 L0 + 核心 security smoke；文档 rustc/缓存路径；可选 `security-cedar` job | 外置 target、Docker | 待做 |
+| **H01** | 生产配置样例包 | `examples/prod-*.toml`：fail_closed、admin_auth 开、audit file+retain、streaming 合理默认；禁止明文口令示例进文档正文 | 无 | **完成** |
+| **H02** | CI smoke 矩阵 | GitHub/本地脚本：security off 四条 L0 + 核心 security smoke；文档 rustc/缓存路径；可选 `security-cedar` job | 外置 target、Docker | **完成** |
 | **H03** | 密钥与 Vault 硬化 | lease/ticket 进程内存 → 可选文件/加密后端占位；配置不回传 password（已有）+ 轮转/吊销 API | S6 vault | 待做 |
 | **H04** | data-ui OIDC 生产联调 | 真实 IdP、回调、角色映射；与 break-glass 并存说明 | data-ui、admin_auth | 待做 |
 
@@ -149,23 +149,30 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> H01 生产配置样例包 + H02 CI smoke 矩阵（建议成对做） <<<**
+**>>> H03 密钥与 Vault 硬化 / 或 B04c OpenDAL S3 <<<**
 
-理由：功能面已齐，最大缺口是「别人能按文档/CI 复现并上线」；比再堆协议/算法更划算。
+H01+H02 已完成：
 
-### H01 规划要点
+- `data-proxy/examples/prod/`：`gateway.example.toml` + `env.example` + `render-config.sh`（占位符，无真实密钥入库）
+- `data-proxy/examples/run-smoke-matrix.sh`：分组 `l0` / `security-core` / `security-extended` / `cedar` / `default` / `all`
+- `.github/workflows/smoke-matrix.yml`：PR/push 默认可跑 `l0`，可 `workflow_dispatch` 选组
 
-1. 新增 `examples/prod-gateway.snippet.toml`（或完整可跑的脱敏样例）：`security.enabled=true`、`fail_closed=true`、审计 file+retain、streaming 默认、admin_auth 开启说明  
-2. 口令/密钥仅 env 占位（`password = "${ENV}"` 若现配置不支持则文档写清注入方式）  
-3. 与 `docs/admin-auth-password.md`、`build-cache.md` 交叉链接  
+```bash
+# 生产配置
+cp examples/prod/env.example /secure/data-nexus.env   # 填密钥
+set -a && source /secure/data-nexus.env && set +a
+./examples/prod/render-config.sh > /secure/gateway.toml
 
-### H02 规划要点
+# 本地/CI 矩阵
+./examples/run-smoke-matrix.sh list
+./examples/run-smoke-matrix.sh l0
+```
 
-1. `data-proxy/examples/run-smoke-matrix.sh`：分组 L0 / security-core / security-optional(cedar)  
-2. 失败即非零退出；日志落 `/tmp` 或 `CI` artifact 路径  
-3. README/看板写明依赖：Docker、rustc 版本、外置 target  
+建议下一任务：
 
-**备选下一焦点**（若跳过 H01/H02）：**B04c OpenDAL S3** 或 **B05b portal 真流式**。
+1. **H03** — 密钥与 Vault 硬化  
+2. **B04c** — OpenDAL S3/OSS  
+3. **B05b** — portal 真流式 NDJSON
 
 ---
 
