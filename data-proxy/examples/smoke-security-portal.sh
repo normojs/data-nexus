@@ -152,7 +152,7 @@ assert "portal" in body.lower()
 print("csv export ok", body.splitlines()[:3])
 PY
 
-echo "==> portal export NDJSON (B05)"
+echo "==> portal export NDJSON chunked (B05b)"
 curl -fsS -D /tmp/dn-portal-ndjson.hdr -o /tmp/dn-portal.ndjson \
   -X POST "http://127.0.0.1:8082/admin/portal/query" \
   -H 'content-type: application/json' \
@@ -161,14 +161,17 @@ python3 - <<'PY'
 import json
 hdr=open("/tmp/dn-portal-ndjson.hdr").read().lower()
 assert "ndjson" in hdr or "json" in hdr, hdr
+assert "x-data-nexus-stream: chunked" in hdr, hdr
+# Transfer-Encoding may be hop-by-hop stripped by some stacks; body shape is authoritative.
 lines=[ln for ln in open("/tmp/dn-portal.ndjson") if ln.strip()]
 assert len(lines) >= 2, lines
 meta=json.loads(lines[0])
 assert meta.get("_meta") is True
 assert meta.get("decision")=="allow"
+assert meta.get("stream")=="chunked"
 row=json.loads(lines[1])
 assert "id" in row and "name" in row
-print("ndjson export ok", meta.get("row_count"), row)
+print("ndjson chunked export ok", meta.get("row_count"), row)
 PY
 
 echo "==> portal invalid format rejected"

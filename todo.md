@@ -92,7 +92,8 @@ examples/        smoke + gateway config 样例
 | B03 | OTel 安全属性 | `b6fe519` |
 | B04 | JSONL 轮转/保留 | `120252f` |
 | B04b | OpenDAL fs/memory | `0dda947` |
-| B04c | OpenDAL S3/OSS | 本提交 |
+| B04c | OpenDAL S3/OSS | `4118e80` |
+| B05b | portal 真流式 NDJSON | 本提交 |
 | F26b | Cedar 热更新 | `82974f9` |
 | chore | target 外置缓存 | `2700698` |
 
@@ -133,7 +134,7 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 依赖/备注 | 状态 |
 |----|----|------|-----------|:----:|
-| **B05b** | portal 真流式 NDJSON | 边读边写 HTTP chunk，避免大结果全量进内存 | portal_execute | 待做 |
+| **B05b** | portal 真流式 NDJSON | 边读边写 HTTP chunk，避免大结果全量进内存 | portal_execute | **完成** |
 | **A05** | 透传路径观测补齐 | passthrough 命中率/字节 metrics；与 B03 属性对齐 | otel/prometheus | 待做 |
 | **UI01** | 票据/金库管理页 | data-ui 发票、双人审批、列表（现多靠 API） | F18、tickets API | 待做 |
 | **UI02** | Cedar 状态页 | 展示 epoch/files/reload 按钮 | F26b API | 延后 |
@@ -150,20 +151,20 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> B05b portal 真流式 NDJSON / 或 B07 Deny 高优队列 / B06 审计检索索引 <<<**
+**>>> B07 Deny 高优审计队列 / 或 B06 审计检索索引 / F28 Local 规则热更新 <<<**
 
-B04c 已交付：`audit-opendal` 支持 `s3`/`oss`，配置字段 + `DN_OPENDAL_*` 凭据，worker 侧 3 次重试，默认二进制仍无 OpenDAL。
+B05b 已交付：`format=ndjson` 经 `Body::channel` 按 `window_rows` 分块写出；meta 带 `stream=chunked`，响应头 `x-data-nexus-stream: chunked`。json/csv 仍缓冲（有界 max_rows）。
 
 ```bash
-cargo test -p gateway_core --features audit-opendal --lib audit_opendal
-# 生产二进制：cargo build -p data-proxy --bin proxy --features audit-opendal
+cargo test -p http --lib portal_ndjson
+# 可选：./examples/smoke-security-portal.sh
 ```
 
-建议下一任务（P3-B/D）：
+建议下一任务（P3-B/C）：
 
-1. **B05b** — portal 真流式 NDJSON  
-2. **B07** — Deny 高优审计队列  
-3. **B06** — 审计检索索引
+1. **B07** — Deny 高优审计队列  
+2. **B06** — 审计检索索引  
+3. **F28** — Local 规则热更新
 
 ---
 

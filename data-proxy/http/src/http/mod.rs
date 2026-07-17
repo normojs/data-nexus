@@ -20,7 +20,7 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Json, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::Response,
@@ -1694,6 +1694,7 @@ impl AxumServer {
 
         // Bound portal result size; export defaults higher but still capped.
         let max_rows = clamp_portal_max_rows(body.max_rows, format);
+        let stream_window = config.security.streaming.window_rows.max(1) as usize;
 
         match portal_execute_logical(
             &config,
@@ -1717,13 +1718,21 @@ impl AxumServer {
                     service: Some(body.service.clone()),
                     outcome: Some(outcome.into()),
                     message: Some(format!(
-                        "format={format} rows={} truncated={}",
-                        resp.row_count, resp.truncated
+                        "format={format} rows={} truncated={} stream={}",
+                        resp.row_count,
+                        resp.truncated,
+                        format == "ndjson"
                     )),
                     audit_level: Some("L0".into()),
                     ..gateway_core::AuditEvent::default()
                 });
-                portal_format_response(&resp, format, download)
+                // B05b: NDJSON is encoded window-by-window into a chunked HTTP body
+                // so the export buffer is not held fully in memory.
+                if format == "ndjson" {
+                    portal_ndjson_chunked_response(resp, download, stream_window)
+                } else {
+                    portal_format_response(&resp, format, download)
+                }
             }
             Err((code, msg)) => {
                 gateway_core::try_audit(gateway_core::AuditEvent {
@@ -2456,6 +2465,8 @@ fn portal_format_response(
                 "portal-export.csv",
             )
         }
+        // Buffered NDJSON retained for tests / callers that already hold `resp`.
+        // Live `/admin/portal/query` uses `portal_ndjson_chunked_response` (B05b).
         "ndjson" => {
             let body = portal_to_ndjson(resp);
             portal_download_response(
@@ -2484,6 +2495,93 @@ fn portal_format_response(
             }
         }
     }
+}
+
+/// B05b: stream NDJSON over a chunked HTTP body, encoding `window_rows` at a time
+/// so the full export document is never assembled as one contiguous buffer.
+fn portal_ndjson_chunked_response(
+    resp: AdminPortalQueryResponse,
+    download: bool,
+    window_rows: usize,
+) -> Response<Body> {
+    let window = window_rows.max(1);
+    let (mut tx, body) = Body::channel();
+    tokio::spawn(async move {
+        let meta = portal_ndjson_meta_value(&resp);
+        match serde_json::to_vec(&meta) {
+            Ok(mut b) => {
+                b.push(b'\n');
+                if tx.send_data(Bytes::from(b)).await.is_err() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+        let columns = resp.columns;
+        let mut rows = resp.rows.into_iter();
+        loop {
+            let mut batch = Vec::with_capacity(window);
+            for _ in 0..window {
+                match rows.next() {
+                    Some(r) => batch.push(r),
+                    None => break,
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let chunk = portal_ndjson_encode_rows(&columns, &batch);
+            if tx.send_data(Bytes::from(chunk)).await.is_err() {
+                return;
+            }
+            // `batch` drops here — progressive free of row memory.
+        }
+    });
+
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")
+        .header("x-data-nexus-stream", "chunked");
+    if download {
+        builder = builder.header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"portal-export.ndjson\"",
+        );
+    }
+    builder.body(body).unwrap_or_else(|error| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(error.to_string()))
+            .expect("static internal server error response is valid")
+    })
+}
+
+fn portal_ndjson_meta_value(resp: &AdminPortalQueryResponse) -> serde_json::Value {
+    serde_json::json!({
+        "_meta": true,
+        "service": resp.service,
+        "decision": resp.decision,
+        "row_count": resp.row_count,
+        "truncated": resp.truncated,
+        "columns": resp.columns,
+        "stream": "chunked",
+    })
+}
+
+/// Encode one NDJSON object line per row (no trailing meta).
+fn portal_ndjson_encode_rows(columns: &[String], rows: &[Vec<serde_json::Value>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for row in rows {
+        let mut obj = serde_json::Map::new();
+        for (i, col) in columns.iter().enumerate() {
+            let v = row.get(i).cloned().unwrap_or(serde_json::Value::Null);
+            obj.insert(col.clone(), v);
+        }
+        if let Ok(b) = serde_json::to_vec(&serde_json::Value::Object(obj)) {
+            out.extend_from_slice(&b);
+            out.push(b'\n');
+        }
+    }
+    out
 }
 
 fn portal_download_response(
@@ -2544,29 +2642,11 @@ fn portal_to_csv(resp: &AdminPortalQueryResponse) -> Vec<u8> {
 
 fn portal_to_ndjson(resp: &AdminPortalQueryResponse) -> Vec<u8> {
     let mut out = Vec::new();
-    let meta = serde_json::json!({
-        "_meta": true,
-        "service": resp.service,
-        "decision": resp.decision,
-        "row_count": resp.row_count,
-        "truncated": resp.truncated,
-        "columns": resp.columns,
-    });
-    if let Ok(b) = serde_json::to_vec(&meta) {
+    if let Ok(b) = serde_json::to_vec(&portal_ndjson_meta_value(resp)) {
         out.extend_from_slice(&b);
         out.push(b'\n');
     }
-    for row in &resp.rows {
-        let mut obj = serde_json::Map::new();
-        for (i, col) in resp.columns.iter().enumerate() {
-            let v = row.get(i).cloned().unwrap_or(serde_json::Value::Null);
-            obj.insert(col.clone(), v);
-        }
-        if let Ok(b) = serde_json::to_vec(&serde_json::Value::Object(obj)) {
-            out.extend_from_slice(&b);
-            out.push(b'\n');
-        }
-    }
+    out.extend_from_slice(&portal_ndjson_encode_rows(&resp.columns, &resp.rows));
     out
 }
 
@@ -3283,5 +3363,95 @@ service = "missing-service"
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn portal_ndjson_encode_rows_windowed_matches_full() {
+        let resp = AdminPortalQueryResponse {
+            columns: vec!["id".into(), "name".into()],
+            rows: (0..5)
+                .map(|i| vec![json!(i), json!(format!("n{i}"))])
+                .collect(),
+            row_count: 5,
+            truncated: false,
+            service: "orders".into(),
+            decision: "allow".into(),
+            message: None,
+        };
+        let full = portal_to_ndjson(&resp);
+        // Window size 2: meta + 3 chunks (2+2+1) should reconstruct same lines.
+        let mut rebuilt = Vec::new();
+        let meta = portal_ndjson_meta_value(&resp);
+        rebuilt.extend(serde_json::to_vec(&meta).unwrap());
+        rebuilt.push(b'\n');
+        for chunk in resp.rows.chunks(2) {
+            rebuilt.extend(portal_ndjson_encode_rows(&resp.columns, chunk));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&full),
+            String::from_utf8_lossy(&rebuilt)
+        );
+        let lines: Vec<_> = std::str::from_utf8(&full)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 6); // meta + 5 rows
+        let meta_v: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(meta_v["_meta"], true);
+        assert_eq!(meta_v["stream"], "chunked");
+        assert_eq!(meta_v["row_count"], 5);
+    }
+
+    #[tokio::test]
+    async fn portal_ndjson_chunked_response_streams_body() {
+        let resp = AdminPortalQueryResponse {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![
+                vec![json!(1), json!("a")],
+                vec![json!(2), json!("b")],
+                vec![json!(3), json!("c")],
+            ],
+            row_count: 3,
+            truncated: true,
+            service: "orders".into(),
+            decision: "allow".into(),
+            message: None,
+        };
+        let response = portal_ndjson_chunked_response(resp, true, 2);
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("ndjson"), "{ct}");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-data-nexus-stream")
+                .and_then(|v| v.to_str().ok()),
+            Some("chunked")
+        );
+        let cd = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(cd.contains("portal-export.ndjson"), "{cd}");
+
+        let bytes = to_bytes(response.into_body()).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        let meta: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(meta["_meta"], true);
+        assert_eq!(meta["truncated"], true);
+        assert_eq!(meta["stream"], "chunked");
+        let r1: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(r1["id"], 1);
+        assert_eq!(r1["name"], "a");
+        let r3: Value = serde_json::from_str(lines[3]).unwrap();
+        assert_eq!(r3["id"], 3);
     }
 }
