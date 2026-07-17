@@ -1746,6 +1746,52 @@ impl AxumServer {
         let max_rows = clamp_portal_max_rows(body.max_rows, format);
         let stream_window = config.security.streaming.window_rows.max(1) as usize;
 
+        // A09: NDJSON uses backend StreamingQuery when available (true windowed
+        // path). json/csv still materialize a bounded ResultSet for response shape.
+        if format == "ndjson" {
+            match portal_execute_ndjson_streaming(
+                &config,
+                &body.service,
+                &body.sql,
+                &subject_id,
+                Some(max_rows),
+                stream_window,
+                download,
+            )
+            .await
+            {
+                Ok(response) => {
+                    gateway_core::try_audit(gateway_core::AuditEvent {
+                        action: Some(AuditAction::Query.as_str().into()),
+                        decision: Some(AuditDecision::Execute.as_str().into()),
+                        subject_id: Some(subject_id),
+                        service: Some(body.service.clone()),
+                        outcome: Some("portal_export".into()),
+                        message: Some(format!(
+                            "format=ndjson stream=backend_window window={stream_window} max_rows={max_rows}"
+                        )),
+                        audit_level: Some("L0".into()),
+                        ..gateway_core::AuditEvent::default()
+                    });
+                    return response;
+                }
+                Err((code, msg)) => {
+                    gateway_core::try_audit(gateway_core::AuditEvent {
+                        action: Some(AuditAction::Query.as_str().into()),
+                        decision: Some(AuditDecision::Deny.as_str().into()),
+                        subject_id: Some(subject_id),
+                        service: Some(body.service.clone()),
+                        outcome: Some("portal_deny".into()),
+                        message: Some(msg.clone()),
+                        code: Some(code.clone()),
+                        audit_level: Some("L0".into()),
+                        ..gateway_core::AuditEvent::default()
+                    });
+                    return admin_json_error(StatusCode::FORBIDDEN, "portal_denied", msg);
+                }
+            }
+        }
+
         match portal_execute_logical(
             &config,
             &body.service,
@@ -1768,21 +1814,13 @@ impl AxumServer {
                     service: Some(body.service.clone()),
                     outcome: Some(outcome.into()),
                     message: Some(format!(
-                        "format={format} rows={} truncated={} stream={}",
-                        resp.row_count,
-                        resp.truncated,
-                        format == "ndjson"
+                        "format={format} rows={} truncated={}",
+                        resp.row_count, resp.truncated
                     )),
                     audit_level: Some("L0".into()),
                     ..gateway_core::AuditEvent::default()
                 });
-                // B05b: NDJSON is encoded window-by-window into a chunked HTTP body
-                // so the export buffer is not held fully in memory.
-                if format == "ndjson" {
-                    portal_ndjson_chunked_response(resp, download, stream_window)
-                } else {
-                    portal_format_response(&resp, format, download)
-                }
+                portal_format_response(&resp, format, download)
             }
             Err((code, msg)) => {
                 gateway_core::try_audit(gateway_core::AuditEvent {
@@ -2308,13 +2346,178 @@ async fn portal_execute_logical(
     subject_id: &str,
     max_rows: Option<u64>,
 ) -> Result<AdminPortalQueryResponse, (String, String)> {
-    // NOTE (performance honesty / B05b boundary):
-    // This path still materializes a full logical ResultSet from the backend plan,
-    // then encodes. B05b only streams the *HTTP* NDJSON body in windows — it does
-    // not make backend execution row-streaming end-to-end.
+    // A09: uses execute_outcome. Streaming backends are drained into a bounded
+    // ResultSet for json/csv response shape; prefer portal_execute_ndjson_streaming
+    // for true windowed HTTP export.
+    let prepared = portal_prepare(config, service_name, sql, subject_id, max_rows)?;
+    let response = prepared
+        .backend
+        .execute_outcome(
+            prepared.command,
+            &mut prepared.session.clone(),
+            prepared.mode,
+        )
+        .await
+        .map_err(|e| ("backend".into(), e.to_string()))?;
+
     use gateway_core::{
-        apply_obligations_to_response, default_dialect_parser, map_response_types, BackendConnector,
-        ExecuteMode, GatewayCommand, GatewayResponse, LocalPdp, Subject,
+        apply_masks_to_rows, apply_obligations_to_response, apply_watermark_to_resultset,
+        build_mask_index, map_response_types, ExecuteOutcome, GatewayResponse, GatewayValue,
+    };
+
+    let session = prepared.session;
+    match response {
+        ExecuteOutcome::Streaming(mut query) => {
+            // Map column types for cross-protocol.
+            if prepared.backend_protocol != prepared.frontend_protocol {
+                for col in &mut query.columns {
+                    col.data_type = gateway_core::map_column_type(
+                        &col.data_type,
+                        &prepared.backend_protocol,
+                        &prepared.frontend_protocol,
+                    );
+                }
+            }
+            let mut columns = query.columns;
+            let mask_idx = build_mask_index(&columns, &prepared.obligations.column_masks);
+            if let Some(wm) = prepared.obligations.watermark.as_ref() {
+                let mut empty = Vec::new();
+                apply_watermark_to_resultset(&mut columns, &mut empty, wm);
+            }
+            let header_width = columns.len();
+            let window = prepared.mode.window_rows().unwrap_or(256).max(1);
+            let max_total = max_rows.or(prepared.obligations.max_rows);
+            let mut all_rows = Vec::new();
+            let mut total: u64 = 0;
+            let mut truncated = false;
+            loop {
+                if let Some(max) = max_total {
+                    if total >= max {
+                        while query.stream.poll_window(window).await.map_err(|e| {
+                            ("backend".into(), e.to_string())
+                        })?.is_some()
+                        {}
+                        truncated = true;
+                        break;
+                    }
+                }
+                let want = match max_total {
+                    Some(max) => ((max - total) as usize).min(window).max(1),
+                    None => window,
+                };
+                let Some(mut chunk) = query
+                    .stream
+                    .poll_window(want)
+                    .await
+                    .map_err(|e| ("backend".into(), e.to_string()))?
+                else {
+                    break;
+                };
+                if !mask_idx.is_empty() {
+                    apply_masks_to_rows(&mut chunk, &mask_idx);
+                }
+                if let Some(wm) = prepared.obligations.watermark.as_ref() {
+                    for row in chunk.iter_mut() {
+                        while row.len() < header_width {
+                            if row.len() + 1 == header_width {
+                                row.push(GatewayValue::String(wm.token.clone()));
+                            } else {
+                                row.push(GatewayValue::Null);
+                            }
+                        }
+                    }
+                }
+                total += chunk.len() as u64;
+                all_rows.extend(chunk);
+            }
+            let col_names: Vec<String> = columns.into_iter().map(|c| c.name).collect();
+            let json_rows = all_rows
+                .into_iter()
+                .map(|row| row.into_iter().map(gateway_value_to_json).collect())
+                .collect::<Vec<_>>();
+            let row_count = json_rows.len();
+            let _ = session;
+            Ok(AdminPortalQueryResponse {
+                columns: col_names,
+                rows: json_rows,
+                row_count,
+                truncated,
+                service: service_name.to_owned(),
+                decision: "allow".into(),
+                message: None,
+            })
+        }
+        ExecuteOutcome::Complete(response) => {
+            let response = map_response_types(
+                response,
+                &prepared.backend_protocol,
+                &prepared.frontend_protocol,
+            );
+            let response = if prepared.obligations.has_result_obligations() {
+                apply_obligations_to_response(response, &prepared.obligations)
+            } else {
+                response
+            };
+            match response {
+                GatewayResponse::ResultSet { columns, rows } => {
+                    let limit = max_rows.or(prepared.obligations.max_rows);
+                    let truncated = limit.map(|m| rows.len() as u64 >= m).unwrap_or(false);
+                    let col_names: Vec<String> = columns.into_iter().map(|c| c.name).collect();
+                    let json_rows = rows
+                        .into_iter()
+                        .map(|row| row.into_iter().map(gateway_value_to_json).collect())
+                        .collect::<Vec<_>>();
+                    let row_count = json_rows.len();
+                    Ok(AdminPortalQueryResponse {
+                        columns: col_names,
+                        rows: json_rows,
+                        row_count,
+                        truncated,
+                        service: service_name.to_owned(),
+                        decision: "allow".into(),
+                        message: None,
+                    })
+                }
+                GatewayResponse::Error { code, message } => Err((code, message)),
+                GatewayResponse::Ok { affected_rows, .. } => Ok(AdminPortalQueryResponse {
+                    columns: vec!["affected_rows".into()],
+                    rows: vec![vec![serde_json::json!(affected_rows)]],
+                    row_count: 1,
+                    truncated: false,
+                    service: service_name.to_owned(),
+                    decision: "allow".into(),
+                    message: Some("ok".into()),
+                }),
+                GatewayResponse::Wire { .. } => Err((
+                    "wire".into(),
+                    "portal expects logical result set".into(),
+                )),
+                other => Err(("unsupported".into(), format!("{other:?}"))),
+            }
+        }
+    }
+}
+
+/// Shared portal setup: PEP + translation + backend connector.
+struct PortalPrepared {
+    backend: std::sync::Arc<dyn gateway_core::BackendConnector>,
+    command: gateway_core::GatewayCommand,
+    session: gateway_core::SessionState,
+    mode: gateway_core::ExecuteMode,
+    obligations: gateway_core::Obligations,
+    frontend_protocol: gateway_core::ProtocolKind,
+    backend_protocol: gateway_core::ProtocolKind,
+}
+
+fn portal_prepare(
+    config: &gateway_core::GatewayConfig,
+    service_name: &str,
+    sql: &str,
+    subject_id: &str,
+    max_rows: Option<u64>,
+) -> Result<PortalPrepared, (String, String)> {
+    use gateway_core::{
+        default_dialect_parser, BackendConnector, ExecuteMode, GatewayCommand, LocalPdp, Subject,
     };
     use runtime_gateway::core_engine::CoreGatewayRuntimePlan;
 
@@ -2346,7 +2549,6 @@ async fn portal_execute_logical(
         return Err(("endpoint".into(), "service has no endpoints".into()));
     }
 
-    // Frontend protocol for type mapping: prefer listener protocol for this service.
     let frontend_protocol = plan
         .listeners()
         .iter()
@@ -2354,10 +2556,8 @@ async fn portal_execute_logical(
         .map(|l| l.listener().protocol.clone())
         .unwrap_or_else(|| service.backend_protocol.clone());
 
-    let objects = runtime_gateway::object_extract::extract_object_set(
-        sql,
-        frontend_protocol.as_str(),
-    );
+    let objects =
+        runtime_gateway::object_extract::extract_object_set(sql, frontend_protocol.as_str());
     let dialect = default_dialect_parser(&frontend_protocol);
     let subject = Subject::from_protocol_user(Some(subject_id), None);
     let mut sql_exec = sql.to_owned();
@@ -2397,18 +2597,16 @@ async fn portal_execute_logical(
             .iter()
             .find(|p| p.name == *policy_name)
         {
-            command = gateway_core::prepare_cross_protocol_command(
-                policy,
-                command,
-                &dialect,
-            )
-            .map_err(|e| ("translation".into(), e.to_string()))?;
+            command = gateway_core::prepare_cross_protocol_command(policy, command, &dialect)
+                .map_err(|e| ("translation".into(), e.to_string()))?;
         }
     }
 
     let backend: std::sync::Arc<dyn BackendConnector> = match service.backend_protocol {
         gateway_core::ProtocolKind::MySql => std::sync::Arc::new(
-            runtime_gateway::backend::mysql::MySqlBackendConnector::with_endpoints(endpoints.clone()),
+            runtime_gateway::backend::mysql::MySqlBackendConnector::with_endpoints(
+                endpoints.clone(),
+            ),
         ),
         gateway_core::ProtocolKind::PostgreSql => std::sync::Arc::new(
             runtime_gateway::backend::postgresql::PostgreSqlBackendConnector::with_endpoints(
@@ -2417,7 +2615,7 @@ async fn portal_execute_logical(
         ),
     };
 
-    let mut session = gateway_core::SessionState {
+    let session = gateway_core::SessionState {
         user: Some(subject_id.to_owned()),
         database: endpoints.first().and_then(|e| e.database.clone()),
         ..Default::default()
@@ -2426,73 +2624,218 @@ async fn portal_execute_logical(
         config.security.streaming.window_rows.max(1),
         max_rows.or(obligations.max_rows),
     );
-    let response = backend
-        .execute_with_mode(command, &mut session, mode)
-        .await
-        .map_err(|e| ("backend".into(), e.to_string()))?;
-    let response = map_response_types(
-        response,
-        &service.backend_protocol,
-        &frontend_protocol,
-    );
-    let response = if obligations.has_result_obligations() {
-        apply_obligations_to_response(response, &obligations)
-    } else {
-        response
+
+    Ok(PortalPrepared {
+        backend,
+        command,
+        session,
+        mode,
+        obligations,
+        frontend_protocol,
+        backend_protocol: service.backend_protocol,
+    })
+}
+
+fn gateway_value_to_json(v: gateway_core::GatewayValue) -> serde_json::Value {
+    match v {
+        gateway_core::GatewayValue::Null => serde_json::Value::Null,
+        gateway_core::GatewayValue::Boolean(b) => serde_json::Value::Bool(b),
+        gateway_core::GatewayValue::Integer(i) => serde_json::json!(i),
+        gateway_core::GatewayValue::UnsignedInteger(u) => serde_json::json!(u),
+        gateway_core::GatewayValue::Float(f) => serde_json::json!(f),
+        gateway_core::GatewayValue::Decimal(s) | gateway_core::GatewayValue::String(s) => {
+            serde_json::Value::String(s)
+        }
+        gateway_core::GatewayValue::Bytes(b) => {
+            serde_json::Value::String(format!("bytes:{}", b.len()))
+        }
+    }
+}
+
+/// A09: NDJSON export with backend window yield → HTTP chunk (when Streaming).
+async fn portal_execute_ndjson_streaming(
+    config: &gateway_core::GatewayConfig,
+    service_name: &str,
+    sql: &str,
+    subject_id: &str,
+    max_rows: Option<u64>,
+    window_rows: usize,
+    download: bool,
+) -> Result<Response<Body>, (String, String)> {
+    use gateway_core::{
+        apply_masks_to_rows, apply_watermark_to_resultset, build_mask_index, map_response_types,
+        ExecuteOutcome, GatewayResponse, GatewayValue,
     };
 
-    match response {
-        GatewayResponse::ResultSet { columns, rows } => {
-            let limit = max_rows.or(obligations.max_rows);
-            let truncated = limit.map(|m| rows.len() as u64 >= m).unwrap_or(false);
-            let col_names: Vec<String> = columns.into_iter().map(|c| c.name).collect();
-            let json_rows = rows
-                .into_iter()
-                .map(|row| {
-                    row.into_iter()
-                        .map(|v| match v {
-                            gateway_core::GatewayValue::Null => serde_json::Value::Null,
-                            gateway_core::GatewayValue::Boolean(b) => serde_json::Value::Bool(b),
-                            gateway_core::GatewayValue::Integer(i) => serde_json::json!(i),
-                            gateway_core::GatewayValue::UnsignedInteger(u) => serde_json::json!(u),
-                            gateway_core::GatewayValue::Float(f) => serde_json::json!(f),
-                            gateway_core::GatewayValue::Decimal(s)
-                            | gateway_core::GatewayValue::String(s) => {
-                                serde_json::Value::String(s)
+    let prepared = portal_prepare(config, service_name, sql, subject_id, max_rows)?;
+    let mut session = prepared.session.clone();
+    let outcome = prepared
+        .backend
+        .execute_outcome(prepared.command, &mut session, prepared.mode)
+        .await
+        .map_err(|e| ("backend".into(), e.to_string()))?;
+
+    let window = window_rows.max(1);
+    let (mut tx, body) = Body::channel();
+
+    match outcome {
+        ExecuteOutcome::Streaming(mut query) => {
+            if prepared.backend_protocol != prepared.frontend_protocol {
+                for col in &mut query.columns {
+                    col.data_type = gateway_core::map_column_type(
+                        &col.data_type,
+                        &prepared.backend_protocol,
+                        &prepared.frontend_protocol,
+                    );
+                }
+            }
+            let mut columns = query.columns;
+            let mask_specs = prepared.obligations.column_masks.clone();
+            let mask_idx: Vec<(usize, gateway_core::MaskSpec)> = {
+                let tmp = build_mask_index(&columns, &mask_specs);
+                tmp.into_iter().map(|(i, s)| (i, s.clone())).collect()
+            };
+            if let Some(wm) = prepared.obligations.watermark.as_ref() {
+                let mut empty = Vec::new();
+                apply_watermark_to_resultset(&mut columns, &mut empty, wm);
+            }
+            let header_width = columns.len();
+            let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let max_total = max_rows.or(prepared.obligations.max_rows);
+            let service = service_name.to_owned();
+            let watermark = prepared.obligations.watermark.clone();
+
+            tokio::spawn(async move {
+                // Keep `_meta` compatible with B05b clients; `stream=backend_window`
+                // marks true backend yield (vs HTTP-only chunked of a materialized set).
+                let meta = serde_json::json!({
+                    "_meta": true,
+                    "columns": col_names,
+                    "service": service,
+                    "decision": "allow",
+                    "stream": "backend_window",
+                    "window_rows": window,
+                });
+                if let Ok(mut b) = serde_json::to_vec(&meta) {
+                    b.push(b'\n');
+                    if tx.send_data(Bytes::from(b)).await.is_err() {
+                        while query.stream.poll_window(window).await.ok().flatten().is_some() {}
+                        return;
+                    }
+                }
+                let mut total: u64 = 0;
+                loop {
+                    if let Some(max) = max_total {
+                        if total >= max {
+                            while query.stream.poll_window(window).await.ok().flatten().is_some() {}
+                            break;
+                        }
+                    }
+                    let want = match max_total {
+                        Some(max) => ((max - total) as usize).min(window).max(1),
+                        None => window,
+                    };
+                    let chunk = match query.stream.poll_window(want).await {
+                        Ok(Some(c)) => c,
+                        Ok(None) => break,
+                        Err(_) => break,
+                    };
+                    let mut chunk = chunk;
+                    if !mask_idx.is_empty() {
+                        let refs: Vec<(usize, &gateway_core::MaskSpec)> =
+                            mask_idx.iter().map(|(i, s)| (*i, s)).collect();
+                        apply_masks_to_rows(&mut chunk, &refs);
+                    }
+                    if let Some(wm) = watermark.as_ref() {
+                        for row in chunk.iter_mut() {
+                            while row.len() < header_width {
+                                if row.len() + 1 == header_width {
+                                    row.push(GatewayValue::String(wm.token.clone()));
+                                } else {
+                                    row.push(GatewayValue::Null);
+                                }
                             }
-                            gateway_core::GatewayValue::Bytes(b) => {
-                                serde_json::Value::String(format!("bytes:{}", b.len()))
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            let row_count = json_rows.len();
-            Ok(AdminPortalQueryResponse {
-                columns: col_names,
-                rows: json_rows,
-                row_count,
-                truncated,
-                service: service_name.to_owned(),
-                decision: "allow".into(),
-                message: None,
-            })
+                        }
+                    }
+                    total += chunk.len() as u64;
+                    let json_batch: Vec<Vec<serde_json::Value>> = chunk
+                        .into_iter()
+                        .map(|row| row.into_iter().map(gateway_value_to_json).collect())
+                        .collect();
+                    let bytes = portal_ndjson_encode_rows(&col_names, &json_batch);
+                    if tx.send_data(Bytes::from(bytes)).await.is_err() {
+                        while query.stream.poll_window(window).await.ok().flatten().is_some() {}
+                        return;
+                    }
+                }
+            });
+
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")
+                .header("x-data-nexus-stream", "backend_window");
+            if download {
+                builder = builder.header(
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"portal-export.ndjson\"",
+                );
+            }
+            Ok(builder.body(body).unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("response build failed"))
+                    .expect("static")
+            }))
         }
-        GatewayResponse::Error { code, message } => Err((code, message)),
-        GatewayResponse::Ok { affected_rows, .. } => Ok(AdminPortalQueryResponse {
-            columns: vec!["affected_rows".into()],
-            rows: vec![vec![serde_json::json!(affected_rows)]],
-            row_count: 1,
-            truncated: false,
-            service: service_name.to_owned(),
-            decision: "allow".into(),
-            message: Some("ok".into()),
-        }),
-        GatewayResponse::Wire { .. } => Err((
-            "wire".into(),
-            "portal expects logical result set".into(),
-        )),
-        other => Err(("unsupported".into(), format!("{other:?}"))),
+        ExecuteOutcome::Complete(response) => {
+            // Fallback: materialize then reuse B05b chunked encoder.
+            let response = map_response_types(
+                response,
+                &prepared.backend_protocol,
+                &prepared.frontend_protocol,
+            );
+            let response = if prepared.obligations.has_result_obligations() {
+                gateway_core::apply_obligations_to_response(response, &prepared.obligations)
+            } else {
+                response
+            };
+            match response {
+                GatewayResponse::ResultSet { columns, rows } => {
+                    let limit = max_rows.or(prepared.obligations.max_rows);
+                    let truncated = limit.map(|m| rows.len() as u64 >= m).unwrap_or(false);
+                    let col_names: Vec<String> = columns.into_iter().map(|c| c.name).collect();
+                    let json_rows = rows
+                        .into_iter()
+                        .map(|row| row.into_iter().map(gateway_value_to_json).collect())
+                        .collect::<Vec<_>>();
+                    let row_count = json_rows.len();
+                    let resp = AdminPortalQueryResponse {
+                        columns: col_names,
+                        rows: json_rows,
+                        row_count,
+                        truncated,
+                        service: service_name.to_owned(),
+                        decision: "allow".into(),
+                        message: None,
+                    };
+                    Ok(portal_ndjson_chunked_response(resp, download, window))
+                }
+                GatewayResponse::Error { code, message } => Err((code, message)),
+                GatewayResponse::Ok { affected_rows, .. } => {
+                    let resp = AdminPortalQueryResponse {
+                        columns: vec!["affected_rows".into()],
+                        rows: vec![vec![serde_json::json!(affected_rows)]],
+                        row_count: 1,
+                        truncated: false,
+                        service: service_name.to_owned(),
+                        decision: "allow".into(),
+                        message: Some("ok".into()),
+                    };
+                    Ok(portal_ndjson_chunked_response(resp, download, window))
+                }
+                other => Err(("unsupported".into(), format!("{other:?}"))),
+            }
+        }
     }
 }
 
@@ -2549,8 +2892,9 @@ fn portal_format_response(
                 "portal-export.csv",
             )
         }
-        // Buffered NDJSON retained for tests / callers that already hold `resp`.
-        // Live `/admin/portal/query` uses `portal_ndjson_chunked_response` (B05b).
+        // Buffered NDJSON for tests / callers that already hold `resp`.
+        // Live NDJSON uses `portal_execute_ndjson_streaming` (A09 backend window
+        // when available, else B05b chunked of a materialized set).
         "ndjson" => {
             let body = portal_to_ndjson(resp);
             portal_download_response(
@@ -3537,5 +3881,47 @@ service = "missing-service"
         assert_eq!(r1["name"], "a");
         let r3: Value = serde_json::from_str(lines[3]).unwrap();
         assert_eq!(r3["id"], 3);
+    }
+
+    #[test]
+    fn gateway_value_to_json_covers_variants() {
+        assert_eq!(gateway_value_to_json(gateway_core::GatewayValue::Null), json!(null));
+        assert_eq!(
+            gateway_value_to_json(gateway_core::GatewayValue::Boolean(true)),
+            json!(true)
+        );
+        assert_eq!(
+            gateway_value_to_json(gateway_core::GatewayValue::Integer(-3)),
+            json!(-3)
+        );
+        assert_eq!(
+            gateway_value_to_json(gateway_core::GatewayValue::UnsignedInteger(9)),
+            json!(9)
+        );
+        assert_eq!(
+            gateway_value_to_json(gateway_core::GatewayValue::String("x".into())),
+            json!("x")
+        );
+        assert_eq!(
+            gateway_value_to_json(gateway_core::GatewayValue::Bytes(vec![1, 2, 3])),
+            json!("bytes:3")
+        );
+    }
+
+    #[test]
+    fn portal_ndjson_backend_window_meta_shape() {
+        // Mirrors A09 streaming producer meta (must stay client-compatible with `_meta`).
+        let meta = json!({
+            "_meta": true,
+            "columns": ["id", "name"],
+            "service": "orders",
+            "decision": "allow",
+            "stream": "backend_window",
+            "window_rows": 256,
+        });
+        assert_eq!(meta["_meta"], true);
+        assert_eq!(meta["stream"], "backend_window");
+        assert_eq!(meta["window_rows"], 256);
+        assert!(meta["columns"].is_array());
     }
 }

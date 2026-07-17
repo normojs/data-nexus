@@ -22,7 +22,7 @@ description: >
 1. **同协议 + 无结果义务** → Wire / Passthrough（MySQL wire；PG 消息级 Wire，非 TCP 帧中继）
 2. **有 mask/水印/max_rows** → `Streaming` + `execute_outcome` / `write_streaming_query_with_obligations`；禁止仅 `apply_obligations_to_response` 全量
 3. **跨协议** → Streaming 窗口 encode + 类型映射
-4. **Portal** → A09 完成前诚实：HTTP chunk ≠ backend 已流式
+4. **Portal NDJSON** → A09：`Streaming` 时 backend 窗口 → HTTP；json/csv 仍物化
 
 ## Code map
 

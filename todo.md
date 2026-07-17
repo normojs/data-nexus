@@ -121,6 +121,8 @@ examples/        smoke + gateway config 样例
 | H01–H04 | 生产配置 / CI 矩阵 / Vault 硬化 / OIDC 文档 | `16abb2b`…`9325215` |
 | chore | rustc 1.94.1 + smoke 硬化 | `ff88c73` |
 | chore | 开发规则 + 审计债小修 | `6ff8cef` |
+| chore | Claude skills/rules/commands | `91abab3` |
+| A09 | portal NDJSON backend 窗口流（部分） | feat(a09) |
 
 ---
 
@@ -138,7 +140,7 @@ examples/        smoke + gateway config 样例
 | **A06** | Backend→PEP 真行流 | `RowStream` + MySQL channel yield；encode 边 mask 边写 | 非事务 Streaming 真窗口 yield；事务路径仍物化 | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | 同协议无义务时 `GatewayResponse::Wire` | 非 TCP 帧中继 | **部分** |
-| **A09** | Portal 端到端流式 | B05b 仅 HTTP chunk；`portal_execute_logical` 仍先物化逻辑结果 | 注释已标明边界 | **待做**（依赖 A06 续） |
+| **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
 | **A10** | 预处理 / 事务透传矩阵 | MySQL prepared encode 仍偏 legacy；**PG prepared encode not implemented** | 易把流量打进慢路径或直接报错 | **待做** |
 
 ### 3.2 P1 — 策略 / 合规深化
@@ -184,7 +186,7 @@ examples/        smoke + gateway config 样例
 
 | 主题 | 限制 |
 |------|------|
-| Portal「流式」 | B05b = **HTTP** 边写；backend 逻辑结果仍可能全量进内存 |
+| Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL 非事务 Streaming 真窗口 yield + A07 socket 写出；事务/PG Streaming 仍可能物化 |
 | PG passthrough | A08：前端 wire 消息包（Wire），**非** backend TCP 帧中继 |
 | 预处理语句 | PG prepared encode 未实现；MySQL 部分仍偏 legacy |
@@ -196,25 +198,25 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A09 portal 共用流 / 或 A06 事务路径流式 / A10 prepared <<<**
+**>>> A06 事务路径 / PostgreSQL Streaming yield 或 A10 prepared <<<**
 
-本轮（A06 续）：
+本轮（A09 部分）：
 
-- `ExecuteOutcome` / `RowStream` / `StreamingQuery`（gateway_core）
-- `write_streaming_query_with_obligations`：窗口 yield → mask → encode → socket
-- MySQL 非事务 `Streaming`：`execute_outcome` 经 channel 推送行窗口（峰值 ≈ 窗口）
-- core_engine 优先消费 Streaming 路径
+- `portal_prepare` 共用 PEP + translation + connector
+- NDJSON：`portal_execute_ndjson_streaming` — Streaming 窗口 mask → HTTP channel body（`x-data-nexus-stream: backend_window`）
+- Complete 回退 `portal_ndjson_chunked_response`（B05b）
+- json/csv：`portal_execute_logical` 仍 drain 为有界 ResultSet（诚实）
 
 ```bash
-cargo test -p gateway_core --lib transport
-cargo test -p runtime_gateway --lib core_engine backend::mysql
+cargo test -p http@0.1.0 --lib portal_ndjson
+# smoke：security-core（含 portal）
 ```
 
 建议下一刀：
 
-1. **A09** — portal 走 StreamingQuery  
-2. **A06 续** — 事务路径 / PostgreSQL Streaming yield  
-3. **A10** — prepared 语句
+1. **A06 续** — 事务路径 / PostgreSQL Streaming yield  
+2. **A10** — prepared 语句  
+3. **A09 续** — portal json/csv 也走窗口（若产品需要）
 
 ---
 
