@@ -89,11 +89,20 @@ SPA routes are handled by `deploy/nginx.conf` (`try_files` → `index.html`).
 ## Auth models
 
 1. **Open** — no password, no OIDC env → no login gate  
-2. **Password** — `NUXT_PUBLIC_ADMIN_PASSWORD`  
+2. **Password** — `NUXT_PUBLIC_ADMIN_PASSWORD` or gateway break-glass via `/admin/auth/login`  
 3. **SSO** — OIDC authorization code + PKCE (`NUXT_PUBLIC_OIDC_ISSUER` + `CLIENT_ID`)  
 4. **Both** — login page offers password and SSO  
 
 IdP must allow the SPA redirect URI and public client (no client secret).
+
+### Production OIDC (H04)
+
+Full runbook: [`docs/oidc-production.md`](docs/oidc-production.md)
+
+- Gateway: `admin_auth.mode = jwt_jwks` + `jwks_url` / `issuer` / `audience` / `role_bindings`  
+  Template: [`../data-proxy/examples/prod/gateway-jwks.example.toml`](../data-proxy/examples/prod/gateway-jwks.example.toml)  
+- UI env template: [`deploy/oidc.env.example`](deploy/oidc.env.example)  
+- UI sends IdP **access_token** as `Authorization: Bearer` to Admin API  
 
 ## Embedded alternative
 

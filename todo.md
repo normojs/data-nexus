@@ -108,7 +108,7 @@ examples/        smoke + gateway config 样例
 | **H01** | 生产配置样例包 | `examples/prod-*.toml`：fail_closed、admin_auth 开、audit file+retain、streaming 合理默认；禁止明文口令示例进文档正文 | 无 | **完成** |
 | **H02** | CI smoke 矩阵 | GitHub/本地脚本：security off 四条 L0 + 核心 security smoke；文档 rustc/缓存路径；可选 `security-cedar` job | 外置 target、Docker | **完成** |
 | **H03** | 密钥与 Vault 硬化 | lease/ticket 吊销·续期·prune；后端密码永不回传且 revoke 时擦除；进程内存（文件加密后端后置） | S6 vault | **完成** |
-| **H04** | data-ui OIDC 生产联调 | 真实 IdP、回调、角色映射；与 break-glass 并存说明 | data-ui、admin_auth | 待做 |
+| **H04** | data-ui OIDC 生产联调 | 真实 IdP、回调、角色映射；与 break-glass 并存说明 | data-ui、admin_auth | **完成**（接线文档+模板；真 IdP 由部署侧完成） |
 
 ### P3-B — 审计与合规
 
@@ -149,20 +149,27 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> H04 data-ui OIDC 生产联调 / 或 B04c OpenDAL S3 <<<**
+**>>> B04c OpenDAL S3/OSS / 或 B05b portal 真流式 / B07 Deny 高优队列 <<<**
 
-H03 已完成：`POST /admin/vault/leases/:id/revoke|renew`、`POST …/prune`；ticket `revoke`/`prune`；JSON 永不含 backend password；revoke 擦除内存口令；`smoke-security-vault`。
+P3-A 生产化四项均已交付：
+
+| ID | 交付物 |
+|----|--------|
+| H01 | `examples/prod/` 模板 + render |
+| H02 | `run-smoke-matrix.sh` + GHA |
+| H03 | vault/ticket revoke·renew·prune |
+| H04 | `data-ui/docs/oidc-production.md` + JWKS/UI env 模板 |
 
 ```bash
-curl -X POST http://127.0.0.1:8082/admin/vault/leases/$ID/revoke -d '{"revoked_by":"ops"}'
-curl -X POST http://127.0.0.1:8082/admin/vault/leases/$ID/renew -d '{"ttl_secs":900}'
+# OIDC（部署侧填真实 IdP）
+# 见 data-ui/docs/oidc-production.md
 ```
 
-建议下一任务：
+建议下一任务（P3-B/D）：
 
-1. **H04** — data-ui OIDC 生产联调  
-2. **B04c** — OpenDAL S3/OSS  
-3. **B05b** — portal 真流式 NDJSON
+1. **B04c** — OpenDAL S3/OSS scheme  
+2. **B05b** — portal 真流式 NDJSON  
+3. **B07** — Deny 高优审计队列
 
 ---
 

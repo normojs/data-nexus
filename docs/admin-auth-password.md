@@ -96,6 +96,12 @@ pnpm dev
 
 UI 使用 OIDC **access_token** 调 Admin API；网关用 JWKS 验签。
 
+### 生产联调清单（H04）
+
+- 完整步骤与排错：[`data-ui/docs/oidc-production.md`](../data-ui/docs/oidc-production.md)
+- 网关 JWKS 模板：[`data-proxy/examples/prod/gateway-jwks.example.toml`](../data-proxy/examples/prod/gateway-jwks.example.toml)
+- UI env 模板：[`data-ui/deploy/oidc.env.example`](../data-ui/deploy/oidc.env.example)
+
 ---
 
 ## API 一览

@@ -1,0 +1,41 @@
+# Gateway admin_auth JWKS fragment for production OIDC (H04).
+# Merge into a full gateway.toml (listeners/services/endpoints omitted here).
+# Replace all example hostnames before use. Do not commit real secrets.
+
+version = "2"
+
+[admin]
+host = "0.0.0.0"
+port = 8082
+log_level = "INFO"
+
+[admin_auth]
+enabled = true
+mode = "jwt_jwks"
+# IdP JWKS (Keycloak-style path shown)
+jwks_url = "https://idp.example.com/realms/ops/protocol/openid-connect/certs"
+issuer = "https://idp.example.com/realms/ops"
+audience = "data-nexus-admin"
+jwks_cache_secs = 300
+leeway_secs = 60
+public_metrics = true
+token_ttl_secs = 3600
+role_claim_paths = ["roles", "groups", "realm_access.roles"]
+
+# Optional emergency HS256 break-glass (keep offline / sealed)
+jwt_secret = "CHANGE_ME_LONG_RANDOM_HMAC_SECRET"
+break_glass_password = "CHANGE_ME_BREAK_GLASS"
+break_glass_role = "admin"
+
+[admin_auth.role_bindings]
+"data-nexus-viewers" = "viewer"
+"data-nexus-operators" = "operator"
+"data-nexus-admins" = "admin"
+"viewer" = "viewer"
+"operator" = "operator"
+"admin" = "admin"
+
+# Data-plane security still required for production (see examples/prod/gateway.example.toml).
+[security]
+enabled = true
+fail_closed = true

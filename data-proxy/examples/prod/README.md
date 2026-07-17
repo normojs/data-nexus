@@ -40,9 +40,11 @@ cargo build -p data-proxy --bin proxy
 
 ## Related docs
 
-- [`docs/admin-auth-password.md`](../../../docs/admin-auth-password.md) — break-glass vs OIDC
-- [`docs/build-cache.md`](../build-cache.md) — Cargo target on external volume
-- [`examples/admin-auth.snippet.toml`](../admin-auth.snippet.toml) — JWKS snippet
+- [`docs/admin-auth-password.md`](../../../docs/admin-auth-password.md) — break-glass vs OIDC  
+- [`data-ui/docs/oidc-production.md`](../../../data-ui/docs/oidc-production.md) — production SSO runbook (H04)  
+- [`gateway-jwks.example.toml`](gateway-jwks.example.toml) — JWKS admin_auth fragment  
+- [`docs/build-cache.md`](../build-cache.md) — Cargo target on external volume  
+- [`examples/admin-auth.snippet.toml`](../admin-auth.snippet.toml) — JWKS snippet  
 - Smoke matrix: [`../run-smoke-matrix.sh`](../run-smoke-matrix.sh)
 
 ## Checklist before go-live
