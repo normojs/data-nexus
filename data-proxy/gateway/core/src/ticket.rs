@@ -304,6 +304,25 @@ impl TicketStore {
         Ok(ticket.clone())
     }
 
+    /// H03: alias of reject for active/pending unused tickets (explicit revoke wording).
+    pub fn revoke(
+        &self,
+        ticket_id: &str,
+        revoked_by: &str,
+        reason: Option<String>,
+    ) -> Result<Ticket, String> {
+        self.reject(ticket_id, revoked_by, reason)
+    }
+
+    /// Drop expired tickets; returns count removed.
+    pub fn prune_expired(&self) -> usize {
+        let now = now_unix_ms();
+        let mut guard = self.inner.lock().expect("ticket lock");
+        let before = guard.len();
+        guard.retain(|_, t| !t.is_expired(now));
+        before.saturating_sub(guard.len())
+    }
+
     /// Validate and consume one use. Returns Ok(ticket) or Err(reason).
     /// Dual-control tickets must be **active** (approved) before consume succeeds.
     pub fn consume(

@@ -741,6 +741,26 @@ impl AxumServer {
                 "/admin/vault/leases",
                 get(Self::admin_list_vault_leases).post(Self::admin_issue_vault_lease),
             )
+            .route(
+                "/admin/vault/leases/prune",
+                post(Self::admin_prune_vault_leases),
+            )
+            .route(
+                "/admin/vault/leases/:id/revoke",
+                post(Self::admin_revoke_vault_lease),
+            )
+            .route(
+                "/admin/vault/leases/:id/renew",
+                post(Self::admin_renew_vault_lease),
+            )
+            .route(
+                "/admin/tickets/:id/revoke",
+                post(Self::admin_revoke_ticket),
+            )
+            .route(
+                "/admin/tickets/prune",
+                post(Self::admin_prune_tickets),
+            )
             .route("/admin/portal/query", post(Self::admin_portal_query))
             .route("/admin/pools", get(Self::admin_pools))
             .route("/admin/pools/refresh", post(Self::admin_refresh_pools))
@@ -1450,6 +1470,165 @@ impl AxumServer {
             ..gateway_core::AuditEvent::default()
         });
         json_response(&lease)
+    }
+
+    async fn admin_revoke_vault_lease(
+        State(state): State<Self>,
+        headers: HeaderMap,
+        Path(id): Path<String>,
+        body: Option<Json<gateway_core::RevokeVaultLeaseRequest>>,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(
+            &headers,
+            "POST",
+            &format!("/admin/vault/leases/{id}/revoke"),
+        ) {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        let mut req = body.map(|Json(b)| b).unwrap_or_default();
+        if req.revoked_by.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if let Some(ctx) = auth_ctx.as_ref() {
+                req.revoked_by = Some(ctx.subject.clone());
+            }
+        }
+        match gateway_core::global_vault_store()
+            .revoke(&id, req.revoked_by.as_deref())
+        {
+            Ok(lease) => {
+                audit_admin_write(
+                    auth_ctx.as_ref(),
+                    "POST",
+                    "/admin/vault/leases/:id/revoke",
+                    "revoked",
+                    Some(id.as_str()),
+                );
+                gateway_core::try_audit(gateway_core::AuditEvent {
+                    action: Some(AuditAction::AdminWrite.as_str().into()),
+                    decision: Some(AuditDecision::Allow.as_str().into()),
+                    subject_id: req.revoked_by.clone(),
+                    outcome: Some("vault_lease_revoked".into()),
+                    message: Some(format!("revoked {id}")),
+                    audit_level: Some("L0".into()),
+                    ..gateway_core::AuditEvent::default()
+                });
+                json_response(&lease)
+            }
+            Err(msg) => admin_json_error(StatusCode::BAD_REQUEST, "vault_revoke_failed", msg),
+        }
+    }
+
+    async fn admin_renew_vault_lease(
+        State(state): State<Self>,
+        headers: HeaderMap,
+        Path(id): Path<String>,
+        body: Option<Json<gateway_core::RenewVaultLeaseRequest>>,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(
+            &headers,
+            "POST",
+            &format!("/admin/vault/leases/{id}/renew"),
+        ) {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        let req = body.map(|Json(b)| b).unwrap_or_default();
+        match gateway_core::global_vault_store().renew(&id, req.ttl_secs) {
+            Ok(lease) => {
+                audit_admin_write(
+                    auth_ctx.as_ref(),
+                    "POST",
+                    "/admin/vault/leases/:id/renew",
+                    "renewed",
+                    Some(id.as_str()),
+                );
+                json_response(&lease)
+            }
+            Err(msg) => admin_json_error(StatusCode::BAD_REQUEST, "vault_renew_failed", msg),
+        }
+    }
+
+    async fn admin_prune_vault_leases(
+        State(state): State<Self>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(&headers, "POST", "/admin/vault/leases/prune") {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        let removed = gateway_core::global_vault_store().prune_expired();
+        audit_admin_write(
+            auth_ctx.as_ref(),
+            "POST",
+            "/admin/vault/leases/prune",
+            "ok",
+            None,
+        );
+        json_response(&serde_json::json!({ "removed": removed }))
+    }
+
+    async fn admin_revoke_ticket(
+        State(state): State<Self>,
+        headers: HeaderMap,
+        Path(id): Path<String>,
+        body: Option<Json<gateway_core::RejectTicketRequest>>,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(
+            &headers,
+            "POST",
+            &format!("/admin/tickets/{id}/revoke"),
+        ) {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        let mut req = body.map(|Json(b)| b).unwrap_or_default();
+        if req.rejected_by.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if let Some(ctx) = auth_ctx.as_ref() {
+                req.rejected_by = Some(ctx.subject.clone());
+            }
+        }
+        let rejector = match req.rejected_by.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => s.to_owned(),
+            None => {
+                return admin_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_revoke_request",
+                    "rejected_by is required (or authenticate so subject is inferred)",
+                );
+            }
+        };
+        match gateway_core::global_ticket_store().revoke(&id, &rejector, req.reason) {
+            Ok(ticket) => {
+                audit_admin_write(
+                    auth_ctx.as_ref(),
+                    "POST",
+                    "/admin/tickets/:id/revoke",
+                    "revoked",
+                    Some(id.as_str()),
+                );
+                json_response(&ticket)
+            }
+            Err(msg) => admin_json_error(StatusCode::BAD_REQUEST, "ticket_revoke_failed", msg),
+        }
+    }
+
+    async fn admin_prune_tickets(
+        State(state): State<Self>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        let auth_ctx = match state.authorize(&headers, "POST", "/admin/tickets/prune") {
+            Ok(ctx) => ctx,
+            Err(response) => return response,
+        };
+        let removed = gateway_core::global_ticket_store().prune_expired();
+        audit_admin_write(
+            auth_ctx.as_ref(),
+            "POST",
+            "/admin/tickets/prune",
+            "ok",
+            None,
+        );
+        json_response(&serde_json::json!({ "removed": removed }))
     }
 
     async fn admin_portal_query(

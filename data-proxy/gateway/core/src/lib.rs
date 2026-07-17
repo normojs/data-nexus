@@ -74,7 +74,8 @@ pub use ticket::{
     TicketStatus, TicketStore,
 };
 pub use vault::{
-    global_vault_store, IssueVaultLeaseRequest, ProjectEnv, VaultLease, VaultStore,
+    global_vault_store, IssueVaultLeaseRequest, ProjectEnv, RenewVaultLeaseRequest,
+    RevokeVaultLeaseRequest, VaultLease, VaultStore,
 };
 pub use dialect::{default_dialect_parser, DialectParser, HeuristicDialectParser};
 pub use error::{GatewayError, GatewayResult};

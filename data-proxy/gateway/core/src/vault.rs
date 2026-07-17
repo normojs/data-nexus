@@ -2,6 +2,9 @@
 //!
 //! Vault leases hide production endpoint passwords from the browser. The portal
 //! SQL path never returns endpoint secrets; it executes through the PEP.
+//!
+//! H03: revoke / renew / prune. Backend passwords stay process-memory only and
+//! are never serialized on public lease JSON.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,6 +46,13 @@ pub struct VaultLease {
     pub expires_at_unix_ms: u64,
     /// Opaque token for portal SQL; never includes backend password.
     pub access_token: String,
+    /// H03: true after explicit revoke (invalid even before expiry).
+    #[serde(default)]
+    pub revoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +65,21 @@ pub struct IssueVaultLeaseRequest {
     pub issued_by: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RenewVaultLeaseRequest {
+    /// Extend TTL from *now* by this many seconds (default 900).
+    #[serde(default = "default_ttl")]
+    pub ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RevokeVaultLeaseRequest {
+    #[serde(default)]
+    pub revoked_by: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 fn default_ttl() -> u64 {
     900
 }
@@ -62,8 +87,7 @@ fn default_ttl() -> u64 {
 #[derive(Debug)]
 struct LeaseRecord {
     lease: VaultLease,
-    /// Backend password kept only server-side for optional future use.
-    #[allow(dead_code)]
+    /// Backend password kept only server-side; never in VaultLease JSON.
     backend_password: String,
     backend_username: String,
 }
@@ -142,6 +166,9 @@ impl VaultStore {
             issued_at_unix_ms: now,
             expires_at_unix_ms: now.saturating_add(req.ttl_secs.saturating_mul(1000)),
             access_token: token,
+            revoked: false,
+            revoked_at_unix_ms: None,
+            revoked_by: None,
         };
         self.leases.lock().expect("leases").insert(
             id,
@@ -151,8 +178,11 @@ impl VaultStore {
                 backend_username: username.to_owned(),
             },
         );
-        // Public response must not include backend password — already doesn't.
         lease
+    }
+
+    fn is_active(lease: &VaultLease, now: u64) -> bool {
+        !lease.revoked && lease.expires_at_unix_ms >= now
     }
 
     pub fn get_valid_lease_by_token(&self, token: &str) -> Option<VaultLease> {
@@ -160,7 +190,7 @@ impl VaultStore {
         let guard = self.leases.lock().ok()?;
         guard
             .values()
-            .find(|r| r.lease.access_token == token && r.lease.expires_at_unix_ms >= now)
+            .find(|r| r.lease.access_token == token && Self::is_active(&r.lease, now))
             .map(|r| r.lease.clone())
     }
 
@@ -168,18 +198,30 @@ impl VaultStore {
         let now = now_ms();
         let guard = self.leases.lock().ok()?;
         let rec = guard.get(lease_id)?;
-        if rec.lease.expires_at_unix_ms < now {
+        if !Self::is_active(&rec.lease, now) {
             return None;
         }
         Some(rec.lease.clone())
     }
 
+    pub fn get_lease(&self, lease_id: &str) -> Option<VaultLease> {
+        self.leases
+            .lock()
+            .ok()?
+            .get(lease_id)
+            .map(|r| r.lease.clone())
+    }
+
     pub fn list_leases(&self, limit: usize) -> Vec<VaultLease> {
+        self.list_leases_filtered(limit, false)
+    }
+
+    pub fn list_leases_filtered(&self, limit: usize, include_inactive: bool) -> Vec<VaultLease> {
         let now = now_ms();
         let guard = self.leases.lock().expect("leases");
         let mut v: Vec<_> = guard
             .values()
-            .filter(|r| r.lease.expires_at_unix_ms >= now)
+            .filter(|r| include_inactive || Self::is_active(&r.lease, now))
             .map(|r| r.lease.clone())
             .collect();
         v.sort_by(|a, b| b.issued_at_unix_ms.cmp(&a.issued_at_unix_ms));
@@ -187,11 +229,52 @@ impl VaultStore {
         v
     }
 
+    pub fn revoke(&self, lease_id: &str, revoked_by: Option<&str>) -> Result<VaultLease, String> {
+        let now = now_ms();
+        let mut guard = self.leases.lock().expect("leases");
+        let rec = guard
+            .get_mut(lease_id)
+            .ok_or_else(|| format!("lease '{lease_id}' not found"))?;
+        if rec.lease.revoked {
+            return Err(format!("lease '{lease_id}' already revoked"));
+        }
+        rec.lease.revoked = true;
+        rec.lease.revoked_at_unix_ms = Some(now);
+        rec.lease.revoked_by = revoked_by.map(|s| s.to_owned());
+        rec.lease.access_token = format!("revoked-{}", rec.lease.lease_id);
+        rec.lease.expires_at_unix_ms = now;
+        rec.backend_password.clear();
+        Ok(rec.lease.clone())
+    }
+
+    pub fn renew(&self, lease_id: &str, ttl_secs: u64) -> Result<VaultLease, String> {
+        let now = now_ms();
+        let mut guard = self.leases.lock().expect("leases");
+        let rec = guard
+            .get_mut(lease_id)
+            .ok_or_else(|| format!("lease '{lease_id}' not found"))?;
+        if rec.lease.revoked {
+            return Err(format!("lease '{lease_id}' is revoked"));
+        }
+        let ttl = ttl_secs.max(1);
+        rec.lease.expires_at_unix_ms = now.saturating_add(ttl.saturating_mul(1000));
+        rec.lease.access_token = format!("pvt-{}", simple_nonce(now ^ ttl));
+        Ok(rec.lease.clone())
+    }
+
+    pub fn prune_expired(&self) -> usize {
+        let now = now_ms();
+        let mut guard = self.leases.lock().expect("leases");
+        let before = guard.len();
+        guard.retain(|_, r| Self::is_active(&r.lease, now));
+        before.saturating_sub(guard.len())
+    }
+
     pub fn backend_identity(&self, lease_id: &str) -> Option<(String, String)> {
         let now = now_ms();
         let guard = self.leases.lock().ok()?;
         let rec = guard.get(lease_id)?;
-        if rec.lease.expires_at_unix_ms < now {
+        if !Self::is_active(&rec.lease, now) {
             return None;
         }
         Some((rec.backend_username.clone(), rec.backend_password.clone()))
@@ -219,20 +302,12 @@ fn simple_nonce(seed: u64) -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn lease_hides_password_and_expires() {
-        let store = VaultStore::new();
-        store.set_projects(vec![ProjectEnv {
-            name: "demo".into(),
-            environment: "dev".into(),
-            service: "orders".into(),
-            description: String::new(),
-        }]);
-        let lease = store.issue_lease(
+    fn issue(store: &VaultStore) -> VaultLease {
+        store.issue_lease(
             IssueVaultLeaseRequest {
                 project: "demo".into(),
                 environment: "dev".into(),
-                ttl_secs: 60,
+                ttl_secs: 600,
                 issued_by: None,
             },
             "orders",
@@ -242,10 +317,57 @@ mod tests {
             Some("orders".into()),
             "root",
             "secret-pass",
-        );
+        )
+    }
+
+    #[test]
+    fn lease_hides_password_and_expires() {
+        let store = VaultStore::new();
+        let lease = issue(&store);
         let json = serde_json::to_string(&lease).unwrap();
         assert!(!json.contains("secret-pass"));
         assert!(store.get_valid_lease(&lease.lease_id).is_some());
         assert!(store.get_valid_lease_by_token(&lease.access_token).is_some());
+    }
+
+    #[test]
+    fn revoke_invalidates_token_and_wipes_backend_secret() {
+        let store = VaultStore::new();
+        let lease = issue(&store);
+        let token = lease.access_token.clone();
+        assert!(store.backend_identity(&lease.lease_id).is_some());
+        let revoked = store.revoke(&lease.lease_id, Some("admin")).unwrap();
+        assert!(revoked.revoked);
+        assert!(store.get_valid_lease(&lease.lease_id).is_none());
+        assert!(store.get_valid_lease_by_token(&token).is_none());
+        assert!(store.backend_identity(&lease.lease_id).is_none());
+        assert!(store.revoke(&lease.lease_id, None).is_err());
+    }
+
+    #[test]
+    fn renew_extends_and_rotates_token() {
+        let store = VaultStore::new();
+        let lease = issue(&store);
+        let old_token = lease.access_token.clone();
+        let renewed = store.renew(&lease.lease_id, 1200).unwrap();
+        assert_ne!(renewed.access_token, old_token);
+        assert!(store.get_valid_lease_by_token(&old_token).is_none());
+        assert!(store
+            .get_valid_lease_by_token(&renewed.access_token)
+            .is_some());
+        store.revoke(&lease.lease_id, None).unwrap();
+        assert!(store.renew(&lease.lease_id, 60).is_err());
+    }
+
+    #[test]
+    fn prune_removes_revoked() {
+        let store = VaultStore::new();
+        let a = issue(&store);
+        let b = issue(&store);
+        store.revoke(&a.lease_id, None).unwrap();
+        let n = store.prune_expired();
+        assert!(n >= 1);
+        assert!(store.get_lease(&a.lease_id).is_none());
+        assert!(store.get_valid_lease(&b.lease_id).is_some());
     }
 }

@@ -62,6 +62,7 @@ security_core_smokes=(
   smoke-security-audit.sh
   smoke-security-ticket.sh
   smoke-security-portal.sh
+  smoke-security-vault.sh
 )
 
 security_extended_smokes=(

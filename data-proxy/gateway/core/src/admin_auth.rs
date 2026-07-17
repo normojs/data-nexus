@@ -391,6 +391,22 @@ pub fn required_permission(method: &str, path: &str) -> Option<AdminPermission> 
         ("GET", "/admin/projects") => Some(AdminPermission::TopologyRead),
         ("GET", "/admin/vault/leases") => Some(AdminPermission::RuntimeRead),
         ("POST", "/admin/vault/leases") => Some(AdminPermission::PolicyWrite),
+        ("POST", p)
+            if p.starts_with("/admin/vault/leases/")
+                && (p.ends_with("/revoke") || p.ends_with("/renew")) =>
+        {
+            Some(AdminPermission::PolicyWrite)
+        }
+        ("DELETE", p) if p.starts_with("/admin/vault/leases/") => {
+            Some(AdminPermission::PolicyWrite)
+        }
+        ("POST", "/admin/vault/leases/prune") => Some(AdminPermission::PolicyWrite),
+        ("POST", p)
+            if p.starts_with("/admin/tickets/") && p.ends_with("/revoke") =>
+        {
+            Some(AdminPermission::PolicyWrite)
+        }
+        ("POST", "/admin/tickets/prune") => Some(AdminPermission::PolicyWrite),
         ("POST", "/admin/portal/query") => Some(AdminPermission::RuntimeRead),
         ("GET", "/admin/pools") => Some(AdminPermission::RuntimeRead),
         ("GET", "/admin/sessions") => Some(AdminPermission::RuntimeRead),
