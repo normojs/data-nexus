@@ -129,6 +129,7 @@ examples/        smoke + gateway config 样例
 | A06 | 事务内 Streaming 还 lease（部分） | feat(a06) |
 | H06 | origin 同步完成 | 223f2c0 |
 | A10 | prepare param defs + PG ParameterDescription（部分） | feat(a10) |
+| A08 | PG wire 无 ResultSet 物化透传（部分） | feat(a08) |
 
 ---
 
@@ -145,7 +146,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
-| **A08** | PostgreSQL wire 透传 | 同协议无义务时 `GatewayResponse::Wire` | 非 TCP 帧中继 | **部分** |
+| **A08** | PostgreSQL wire 透传 | 同协议无义务时 `simple_query_raw`→Wire（无 ResultSet 物化） | 仍非 backend TCP 帧中继；Wire 包仍汇总后写出 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
 | **A10** | 预处理 / 事务透传矩阵 | 注册表 + 参数绑定 + MySQL param defs + PG ParameterDescription | binary 结果集仍 text；Describe 无真列类型 OID | **部分** |
 
@@ -194,7 +195,7 @@ examples/        smoke + gateway config 样例
 |------|------|
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
-| PG passthrough | A08：前端 wire 消息包（Wire），**非** backend TCP 帧中继 |
+| PG passthrough | A08：`simple_query_raw` 边解码边编码 Wire（无逻辑 ResultSet）；**非** backend TCP 帧中继；包仍可汇总 |
 | 预处理语句 | A10：MySQL param ColumnDefinition + `?` 绑定；PG ParameterDescription + text Bind；**binary resultset / 真列 OID 未做** |
 | 多副本 | 票据/金库/SQLite 索引/LocalPdp **非**共享状态 |
 | L2 样本合规 | **未实现**（B08） |
@@ -204,22 +205,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A08 PG TCP 帧透传 或 A10 binary resultset 或 F32 审计裁剪 <<<**
+**>>> A10 binary resultset 或 F32 审计裁剪 或 A08 TCP 真中继 <<<**
 
-本轮（A10 Describe/param defs）：
+本轮（A08 续）：
 
-- MySQL：`parameter_count>0` 时 COM_STMT_PREPARE 附带 param ColumnDefinition + EOF
-- PG：Describe → `ParameterDescription`（`$n` 计数，OID=0）+ `NoData`（无行元数据）
+- PG Passthrough：`stream_simple_query_to_pg_wire` 经 `simple_query_raw` 直接编码 Wire
+- 不再先 `Materialized ResultSet` 再 `logical_response_to_pg_wire`
+- 事务路径同样还 lease
 
 ```bash
-cargo test -p runtime_gateway --lib a10_
+cargo test -p runtime_gateway --lib backend::postgresql
+# smoke：security-extended（passthrough）
 ```
 
 建议下一刀：
 
-1. **A08 续** — PG TCP 帧级透传  
-2. **A10 续** — binary resultset / 真列 OID  
-3. **F32** — 审计 L0/L1 载荷裁剪
+1. **F32** — 审计 L0/L1 载荷裁剪  
+2. **A10 续** — binary resultset  
+3. **A08 续** — 真 TCP 帧中继（需 raw socket，大刀）
 
 ---
 

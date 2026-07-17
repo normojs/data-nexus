@@ -19,7 +19,7 @@ description: >
 
 ## Decision tree
 
-1. **同协议 + 无结果义务** → Wire / Passthrough（MySQL wire；PG 消息级 Wire，非 TCP 帧中继）
+1. **同协议 + 无结果义务** → Wire / Passthrough（MySQL 原包透传；PG `simple_query_raw`→Wire，非 TCP 帧中继）
 2. **有 mask/水印/max_rows** → `Streaming` + `execute_outcome` / `write_streaming_query_with_obligations`；禁止仅 `apply_obligations_to_response` 全量
 3. **事务内 Streaming** → producer 结束后必须写回 `txn_lease`（见 MySQL/PG backend）
 4. **跨协议** → Streaming 窗口 encode + 类型映射

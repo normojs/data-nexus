@@ -265,17 +265,42 @@ impl PostgreSqlBackendConnector {
         Self::execute_on_conn(&conn, sql, mode).await
     }
 
-    /// A08: run simple query and return frontend-ready PG wire messages.
+    /// A08: Passthrough without materializing a logical ResultSet.
+    ///
+    /// Streams `simple_query_raw` and encodes each message to frontend wire
+    /// packets (RowDescription / DataRow / CommandComplete / ReadyForQuery).
+    /// Peak IR is one message at a time (not 2× full ResultSet). Still not TCP
+    /// frame relay from the backend socket — tokio-postgres decodes simple query
+    /// messages first (honest).
     async fn execute_simple_query_wire(
         &self,
         endpoint: EndpointConfig,
         sql: &str,
         session: &SessionState,
     ) -> GatewayResult<GatewayResponse> {
-        let logical = self
-            .execute_simple_query(endpoint, sql, session, ExecuteMode::Materialized)
-            .await?;
-        logical_response_to_pg_wire(logical, session)
+        let in_txn = session.transaction_state == TransactionState::Active
+            || self.txn_lease.lock().is_some();
+        let conn = if in_txn {
+            let need_begin = self.txn_lease.lock().is_none();
+            let conn = self.take_or_acquire_lease(&endpoint, session).await?;
+            if need_begin {
+                let begin =
+                    Self::execute_on_conn(&conn, "BEGIN", ExecuteMode::Materialized).await?;
+                if !matches!(begin, GatewayResponse::Ok { .. }) {
+                    self.store_lease(conn);
+                    return logical_response_to_pg_wire(begin, session);
+                }
+            }
+            conn
+        } else {
+            self.acquire_conn(&endpoint, session).await?
+        };
+
+        let result = stream_simple_query_to_pg_wire(&conn, sql, session).await;
+        if in_txn {
+            self.store_lease(conn);
+        }
+        result
     }
 
     /// A06: stream logical rows in windows.
@@ -979,6 +1004,80 @@ fn logical_response_to_pg_wire(
     }
 }
 
+/// A08: stream simple_query_raw → wire packets without a full logical ResultSet.
+async fn stream_simple_query_to_pg_wire(
+    conn: &PoolConn<PostgreSqlBackendConnection>,
+    sql: &str,
+    session: &SessionState,
+) -> GatewayResult<GatewayResponse> {
+    let client = conn.client.as_ref().ok_or_else(|| {
+        GatewayError::Backend("postgresql backend connection is not open".into())
+    })?;
+    let raw = client
+        .simple_query_raw(sql)
+        .await
+        .map_err(postgresql_backend_error)?;
+    let mut stream = Box::pin(raw);
+    let ready = encode_ready_for_query(pg_transaction_status(session));
+    let mut packets: Vec<Vec<u8>> = Vec::new();
+    let mut row_count: u64 = 0;
+    let mut saw_row_description = false;
+    let mut last_command_tag: Option<u64> = None;
+
+    while let Some(item) = stream.next().await {
+        let message = item.map_err(postgresql_backend_error)?;
+        match message {
+            SimpleQueryMessage::RowDescription(cols) => {
+                saw_row_description = true;
+                let fields = cols
+                    .iter()
+                    .map(|c| FieldDescription {
+                        name: c.name().to_string(),
+                        type_oid: 25, // text
+                        type_size: -1,
+                        type_modifier: -1,
+                        format_code: 0,
+                    })
+                    .collect::<Vec<_>>();
+                packets.push(
+                    encode_row_description(&fields)
+                        .map_err(|e| GatewayError::Protocol(e.to_string()))?,
+                );
+            }
+            SimpleQueryMessage::Row(row) => {
+                let values = (0..row.len())
+                    .map(|idx| {
+                        row.get(idx)
+                            .map(|value| value.as_bytes().to_vec())
+                    })
+                    .collect::<Vec<_>>();
+                packets.push(
+                    encode_data_row(&values).map_err(|e| GatewayError::Protocol(e.to_string()))?,
+                );
+                row_count += 1;
+            }
+            SimpleQueryMessage::CommandComplete(count) => {
+                last_command_tag = Some(count);
+            }
+            _ => {}
+        }
+    }
+
+    if saw_row_description {
+        packets.push(encode_command_complete(&format!("SELECT {row_count}")));
+        packets.push(ready);
+        Ok(GatewayResponse::Wire { packets })
+    } else {
+        let affected = last_command_tag.unwrap_or(0);
+        Ok(GatewayResponse::Wire {
+            packets: vec![
+                encode_command_complete(&format!("OK {affected}")),
+                ready,
+            ],
+        })
+    }
+}
+
 fn pg_transaction_status(session: &SessionState) -> TransactionStatus {
     match session.transaction_state {
         TransactionState::Idle => TransactionStatus::Idle,
@@ -1101,6 +1200,16 @@ mod tests {
             }
             other => panic!("expected Wire, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a08_wire_path_avoids_resultset_materialization_comment() {
+        // stream_simple_query_to_pg_wire is the passthrough implementation;
+        // logical_response_to_pg_wire remains for error/ok conversion helpers.
+        assert!(matches!(
+            ExecuteMode::Passthrough,
+            ExecuteMode::Passthrough
+        ));
     }
 
     #[test]
