@@ -101,6 +101,64 @@ export type AdminVaultLease = {
   issued_at_unix_ms: number
   expires_at_unix_ms: number
   access_token: string
+  revoked?: boolean
+  revoked_at_unix_ms?: number | null
+  revoked_by?: string | null
+}
+
+export type AdminTicketStatus = 'pending' | 'active' | 'rejected'
+
+export type AdminTicket = {
+  id: string
+  ticket_type: string
+  subject_id: string
+  sql_fingerprint: string
+  sql_sample?: string | null
+  issued_at_unix_ms: number
+  expires_at_unix_ms: number
+  max_uses: number
+  uses: number
+  issued_by?: string | null
+  note?: string | null
+  dual_control?: boolean
+  status: AdminTicketStatus
+  approved_by?: string | null
+  approved_at_unix_ms?: number | null
+  rejected_by?: string | null
+  reject_reason?: string | null
+}
+
+export type AdminIssueTicketRequest = {
+  subject_id: string
+  sql: string
+  ticket_type?: string
+  ttl_secs?: number
+  max_uses?: number
+  note?: string
+  dual_control?: boolean
+}
+
+export type AdminCedarStatus = {
+  installed?: boolean
+  ready?: boolean
+  epoch?: number
+  source?: string
+  files?: number
+  policy_count?: number
+  loaded_at_unix_ms?: number
+  pdp_backend?: string
+  cache_epoch_reload?: boolean
+  feature?: string
+  message?: string
+}
+
+export type AdminCedarReloadInfo = {
+  epoch: number
+  source: string
+  files: number
+  policy_count: number
+  loaded_at_unix_ms: number
+  swapped: boolean
 }
 
 export type AdminPortalQueryResult = {
@@ -241,6 +299,60 @@ export function useAdminApi() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body,
+      }, base),
+    revokeVaultLease: (id: string, body?: { reason?: string }, base?: string) =>
+      adminFetch<AdminVaultLease>(`/admin/vault/leases/${encodeURIComponent(id)}/revoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body || {},
+      }, base),
+    renewVaultLease: (id: string, body?: { ttl_secs?: number }, base?: string) =>
+      adminFetch<AdminVaultLease>(`/admin/vault/leases/${encodeURIComponent(id)}/renew`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body || {},
+      }, base),
+    pruneVaultLeases: (base?: string) =>
+      adminFetch<{ removed: number }>('/admin/vault/leases/prune', {
+        method: 'POST',
+      }, base),
+    // UI01: tickets
+    tickets: (limit = 50, base?: string) =>
+      getJson<{ tickets: AdminTicket[] }>(`/admin/tickets?limit=${limit}`, base)
+        .then(r => r.tickets || []),
+    issueTicket: (body: AdminIssueTicketRequest, base?: string) =>
+      adminFetch<AdminTicket>('/admin/tickets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      }, base),
+    approveTicket: (id: string, body?: { note?: string }, base?: string) =>
+      adminFetch<AdminTicket>(`/admin/tickets/${encodeURIComponent(id)}/approve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body || {},
+      }, base),
+    rejectTicket: (id: string, body?: { reason?: string }, base?: string) =>
+      adminFetch<AdminTicket>(`/admin/tickets/${encodeURIComponent(id)}/reject`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body || {},
+      }, base),
+    revokeTicket: (id: string, body?: { reason?: string }, base?: string) =>
+      adminFetch<AdminTicket>(`/admin/tickets/${encodeURIComponent(id)}/revoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body || {},
+      }, base),
+    pruneTickets: (base?: string) =>
+      adminFetch<{ removed?: number, pruned?: number }>('/admin/tickets/prune', {
+        method: 'POST',
+      }, base),
+    // UI02: Cedar PDP status + reload
+    cedarStatus: (base?: string) => getJson<AdminCedarStatus>('/admin/security/cedar', base),
+    cedarReload: (base?: string) =>
+      adminFetch<AdminCedarReloadInfo>('/admin/security/cedar/reload', {
+        method: 'POST',
       }, base),
     portalQuery: (body: {
       service: string

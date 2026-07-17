@@ -97,7 +97,9 @@ examples/        smoke + gateway config 样例
 | B07 | Deny 高优审计队列 | `26ce55c` |
 | B06 | 审计 SQLite 检索索引 | `bc88b36` |
 | F28 | Local 规则热更新 | `b642c29` |
-| A05 | 透传路径观测补齐 | 本提交 |
+| A05 | 透传路径观测补齐 | `25bc948` |
+| UI01 | 票据/金库管理页 | 本提交 |
+| UI02 | Cedar 状态页 | 本提交 |
 | F26b | Cedar 热更新 | `82974f9` |
 | chore | target 外置缓存 | `2700698` |
 
@@ -140,8 +142,8 @@ examples/        smoke + gateway config 样例
 |----|----|------|-----------|:----:|
 | **B05b** | portal 真流式 NDJSON | 边读边写 HTTP chunk，避免大结果全量进内存 | portal_execute | **完成** |
 | **A05** | 透传路径观测补齐 | passthrough 命中率/字节 metrics；与 B03 属性对齐 | otel/prometheus | **完成** |
-| **UI01** | 票据/金库管理页 | data-ui 发票、双人审批、列表（现多靠 API） | F18、tickets API | 待做 |
-| **UI02** | Cedar 状态页 | 展示 epoch/files/reload 按钮 | F26b API | 延后 |
+| **UI01** | 票据/金库管理页 | data-ui 发票、双人审批、列表（现多靠 API） | F18、tickets API | **完成** |
+| **UI02** | Cedar 状态页 | 展示 epoch/files/reload 按钮 | F26b API | **完成** |
 
 ### P3-E — 边界扩展（明确后置）
 
@@ -155,20 +157,20 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> UI01 票据/金库管理页 / 或 UI02 Cedar 状态页 <<<**
+**>>> P3 余项：F29 / F30 / F31 / B08 / P03（均为延后）或生产联调 <<<**
 
-A05 已交付：Prometheus `gateway_execute_path_total{execute_path}` + `gateway_passthrough_bytes_total`；OTel `data_nexus.gateway.execute_path` / `passthrough_bytes`；与 B03 `execute_path` 属性对齐。
+UI01/UI02 已交付：data-ui `/tickets`（发票、双人审批、拒绝/吊销、prune）、`/vault`（签发/续期/吊销/prune）、`/cedar`（epoch/files/reload）。导航已挂到 admin layout。
 
 ```bash
-cargo test -p runtime_gateway --lib server::metrics
-cargo test -p runtime_gateway --lib otel_metrics
+cd data-ui && pnpm dev
+# open http://127.0.0.1:3000/tickets  /vault  /cedar
 ```
 
-建议下一任务（P3-D）：
+建议下一任务：
 
-1. **UI01** — 票据/金库管理页  
-2. **UI02** — Cedar 状态页（延后）  
-3. **F29** — Cedar 实体属性（延后）
+1. 生产联调 / smoke 矩阵全量  
+2. **F29** Cedar 实体属性（延后）  
+3. **B08** L2 样本（延后）
 
 ---
 
