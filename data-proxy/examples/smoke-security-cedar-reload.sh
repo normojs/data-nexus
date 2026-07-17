@@ -13,6 +13,7 @@ else
   export PATH="/usr/local/bin:/opt/homebrew/bin:${HOME}/.cargo/bin:${PATH:-}"
 fi
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/fushilu/.caches/data-nexus/cargo-target}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.1}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE_FILE="$ROOT/examples/docker-compose.dev.yml"

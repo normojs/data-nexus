@@ -3,11 +3,12 @@
 # Requires: docker, cargo
 set -euo pipefail
 
-export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${HOME}/.cargo/bin:/Volumes/fushilu/.rustup/toolchains/nightly-2025-01-07-aarch64-apple-darwin/bin:${PATH:-}"
+export PATH="/Volumes/fushilu/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${HOME}/.cargo/bin:/Volumes/fushilu/.rustup/toolchains/nightly-2025-01-07-aarch64-apple-darwin/bin:${PATH:-}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 # Prefer local disk when external target volume is full.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/fushilu/.caches/data-nexus/cargo-target}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.1}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE_FILE="$ROOT/examples/docker-compose.dev.yml"
@@ -34,6 +35,9 @@ need docker
 need cargo
 need curl
 
+pkill -f '/debug/proxy' 2>/dev/null || true
+sleep 1
+
 echo "==> starting backend containers"
 "${COMPOSE[@]}" up -d
 
@@ -51,15 +55,16 @@ echo "==> seed employees table on backend (bypass gateway)"
 "${COMPOSE[@]}" exec -T mysql-primary mysql -uroot -proot -e "
 CREATE DATABASE IF NOT EXISTS orders;
 USE orders;
-CREATE TABLE IF NOT EXISTS employees (
+-- Recreate so schema matches column ACL smoke (ssn may be missing on older volumes).
+DROP TABLE IF EXISTS employees;
+CREATE TABLE employees (
   id INT PRIMARY KEY,
   name VARCHAR(64) NOT NULL,
   salary INT NOT NULL,
   ssn VARCHAR(32) NOT NULL
 );
 INSERT INTO employees (id, name, salary, ssn) VALUES
-  (1, 'alice', 90000, '111-22-3333')
-ON DUPLICATE KEY UPDATE name=VALUES(name), salary=VALUES(salary), ssn=VALUES(ssn);
+  (1, 'alice', 90000, '111-22-3333');
 "
 
 echo "==> building and starting gateway (security column ACL)"

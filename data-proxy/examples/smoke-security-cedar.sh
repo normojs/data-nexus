@@ -9,11 +9,12 @@ export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 if [[ -x /Volumes/fushilu/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin/cargo ]]; then
   export PATH="/Volumes/fushilu/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:${HOME}/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${PATH:-}"
 elif [[ -x "$HOME/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin/cargo" ]]; then
-  export PATH="$HOME/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:${HOME}/.cargo/bin:/usr/local/bin:${PATH:-}"
+  export PATH="/Volumes/fushilu/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:$HOME/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:${HOME}/.cargo/bin:/usr/local/bin:${PATH:-}"
 else
-  export PATH="/usr/local/bin:/opt/homebrew/bin:${HOME}/.cargo/bin:/Volumes/fushilu/.rustup/toolchains/nightly-2025-01-07-aarch64-apple-darwin/bin:${PATH:-}"
+  export PATH="/Volumes/fushilu/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:/usr/local/bin:/opt/homebrew/bin:${HOME}/.cargo/bin:/Volumes/fushilu/.rustup/toolchains/nightly-2025-01-07-aarch64-apple-darwin/bin:${PATH:-}"
 fi
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/fushilu/.caches/data-nexus/cargo-target}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.1}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE_FILE="$ROOT/examples/docker-compose.dev.yml"

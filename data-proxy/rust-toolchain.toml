@@ -1,10 +1,4 @@
 [toolchain]
-#channel = "nightly-2024-05-01"
-channel = "nightly-2025-01-07"
-
-#channel = "nightly-2025-04-14"
-
-#channel = "nightly-aarch64-apple-darwin"
-#channel = "stable-aarch64-apple-darwin"
-#channel = "nightly-2023-08-21"
-#rustc 1.80.0-nightly (f705de596 2024-04-30)
+# Smoke / Cedar / time crate MSRV need rustc ≥ 1.88.
+# Pin to installed stable 1.94.1 (see todo.md tool chain notes).
+channel = "1.94.1"

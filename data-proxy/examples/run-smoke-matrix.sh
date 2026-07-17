@@ -20,10 +20,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EXAMPLES="$ROOT/examples"
-export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${HOME}/.cargo/bin:/Volumes/fushilu/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:/Volumes/fushilu/.rustup/toolchains/nightly-2025-01-07-aarch64-apple-darwin/bin:${PATH:-}"
+# Prefer rustc 1.94.1 (MSRV for time/cedar); fall back to project toolchain.
+export PATH="/Volumes/fushilu/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${HOME}/.cargo/bin:/Volumes/fushilu/.rustup/toolchains/nightly-2025-01-07-aarch64-apple-darwin/bin:${PATH:-}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/fushilu/.caches/data-nexus/cargo-target}"
 export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
 export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.1}"
 
 KEEP_GOING="${DN_SMOKE_KEEP_GOING:-0}"
 TIMEOUT_SECS="${DN_SMOKE_TIMEOUT_SECS:-900}"
