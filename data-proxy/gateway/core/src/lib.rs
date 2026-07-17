@@ -59,8 +59,10 @@ pub use obligations::{
     Obligations, WatermarkMode, WatermarkSpec,
 };
 pub use pdp::{
-    action_from_command, extract_table_names, sql_from_command, AccessRequest, LocalPdp,
-    SecurityDecision, StatementAction, Subject,
+    action_from_command, extract_table_names, global_local_pdp_store, install_local_pdp,
+    reload_global_local_pdp, security_local_pdp_hot_reloadable_only,
+    security_requires_listener_rebuild, sql_from_command, AccessRequest, LocalPdp,
+    LocalPdpReloadInfo, LocalPdpStore, SecurityDecision, StatementAction, Subject,
 };
 pub use security::{
     SecurityAuditConfig, SecurityColumnTagConfig, SecurityHighRiskRuleConfig,

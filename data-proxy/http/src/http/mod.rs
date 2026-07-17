@@ -570,8 +570,16 @@ const PORTAL_DEFAULT_EXPORT_MAX_ROWS: u64 = 5_000;
 struct GatewayConfigDiff {
     admin_changed: bool,
     version_changed: bool,
-    /// Data-plane security shell / rules changed (S1+ forces listener rebuild).
+    /// Data-plane security section differs (rules, audit, streaming, …).
     security_changed: bool,
+    /// F28: security change is rules/mask/time/audit only — Local PDP hot-swap,
+    /// no listener rebuild.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    security_local_hot_reload: bool,
+    /// F28: security change requires listener rebuild (enabled/subject/pdp/
+    /// streaming window/passthrough).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    security_requires_listener_rebuild: bool,
     listeners: NamedSectionDiff,
     services: NamedSectionDiff,
     endpoints: NamedSectionDiff,
@@ -583,14 +591,21 @@ struct GatewayConfigDiff {
 impl GatewayConfigDiff {
     fn between(current: &GatewayConfigDocument, next: &GatewayConfigDocument) -> Self {
         let security_changed = current.gateway.security != next.gateway.security;
+        let security_requires_listener_rebuild = security_changed
+            && gateway_core::security_requires_listener_rebuild(
+                &current.gateway.security,
+                &next.gateway.security,
+            );
+        let security_local_hot_reload = security_changed && !security_requires_listener_rebuild;
         let mut listeners = diff_named_section(
             &current.gateway.listeners,
             &next.gateway.listeners,
             |item| item.name.as_str(),
         );
-        // Security PDP is bound per connection at listener build time; when rules
-        // change, rebuild all listeners so new PDP snapshot is applied.
-        if security_changed {
+        // Only force-rebuild listeners when security changes cannot be applied
+        // via the process-wide Local PDP snapshot (F28). Rule/mask/time/audit
+        // alone hot-swap without tearing down accept loops.
+        if security_requires_listener_rebuild {
             for listener in &next.gateway.listeners {
                 let name = listener.name.clone();
                 if !listeners.added.contains(&name)
@@ -606,6 +621,8 @@ impl GatewayConfigDiff {
                 != serde_json::to_value(&next.admin).ok(),
             version_changed: current.version != next.version,
             security_changed,
+            security_local_hot_reload,
+            security_requires_listener_rebuild,
             listeners,
             services: diff_named_section(
                 &current.gateway.services,
@@ -2140,6 +2157,15 @@ impl AxumServer {
             }
         }
 
+        // F28: Local rules/mask/time/watermark/audit hot-swap without listener rebuild.
+        // Always refresh the process-wide PDP snapshot when security is enabled so
+        // live connections (holding the same store handle) see the new epoch.
+        maybe_reload_local_pdp(&next_config.gateway.security, &diff);
+        // Audit pipeline reconfigure is idempotent (queue worker stays up).
+        if diff.security_changed {
+            let _ = gateway_core::install_audit_pipeline(&next_config.gateway.security.audit);
+        }
+
         // Cedar policy hot-reload (keep-old on failure): when security.pdp is cedar
         // and cache_epoch_reload is true, re-read policy_dir without restarting listeners.
         maybe_reload_cedar_policies(&next_config.gateway.security);
@@ -2177,6 +2203,27 @@ impl AxumServer {
     }
 }
 
+
+/// F28: swap Local PDP snapshot when security is enabled and changed.
+fn maybe_reload_local_pdp(
+    security: &gateway_core::SecurityPolicyConfig,
+    diff: &GatewayConfigDiff,
+) {
+    if !security.enabled || !diff.security_changed {
+        return;
+    }
+    if let Some(info) = gateway_core::reload_global_local_pdp(security) {
+        tracing::info!(
+            target: AUDIT_TARGET,
+            epoch = info.epoch,
+            rules = info.rule_count,
+            previous_rules = info.previous_rule_count,
+            local_hot = diff.security_local_hot_reload,
+            requires_listener_rebuild = diff.security_requires_listener_rebuild,
+            "local PDP hot-reloaded with admin reload"
+        );
+    }
+}
 
 fn maybe_reload_cedar_policies(security: &gateway_core::SecurityPolicyConfig) {
     #[cfg(feature = "security-cedar")]

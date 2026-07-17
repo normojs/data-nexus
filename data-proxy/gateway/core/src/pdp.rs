@@ -3,6 +3,9 @@
 //! Evaluates `SecurityPolicyConfig.rules` against subject + statement action +
 //! tables, and optionally column ACL against an [`ObjectSet`] provided by the
 //! runtime extractor.
+//!
+//! F28: fields live behind a process-wide `Arc` snapshot. Connections hold a
+//! store handle; admin reload swaps the snapshot without listener rebuild.
 
 use crate::object_set::{ColumnAclOutcome, ObjectSet, StarPolicy};
 use crate::obligations::{inject_row_filter, MaskAlgorithm, MaskSpec, Obligations, WatermarkMode, WatermarkSpec};
@@ -14,6 +17,8 @@ use crate::{
     SecurityHighRiskRuleConfig, SecurityMaskRuleConfig, SecurityPolicyConfig, SecurityRuleConfig,
     SecurityTimeRuleConfig, SecurityWatermarkConfig,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Data-plane identity (not Admin JWT).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,9 +138,9 @@ impl SecurityDecision {
     }
 }
 
-/// Compiled local PDP snapshot (cheap to clone via Arc at runtime).
+/// Immutable Local PDP policy fields (F28 snapshot).
 #[derive(Debug, Clone)]
-pub struct LocalPdp {
+struct LocalPdpInner {
     fail_closed: bool,
     star_policy: StarPolicy,
     rules: Vec<SecurityRuleConfig>,
@@ -153,12 +158,8 @@ pub struct LocalPdp {
     cedar_required: bool,
 }
 
-impl LocalPdp {
-    /// Build PDP when security is enabled; `None` when disabled (fast path).
-    pub fn from_config(config: &SecurityPolicyConfig) -> Option<Self> {
-        if !config.enabled {
-            return None;
-        }
+impl LocalPdpInner {
+    fn from_config(config: &SecurityPolicyConfig) -> Self {
         #[cfg(feature = "security-cedar")]
         let (cedar, cedar_required) = if config.pdp.backend.eq_ignore_ascii_case("cedar") {
             match crate::cedar_pdp::try_load_from_config(&config.pdp.policy_dir) {
@@ -176,7 +177,7 @@ impl LocalPdp {
             (None, false)
         };
 
-        Some(Self {
+        Self {
             fail_closed: config.fail_closed,
             star_policy: StarPolicy::from_config(&config.star_policy),
             rules: config.rules.clone(),
@@ -190,31 +191,208 @@ impl LocalPdp {
             cedar,
             #[cfg(feature = "security-cedar")]
             cedar_required,
-        })
+        }
+    }
+
+    fn from_config_preserving_cedar(config: &SecurityPolicyConfig, previous: &Self) -> Self {
+        #[cfg(feature = "security-cedar")]
+        {
+            let mut next = Self::from_config(config);
+            if next.cedar_required && previous.cedar_required && next.cedar.is_none() {
+                next.cedar = previous.cedar.clone();
+            }
+            next
+        }
+        #[cfg(not(feature = "security-cedar"))]
+        {
+            let _ = previous;
+            Self::from_config(config)
+        }
+    }
+}
+
+/// Process-wide Local PDP store (F28).
+#[derive(Debug)]
+pub struct LocalPdpStore {
+    epoch: AtomicU64,
+    current: RwLock<Arc<LocalPdpInner>>,
+}
+
+impl LocalPdpStore {
+    fn empty_inner() -> LocalPdpInner {
+        LocalPdpInner {
+            fail_closed: true,
+            star_policy: StarPolicy::Deny,
+            rules: Vec::new(),
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
+            default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
+        }
+    }
+
+    fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            current: RwLock::new(Arc::new(Self::empty_inner())),
+        }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    fn load(&self) -> Arc<LocalPdpInner> {
+        self.current.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn swap(&self, inner: LocalPdpInner) -> LocalPdpReloadInfo {
+        let previous_rule_count = self.load().rules.len();
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(inner);
+        LocalPdpReloadInfo {
+            epoch,
+            swapped: true,
+            previous_rule_count,
+            rule_count: self.load().rules.len(),
+        }
+    }
+}
+
+/// Result of a Local PDP hot-reload (F28).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LocalPdpReloadInfo {
+    pub epoch: u64,
+    pub swapped: bool,
+    pub previous_rule_count: usize,
+    pub rule_count: usize,
+}
+
+static GLOBAL_LOCAL_PDP: OnceLock<Arc<LocalPdpStore>> = OnceLock::new();
+
+fn global_store() -> Arc<LocalPdpStore> {
+    GLOBAL_LOCAL_PDP
+        .get_or_init(|| Arc::new(LocalPdpStore::new()))
+        .clone()
+}
+
+/// Process-wide store after first install.
+pub fn global_local_pdp_store() -> Option<Arc<LocalPdpStore>> {
+    GLOBAL_LOCAL_PDP.get().cloned()
+}
+
+/// Install/replace the global Local PDP snapshot.
+pub fn install_local_pdp(config: &SecurityPolicyConfig) -> Option<LocalPdp> {
+    if !config.enabled {
+        return None;
+    }
+    let store = global_store();
+    let _ = store.swap(LocalPdpInner::from_config(config));
+    Some(LocalPdp { store })
+}
+
+/// Hot-swap Local rules/mask/time/watermark (F28).
+pub fn reload_global_local_pdp(config: &SecurityPolicyConfig) -> Option<LocalPdpReloadInfo> {
+    if !config.enabled {
+        return None;
+    }
+    let store = global_store();
+    let previous = store.load();
+    let inner = LocalPdpInner::from_config_preserving_cedar(config, &previous);
+    let info = store.swap(inner);
+    tracing::info!(
+        target: "data_nexus::security",
+        epoch = info.epoch,
+        rules = info.rule_count,
+        previous_rules = info.previous_rule_count,
+        "local PDP snapshot hot-reloaded"
+    );
+    Some(info)
+}
+
+/// Security changes that require listener rebuild (not hot-reloadable).
+pub fn security_requires_listener_rebuild(
+    current: &SecurityPolicyConfig,
+    next: &SecurityPolicyConfig,
+) -> bool {
+    if current == next {
+        return false;
+    }
+    current.enabled != next.enabled
+        || current.subject != next.subject
+        || current.pdp != next.pdp
+        || current.streaming.window_rows != next.streaming.window_rows
+        || current.streaming.passthrough != next.streaming.passthrough
+        || current.streaming.max_bytes != next.streaming.max_bytes
+}
+
+/// True when only Local PDP hot-reloadable fields changed (F28).
+pub fn security_local_pdp_hot_reloadable_only(
+    current: &SecurityPolicyConfig,
+    next: &SecurityPolicyConfig,
+) -> bool {
+    current != next && !security_requires_listener_rebuild(current, next)
+}
+
+/// Handle to the process-wide Local PDP store (cheap clone; F28).
+#[derive(Debug, Clone)]
+pub struct LocalPdp {
+    store: Arc<LocalPdpStore>,
+}
+
+impl LocalPdp {
+    /// Build PDP when security is enabled; `None` when disabled (fast path).
+    pub fn from_config(config: &SecurityPolicyConfig) -> Option<Self> {
+        install_local_pdp(config)
+    }
+
+    /// Private store for unit tests (does not touch the global process store).
+    #[cfg(test)]
+    fn from_inner(inner: LocalPdpInner) -> Self {
+        let store = Arc::new(LocalPdpStore::new());
+        let _ = store.swap(inner);
+        Self { store }
+    }
+
+    #[inline]
+    fn inner(&self) -> Arc<LocalPdpInner> {
+        self.store.load()
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.store.epoch()
     }
 
     pub fn fail_closed(&self) -> bool {
-        self.fail_closed
+        self.inner().fail_closed
     }
 
     pub fn star_policy(&self) -> StarPolicy {
-        self.star_policy
+        self.inner().star_policy
     }
 
-    pub fn rules(&self) -> &[SecurityRuleConfig] {
-        &self.rules
+    pub fn rules(&self) -> Vec<SecurityRuleConfig> {
+        self.inner().rules.clone()
     }
 
     pub fn has_column_rules(&self) -> bool {
-        self.rules.iter().any(|r| !r.columns.is_empty())
+        self.inner().rules.iter().any(|r| !r.columns.is_empty())
     }
 
     pub fn has_mask_config(&self) -> bool {
-        !self.column_tags.is_empty() && !self.mask_rules.is_empty()
+        let i = self.inner();
+        !i.column_tags.is_empty() && !i.mask_rules.is_empty()
     }
 
     pub fn evaluate(&self, request: &AccessRequest<'_>) -> SecurityDecision {
-        for rule in &self.rules {
+        let __p = self.inner();
+        for rule in &__p.rules {
             // Column-only rules are handled in `evaluate_column_acl`.
             if !rule.columns.is_empty() {
                 continue;
@@ -267,6 +445,7 @@ impl LocalPdp {
         dialect: &dyn DialectParser,
         objects: Option<&ObjectSet>,
     ) -> SecurityDecision {
+        let __p = self.inner();
         match command {
             GatewayCommand::Ping | GatewayCommand::Quit | GatewayCommand::CloseStatement { .. } => {
                 SecurityDecision::allow_empty()
@@ -294,7 +473,7 @@ impl LocalPdp {
                 self.evaluate(&request)
             }
             GatewayCommand::Execute { .. } => {
-                if self.fail_closed {
+                if __p.fail_closed {
                     SecurityDecision::Deny {
                         rule: "fail_closed".into(),
                         message:
@@ -307,7 +486,7 @@ impl LocalPdp {
             }
             GatewayCommand::Query { sql } | GatewayCommand::Prepare { sql } => {
                 if let Some(set) = objects {
-                    if set.parse_failed && set.objects.is_empty() && self.fail_closed {
+                    if set.parse_failed && set.objects.is_empty() && __p.fail_closed {
                         return SecurityDecision::Deny {
                             rule: "fail_closed".into(),
                             message:
@@ -321,7 +500,7 @@ impl LocalPdp {
                 let action = match keyword.as_deref() {
                     Some(k) => StatementAction::from_keyword(k),
                     None => {
-                        if self.fail_closed {
+                        if __p.fail_closed {
                             return SecurityDecision::Deny {
                                 rule: "fail_closed".into(),
                                 message:
@@ -411,7 +590,7 @@ impl LocalPdp {
                                     return SecurityDecision::Deny { rule, message };
                                 }
                             }
-                        } else if self.fail_closed {
+                        } else if __p.fail_closed {
                             return SecurityDecision::Deny {
                                 rule: "fail_closed".into(),
                                 message: "security policy deny: column ACL requires parseable SQL (fail_closed)"
@@ -422,7 +601,7 @@ impl LocalPdp {
                 }
 
                 let mut obligations = Obligations::default();
-                if let Some(max) = self.default_max_rows {
+                if let Some(max) = __p.default_max_rows {
                     obligations.max_rows = Some(max);
                 }
 
@@ -435,7 +614,7 @@ impl LocalPdp {
                                 rewritten_sql = Some(next);
                                 obligations.row_filter = Some(filter);
                             }
-                            None if self.fail_closed => {
+                            None if __p.fail_closed => {
                                 return SecurityDecision::Deny {
                                     rule: "row_filter".into(),
                                     message: format!(
@@ -479,8 +658,9 @@ impl LocalPdp {
         objects: Option<&ObjectSet>,
         tables: &[String],
     ) -> Option<String> {
+        let __p = self.inner();
         let mut filters: Vec<String> = Vec::new();
-        for rule in &self.rules {
+        for rule in &__p.rules {
             let Some(filter) = rule.row_filter.as_ref() else {
                 continue;
             };
@@ -537,11 +717,12 @@ impl LocalPdp {
         tables: &[String],
         columns: &[String],
     ) -> Vec<MaskSpec> {
-        if self.column_tags.is_empty() || self.mask_rules.is_empty() {
+        let __p = self.inner();
+        if __p.column_tags.is_empty() || __p.mask_rules.is_empty() {
             return Vec::new();
         }
         let mut out = Vec::new();
-        let mask_by_name: std::collections::BTreeMap<String, &SecurityMaskRuleConfig> = self
+        let mask_by_name: std::collections::BTreeMap<String, &SecurityMaskRuleConfig> = __p
             .mask_rules
             .iter()
             .map(|m| (m.name.to_ascii_lowercase(), m))
@@ -555,7 +736,7 @@ impl LocalPdp {
                 }
                 // Wildcard: still apply tags by configured column names (result meta will match).
                 if obj.has_wildcard {
-                    for tag in &self.column_tags {
+                    for tag in &__p.column_tags {
                         let bare = tag
                             .column
                             .rsplit('.')
@@ -568,7 +749,7 @@ impl LocalPdp {
             }
             if pairs.is_empty() {
                 // No projection columns known — still emit tags for result-meta matching.
-                for tag in &self.column_tags {
+                for tag in &__p.column_tags {
                     let bare = tag
                         .column
                         .rsplit('.')
@@ -593,7 +774,7 @@ impl LocalPdp {
         };
 
         for (table, col) in candidate_columns {
-            for tag in &self.column_tags {
+            for tag in &__p.column_tags {
                 if !tag.subjects.is_empty() {
                     let sid = subject.subject_id.as_str();
                     if !tag.subjects.iter().any(|p| glob_match(p, sid)) {
@@ -638,10 +819,11 @@ impl LocalPdp {
 
 
     fn build_watermark(&self, subject: &Subject, service: &str) -> Option<WatermarkSpec> {
-        if !self.watermark.enabled {
+        let __p = self.inner();
+        if !__p.watermark.enabled {
             return None;
         }
-        let token = if self.watermark.token.trim().is_empty() {
+        let token = if __p.watermark.token.trim().is_empty() {
             // subject|service|millis — demo trace id (not crypto).
             let ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -649,14 +831,14 @@ impl LocalPdp {
                 .unwrap_or(0);
             format!("{}|{}|{:x}", subject.subject_id, service, ms)
         } else {
-            self.watermark.token.clone()
+            __p.watermark.token.clone()
         };
         Some(WatermarkSpec {
-            mode: WatermarkMode::parse(&self.watermark.mode),
-            column: if self.watermark.column.trim().is_empty() {
+            mode: WatermarkMode::parse(&__p.watermark.mode),
+            column: if __p.watermark.column.trim().is_empty() {
                 "_dn_wm".into()
             } else {
-                self.watermark.column.clone()
+                __p.watermark.column.clone()
             },
             token,
         })
@@ -669,12 +851,13 @@ impl LocalPdp {
         action: StatementAction,
         tables: &[String],
     ) -> Option<SecurityDecision> {
+        let __p = self.inner();
         #[cfg(feature = "security-cedar")]
         {
-            if !self.cedar_required {
+            if !__p.cedar_required {
                 return None;
             }
-            let Some(engine) = self.cedar.as_ref() else {
+            let Some(engine) = __p.cedar.as_ref() else {
                 return Some(SecurityDecision::Deny {
                     rule: "cedar".into(),
                     message: "cedar PDP failed to load; deny (fail closed)".into(),
@@ -704,11 +887,12 @@ impl LocalPdp {
         objects: Option<&ObjectSet>,
         tables: &[String],
     ) -> Option<SecurityDecision> {
-        if self.time_rules.is_empty() {
+        let __p = self.inner();
+        if __p.time_rules.is_empty() {
             return None;
         }
         let now = crate::security_now_unix_secs();
-        for tr in &self.time_rules {
+        for tr in &__p.time_rules {
             if !tr.subjects.is_empty() {
                 let sid = subject.subject_id.as_str();
                 if !tr.subjects.iter().any(|p| glob_match(p, sid)) {
@@ -819,7 +1003,8 @@ impl LocalPdp {
         objects: Option<&ObjectSet>,
         tables: &[String],
     ) -> Option<SecurityHighRiskRuleConfig> {
-        for hr in &self.high_risk_rules {
+        let __p = self.inner();
+        for hr in &__p.high_risk_rules {
             if !hr.subjects.is_empty() {
                 let sid = subject.subject_id.as_str();
                 if !hr.subjects.iter().any(|p| glob_match(p, sid)) {
@@ -923,9 +1108,10 @@ impl LocalPdp {
         objects: &ObjectSet,
         sql: &str,
     ) -> ColumnAclOutcome {
+        let __p = self.inner();
         let mut denied_columns: Vec<(String, String)> = Vec::new(); // (rule, column)
 
-        for rule in &self.rules {
+        for rule in &__p.rules {
             if rule.columns.is_empty() {
                 continue;
             }
@@ -942,7 +1128,7 @@ impl LocalPdp {
                 }
 
                 if obj.has_wildcard {
-                    if self.star_policy == StarPolicy::Deny
+                    if __p.star_policy == StarPolicy::Deny
                         && rule.effect.eq_ignore_ascii_case("deny")
                     {
                         return ColumnAclOutcome::Deny {
@@ -1551,7 +1737,7 @@ mod tests {
     use crate::{HeuristicDialectParser, ProtocolKind};
 
     fn pdp_with(rules: Vec<SecurityRuleConfig>) -> LocalPdp {
-        LocalPdp {
+        LocalPdp::from_inner(LocalPdpInner {
             fail_closed: true,
             star_policy: StarPolicy::Deny,
             rules,
@@ -1566,7 +1752,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
-        }
+        })
     }
 
     fn subject(user: &str) -> Subject {
@@ -1769,7 +1955,7 @@ mod tests {
 
     #[test]
     fn row_filter_injects_where() {
-        let pdp = LocalPdp {
+        let pdp = LocalPdp::from_inner(LocalPdpInner {
             fail_closed: true,
             star_policy: StarPolicy::Deny,
             rules: vec![SecurityRuleConfig {
@@ -1792,7 +1978,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
-        };
+        });
         let mut set = ObjectSet::empty();
         let mut obj = ObjectAccess::new("employees", StatementAction::Select);
         obj.columns = vec!["id".into(), "name".into()];
@@ -1814,7 +2000,7 @@ mod tests {
     #[test]
     fn mask_tags_produce_obligations() {
         use crate::{SecurityColumnTagConfig, SecurityMaskRuleConfig};
-        let pdp = LocalPdp {
+        let pdp = LocalPdp::from_inner(LocalPdpInner {
             fail_closed: true,
             star_policy: StarPolicy::Allow,
             rules: Vec::new(),
@@ -1841,7 +2027,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
-        };
+        });
         let mut set = ObjectSet::empty();
         let mut obj = ObjectAccess::new("employees", StatementAction::Select);
         obj.columns = vec!["id".into(), "phone".into()];
@@ -1863,7 +2049,7 @@ mod tests {
     #[test]
     fn high_risk_requires_ticket_then_allows() {
         use crate::{global_ticket_store, IssueTicketRequest, SecurityHighRiskRuleConfig};
-        let pdp = LocalPdp {
+        let pdp = LocalPdp::from_inner(LocalPdpInner {
             fail_closed: true,
             star_policy: StarPolicy::Deny,
             rules: Vec::new(),
@@ -1886,7 +2072,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
-        };
+        });
         let sub = subject("root");
         let dialect = HeuristicDialectParser::mysql();
         let sql = "DROP TABLE smoke_t";
@@ -1930,7 +2116,7 @@ mod tests {
             .timestamp();
         std::env::set_var("DATA_NEXUS_SECURITY_NOW_UNIX", ts_out.to_string());
 
-        let pdp = LocalPdp {
+        let pdp = LocalPdp::from_inner(LocalPdpInner {
             fail_closed: true,
             star_policy: StarPolicy::Allow,
             rules: Vec::new(),
@@ -1969,7 +2155,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
-        };
+        });
         let sub = subject("root");
         let dialect = HeuristicDialectParser::mysql();
         let sel = GatewayCommand::Query {
@@ -2003,4 +2189,83 @@ mod tests {
         std::env::remove_var("DATA_NEXUS_SECURITY_NOW_UNIX");
     }
 
+
+    #[test]
+    fn local_pdp_hot_reload_swaps_rules_for_existing_handle() {
+        let pdp = LocalPdp::from_inner(LocalPdpInner {
+            fail_closed: true,
+            star_policy: StarPolicy::Deny,
+            rules: vec![SecurityRuleConfig {
+                name: "deny-secret".into(),
+                effect: "deny".into(),
+                actions: vec!["select".into()],
+                tables: vec!["secret_*".into()],
+                columns: vec![],
+                subjects: vec![],
+                row_filter: None,
+            }],
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
+            default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
+        });
+        let sub = subject("app");
+        let dialect = HeuristicDialectParser::new(ProtocolKind::MySql);
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT * FROM secret_tokens".into(),
+        };
+        assert!(pdp.authorize_command(&sub, "orders", &cmd, &dialect).is_deny());
+        let epoch_before = pdp.epoch();
+        let _ = pdp.store.swap(LocalPdpInner {
+            fail_closed: true,
+            star_policy: StarPolicy::Deny,
+            rules: Vec::new(),
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
+            default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
+        });
+        assert!(pdp.epoch() > epoch_before);
+        assert!(!pdp.authorize_command(&sub, "orders", &cmd, &dialect).is_deny());
+    }
+
+    #[test]
+    fn security_hot_reloadable_diff_helpers() {
+        let mut a = SecurityPolicyConfig::default();
+        a.enabled = true;
+        a.rules.push(SecurityRuleConfig {
+            name: "r1".into(),
+            effect: "deny".into(),
+            actions: vec!["select".into()],
+            tables: vec!["t".into()],
+            columns: vec![],
+            subjects: vec![],
+            row_filter: None,
+        });
+        let mut b = a.clone();
+        b.rules[0].name = "r2".into();
+        assert!(security_local_pdp_hot_reloadable_only(&a, &b));
+        assert!(!security_requires_listener_rebuild(&a, &b));
+
+        let mut c = a.clone();
+        c.streaming.window_rows = 64;
+        assert!(security_requires_listener_rebuild(&a, &c));
+        assert!(!security_local_pdp_hot_reloadable_only(&a, &c));
+
+        let mut d = a.clone();
+        d.enabled = false;
+        assert!(security_requires_listener_rebuild(&a, &d));
+    }
 }

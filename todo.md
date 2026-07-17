@@ -95,7 +95,8 @@ examples/        smoke + gateway config 样例
 | B04c | OpenDAL S3/OSS | `4118e80` |
 | B05b | portal 真流式 NDJSON | `b0343be` |
 | B07 | Deny 高优审计队列 | `26ce55c` |
-| B06 | 审计 SQLite 检索索引 | 本提交 |
+| B06 | 审计 SQLite 检索索引 | `bc88b36` |
+| F28 | Local 规则热更新 | 本提交 |
 | F26b | Cedar 热更新 | `82974f9` |
 | chore | target 外置缓存 | `2700698` |
 
@@ -127,7 +128,7 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 依赖/备注 | 状态 |
 |----|----|------|-----------|:----:|
-| **F28** | Local 规则热更新 | 仅 `security.rules`/mask 变更时刷新 PDP，避免无谓 listener 重建 | reload diff | 待做 |
+| **F28** | Local 规则热更新 | 仅 `security.rules`/mask 变更时刷新 PDP，避免无谓 listener 重建 | reload diff | **完成** |
 | **F29** | Cedar 实体属性 | Subject/Table 属性（tenant/clearance）进 Entities；与 Local 对照用例 | F26 | 延后 |
 | **F30** | 敏感识别增强 | 静态列标签之外的规则/词典 MVP（仍不做全量 DLP） | S2/S3 tags | 延后 |
 | **F31** | Remote PDP 适配器 | HTTP 旁路 OPA/外部 PDP；超时 fail_closed | 架构 RemotePDP | 延后 |
@@ -153,20 +154,19 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> F28 Local 规则热更新 / 或 A05 透传观测 / UI01 票据页 <<<**
+**>>> A05 透传路径观测补齐 / 或 UI01 票据页 <<<**
 
-B06 已交付：`security.audit.index_path` 打开 SQLite 旁路索引；worker 入队后写索引；`GET /admin/audit/events` 支持 `event_id` / `from_ms` / `to_ms`，`source=index|recent`；stats 暴露 `index_*`。空 `index_path` 保持仅 recent ring。
+F28 已交付：`LocalPdp` 持有进程级 snapshot store；`security.rules` / mask / time / watermark / audit / fail_closed / star_policy / max_rows 变更走热替换（`security_local_hot_reload`），**不**把全部 listener 标为 changed。`enabled` / `subject` / `pdp` / `streaming.window_rows|passthrough|max_bytes` 仍触发 listener 重建。
 
 ```bash
-cargo test -p gateway_core --lib audit_index
-cargo test -p gateway_core --lib audit_pipeline
+cargo test -p gateway_core --lib pdp
 ```
 
-建议下一任务（P3-C/D）：
+建议下一任务（P3-D）：
 
-1. **F28** — Local 规则热更新  
-2. **A05** — 透传路径观测补齐  
-3. **UI01** — 票据/金库管理页
+1. **A05** — 透传路径观测补齐  
+2. **UI01** — 票据/金库管理页  
+3. **UI02** — Cedar 状态页（延后）
 
 ---
 
