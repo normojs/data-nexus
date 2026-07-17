@@ -34,6 +34,8 @@ max_file_bytes = 1048576
 retain_days = 7
 rotate_keep = 16
 archive_dir = "/tmp/data-nexus-audit-archive"
+# B06: SQLite side-index so Admin query survives beyond the in-memory recent ring.
+index_path = "/tmp/data-nexus-audit-index.sqlite"
 
 # Deny SELECT (and other listed actions) against secret_* tables.
 [[security.rules]]

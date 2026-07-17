@@ -68,6 +68,9 @@ max_file_bytes = 268435456
 retain_days = 14
 rotate_keep = 32
 archive_dir = "/var/log/data-nexus/audit/archive"
+# B06: SQLite side-index for Admin search (event_id/subject/decision/time/service).
+# Empty disables index; queries fall back to in-memory recent ring only.
+index_path = "/var/log/data-nexus/audit/index.sqlite"
 # Optional cold archive via OpenDAL (binary must be built with --features audit-opendal).
 # Local:   opendal_scheme = "fs", opendal_root = "/var/log/data-nexus/audit/od"
 # S3/MinIO:

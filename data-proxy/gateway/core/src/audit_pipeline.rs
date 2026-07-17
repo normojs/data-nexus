@@ -4,10 +4,13 @@
 //! and optionally drops oldest/newest per config.
 //!
 //! B04: optional size-based rotation, age prune, and keep-N for JSONL files.
+//! B06: optional SQLite side-index (`index_path`) for Admin search beyond the
+//! in-memory recent ring; worker inserts after dequeue (never on hot path).
 //! B07: deny / require_approval use a separate bounded priority queue so a
 //! flood of allow/execute under `drop_new` cannot discard critical events.
 
 use crate::audit::AuditEvent;
+use crate::audit_index::{AuditIndex, AuditQueryFilter};
 use crate::security::SecurityAuditConfig;
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
@@ -142,6 +145,8 @@ pub struct AuditPipeline {
     file_policy: Mutex<FileSinkPolicy>,
     write_file: AtomicBool,
     write_tracing: AtomicBool,
+    /// B06: SQLite side-index; `None` when `index_path` empty.
+    index: Mutex<Option<Arc<AuditIndex>>>,
     state: Mutex<SharedState>,
     cv: Condvar,
     dropped: AtomicU64,
@@ -173,6 +178,7 @@ impl AuditPipeline {
         } else {
             Some(PathBuf::from(config.file_path.trim()))
         };
+        let index = open_index(config.index_path.trim());
         Self {
             capacity,
             priority_capacity,
@@ -182,6 +188,7 @@ impl AuditPipeline {
             file_policy: Mutex::new(FileSinkPolicy::from_config(config)),
             write_file: AtomicBool::new(write_file),
             write_tracing: AtomicBool::new(write_tracing),
+            index: Mutex::new(index),
             state: Mutex::new(SharedState {
                 queue: VecDeque::with_capacity(capacity),
                 priority_queue: VecDeque::with_capacity(priority_capacity.max(1)),
@@ -218,7 +225,26 @@ impl AuditPipeline {
         if let Ok(mut pol) = self.file_policy.lock() {
             *pol = FileSinkPolicy::from_config(config);
         }
+        // Re-open index only when path changes (or enable/disable).
+        if let Ok(mut guard) = self.index.lock() {
+            let want = config.index_path.trim();
+            let current = guard.as_ref().map(|i| i.path().to_string_lossy().to_string());
+            let need_reopen = match (want.is_empty(), &current) {
+                (true, None) => false,
+                (true, Some(_)) => true,
+                (false, None) => true,
+                (false, Some(cur)) => cur != want,
+            };
+            if need_reopen {
+                *guard = open_index(want);
+            }
+        }
         configure_opendal_archive(config);
+    }
+
+    /// B06: shared handle to the SQLite index when configured.
+    pub fn index(&self) -> Option<Arc<AuditIndex>> {
+        self.index.lock().ok().and_then(|g| g.clone())
     }
 
     pub fn spawn_worker(self: &Arc<Self>) {
@@ -313,6 +339,10 @@ impl AuditPipeline {
         }
     }
 
+    /// Query recent ring and/or SQLite index (B06).
+    ///
+    /// When an index is configured, results come from SQLite (survives beyond
+    /// the in-memory ring). Otherwise falls back to the recent ring filter.
     pub fn query(
         &self,
         decision: Option<&str>,
@@ -320,21 +350,69 @@ impl AuditPipeline {
         service: Option<&str>,
         limit: usize,
     ) -> Vec<AuditEvent> {
+        self.query_filter(&AuditQueryFilter {
+            decision: decision.map(|s| s.to_owned()),
+            subject_id: subject_id.map(|s| s.to_owned()),
+            service: service.map(|s| s.to_owned()),
+            limit,
+            ..Default::default()
+        })
+    }
+
+    /// Full filter API used by Admin (event_id / time range). B06.
+    pub fn query_filter(&self, filter: &AuditQueryFilter) -> Vec<AuditEvent> {
+        let limit = filter.limit_clamped().min(1000);
+        if let Some(idx) = self.index() {
+            let mut f = filter.clone();
+            f.limit = limit;
+            match idx.query(&f) {
+                Ok(rows) => return rows,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "data_nexus::audit",
+                        error = %e,
+                        "audit index query failed; falling back to recent ring"
+                    );
+                }
+            }
+        }
+        self.query_recent(filter, limit)
+    }
+
+    fn query_recent(&self, filter: &AuditQueryFilter, limit: usize) -> Vec<AuditEvent> {
         let state = self.state.lock().expect("audit state");
-        let limit = limit.clamp(1, 500);
         state
             .recent
             .iter()
             .rev()
             .filter(|e| {
-                decision
-                    .map(|d| e.decision.as_deref() == Some(d))
+                filter
+                    .event_id
+                    .as_deref()
+                    .map(|id| e.event_id.as_deref() == Some(id))
                     .unwrap_or(true)
-                    && subject_id
+                    && filter
+                        .decision
+                        .as_deref()
+                        .map(|d| e.decision.as_deref() == Some(d))
+                        .unwrap_or(true)
+                    && filter
+                        .subject_id
+                        .as_deref()
                         .map(|s| e.subject_id.as_deref() == Some(s))
                         .unwrap_or(true)
-                    && service
+                    && filter
+                        .service
+                        .as_deref()
                         .map(|s| e.service.as_deref() == Some(s))
+                        .unwrap_or(true)
+                    && filter
+                        .from_ms
+                        .map(|from| e.ts_unix_ms.unwrap_or(0) >= from)
+                        .unwrap_or(true)
+                    && filter
+                        .to_ms
+                        .map(|to| e.ts_unix_ms.unwrap_or(u64::MAX) <= to)
                         .unwrap_or(true)
             })
             .take(limit)
@@ -354,6 +432,17 @@ impl AuditPipeline {
                 )
             })
             .unwrap_or((0, 0, 0));
+        let (index_enabled, index_rows, index_inserted, index_errors, index_pruned) =
+            match self.index() {
+                Some(idx) => (
+                    true,
+                    idx.row_count(),
+                    idx.inserted(),
+                    idx.errors(),
+                    idx.pruned(),
+                ),
+                None => (false, 0, 0, 0, 0),
+            };
         AuditPipelineStats {
             accepted: self.accepted.load(Ordering::Relaxed),
             written: self.written.load(Ordering::Relaxed),
@@ -367,24 +456,32 @@ impl AuditPipeline {
             recent_len,
             rotated: self.rotated.load(Ordering::Relaxed),
             pruned: self.pruned.load(Ordering::Relaxed),
+            index_enabled,
+            index_rows,
+            index_inserted,
+            index_errors,
+            index_pruned,
         }
     }
 
     pub fn run_retention_now(&self) {
         let path = match self.file_path.lock() {
             Ok(g) => g.clone(),
-            Err(_) => return,
-        };
-        let Some(active) = path else {
-            return;
+            Err(_) => None,
         };
         let policy = match self.file_policy.lock() {
             Ok(g) => g.clone(),
             Err(_) => return,
         };
-        let pruned = prune_rotated_files(&active, &policy);
-        if pruned > 0 {
-            self.pruned.fetch_add(pruned, Ordering::Relaxed);
+        if let Some(active) = path {
+            let pruned = prune_rotated_files(&active, &policy);
+            if pruned > 0 {
+                self.pruned.fetch_add(pruned, Ordering::Relaxed);
+            }
+        }
+        // B06: age-prune SQLite index with the same retain_days as JSONL.
+        if let Some(idx) = self.index() {
+            let _ = idx.prune_older_than_days(policy.retain_days);
         }
     }
 
@@ -460,6 +557,17 @@ impl AuditPipeline {
                 }
             }
         }
+        // B06: side-index insert on worker only (never blocks try_send).
+        if let Some(idx) = self.index() {
+            if let Err(e) = idx.insert(event) {
+                idx.record_error();
+                tracing::warn!(
+                    target: "data_nexus::audit",
+                    error = %e,
+                    "audit index insert failed"
+                );
+            }
+        }
     }
 }
 
@@ -478,6 +586,12 @@ pub struct AuditPipelineStats {
     pub recent_len: u64,
     pub rotated: u64,
     pub pruned: u64,
+    /// B06: SQLite side-index is open.
+    pub index_enabled: bool,
+    pub index_rows: u64,
+    pub index_inserted: u64,
+    pub index_errors: u64,
+    pub index_pruned: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,6 +740,32 @@ fn append_jsonl(path: &Path, event: &AuditEvent) -> std::io::Result<()> {
         },
     )
     .map(|_| ())
+}
+
+fn open_index(path: &str) -> Option<Arc<AuditIndex>> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    match AuditIndex::open(path) {
+        Ok(idx) => {
+            tracing::info!(
+                target: "data_nexus::audit",
+                path = %path,
+                "audit SQLite index enabled"
+            );
+            Some(Arc::new(idx))
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "data_nexus::audit",
+                path = %path,
+                error = %e,
+                "failed to open audit SQLite index"
+            );
+            None
+        }
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -890,5 +1030,104 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(pipe.stats().written >= 10, "{:?}", pipe.stats());
+    }
+
+    #[test]
+    fn index_survives_beyond_recent_ring() {
+        // B06: SQLite index keeps events after the in-memory recent ring rolls.
+        let dir = std::env::temp_dir().join(format!("dn-audit-idx-pipe-{}", now_unix_ms()));
+        let _ = fs::create_dir_all(&dir);
+        let index_path = dir.join("index.sqlite");
+
+        let mut cfg = SecurityAuditConfig::default();
+        // recent_capacity = capacity.min(4096).max(64). Keep queue large; pace sends
+        // so the worker drains without drop_new losses.
+        cfg.queue_capacity = 128;
+        cfg.priority_queue_capacity = 32;
+        cfg.overflow = "drop_new".into();
+        cfg.sinks = vec!["tracing".into()];
+        cfg.index_path = index_path.to_string_lossy().into();
+        let pipe = Arc::new(AuditPipeline::new(&cfg));
+        assert!(pipe.index().is_some());
+        pipe.spawn_worker();
+
+        let mut first = AuditEvent::default();
+        first.decision = Some("deny".into());
+        first.subject_id = Some("early-alice".into());
+        first.service = Some("orders".into());
+        first.rule = Some("seed".into());
+        pipe.try_send(first);
+
+        // 200 > recent_capacity (128) so early deny leaves the in-memory ring.
+        for i in 0..200 {
+            let mut e = AuditEvent::default();
+            e.decision = Some("execute".into());
+            e.subject_id = Some(format!("u{i}"));
+            e.service = Some("orders".into());
+            pipe.try_send(e);
+            // Pace so worker can drain; avoid drop_new under flood.
+            if i % 16 == 15 {
+                for _ in 0..50 {
+                    if pipe.stats().queue_len < 32 {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        for _ in 0..200 {
+            let s = pipe.stats();
+            if s.written >= 201 && s.index_inserted >= 201 && s.queue_len == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let stats = pipe.stats();
+        assert!(stats.index_enabled, "{stats:?}");
+        assert!(stats.index_inserted >= 201, "{stats:?}");
+        assert_eq!(stats.index_errors, 0, "{stats:?}");
+        assert_eq!(stats.dropped, 0, "{stats:?}");
+        // Ring has rolled; early-alice is no longer in recent.
+        assert!(
+            !pipe
+                .query_recent(
+                    &AuditQueryFilter {
+                        subject_id: Some("early-alice".into()),
+                        limit: 10,
+                        ..Default::default()
+                    },
+                    10
+                )
+                .iter()
+                .any(|e| e.subject_id.as_deref() == Some("early-alice")),
+            "expected early-alice to fall out of recent ring"
+        );
+
+        let denies = pipe.query(Some("deny"), Some("early-alice"), Some("orders"), 10);
+        assert_eq!(denies.len(), 1, "{denies:?}");
+        assert_eq!(denies[0].rule.as_deref(), Some("seed"));
+
+        let by_filter = pipe.query_filter(&AuditQueryFilter {
+            subject_id: Some("early-alice".into()),
+            limit: 5,
+            ..Default::default()
+        });
+        assert_eq!(by_filter.len(), 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_index_path_keeps_recent_only() {
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.queue_capacity = 32;
+        cfg.sinks = vec!["tracing".into()];
+        cfg.index_path = String::new();
+        let pipe = AuditPipeline::new(&cfg);
+        assert!(pipe.index().is_none());
+        let stats = pipe.stats();
+        assert!(!stats.index_enabled);
+        assert_eq!(stats.index_rows, 0);
     }
 }

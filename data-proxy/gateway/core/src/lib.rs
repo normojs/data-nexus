@@ -6,6 +6,7 @@
 
 mod admin_auth;
 mod audit;
+mod audit_index;
 #[cfg(feature = "audit-opendal")]
 mod audit_opendal;
 mod audit_pipeline;
@@ -36,6 +37,7 @@ pub use admin_auth::{
 pub use audit::{
     fields as audit_fields, AuditAction, AuditDecision, AuditEvent, AuditLevel, AUDIT_TARGET,
 };
+pub use audit_index::{AuditIndex, AuditQueryFilter};
 #[cfg(feature = "audit-opendal")]
 pub use audit_opendal::OpendalArchive;
 pub use audit_pipeline::{

@@ -1,0 +1,426 @@
+//! B06: SQLite side-index for audit events.
+//!
+//! The hot path still only `try_send`s; the audit worker inserts into this index
+//! after dequeuing. Admin `GET /admin/audit/events` queries the index when
+//! configured so it does not scan full JSONL or rely solely on the in-memory
+//! ring buffer.
+//!
+//! Enable with non-empty `security.audit.index_path`. Empty path = off.
+
+use crate::audit::AuditEvent;
+use rusqlite::{params, Connection, OptionalExtension};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS audit_events (
+    event_id    TEXT PRIMARY KEY NOT NULL,
+    ts_unix_ms  INTEGER NOT NULL,
+    decision    TEXT,
+    subject_id  TEXT,
+    service     TEXT,
+    action      TEXT,
+    listener    TEXT,
+    rule        TEXT,
+    outcome     TEXT,
+    payload     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_decision_ts ON audit_events(decision, ts_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_subject_ts ON audit_events(subject_id, ts_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_service_ts ON audit_events(service, ts_unix_ms DESC);
+"#;
+
+/// Filter for Admin / index queries (B06).
+#[derive(Debug, Clone, Default)]
+pub struct AuditQueryFilter {
+    pub decision: Option<String>,
+    pub subject_id: Option<String>,
+    pub service: Option<String>,
+    pub event_id: Option<String>,
+    /// Inclusive lower bound on `ts_unix_ms`.
+    pub from_ms: Option<u64>,
+    /// Inclusive upper bound on `ts_unix_ms`.
+    pub to_ms: Option<u64>,
+    pub limit: usize,
+}
+
+impl AuditQueryFilter {
+    pub fn limit_clamped(&self) -> usize {
+        self.limit.clamp(1, 1000)
+    }
+}
+
+pub struct AuditIndex {
+    path: PathBuf,
+    conn: Mutex<Connection>,
+    inserted: AtomicU64,
+    errors: AtomicU64,
+    pruned: AtomicU64,
+}
+
+impl AuditIndex {
+    /// Open (or create) a SQLite index at `path`. Parent dirs are created.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("create audit index dir {}: {e}", parent.display())
+                })?;
+            }
+        }
+        let conn = Connection::open(&path)
+            .map_err(|e| format!("open audit index {}: {e}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA temp_store=MEMORY;",
+        )
+        .map_err(|e| format!("pragma audit index: {e}"))?;
+        conn.execute_batch(SCHEMA)
+            .map_err(|e| format!("schema audit index: {e}"))?;
+        Ok(Self {
+            path,
+            conn: Mutex::new(conn),
+            inserted: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            pruned: AtomicU64::new(0),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn inserted(&self) -> u64 {
+        self.inserted.load(Ordering::Relaxed)
+    }
+
+    pub fn errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
+    }
+
+    pub fn pruned(&self) -> u64 {
+        self.pruned.load(Ordering::Relaxed)
+    }
+
+    pub fn row_count(&self) -> u64 {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+        conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get::<_, i64>(0))
+            .map(|n| n as u64)
+            .unwrap_or(0)
+    }
+
+    /// Insert or replace one event. Failures are counted and logged by the caller.
+    pub fn insert(&self, event: &AuditEvent) -> Result<(), String> {
+        let event_id = event
+            .event_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| format!("ae-missing-{}", now_unix_ms()));
+        let ts = event.ts_unix_ms.unwrap_or_else(now_unix_ms) as i64;
+        let payload = serde_json::to_string(event)
+            .map_err(|e| format!("serialize audit event: {e}"))?;
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "audit index lock poisoned".to_string())?;
+        conn.execute(
+            r#"
+            INSERT INTO audit_events (
+                event_id, ts_unix_ms, decision, subject_id, service,
+                action, listener, rule, outcome, payload
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(event_id) DO UPDATE SET
+                ts_unix_ms=excluded.ts_unix_ms,
+                decision=excluded.decision,
+                subject_id=excluded.subject_id,
+                service=excluded.service,
+                action=excluded.action,
+                listener=excluded.listener,
+                rule=excluded.rule,
+                outcome=excluded.outcome,
+                payload=excluded.payload
+            "#,
+            params![
+                event_id,
+                ts,
+                event.decision.as_deref(),
+                event.subject_id.as_deref(),
+                event.service.as_deref(),
+                event.action.as_deref(),
+                event.listener.as_deref(),
+                event.rule.as_deref(),
+                event.outcome.as_deref(),
+                payload,
+            ],
+        )
+        .map_err(|e| format!("insert audit index: {e}"))?;
+        self.inserted.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn record_error(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn query(&self, filter: &AuditQueryFilter) -> Result<Vec<AuditEvent>, String> {
+        let limit = filter.limit_clamped() as i64;
+        let mut sql = String::from(
+            "SELECT payload FROM audit_events WHERE 1=1",
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(ref id) = filter.event_id {
+            sql.push_str(" AND event_id = ?");
+            binds.push(Box::new(id.clone()));
+        }
+        if let Some(ref d) = filter.decision {
+            sql.push_str(" AND decision = ?");
+            binds.push(Box::new(d.clone()));
+        }
+        if let Some(ref s) = filter.subject_id {
+            sql.push_str(" AND subject_id = ?");
+            binds.push(Box::new(s.clone()));
+        }
+        if let Some(ref s) = filter.service {
+            sql.push_str(" AND service = ?");
+            binds.push(Box::new(s.clone()));
+        }
+        if let Some(from) = filter.from_ms {
+            sql.push_str(" AND ts_unix_ms >= ?");
+            binds.push(Box::new(from as i64));
+        }
+        if let Some(to) = filter.to_ms {
+            sql.push_str(" AND ts_unix_ms <= ?");
+            binds.push(Box::new(to as i64));
+        }
+        sql.push_str(" ORDER BY ts_unix_ms DESC LIMIT ?");
+        binds.push(Box::new(limit));
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "audit index lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare audit query: {e}"))?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                let payload: String = row.get(0)?;
+                Ok(payload)
+            })
+            .map_err(|e| format!("query audit index: {e}"))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let payload = row.map_err(|e| format!("row audit index: {e}"))?;
+            match serde_json::from_str::<AuditEvent>(&payload) {
+                Ok(ev) => out.push(ev),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "data_nexus::audit",
+                        error = %e,
+                        "skip corrupt audit index payload"
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_by_id(&self, event_id: &str) -> Result<Option<AuditEvent>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "audit index lock poisoned".to_string())?;
+        let payload: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM audit_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("get audit index: {e}"))?;
+        match payload {
+            Some(p) => serde_json::from_str(&p)
+                .map(Some)
+                .map_err(|e| format!("decode audit index: {e}")),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete rows older than `retain_days`. Returns number of deleted rows.
+    pub fn prune_older_than_days(&self, retain_days: u32) -> u64 {
+        if retain_days == 0 {
+            return 0;
+        }
+        let cutoff = now_unix_ms().saturating_sub(u64::from(retain_days) * 86_400_000) as i64;
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+        match conn.execute(
+            "DELETE FROM audit_events WHERE ts_unix_ms < ?1",
+            params![cutoff],
+        ) {
+            Ok(n) => {
+                let n = n as u64;
+                if n > 0 {
+                    self.pruned.fetch_add(n, Ordering::Relaxed);
+                }
+                n
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "data_nexus::audit",
+                    error = %e,
+                    "audit index prune failed"
+                );
+                0
+            }
+        }
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_path(tag: &str) -> PathBuf {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        std::env::temp_dir().join(format!("dn-audit-idx-{tag}-{ms}.sqlite"))
+    }
+
+    fn sample(decision: &str, subject: &str, service: &str, ts: u64) -> AuditEvent {
+        AuditEvent {
+            event_id: Some(format!("ae-{decision}-{subject}-{ts}")),
+            ts_unix_ms: Some(ts),
+            decision: Some(decision.into()),
+            subject_id: Some(subject.into()),
+            service: Some(service.into()),
+            action: Some("query".into()),
+            outcome: Some("ok".into()),
+            ..AuditEvent::default()
+        }
+    }
+
+    #[test]
+    fn insert_and_filter_by_decision_subject_service() {
+        let path = tmp_path("filter");
+        let idx = AuditIndex::open(&path).unwrap();
+        idx.insert(&sample("deny", "alice", "orders", 1000)).unwrap();
+        idx.insert(&sample("execute", "alice", "orders", 1001))
+            .unwrap();
+        idx.insert(&sample("deny", "bob", "orders", 1002)).unwrap();
+        idx.insert(&sample("deny", "alice", "billing", 1003))
+            .unwrap();
+
+        let denies = idx
+            .query(&AuditQueryFilter {
+                decision: Some("deny".into()),
+                subject_id: Some("alice".into()),
+                service: Some("orders".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(denies.len(), 1);
+        assert_eq!(denies[0].subject_id.as_deref(), Some("alice"));
+        assert_eq!(denies[0].service.as_deref(), Some("orders"));
+
+        let by_id = idx
+            .get_by_id("ae-deny-alice-1000")
+            .unwrap()
+            .expect("row");
+        assert_eq!(by_id.decision.as_deref(), Some("deny"));
+        assert_eq!(idx.row_count(), 4);
+        assert_eq!(idx.inserted(), 4);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn time_range_and_order_desc() {
+        let path = tmp_path("range");
+        let idx = AuditIndex::open(&path).unwrap();
+        for i in 0..5 {
+            idx.insert(&sample("execute", "u", "svc", 1000 + i)).unwrap();
+        }
+        let mid = idx
+            .query(&AuditQueryFilter {
+                from_ms: Some(1001),
+                to_ms: Some(1003),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(mid.len(), 3);
+        // Newest first.
+        assert_eq!(mid[0].ts_unix_ms, Some(1003));
+        assert_eq!(mid[2].ts_unix_ms, Some(1001));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prune_by_age() {
+        let path = tmp_path("prune");
+        let idx = AuditIndex::open(&path).unwrap();
+        let old_ts = now_unix_ms().saturating_sub(10 * 86_400_000);
+        idx.insert(&sample("deny", "old", "s", old_ts)).unwrap();
+        idx.insert(&sample("deny", "new", "s", now_unix_ms()))
+            .unwrap();
+        // retain_days=1 drops the 10-day-old row.
+        let n = idx.prune_older_than_days(1);
+        assert_eq!(n, 1);
+        assert_eq!(idx.row_count(), 1);
+        let left = idx
+            .query(&AuditQueryFilter {
+                decision: Some("deny".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(left[0].subject_id.as_deref(), Some("new"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upsert_same_event_id() {
+        let path = tmp_path("upsert");
+        let idx = AuditIndex::open(&path).unwrap();
+        let mut e = sample("deny", "alice", "orders", 1);
+        e.event_id = Some("same".into());
+        idx.insert(&e).unwrap();
+        e.outcome = Some("updated".into());
+        e.ts_unix_ms = Some(2);
+        idx.insert(&e).unwrap();
+        assert_eq!(idx.row_count(), 1);
+        let got = idx.get_by_id("same").unwrap().unwrap();
+        assert_eq!(got.outcome.as_deref(), Some("updated"));
+        assert_eq!(got.ts_unix_ms, Some(2));
+        let _ = std::fs::remove_file(&path);
+    }
+}

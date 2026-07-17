@@ -94,7 +94,8 @@ examples/        smoke + gateway config 样例
 | B04b | OpenDAL fs/memory | `0dda947` |
 | B04c | OpenDAL S3/OSS | `4118e80` |
 | B05b | portal 真流式 NDJSON | `b0343be` |
-| B07 | Deny 高优审计队列 | 本提交 |
+| B07 | Deny 高优审计队列 | `26ce55c` |
+| B06 | 审计 SQLite 检索索引 | 本提交 |
 | F26b | Cedar 热更新 | `82974f9` |
 | chore | target 外置缓存 | `2700698` |
 
@@ -118,7 +119,7 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 依赖/备注 | 状态 |
 |----|----|------|-----------|:----:|
 | **B04c** | OpenDAL S3/OSS scheme | `opendal_scheme=s3|oss` + endpoint/region/凭据 env；失败重试不堵查询 | `audit-opendal` | **完成** |
-| **B06** | 审计检索索引 | SQLite/PG 旁路索引（event_id/subject/decision/time）；Admin 查询不扫全量 JSONL | 架构 S4 | 待做 |
+| **B06** | 审计检索索引 | SQLite 旁路索引（event_id/subject/decision/time/service）；Admin 查询走索引不扫 JSONL | 架构 S4 | **完成** |
 | **B07** | Deny 高优审计队列 | deny/require_ticket 独立有界队列或优先入队，防 drop_new 丢关键事件 | audit_pipeline | **完成** |
 | **B08** | L2 样本/大 payload | 可选结果样本上传 OpenDAL；体积/采样策略可配 | B04c、流式 | 延后 |
 
@@ -152,19 +153,20 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> B06 审计检索索引 / 或 F28 Local 规则热更新 / A05 透传观测 <<<**
+**>>> F28 Local 规则热更新 / 或 A05 透传观测 / UI01 票据页 <<<**
 
-B07 已交付：`deny` / `require_approval` 走独立 `priority_queue_capacity`（默认 1024）；worker 先 drain 高优队列；stats 暴露 `priority_*` 字段。`priority_queue_capacity=0` 可关回单队列。
+B06 已交付：`security.audit.index_path` 打开 SQLite 旁路索引；worker 入队后写索引；`GET /admin/audit/events` 支持 `event_id` / `from_ms` / `to_ms`，`source=index|recent`；stats 暴露 `index_*`。空 `index_path` 保持仅 recent ring。
 
 ```bash
+cargo test -p gateway_core --lib audit_index
 cargo test -p gateway_core --lib audit_pipeline
 ```
 
-建议下一任务（P3-B/C）：
+建议下一任务（P3-C/D）：
 
-1. **B06** — 审计检索索引  
-2. **F28** — Local 规则热更新  
-3. **A05** — 透传路径观测补齐
+1. **F28** — Local 规则热更新  
+2. **A05** — 透传路径观测补齐  
+3. **UI01** — 票据/金库管理页
 
 ---
 

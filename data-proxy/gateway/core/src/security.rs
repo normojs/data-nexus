@@ -368,6 +368,11 @@ pub struct SecurityAuditConfig {
     /// Optional session token (or env `DN_OPENDAL_SESSION_TOKEN` / `AWS_SESSION_TOKEN`).
     #[serde(default)]
     pub opendal_session_token: String,
+    /// B06: SQLite side-index path for Admin audit search.
+    /// Empty = disabled (query falls back to in-memory recent ring).
+    /// Example: `/var/log/data-nexus/audit/index.sqlite`.
+    #[serde(default)]
+    pub index_path: String,
 }
 
 fn default_queue_capacity() -> u32 {
@@ -415,6 +420,7 @@ impl Default for SecurityAuditConfig {
             opendal_access_key_id: String::new(),
             opendal_secret_access_key: String::new(),
             opendal_session_token: String::new(),
+            index_path: String::new(),
         }
     }
 }

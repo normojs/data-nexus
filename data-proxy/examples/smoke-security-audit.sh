@@ -12,6 +12,7 @@ COMPOSE_FILE="$ROOT/examples/docker-compose.dev.yml"
 CONFIG_FILE="$ROOT/examples/security-deny-gateway-config.toml"
 PROXY_LOG="${TMPDIR:-/tmp}/data-nexus-security-audit.log"
 AUDIT_FILE="/tmp/data-nexus-audit-events.jsonl"
+AUDIT_INDEX="/tmp/data-nexus-audit-index.sqlite"
 COMPOSE=(docker compose -f "$COMPOSE_FILE")
 
 cleanup() {
@@ -27,7 +28,7 @@ need docker; need cargo; need curl
 
 pkill -f '/debug/proxy' 2>/dev/null || true
 sleep 1
-rm -f "$AUDIT_FILE"
+rm -f "$AUDIT_FILE" "$AUDIT_INDEX" "${AUDIT_INDEX}-wal" "${AUDIT_INDEX}-shm"
 
 echo "==> start backends"
 "${COMPOSE[@]}" up -d
@@ -61,7 +62,15 @@ mysql_via_gateway() {
 echo "==> generate allow + deny traffic"
 mysql_via_gateway 'SELECT 1;'
 mysql_via_gateway 'SELECT id FROM secret_tokens;'
-sleep 0.5
+
+echo "==> wait for audit worker + index"
+for _ in $(seq 1 50); do
+  if curl -fsS "http://127.0.0.1:8082/admin/audit/stats" 2>/dev/null \
+    | python3 -c 'import sys,json; s=json.load(sys.stdin); raise SystemExit(0 if s.get("index_inserted",0)>=1 and s.get("accepted",0)>=1 else 1)'; then
+    break
+  fi
+  sleep 0.1
+done
 
 echo "==> GET /admin/audit/stats"
 curl -fsS "http://127.0.0.1:8082/admin/audit/stats" | tee /tmp/dn-audit-stats.json
@@ -72,6 +81,10 @@ assert s.get("accepted",0) >= 1, s
 # B04 fields present (defaults 0 when no rotate yet)
 assert "rotated" in s, s
 assert "pruned" in s, s
+# B06 index stats
+assert s.get("index_enabled") is True, s
+assert s.get("index_inserted", 0) >= 1, s
+assert "index_rows" in s and "index_errors" in s, s
 print("stats ok", s)
 PY
 
@@ -83,7 +96,25 @@ data=json.load(open("/tmp/dn-audit-events.json"))
 ev=data.get("events") or []
 assert any((e.get("decision")=="deny") for e in ev), data
 assert any((e.get("outcome")=="security_deny" or e.get("code")=="security_deny") for e in ev), data
-print("deny events:", len(ev))
+assert data.get("source") == "index", data
+print("deny events:", len(ev), "source=", data.get("source"))
+# B06 event_id round-trip via index
+eid = next(e.get("event_id") for e in ev if e.get("decision")=="deny" and e.get("event_id"))
+open("/tmp/dn-audit-deny-eid.txt","w").write(eid)
+print("deny event_id", eid)
+PY
+
+DENY_EID=$(cat /tmp/dn-audit-deny-eid.txt)
+echo "==> GET /admin/audit/events?event_id=$DENY_EID"
+curl -fsS "http://127.0.0.1:8082/admin/audit/events?event_id=${DENY_EID}&limit=5" | tee /tmp/dn-audit-by-id.json
+python3 - <<PY
+import json
+data=json.load(open("/tmp/dn-audit-by-id.json"))
+ev=data.get("events") or []
+assert len(ev) == 1, data
+assert ev[0].get("event_id") == "$DENY_EID", data
+assert data.get("source") == "index", data
+print("event_id lookup ok")
 PY
 
 echo "==> JSONL file sink"
@@ -93,6 +124,13 @@ if [[ -f "$AUDIT_FILE" ]]; then
   [[ "$lines" -ge 1 ]]
 else
   echo "warn: jsonl not found yet (worker lag); recent API is source of truth"
+fi
+
+if [[ -f "$AUDIT_INDEX" ]]; then
+  echo "sqlite index present: $AUDIT_INDEX"
+else
+  echo "error: expected SQLite index at $AUDIT_INDEX" >&2
+  exit 1
 fi
 
 echo "smoke-security-audit: OK"

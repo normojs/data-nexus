@@ -496,6 +496,12 @@ struct AdminAuditEventsQuery {
     decision: Option<String>,
     subject_id: Option<String>,
     service: Option<String>,
+    /// Exact event id lookup (B06 index / recent).
+    event_id: Option<String>,
+    /// Inclusive lower bound, unix epoch milliseconds.
+    from_ms: Option<u64>,
+    /// Inclusive upper bound, unix epoch milliseconds.
+    to_ms: Option<u64>,
     limit: Option<u32>,
 }
 
@@ -503,6 +509,9 @@ struct AdminAuditEventsQuery {
 struct AdminAuditEventsResponse {
     events: Vec<gateway_core::AuditEvent>,
     stats: Option<gateway_core::AuditPipelineStats>,
+    /// `index` when served from SQLite side-index; `recent` for in-memory ring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
@@ -1114,20 +1123,31 @@ impl AxumServer {
             return json_response(&AdminAuditEventsResponse {
                 events: vec![],
                 stats: None,
+                source: None,
                 note: Some("audit pipeline not installed (gateway not started with security.audit)".into()),
             });
         };
         let limit = query.limit.unwrap_or(100).clamp(1, 1000) as usize;
-        let events = pipe.query(
-            query.decision.as_deref(),
-            query.subject_id.as_deref(),
-            query.service.as_deref(),
+        let filter = gateway_core::AuditQueryFilter {
+            decision: query.decision.clone(),
+            subject_id: query.subject_id.clone(),
+            service: query.service.clone(),
+            event_id: query.event_id.clone(),
+            from_ms: query.from_ms,
+            to_ms: query.to_ms,
             limit,
-        );
+        };
+        let events = pipe.query_filter(&filter);
         let stats = pipe.stats();
+        let source = if stats.index_enabled {
+            Some("index".into())
+        } else {
+            Some("recent".into())
+        };
         json_response(&AdminAuditEventsResponse {
             events,
             stats: Some(stats),
+            source,
             note: None,
         })
     }
@@ -1154,6 +1174,11 @@ impl AxumServer {
                 "recent_len": 0,
                 "rotated": 0,
                 "pruned": 0,
+                "index_enabled": false,
+                "index_rows": 0,
+                "index_inserted": 0,
+                "index_errors": 0,
+                "index_pruned": 0,
                 "installed": false
             })),
         }
