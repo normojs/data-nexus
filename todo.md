@@ -127,7 +127,7 @@ examples/        smoke + gateway config 样例
 | A10 | prepared 注册表 + encode（部分） | feat(a10) |
 | A10 | 参数绑定 + PG 扩展协议解码（部分） | feat(a10) |
 | A06 | 事务内 Streaming 还 lease（部分） | feat(a06) |
-| H06 | 全量 smoke 就绪待 push | all+cedar green |
+| H06 | origin 同步完成 | 223f2c0 |
 
 ---
 
@@ -164,7 +164,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
 | **H05** | 多实例状态外置 | ticket / vault / LocalPdp / SQLite 索引现为**进程内** | 水平扩展需粘性或外置 store | **待做** |
-| **H06** | 发布与 origin 同步 | `main` 长期领先 origin；发布 checklist + 默认 smoke | 本机 **all + cedar 已绿**；领先 origin **104** commits；**未 push**（待确认） | **就绪/待 push** |
+| **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `223f2c0` → origin/main | **完成** |
 | **H07** | CI 矩阵加深 | PR 已 default；extended / cedar job 可选或 nightly | workflow_dispatch 可选手动 | **可选** |
 | **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | H03 已声明后置 | **延后** |
 
@@ -203,25 +203,19 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> H06 push origin（需用户确认） 或 A10 binary/Describe / A08 TCP 透传 <<<**
+**>>> A10 binary resultset / Describe 元数据 或 A08 PG TCP 帧透传 <<<**
 
-本轮（H06 验证）：
+本轮（H06）：
 
-- smoke `all`：**17/17**
-- smoke `cedar`：**2/2**，并已 `cargo build -p data-proxy --bin proxy` 恢复默认二进制
-- 工作区干净；`main` ahead of `origin/main` by **104**
-- **未执行 `git push`**（dn-release：须用户明确同意）
-
-```bash
-# 用户确认后再：
-git push origin HEAD
-```
+- smoke all **17/17** + cedar **2/2**
+- `git push origin HEAD` 成功：`e742643..223f2c0` → `origin/main`
+- `main` 与 origin 对齐
 
 建议下一刀：
 
-1. **H06 push** — 用户确认后同步 origin  
-2. **A10 续** — binary resultset / Describe 真元数据  
-3. **A08 续** — PG TCP 帧级透传
+1. **A10 续** — binary resultset / Describe 真元数据  
+2. **A08 续** — PG TCP 帧级透传  
+3. **F32 / H05** — 审计裁剪 / 多实例状态外置
 
 ---
 
