@@ -113,6 +113,10 @@ pub struct SessionState {
     pub backend_endpoint: Option<String>,
     #[serde(default)]
     pub transaction_state: TransactionState,
+    /// A10: next ResultSet should use MySQL binary protocol rows (after COM_STMT_EXECUTE).
+    /// Frontend clears this after encoding one resultset (or non-result response).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_binary_result: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

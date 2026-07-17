@@ -148,7 +148,7 @@ impl CoreGatewayConnection {
         writer: &mut dyn ResponseWriter,
     ) -> GatewayResult<()> {
         let deferred_obl = self.pending_encode_obligations.take();
-        match response {
+        let result = match response {
             GatewayResponse::ResultSet { columns, rows } => {
                 // A4: cross-protocol always window-encodes after type mapping so
                 // frontend dialect packets are produced without one giant encode.
@@ -202,7 +202,10 @@ impl CoreGatewayConnection {
                 let packets = self.frontend.encode(other, &self.session)?;
                 writer.write_packets(packets).await
             }
-        }
+        };
+        // A10: binary result flag applies to one response only (COM_STMT_EXECUTE).
+        self.session.prefer_binary_result = false;
+        result
     }
 
     pub fn frontend_protocol(&self) -> ProtocolKind {
@@ -721,6 +724,8 @@ impl CoreGatewayConnection {
                         writer,
                     )
                     .await?;
+                    // A10: binary flag is one-shot per Execute response.
+                    self.session.prefer_binary_result = false;
                     // Synthetic ResultSet metadata for metrics/audit only (no rows).
                     let _ = total;
                     let execute_path = if self.translation_policy.is_some() {

@@ -131,6 +131,7 @@ examples/        smoke + gateway config 样例
 | A10 | prepare param defs + PG ParameterDescription（部分） | feat(a10) |
 | A08 | PG wire 无 ResultSet 物化透传（部分） | feat(a08) |
 | F32 | 审计 L0/L1 SQL 载荷裁剪 | feat(f32) |
+| A10 | MySQL binary resultset after Execute（部分） | feat(a10) |
 
 ---
 
@@ -149,7 +150,7 @@ examples/        smoke + gateway config 样例
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | 同协议无义务时 `simple_query_raw`→Wire（无 ResultSet 物化） | 仍非 backend TCP 帧中继；Wire 包仍汇总后写出 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
-| **A10** | 预处理 / 事务透传矩阵 | 注册表 + 参数绑定 + MySQL param defs + PG ParameterDescription | binary 结果集仍 text；Describe 无真列类型 OID | **部分** |
+| **A10** | 预处理 / 事务透传矩阵 | 注册表 + 参数绑定 + MySQL **binary 结果行** + PG ParameterDescription | 日期/时间 binary 仍简化；PG 无 binary portal 结果 | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
 
@@ -197,7 +198,7 @@ examples/        smoke + gateway config 样例
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：`simple_query_raw` 边解码边编码 Wire（无逻辑 ResultSet）；**非** backend TCP 帧中继；包仍可汇总 |
-| 预处理语句 | A10：MySQL param ColumnDefinition + `?` 绑定；PG ParameterDescription + text Bind；**binary resultset / 真列 OID 未做** |
+| 预处理语句 | A10：MySQL COM_STMT_EXECUTE → binary ProtocolBinary 行；PG 仍 text Bind→Query；日期/时间 binary 简化 |
 | 多副本 | 票据/金库/SQLite 索引/LocalPdp **非**共享状态 |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
@@ -206,24 +207,23 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A10 binary resultset 或 H05 多实例外置 或 A08 TCP 真中继 <<<**
+**>>> H05 多实例外置 或 A08 TCP 真中继 或 A10 日期 binary <<<**
 
-本轮（F32）：
+本轮（A10 binary resultset）：
 
-- `AuditEvent.sql_text` + `apply_audit_level_payload`：L0 剥离 SQL；L1/L2 截断（`audit.sql_text_max_chars`，默认 2048）
-- 管道 `try_send` 强制配置级别上限（事件 L2 不能突破部署 L0）
-- 数据面 Query/Prepare 审计附带 fingerprint + tables + sql_text（经管道裁剪）
+- `SessionState.prefer_binary_result`：COM_STMT_EXECUTE 置位，编码后清零
+- MySQL `encode_binary_row` / windowed `encode_resultset_rows` 支持 binary
+- 数值/字符串/bytes/null 覆盖；日期/时间仍按字符串 length-encoded（诚实）
 
 ```bash
-cargo test -p gateway_core --lib audit
-cargo test -p runtime_gateway --lib core_engine
+cargo test -p runtime_gateway --lib a10_
 ```
 
 建议下一刀：
 
-1. **A10 续** — binary resultset  
-2. **H05** — 多实例状态外置  
-3. **A08 续** — 真 TCP 帧中继
+1. **H05** — 多实例状态外置  
+2. **A08 续** — 真 TCP 帧中继  
+3. **A10 续** — 日期/时间 binary + PG binary 结果
 
 ---
 

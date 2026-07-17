@@ -128,7 +128,11 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
             COM_QUERY => decode_query_command(payload, session)?,
             COM_PING => GatewayCommand::Ping,
             COM_STMT_PREPARE => GatewayCommand::Prepare { sql: decode_text_payload(payload)? },
-            COM_STMT_EXECUTE => decode_stmt_execute(payload)?,
+            COM_STMT_EXECUTE => {
+                // Next resultset (if any) is binary protocol for this client.
+                session.prefer_binary_result = true;
+                decode_stmt_execute(payload)?
+            }
             COM_STMT_CLOSE => {
                 GatewayCommand::CloseStatement { statement_id: decode_statement_id(payload)? }
             }
@@ -146,7 +150,7 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
     fn encode(
         &mut self,
         response: GatewayResponse,
-        _session: &SessionState,
+        session: &SessionState,
     ) -> GatewayResult<Vec<Vec<u8>>> {
         match response {
             GatewayResponse::Ok { .. } | GatewayResponse::Pong | GatewayResponse::Bye => {
@@ -157,10 +161,17 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
                 Ok(vec![make_err_packet(MySQLError::new(code, b"HY000".to_vec(), message))[4..]
                     .to_vec()])
             }
-            GatewayResponse::ResultSet { columns, rows } => encode_text_resultset(columns, rows),
+            GatewayResponse::ResultSet { columns, rows } => {
+                if session.prefer_binary_result {
+                    encode_binary_resultset(columns, rows)
+                } else {
+                    encode_text_resultset(columns, rows)
+                }
+            }
             GatewayResponse::Wire { packets } => Ok(packets),
             // A10: COM_STMT_PREPARE OK + optional parameter column definitions + EOF.
-            // Result column defs still omitted (num_columns=0); execute returns text resultset.
+            // Result column defs still omitted (num_columns=0) on prepare; execute returns
+            // text or binary resultset depending on session.prefer_binary_result.
             GatewayResponse::Prepared {
                 statement_id,
                 parameter_count,
@@ -180,9 +191,13 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
         &mut self,
         columns: &[GatewayColumn],
         rows: &[Vec<GatewayValue>],
-        _session: &SessionState,
+        session: &SessionState,
     ) -> GatewayResult<Vec<Vec<u8>>> {
-        encode_mysql_resultset_rows(columns, rows)
+        if session.prefer_binary_result {
+            encode_mysql_binary_resultset_rows(columns, rows)
+        } else {
+            encode_mysql_resultset_rows(columns, rows)
+        }
     }
 
     fn encode_resultset_footer(
@@ -536,6 +551,17 @@ fn encode_mysql_resultset_rows(
     Ok(packets)
 }
 
+fn encode_mysql_binary_resultset_rows(
+    columns: &[GatewayColumn],
+    rows: &[Vec<GatewayValue>],
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut packets = Vec::with_capacity(rows.len());
+    for row in rows {
+        packets.push(encode_binary_row(row, columns)?);
+    }
+    Ok(packets)
+}
+
 fn encode_text_resultset(
     columns: Vec<GatewayColumn>,
     rows: Vec<Vec<GatewayValue>>,
@@ -544,6 +570,117 @@ fn encode_text_resultset(
     packets.extend(encode_mysql_resultset_rows(&columns, &rows)?);
     packets.push(make_eof_packet()[4..].to_vec());
     Ok(packets)
+}
+
+/// Binary protocol resultset (COM_STMT_EXECUTE): same header/column defs/EOF as text,
+/// but data rows use ProtocolBinary::ResultsetRow.
+fn encode_binary_resultset(
+    columns: Vec<GatewayColumn>,
+    rows: Vec<Vec<GatewayValue>>,
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut packets = encode_mysql_resultset_header(&columns)?;
+    packets.extend(encode_mysql_binary_resultset_rows(&columns, &rows)?);
+    packets.push(make_eof_packet()[4..].to_vec());
+    Ok(packets)
+}
+
+/// ProtocolBinary::ResultsetRow body (no 4-byte header):
+/// packet_header(1)=0x00, null_bitmap((n+7+2)/8), values…
+fn encode_binary_row(row: &[GatewayValue], columns: &[GatewayColumn]) -> GatewayResult<Vec<u8>> {
+    if row.len() != columns.len() {
+        return Err(GatewayError::Protocol(format!(
+            "mysql binary resultset row has {} values for {} columns",
+            row.len(),
+            columns.len()
+        )));
+    }
+    let n = columns.len();
+    let null_len = (n + 7 + 2) / 8;
+    let mut packet = Vec::with_capacity(1 + null_len + n * 8);
+    packet.push(0x00); // binary row header
+    let mut null_bitmap = vec![0u8; null_len];
+    for (i, value) in row.iter().enumerate() {
+        if matches!(value, GatewayValue::Null) {
+            // Bit offset starts at 2 in MySQL binary protocol.
+            let bit = i + 2;
+            null_bitmap[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+    packet.extend_from_slice(&null_bitmap);
+    for (i, value) in row.iter().enumerate() {
+        if matches!(value, GatewayValue::Null) {
+            continue;
+        }
+        encode_binary_value(&mut packet, value, &columns[i].data_type)?;
+    }
+    Ok(packet)
+}
+
+fn encode_binary_value(
+    packet: &mut Vec<u8>,
+    value: &GatewayValue,
+    data_type: &str,
+) -> GatewayResult<()> {
+    match value {
+        GatewayValue::Null => Ok(()),
+        GatewayValue::Boolean(b) => {
+            packet.push(if *b { 1 } else { 0 });
+            Ok(())
+        }
+        GatewayValue::Integer(i) => {
+            // Prefer wire width from column type when known.
+            match data_type.to_ascii_lowercase().as_str() {
+                "tiny" | "int1" | "bool" | "boolean" => {
+                    packet.push(*i as i8 as u8);
+                }
+                "short" | "int2" | "smallint" | "year" => {
+                    packet.extend_from_slice(&(*i as i16).to_le_bytes());
+                }
+                "longlong" | "int8" | "bigint" => {
+                    packet.extend_from_slice(&i.to_le_bytes());
+                }
+                _ => {
+                    // default 4-byte LONG
+                    packet.extend_from_slice(&(*i as i32).to_le_bytes());
+                }
+            }
+            Ok(())
+        }
+        GatewayValue::UnsignedInteger(u) => {
+            match data_type.to_ascii_lowercase().as_str() {
+                "tiny" | "int1" => packet.push(*u as u8),
+                "short" | "int2" | "smallint" => {
+                    packet.extend_from_slice(&(*u as u16).to_le_bytes());
+                }
+                "longlong" | "int8" | "bigint" => {
+                    packet.extend_from_slice(&u.to_le_bytes());
+                }
+                _ => packet.extend_from_slice(&(*u as u32).to_le_bytes()),
+            }
+            Ok(())
+        }
+        GatewayValue::Float(f) => {
+            if matches!(
+                data_type.to_ascii_lowercase().as_str(),
+                "double" | "float8"
+            ) {
+                packet.extend_from_slice(&f.to_bits().to_le_bytes());
+            } else {
+                packet.extend_from_slice(&(*f as f32).to_bits().to_le_bytes());
+            }
+            Ok(())
+        }
+        GatewayValue::Decimal(s) | GatewayValue::String(s) => {
+            packet.put_lenc_int(s.len() as u64, true);
+            packet.extend_from_slice(s.as_bytes());
+            Ok(())
+        }
+        GatewayValue::Bytes(b) => {
+            packet.put_lenc_int(b.len() as u64, true);
+            packet.extend_from_slice(b);
+            Ok(())
+        }
+    }
 }
 
 fn gateway_column_to_mysql_column(column: &GatewayColumn) -> ColumnInfo {
@@ -907,26 +1044,55 @@ mod tests {
     }
 
     #[test]
-    fn a10_encodes_prepare_with_param_defs() {
+    fn a10_encodes_binary_resultset_after_execute_flag() {
         let mut adapter = adapter();
-        let session = SessionState::default();
+        let session = SessionState {
+            prefer_binary_result: true,
+            ..SessionState::default()
+        };
         let packets = adapter
             .encode(
-                GatewayResponse::Prepared {
-                    statement_id: "7".into(),
-                    parameter_count: 2,
+                GatewayResponse::ResultSet {
+                    columns: vec![
+                        GatewayColumn {
+                            name: "id".into(),
+                            data_type: "int".into(),
+                        },
+                        GatewayColumn {
+                            name: "name".into(),
+                            data_type: "varchar".into(),
+                        },
+                    ],
+                    rows: vec![
+                        vec![GatewayValue::Integer(1), GatewayValue::String("a".into())],
+                        vec![GatewayValue::Null, GatewayValue::String("b".into())],
+                    ],
                 },
                 &session,
             )
             .unwrap();
-        // OK + 2 column defs + EOF
-        assert_eq!(packets.len(), 4);
-        assert_eq!(packets[0][0], 0);
-        assert_eq!(u16::from_le_bytes([packets[0][7], packets[0][8]]), 2);
-        assert_eq!(packets[3], make_eof_packet()[4..].to_vec());
-        // Column def packets are non-empty Protocol::ColumnDefinition41 bodies.
-        assert!(!packets[1].is_empty());
-        assert!(!packets[2].is_empty());
+        // column_count + 2 col defs + col EOF + 2 binary rows + row EOF
+        assert_eq!(packets.len(), 7);
+        assert_eq!(packets[0], vec![2]); // column count
+        // binary rows start with 0x00 (indices after header packets)
+        assert_eq!(packets[4][0], 0x00);
+        assert_eq!(packets[5][0], 0x00);
+        // second row has null on col0 → null bitmap bit 2 set
+        let null_bitmap = packets[5][1];
+        assert_ne!(null_bitmap & (1 << 2), 0);
+        assert_eq!(packets[6], make_eof_packet()[4..].to_vec());
+    }
+
+    #[test]
+    fn a10_decode_execute_sets_prefer_binary_result() {
+        let mut adapter = adapter();
+        let mut session = SessionState::default();
+        let mut exec = vec![COM_STMT_EXECUTE];
+        exec.extend_from_slice(&1u32.to_le_bytes());
+        exec.push(0);
+        exec.extend_from_slice(&1u32.to_le_bytes());
+        let _ = adapter.decode(&exec, &mut session).unwrap();
+        assert!(session.prefer_binary_result);
     }
 
     #[test]
