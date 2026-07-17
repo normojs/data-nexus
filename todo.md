@@ -10,7 +10,8 @@
 | `docs/data-audit-architecture.md` | 审计/流式专项 |
 | `data-proxy/docs/build-cache.md` | Cargo target 外置缓存 |
 | `.claude/rules/data-nexus-development.md` | **开发强制规则**（DoD / 铁律 / 双路径） |
-| `CLAUDE.md` | 规则入口 |
+| `.claude/README.md` | Claude Skills / Superpowers 能力地图 |
+| `CLAUDE.md` | 规则与技能入口 |
 
 ---
 
@@ -82,12 +83,12 @@ cd data-proxy
 ### 1.4 代码落点
 
 ```text
-gateway/core     security / pdp / cedar_pdp / obligations / audit_* / ticket / vault
+gateway/core     security / pdp / cedar_pdp / obligations / audit_* / ticket / vault / transport
 runtime/gateway  core_engine PEP、流式/透传、object_extract
 http             Admin API（策略/审计/票据/门户/Cedar reload）
 data-ui          运维台 + SQL Portal + Audit + Tickets + Vault + Cedar
 examples/        smoke + gateway config 样例
-.claude/rules/   开发强制规则
+.claude/         rules + skills（Superpowers 工作流）
 ```
 
 ---

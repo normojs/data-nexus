@@ -1,0 +1,49 @@
+# 流式与热路径（强制补充）
+
+与 [`data-nexus-development.md`](data-nexus-development.md) 配套。改 PEP、backend、portal 结果路径时必读。
+
+## 目标态
+
+```text
+backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 写出
+峰值内存 ≈ 1～2 个窗口，而不是 2× 全量 ResultSet
+```
+
+## 路径选择
+
+| 条件 | 路径 | 要求 |
+|------|------|------|
+| 同协议 + 无结果义务 + passthrough | Wire / 帧级 | 禁止无谓 `ResultSet` |
+| 有 mask / 列删 / 水印 / max_rows | Streaming + 窗口义务 | 禁止「先全量再 `apply_obligations`」成为唯一路径 |
+| 跨协议 | Streaming 窗口 encode | 禁止 Materialized 当生产默认 |
+
+## 当前诚实边界（勿宣传为已完成）
+
+- MySQL **非事务** `Streaming`：channel `RowStream` 窗口 yield（A06 部分）。
+- 事务内查询、PostgreSQL Streaming：仍可能物化。
+- Portal B05b：HTTP chunk 真；逻辑结果可能仍先物化（A09）。
+- PG Passthrough：前端 Wire 消息，非 backend TCP 帧中继（A08 部分）。
+- A07：`handle_frame_to_writer` + socket `ResponseWriter` 已接。
+
+## 实现检查清单
+
+改结果路径时自问：
+
+1. 会不会迫使 `Vec<Vec<GatewayValue>>` 全量？会 → 设计 `RowStream` / 窗口或明确 cap。  
+2. 有义务时是否仍 `apply_obligations_to_response` 整包？→ 优先 `write_streaming_query_with_obligations` / encode 窗口 mask。  
+3. 是否接到 socket writer，而不是只 `CollectingWriter`？  
+4. 失败/提前结束是否 drain 流并归还连接？  
+5. todo §3.6 与 OBSERVABILITY 是否需要更新诚实账？
+
+## 落点
+
+```text
+gateway/core     transport (RowStream, ExecuteOutcome, write_*_windowed*)
+                 obligations (mask 窗口)
+runtime/gateway  core_engine (execute_outcome, handle_frame_to_writer)
+                 backend/mysql (channel RowStream)
+                 gateway.rs (MySqlSocketWriter / PgSocketWriter)
+http             portal_execute（A09 待对齐 Streaming）
+```
+
+详细任务 ID：`todo.md` A06–A10。实现时用 skill **dn-stream**。
