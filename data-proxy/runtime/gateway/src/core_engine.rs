@@ -16,12 +16,14 @@ use std::{sync::Arc, time::Instant};
 
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
-        write_resultset_windowed, write_resultset_windowed_with_obligations, CollectingWriter,
-        map_response_types, prepare_cross_protocol_command, BackendConnector, CommandSummary,
-        DialectParser, EndpointConfig, EndpointRef, EndpointRole, FrontendProtocolAdapter,
-        ExecuteMode, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse, GatewayResult,
-        ListenerConfig, Obligations, PluginContext, PluginDecision, ProtocolKind, ResponseWriter,
-        RoutePlan, ServiceConfig, SessionState, TransactionState, TranslationPolicyConfig,
+        write_resultset_windowed, write_resultset_windowed_with_obligations,
+        write_streaming_query_with_obligations, CollectingWriter, map_response_types,
+        prepare_cross_protocol_command, BackendConnector, CommandSummary, DialectParser,
+        EndpointConfig, EndpointRef, EndpointRole, ExecuteMode, ExecuteOutcome,
+        FrontendProtocolAdapter, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse,
+        GatewayResult, ListenerConfig, Obligations, PluginContext, PluginDecision, ProtocolKind,
+        ResponseWriter, RoutePlan, ServiceConfig, SessionState, TransactionState,
+        TranslationPolicyConfig,
     };
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use parking_lot::Mutex;
@@ -646,11 +648,133 @@ impl CoreGatewayConnection {
 
             let response = match self
                 .backend
-                .execute_with_mode(command, &mut self.session, exec_mode)
+                .execute_outcome(command, &mut self.session, exec_mode)
                 .instrument(command_span.clone())
                 .await
             {
-                Ok(response) => {
+                Ok(ExecuteOutcome::Streaming(mut query)) => {
+                    // A06: progressive rows — type-map column metadata, then encode
+                    // window-by-window with optional obligations (no full ResultSet).
+                    if self.translation_policy.is_some() {
+                        let backend = self.backend.protocol();
+                        let frontend = self.frontend.protocol();
+                        if backend != frontend {
+                            for col in &mut query.columns {
+                                col.data_type = gateway_core::map_column_type(
+                                    &col.data_type,
+                                    &backend,
+                                    &frontend,
+                                );
+                            }
+                        }
+                    }
+                    if pending_obligations.has_result_obligations() {
+                        info!(
+                            target: gateway_core::AUDIT_TARGET,
+                            action = gateway_core::AuditAction::Query.as_str(),
+                            listener = %self.listener_name,
+                            service = %self.service_name,
+                            mask_count = pending_obligations.column_masks.len(),
+                            max_rows = ?pending_obligations.max_rows,
+                            "security streaming path with result obligations"
+                        );
+                    }
+                    let window = exec_mode.window_rows().unwrap_or(256).max(1);
+                    let obl = if pending_obligations.has_result_obligations() {
+                        Some(&pending_obligations)
+                    } else {
+                        None
+                    };
+                    let total = write_streaming_query_with_obligations(
+                        self.frontend.as_mut(),
+                        &self.session,
+                        query,
+                        window,
+                        obl,
+                        writer,
+                    )
+                    .await?;
+                    // Synthetic ResultSet metadata for metrics/audit only (no rows).
+                    let _ = total;
+                    let execute_path = if self.translation_policy.is_some() {
+                        "xproto_stream"
+                    } else {
+                        "streaming"
+                    };
+                    let sec_decision = if pending_obligations.has_result_obligations() {
+                        "allow_obligations"
+                    } else {
+                        "allow"
+                    };
+                    command_span.record("outcome", "resultset");
+                    command_span.record("security_decision", sec_decision);
+                    command_span.record("security_rule_class", "none");
+                    command_span.record("execute_path", execute_path);
+                    info!(
+                        target: gateway_core::AUDIT_TARGET,
+                        action = gateway_core::AuditAction::Query.as_str(),
+                        listener = %self.listener_name,
+                        service = %self.service_name,
+                        frontend_protocol = %protocol_metric_name(&self.frontend.protocol()),
+                        backend_protocol = %protocol_metric_name(&self.backend.protocol()),
+                        command_type = %command_type,
+                        endpoint = %label_owned[5],
+                        db_user = ?self.session.user,
+                        database = ?self.session.database,
+                        decision = gateway_core::AuditDecision::Execute.as_str(),
+                        outcome = "resultset",
+                        latency_ms = started_at.elapsed().as_millis() as u64,
+                        "gateway command audited"
+                    );
+                    gateway_core::try_audit(gateway_core::AuditEvent {
+                        action: Some(gateway_core::AuditAction::Query.as_str().into()),
+                        decision: Some(gateway_core::AuditDecision::Execute.as_str().into()),
+                        subject_id: self.session.user.clone(),
+                        db_user: self.session.user.clone(),
+                        listener: Some(self.listener_name.clone()),
+                        service: Some(self.service_name.clone()),
+                        frontend_protocol: Some(
+                            protocol_metric_name(&self.frontend.protocol()).to_owned(),
+                        ),
+                        backend_protocol: Some(
+                            protocol_metric_name(&self.backend.protocol()).to_owned(),
+                        ),
+                        command_type: Some(command_type.to_owned()),
+                        endpoint: Some(label_owned[5].clone()),
+                        database: self.session.database.clone(),
+                        outcome: Some("resultset".into()),
+                        latency_ms: Some(started_at.elapsed().as_millis() as u64),
+                        audit_level: Some("L0".into()),
+                        ..gateway_core::AuditEvent::default()
+                    });
+                    if let (Some(plugins), Some(idx)) =
+                        (self.plugins.as_mut(), concurrency_rule_idx)
+                    {
+                        plugins.release_concurrency(idx);
+                    }
+                    record_otel_command(
+                        &self.listener_name,
+                        &self.service_name,
+                        labels[2],
+                        labels[3],
+                        command_type,
+                        labels[5],
+                        "resultset",
+                        started_at,
+                        &crate::otel_metrics::CommandOtelAttrs::security(sec_decision, "none")
+                            .with_execute_path(execute_path)
+                            .with_wire_bytes(0),
+                    );
+                    finish_command_metrics(
+                        &self.metrics,
+                        &labels,
+                        started_at,
+                        execute_path,
+                        0,
+                    );
+                    continue;
+                }
+                Ok(ExecuteOutcome::Complete(response)) => {
                     // Wire packets must not be type-mapped; logical results still may.
                     let response = match response {
                         GatewayResponse::Wire { .. } => response,
@@ -670,8 +794,6 @@ impl CoreGatewayConnection {
                             max_rows = ?pending_obligations.max_rows,
                             "security deferred result obligations to encode path"
                         );
-                        // A06/A07: defer mask to encode so each window is masked then
-                        // encoded without retaining a full unmasked+masked pair.
                         self.pending_encode_obligations = Some(pending_obligations.clone());
                         response
                     } else {

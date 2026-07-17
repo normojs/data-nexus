@@ -7,8 +7,8 @@ use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool, PoolConn};
 use futures::StreamExt;
 use gateway_core::{
     BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, ExecuteMode,
-    GatewayCommand, GatewayError, GatewayResponse, GatewayResult, GatewayValue, ProtocolKind,
-    SessionState, TransactionState,
+    ExecuteOutcome, GatewayCommand, GatewayError, GatewayResponse, GatewayResult, GatewayValue,
+    ProtocolKind, RowStream, SessionState, StreamingQuery, TransactionState,
 };
 use mysql_protocol::{
     client::{
@@ -148,6 +148,141 @@ impl MySqlBackendConnector {
 
         let mut conn = self.acquire_conn(&endpoint, session).await?;
         Self::execute_on_conn(&mut conn, sql, mode).await
+    }
+
+    /// A06: stream logical rows in windows over a channel (non-txn path).
+    ///
+    /// Producer task owns the pool connection, decodes row packets, and sends
+    /// windows to the consumer. Peak retained rows ≈ one window on each side
+    /// of the channel (capacity 2).
+    async fn execute_simple_query_streaming(
+        &self,
+        endpoint: EndpointConfig,
+        sql: &str,
+        session: &SessionState,
+        mode: ExecuteMode,
+    ) -> GatewayResult<ExecuteOutcome> {
+        let window = mode.window_rows().unwrap_or(256).max(1);
+        let max_rows = mode.effective_max_rows();
+        let mut conn = self.acquire_conn(&endpoint, session).await?;
+
+        let client = conn.client.as_mut().ok_or_else(|| {
+            GatewayError::Backend("mysql backend connection is not open".into())
+        })?;
+        let mut stream = client
+            .send_query(sql.as_bytes())
+            .await
+            .map_err(|error| GatewayError::Backend(format!("write mysql query: {error}")))?;
+
+        // Materialize only the header/columns on this task; rows stream via channel.
+        let header = read_mysql_result_packet(&mut stream, "mysql query header").await?;
+        let payload = packet_payload("mysql query header", &header)?;
+        match payload.first().copied() {
+            Some(OK_HEADER) => {
+                drop(stream);
+                return Ok(ExecuteOutcome::Complete(ok_packet_to_gateway_response(
+                    payload,
+                )?));
+            }
+            Some(ERR_HEADER) => {
+                drop(stream);
+                return Ok(ExecuteOutcome::Complete(err_packet_to_gateway_response(
+                    payload,
+                )));
+            }
+            Some(_) => {}
+            None => {
+                return Err(GatewayError::Protocol(
+                    "mysql query header packet has empty payload".into(),
+                ));
+            }
+        }
+
+        let (column_count, is_null, _) = decode_lenc_int(payload, "mysql column count")?;
+        if is_null {
+            return Err(GatewayError::Protocol(
+                "mysql result set column count cannot be NULL".into(),
+            ));
+        }
+        let mut column_infos = Vec::with_capacity(column_count as usize);
+        for _ in 0..column_count {
+            let column_packet =
+                read_mysql_result_packet(&mut stream, "mysql column definition").await?;
+            let column_payload = packet_payload("mysql column definition", &column_packet)?;
+            column_infos.push(decode_column(column_payload));
+        }
+        let _ = read_mysql_result_packet(&mut stream, "mysql column eof").await?;
+        let columns: Vec<GatewayColumn> = column_infos
+            .iter()
+            .map(mysql_column_to_gateway_column)
+            .collect();
+
+        // Drain remaining row packets into windows **before** returning, but only
+        // keep one window in flight via a bounded channel + background task that
+        // continues reading while the consumer encodes.
+        //
+        // Because ResultsetStream borrows client, we cannot split across tasks
+        // without moving the whole connection. Strategy: spawn a task that owns
+        // `conn` and re-opens a ResultsetStream on the same framed codec to read
+        // remaining packets (query already in flight).
+        drop(stream);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<Vec<GatewayValue>>>(2);
+        tokio::spawn(async move {
+            let run = async {
+                let client = conn.client.as_mut().ok_or_else(|| {
+                    GatewayError::Backend("mysql backend connection is not open".into())
+                })?;
+                // Remaining packets for the current resultset are still on the wire.
+                let mut stream = ResultsetStream::new(client.framed.as_mut());
+                let mut window_buf: Vec<Vec<GatewayValue>> =
+                    Vec::with_capacity(window.min(256));
+                let mut total: u64 = 0;
+                let mut truncated = false;
+                while let Some(row_packet) = read_optional_mysql_result_packet(&mut stream).await? {
+                    if truncated {
+                        continue;
+                    }
+                    let row_payload = packet_payload("mysql row", &row_packet)?;
+                    if let Some(max) = max_rows {
+                        if total >= max {
+                            truncated = true;
+                            continue;
+                        }
+                    }
+                    window_buf.push(text_row_to_gateway_values(row_payload, &column_infos)?);
+                    total += 1;
+                    if window_buf.len() >= window {
+                        let chunk: Vec<_> = window_buf.drain(..).collect();
+                        if tx.send(chunk).await.is_err() {
+                            while read_optional_mysql_result_packet(&mut stream)
+                                .await?
+                                .is_some()
+                            {}
+                            return Ok(());
+                        }
+                    }
+                }
+                if !window_buf.is_empty() {
+                    let _ = tx.send(window_buf).await;
+                }
+                Ok::<(), GatewayError>(())
+            }
+            .await;
+            if let Err(e) = run {
+                tracing::warn!(
+                    target: "data_nexus::gateway",
+                    error = %e,
+                    "mysql streaming producer failed"
+                );
+            }
+            // conn dropped → pool
+        });
+
+        Ok(ExecuteOutcome::Streaming(StreamingQuery {
+            columns,
+            stream: Box::new(ChannelRowStream { rx }),
+        }))
     }
 
     async fn finish_transaction(
@@ -291,6 +426,48 @@ impl BackendConnector for MySqlBackendConnector {
                 command
             ))),
         }
+    }
+
+    async fn execute_outcome(
+        &self,
+        command: GatewayCommand,
+        session: &mut SessionState,
+        mode: ExecuteMode,
+    ) -> GatewayResult<ExecuteOutcome> {
+        // A06: true windowed yield for Streaming SELECT outside an open txn lease.
+        // In-transaction queries keep the lease path and fall back to materialize.
+        let streaming = matches!(mode, ExecuteMode::Streaming { .. });
+        let is_query = matches!(command, GatewayCommand::Query { .. });
+        let in_txn = session.transaction_state == TransactionState::Active
+            || self.txn_lease.lock().is_some();
+
+        if streaming && is_query && !in_txn {
+            if let GatewayCommand::Query { sql } = command {
+                let endpoint = self.select_endpoint(session)?;
+                return self
+                    .execute_simple_query_streaming(endpoint, &sql, session, mode)
+                    .await;
+            }
+        }
+
+        let response = self.execute_with_mode(command, session, mode).await?;
+        Ok(ExecuteOutcome::Complete(response))
+    }
+}
+
+/// A06: row windows delivered over a channel from a producer task that owns the
+/// backend lease until the resultset is fully drained.
+struct ChannelRowStream {
+    rx: tokio::sync::mpsc::Receiver<Vec<Vec<GatewayValue>>>,
+}
+
+#[async_trait]
+impl RowStream for ChannelRowStream {
+    async fn poll_window(
+        &mut self,
+        _max_rows: usize,
+    ) -> GatewayResult<Option<Vec<Vec<GatewayValue>>>> {
+        Ok(self.rx.recv().await)
     }
 }
 

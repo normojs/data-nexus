@@ -105,6 +105,172 @@ pub trait BackendConnector: Send + Sync {
         self.execute_with_mode(command, session, ExecuteMode::Materialized)
             .await
     }
+
+    /// A06: execute and optionally return a progressive row stream.
+    ///
+    /// Default implementation materializes via [`execute_with_mode`]. Backends
+    /// that support true windowed decode override this for
+    /// [`ExecuteMode::Streaming`] queries.
+    async fn execute_outcome(
+        &self,
+        command: GatewayCommand,
+        session: &mut SessionState,
+        mode: ExecuteMode,
+    ) -> GatewayResult<ExecuteOutcome> {
+        let response = self.execute_with_mode(command, session, mode).await?;
+        Ok(ExecuteOutcome::Complete(response))
+    }
+}
+
+/// A06: progressive logical result from a backend (columns + row windows).
+pub struct StreamingQuery {
+    pub columns: Vec<Column>,
+    pub stream: Box<dyn RowStream>,
+}
+
+/// Outcome of a backend execute that may stream rows (A06).
+pub enum ExecuteOutcome {
+    /// Fully materialized / wire / error response.
+    Complete(GatewayResponse),
+    /// Progressive logical rows; caller must drain `stream` before next command.
+    Streaming(StreamingQuery),
+}
+
+/// Yields logical row windows from a backend result (A06).
+///
+/// Implementations must keep the backend connection usable: if the consumer
+/// stops early, `poll_window` should still be driven to completion or the
+/// stream dropped only after draining remaining packets.
+#[async_trait]
+pub trait RowStream: Send {
+    /// Next window of rows (up to `max_rows` in this window). `None` = end.
+    async fn poll_window(
+        &mut self,
+        max_rows: usize,
+    ) -> GatewayResult<Option<Vec<Vec<GatewayValue>>>>;
+}
+
+/// In-memory row stream used when a backend materializes first (fallback).
+pub struct VecRowStream {
+    rows: std::vec::IntoIter<Vec<GatewayValue>>,
+}
+
+impl VecRowStream {
+    pub fn new(rows: Vec<Vec<GatewayValue>>) -> Self {
+        Self {
+            rows: rows.into_iter(),
+        }
+    }
+}
+
+#[async_trait]
+impl RowStream for VecRowStream {
+    async fn poll_window(
+        &mut self,
+        max_rows: usize,
+    ) -> GatewayResult<Option<Vec<Vec<GatewayValue>>>> {
+        let max_rows = max_rows.max(1);
+        let mut out = Vec::with_capacity(max_rows);
+        for _ in 0..max_rows {
+            match self.rows.next() {
+                Some(r) => out.push(r),
+                None => break,
+            }
+        }
+        if out.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(out))
+        }
+    }
+}
+
+/// Encode a progressive [`StreamingQuery`] through `writer` (A06+A07).
+///
+/// Masks each window in place before encode; never holds a full unmasked copy
+/// alongside encoded packets. Peak retained rows ≈ one window.
+pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
+    frontend: &mut dyn FrontendProtocolAdapter,
+    session: &SessionState,
+    mut query: StreamingQuery,
+    window_rows: usize,
+    obligations: Option<&Obligations>,
+    writer: &mut W,
+) -> GatewayResult<u64> {
+    let window = window_rows.max(1);
+    let mut columns = query.columns;
+
+    // Expand header once for watermark column mode before first encode.
+    let wm = obligations.and_then(|o| o.watermark.as_ref());
+    if let Some(wm) = wm {
+        let mut empty: Vec<Vec<GatewayValue>> = Vec::new();
+        apply_watermark_to_resultset(&mut columns, &mut empty, wm);
+    }
+
+    let mask_idx = obligations
+        .map(|o| build_mask_index(&columns, &o.column_masks))
+        .unwrap_or_default();
+    let max_total = obligations.and_then(|o| o.max_rows);
+    let header_width = columns.len();
+
+    writer
+        .write_packets(frontend.encode_resultset_header(&columns, session)?)
+        .await?;
+
+    let mut total: u64 = 0;
+
+    loop {
+        if let Some(max) = max_total {
+            if total >= max {
+                while query.stream.poll_window(window).await?.is_some() {}
+                break;
+            }
+        }
+        let want = match max_total {
+            Some(max) => ((max - total) as usize).min(window).max(1),
+            None => window,
+        };
+        let Some(mut chunk) = query.stream.poll_window(want).await? else {
+            break;
+        };
+        if !mask_idx.is_empty() {
+            apply_masks_to_rows(&mut chunk, &mask_idx);
+        }
+        if let Some(wm) = wm {
+            // Per-window stamp so Column mode tokens align with expanded header.
+            for row in chunk.iter_mut() {
+                while row.len() < header_width {
+                    // Watermark column is last for Column mode; suffix mode does not grow width.
+                    if row.len() + 1 == header_width {
+                        row.push(GatewayValue::String(wm.token.clone()));
+                    } else {
+                        row.push(GatewayValue::Null);
+                    }
+                }
+                // Suffix mode: append marker to first string cell.
+                if matches!(wm.mode, crate::WatermarkMode::Suffix) {
+                    let marker = format!(" |wm={}", wm.token);
+                    for cell in row.iter_mut() {
+                        if let GatewayValue::String(s) = cell {
+                            if !s.contains(" |wm=") {
+                                s.push_str(&marker);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        total += chunk.len() as u64;
+        let packets = frontend.encode_resultset_rows(&columns, &chunk, session)?;
+        drop(chunk);
+        writer.write_packets(packets).await?;
+    }
+
+    writer
+        .write_packets(frontend.encode_resultset_footer(&columns, total as usize, session)?)
+        .await?;
+    Ok(total)
 }
 
 /// Encode a result set in windows, writing each phase through `writer` (A2).
@@ -320,5 +486,58 @@ mod tests {
         assert_eq!(fe.footer_calls, 1);
         // footer carries total_rows after truncate
         assert_eq!(writer.packets.last().unwrap(), &vec![2u8]);
+    }
+
+    #[tokio::test]
+    async fn streaming_query_yields_windows_with_mask() {
+        use crate::{MaskAlgorithm, MaskSpec, Obligations};
+
+        let mut fe = FakeFrontend {
+            header_calls: 0,
+            row_calls: 0,
+            footer_calls: 0,
+        };
+        let session = SessionState::default();
+        let columns = vec![
+            Column {
+                name: "id".into(),
+                data_type: "int".into(),
+            },
+            Column {
+                name: "salary".into(),
+                data_type: "int".into(),
+            },
+        ];
+        let rows = vec![
+            vec![GatewayValue::Integer(1), GatewayValue::Integer(100)],
+            vec![GatewayValue::Integer(2), GatewayValue::Integer(200)],
+            vec![GatewayValue::Integer(3), GatewayValue::Integer(300)],
+            vec![GatewayValue::Integer(4), GatewayValue::Integer(400)],
+        ];
+        let mut obl = Obligations::default();
+        obl.column_masks
+            .push(MaskSpec::new("salary", MaskAlgorithm::Nullify, "m"));
+        obl.max_rows = Some(3);
+        let query = StreamingQuery {
+            columns,
+            stream: Box::new(VecRowStream::new(rows)),
+        };
+        let mut writer = CollectingWriter::new();
+        let total = write_streaming_query_with_obligations(
+            &mut fe,
+            &session,
+            query,
+            2,
+            Some(&obl),
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(fe.header_calls, 1);
+        // windows of 2 then 1
+        assert_eq!(fe.row_calls, 2);
+        assert_eq!(fe.footer_calls, 1);
+        assert_eq!(writer.packets.last().unwrap(), &vec![3u8]);
     }
 }

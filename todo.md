@@ -134,7 +134,7 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
-| **A06** | Backend→PEP 真行流 | 窗口 mask + encode 合一；有义务强制 Streaming | 边 encode 边 mask 已落地；backend 真行 yield 仍待续 | **部分** |
+| **A06** | Backend→PEP 真行流 | `RowStream` + MySQL channel yield；encode 边 mask 边写 | 非事务 Streaming 真窗口 yield；事务路径仍物化 | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | 同协议无义务时 `GatewayResponse::Wire` | 非 TCP 帧中继 | **部分** |
 | **A09** | Portal 端到端流式 | B05b 仅 HTTP chunk；`portal_execute_logical` 仍先物化逻辑结果 | 注释已标明边界 | **待做**（依赖 A06 续） |
@@ -184,7 +184,7 @@ examples/        smoke + gateway config 样例
 | 主题 | 限制 |
 |------|------|
 | Portal「流式」 | B05b = **HTTP** 边写；backend 逻辑结果仍可能全量进内存 |
-| 脱敏大数据 | A06 窗口 mask + A07 socket 写出已落地；backend 仍可能先组装 ResultSet（A06 续） |
+| 脱敏大数据 | A06 MySQL 非事务 Streaming 真窗口 yield + A07 socket 写出；事务/PG Streaming 仍可能物化 |
 | PG passthrough | A08：前端 wire 消息包（Wire），**非** backend TCP 帧中继 |
 | 预处理语句 | PG prepared encode 未实现；MySQL 部分仍偏 legacy |
 | 多副本 | 票据/金库/SQLite 索引/LocalPdp **非**共享状态 |
@@ -195,23 +195,25 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A06 续：backend 真行 yield（或 A09 portal 共用流） <<<**
+**>>> A09 portal 共用流 / 或 A06 事务路径流式 / A10 prepared <<<**
 
-本轮（A07 完成）：
+本轮（A06 续）：
 
-- `handle_frame_to_writer`：结果经 `ResponseWriter` 渐进写出
-- MySQL `MySqlSocketWriter` / PG `PgSocketWriter` 按窗口写 socket
-- 测试仍可用 `handle_frame` + CollectingWriter
+- `ExecuteOutcome` / `RowStream` / `StreamingQuery`（gateway_core）
+- `write_streaming_query_with_obligations`：窗口 yield → mask → encode → socket
+- MySQL 非事务 `Streaming`：`execute_outcome` 经 channel 推送行窗口（峰值 ≈ 窗口）
+- core_engine 优先消费 Streaming 路径
 
 ```bash
-cargo test -p runtime_gateway --lib core_engine
+cargo test -p gateway_core --lib transport
+cargo test -p runtime_gateway --lib core_engine backend::mysql
 ```
 
 建议下一刀：
 
-1. **A06 续** — backend 按窗口 yield（真降峰值内存）  
-2. **A09** — portal 共用 encode 流式路径  
-3. **A10** — prepared 语句矩阵
+1. **A09** — portal 走 StreamingQuery  
+2. **A06 续** — 事务路径 / PostgreSQL Streaming yield  
+3. **A10** — prepared 语句
 
 ---
 
