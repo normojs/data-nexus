@@ -380,6 +380,9 @@ pub struct SecurityAuditConfig {
     /// Example: `/var/log/data-nexus/audit/index.sqlite`.
     #[serde(default)]
     pub index_path: String,
+    /// F32: max characters of SQL stored at L1/L2 (`sql_text`). Default 2048.
+    #[serde(default = "default_sql_text_max_chars")]
+    pub sql_text_max_chars: u32,
 }
 
 fn default_queue_capacity() -> u32 {
@@ -406,6 +409,10 @@ fn default_rotate_keep() -> u32 {
     32
 }
 
+fn default_sql_text_max_chars() -> u32 {
+    2048
+}
+
 impl Default for SecurityAuditConfig {
     fn default() -> Self {
         Self {
@@ -428,6 +435,7 @@ impl Default for SecurityAuditConfig {
             opendal_secret_access_key: String::new(),
             opendal_session_token: String::new(),
             index_path: String::new(),
+            sql_text_max_chars: default_sql_text_max_chars(),
         }
     }
 }

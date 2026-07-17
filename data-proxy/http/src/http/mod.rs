@@ -2202,7 +2202,7 @@ impl AxumServer {
         maybe_reload_local_pdp(&next_config.gateway.security, &diff);
         // Audit pipeline reconfigure is idempotent (queue worker stays up).
         if diff.security_changed {
-            let _ = gateway_core::install_audit_pipeline(&next_config.gateway.security.audit);
+            let _ = gateway_core::install_audit_pipeline(&next_config.gateway.security.audit, &next_config.gateway.security.default_audit_level);
         }
 
         // Cedar policy hot-reload (keep-old on failure): when security.pdp is cedar

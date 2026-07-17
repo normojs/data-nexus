@@ -130,6 +130,7 @@ examples/        smoke + gateway config 样例
 | H06 | origin 同步完成 | 223f2c0 |
 | A10 | prepare param defs + PG ParameterDescription（部分） | feat(a10) |
 | A08 | PG wire 无 ResultSet 物化透传（部分） | feat(a08) |
+| F32 | 审计 L0/L1 SQL 载荷裁剪 | feat(f32) |
 
 ---
 
@@ -158,7 +159,7 @@ examples/        smoke + gateway config 样例
 | **B08** | L2 样本 / 大 payload | 可选结果样本上传 OpenDAL；体积/采样可配 | 有 `AuditLevel::L2` 枚举，**无**样本上传实现 | **延后** |
 | **F31** | Remote PDP 适配器 | HTTP 旁路 OPA/外部 PDP；超时 fail_closed | 配置已 **拒绝** `backend=remote`（防静默 no-op）；实现后放开 | **延后** |
 | **F30** | 敏感识别增强 | 静态列标签之外的规则/词典 MVP（仍不做全量 DLP） | 仅 `column_tags` + mask 规则 | **延后** |
-| **F32** | 审计 L0/L1 载荷裁剪 | 按 audit level 控制 SQL 全文是否进管道/索引 | 级别可配，管道未严格按级裁剪 | **待做** |
+| **F32** | 审计 L0/L1 载荷裁剪 | 按 `default_audit_level` 裁剪 `sql_text`；L0 剥离、L1/L2 截断 | L2 样本上传仍未做（B08） | **完成** |
 
 ### 3.3 P1 — 运维 / 多实例 / 发布
 
@@ -205,24 +206,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A10 binary resultset 或 F32 审计裁剪 或 A08 TCP 真中继 <<<**
+**>>> A10 binary resultset 或 H05 多实例外置 或 A08 TCP 真中继 <<<**
 
-本轮（A08 续）：
+本轮（F32）：
 
-- PG Passthrough：`stream_simple_query_to_pg_wire` 经 `simple_query_raw` 直接编码 Wire
-- 不再先 `Materialized ResultSet` 再 `logical_response_to_pg_wire`
-- 事务路径同样还 lease
+- `AuditEvent.sql_text` + `apply_audit_level_payload`：L0 剥离 SQL；L1/L2 截断（`audit.sql_text_max_chars`，默认 2048）
+- 管道 `try_send` 强制配置级别上限（事件 L2 不能突破部署 L0）
+- 数据面 Query/Prepare 审计附带 fingerprint + tables + sql_text（经管道裁剪）
 
 ```bash
-cargo test -p runtime_gateway --lib backend::postgresql
-# smoke：security-extended（passthrough）
+cargo test -p gateway_core --lib audit
+cargo test -p runtime_gateway --lib core_engine
 ```
 
 建议下一刀：
 
-1. **F32** — 审计 L0/L1 载荷裁剪  
-2. **A10 续** — binary resultset  
-3. **A08 续** — 真 TCP 帧中继（需 raw socket，大刀）
+1. **A10 续** — binary resultset  
+2. **H05** — 多实例状态外置  
+3. **A08 续** — 真 TCP 帧中继
 
 ---
 

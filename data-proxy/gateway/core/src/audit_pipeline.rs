@@ -9,7 +9,7 @@
 //! B07: deny / require_approval use a separate bounded priority queue so a
 //! flood of allow/execute under `drop_new` cannot discard critical events.
 
-use crate::audit::AuditEvent;
+use crate::audit::{apply_audit_level_payload, AuditEvent, AuditLevel};
 use crate::audit_index::{AuditIndex, AuditQueryFilter};
 use crate::security::SecurityAuditConfig;
 use std::collections::VecDeque;
@@ -23,13 +23,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static GLOBAL: OnceLock<Arc<AuditPipeline>> = OnceLock::new();
 
-pub fn install_audit_pipeline(config: &SecurityAuditConfig) -> Arc<AuditPipeline> {
+pub fn install_audit_pipeline(
+    config: &SecurityAuditConfig,
+    default_audit_level: &str,
+) -> Arc<AuditPipeline> {
     configure_opendal_archive(config);
     if let Some(existing) = GLOBAL.get() {
-        existing.reconfigure(config);
+        existing.reconfigure(config, default_audit_level);
         return existing.clone();
     }
-    let pipe = Arc::new(AuditPipeline::new(config));
+    let pipe = Arc::new(AuditPipeline::new(config, default_audit_level));
     pipe.spawn_worker();
     let _ = GLOBAL.set(pipe.clone());
     pipe
@@ -141,6 +144,10 @@ pub struct AuditPipeline {
     priority_capacity: usize,
     recent_capacity: usize,
     overflow: OverflowPolicy,
+    /// F32: configured default audit level for payload trim.
+    payload_level: Mutex<AuditLevel>,
+    /// F32: max SQL chars at L1/L2.
+    sql_text_max_chars: Mutex<usize>,
     file_path: Mutex<Option<PathBuf>>,
     file_policy: Mutex<FileSinkPolicy>,
     write_file: AtomicBool,
@@ -162,7 +169,7 @@ pub struct AuditPipeline {
 }
 
 impl AuditPipeline {
-    pub fn new(config: &SecurityAuditConfig) -> Self {
+    pub fn new(config: &SecurityAuditConfig, default_audit_level: &str) -> Self {
         let capacity = config.queue_capacity.max(1) as usize;
         let priority_capacity = config.priority_queue_capacity as usize;
         let recent_capacity = capacity.min(4096).max(64);
@@ -179,11 +186,19 @@ impl AuditPipeline {
             Some(PathBuf::from(config.file_path.trim()))
         };
         let index = open_index(config.index_path.trim());
+        let level = AuditLevel::parse(default_audit_level).unwrap_or(AuditLevel::L0);
+        let max_sql = if config.sql_text_max_chars == 0 {
+            AuditLevel::DEFAULT_SQL_TEXT_MAX_CHARS
+        } else {
+            config.sql_text_max_chars as usize
+        };
         Self {
             capacity,
             priority_capacity,
             recent_capacity,
             overflow: OverflowPolicy::parse(&config.overflow),
+            payload_level: Mutex::new(level),
+            sql_text_max_chars: Mutex::new(max_sql),
             file_path: Mutex::new(file_path),
             file_policy: Mutex::new(FileSinkPolicy::from_config(config)),
             write_file: AtomicBool::new(write_file),
@@ -207,7 +222,7 @@ impl AuditPipeline {
         }
     }
 
-    pub fn reconfigure(&self, config: &SecurityAuditConfig) {
+    pub fn reconfigure(&self, config: &SecurityAuditConfig, default_audit_level: &str) {
         let sinks = config
             .sinks
             .iter()
@@ -217,6 +232,16 @@ impl AuditPipeline {
         let write_tracing = sinks.is_empty() || sinks.iter().any(|s| s == "tracing");
         self.write_file.store(write_file, Ordering::Relaxed);
         self.write_tracing.store(write_tracing, Ordering::Relaxed);
+        if let Ok(mut lvl) = self.payload_level.lock() {
+            *lvl = AuditLevel::parse(default_audit_level).unwrap_or(AuditLevel::L0);
+        }
+        if let Ok(mut max) = self.sql_text_max_chars.lock() {
+            *max = if config.sql_text_max_chars == 0 {
+                AuditLevel::DEFAULT_SQL_TEXT_MAX_CHARS
+            } else {
+                config.sql_text_max_chars as usize
+            };
+        }
         if !config.file_path.trim().is_empty() {
             if let Ok(mut path) = self.file_path.lock() {
                 *path = Some(PathBuf::from(config.file_path.trim()));
@@ -267,6 +292,18 @@ impl AuditPipeline {
         if event.ts_unix_ms.is_none() {
             event.ts_unix_ms = Some(now_unix_ms());
         }
+        // F32: enforce L0/L1/L2 payload policy before ring/queue/index.
+        let level = self
+            .payload_level
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(AuditLevel::L0);
+        let max_sql = self
+            .sql_text_max_chars
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(AuditLevel::DEFAULT_SQL_TEXT_MAX_CHARS);
+        apply_audit_level_payload(&mut event, level, max_sql);
         {
             let mut state = self.state.lock().expect("audit state");
             if state.recent.len() >= self.recent_capacity {
@@ -825,7 +862,7 @@ mod tests {
         cfg.queue_capacity = 128;
         cfg.sinks = vec!["tracing".into()];
         cfg.overflow = "drop_new".into();
-        let pipe = AuditPipeline::new(&cfg);
+        let pipe = AuditPipeline::new(&cfg, "L0");
         for i in 0..5 {
             let mut e = AuditEvent::default();
             e.decision = Some(if i % 2 == 0 { "deny" } else { "execute" }.into());
@@ -847,7 +884,7 @@ mod tests {
         cfg.queue_capacity = 2;
         cfg.overflow = "drop_new".into();
         cfg.sinks = vec!["tracing".into()];
-        let pipe = AuditPipeline::new(&cfg);
+        let pipe = AuditPipeline::new(&cfg, "L0");
         for i in 0..5 {
             let mut e = AuditEvent::default();
             e.decision = Some("execute".into());
@@ -867,7 +904,7 @@ mod tests {
         cfg.priority_queue_capacity = 8;
         cfg.overflow = "drop_new".into();
         cfg.sinks = vec!["tracing".into()];
-        let pipe = AuditPipeline::new(&cfg);
+        let pipe = AuditPipeline::new(&cfg, "L0");
 
         for i in 0..10 {
             let mut e = AuditEvent::default();
@@ -910,7 +947,7 @@ mod tests {
         cfg.priority_queue_capacity = 16;
         cfg.sinks = vec!["tracing".into()];
         // Do not spawn worker yet — fill both queues, then drain order via pop logic.
-        let pipe = AuditPipeline::new(&cfg);
+        let pipe = AuditPipeline::new(&cfg, "L0");
         for _ in 0..3 {
             let mut e = AuditEvent::default();
             e.decision = Some("execute".into());
@@ -945,7 +982,7 @@ mod tests {
         cfg.priority_queue_capacity = 0;
         cfg.overflow = "drop_new".into();
         cfg.sinks = vec!["tracing".into()];
-        let pipe = AuditPipeline::new(&cfg);
+        let pipe = AuditPipeline::new(&cfg, "L0");
         for i in 0..4 {
             let mut e = AuditEvent::default();
             e.decision = Some(if i == 3 { "deny" } else { "execute" }.into());
@@ -1016,7 +1053,7 @@ mod tests {
         let mut cfg = SecurityAuditConfig::default();
         cfg.queue_capacity = 64;
         cfg.sinks = vec!["tracing".into()];
-        let pipe = Arc::new(AuditPipeline::new(&cfg));
+        let pipe = Arc::new(AuditPipeline::new(&cfg, "L0"));
         pipe.spawn_worker();
         for _ in 0..10 {
             let mut e = AuditEvent::default();
@@ -1047,7 +1084,7 @@ mod tests {
         cfg.overflow = "drop_new".into();
         cfg.sinks = vec!["tracing".into()];
         cfg.index_path = index_path.to_string_lossy().into();
-        let pipe = Arc::new(AuditPipeline::new(&cfg));
+        let pipe = Arc::new(AuditPipeline::new(&cfg, "L0"));
         assert!(pipe.index().is_some());
         pipe.spawn_worker();
 
@@ -1124,10 +1161,47 @@ mod tests {
         cfg.queue_capacity = 32;
         cfg.sinks = vec!["tracing".into()];
         cfg.index_path = String::new();
-        let pipe = AuditPipeline::new(&cfg);
+        let pipe = AuditPipeline::new(&cfg, "L0");
         assert!(pipe.index().is_none());
         let stats = pipe.stats();
         assert!(!stats.index_enabled);
         assert_eq!(stats.index_rows, 0);
     }
+
+    #[test]
+    fn f32_try_send_strips_sql_at_l0() {
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.queue_capacity = 32;
+        cfg.sinks = vec!["tracing".into()];
+        let pipe = AuditPipeline::new(&cfg, "L0");
+        let mut e = AuditEvent::default();
+        e.decision = Some("execute".into());
+        e.sql_text = Some("SELECT secret FROM t".into());
+        e.sql_fingerprint = Some("fp".into());
+        e.audit_level = Some("L1".into()); // capped by configured L0
+        pipe.try_send(e);
+        let recent = pipe.query(None, None, None, 10);
+        assert_eq!(recent.len(), 1);
+        assert!(recent[0].sql_text.is_none());
+        assert_eq!(recent[0].sql_fingerprint.as_deref(), Some("fp"));
+        assert_eq!(recent[0].audit_level.as_deref(), Some("L0"));
+    }
+
+    #[test]
+    fn f32_try_send_keeps_truncated_sql_at_l1() {
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.queue_capacity = 32;
+        cfg.sql_text_max_chars = 8;
+        cfg.sinks = vec!["tracing".into()];
+        let pipe = AuditPipeline::new(&cfg, "L1");
+        let mut e = AuditEvent::default();
+        e.decision = Some("execute".into());
+        e.sql_text = Some("1234567890abcdef".into());
+        e.audit_level = Some("L1".into());
+        pipe.try_send(e);
+        let recent = pipe.query(None, None, None, 10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].sql_text.as_deref(), Some("12345678…"));
+    }
+
 }

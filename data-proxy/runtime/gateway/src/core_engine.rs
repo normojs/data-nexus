@@ -56,6 +56,8 @@ pub struct CoreGatewayConnection {
     frontend_dialect: Arc<dyn DialectParser>,
     /// Data-plane Local PDP when `security.enabled` (S1+).
     security: Option<gateway_core::LocalPdp>,
+    /// F32: deployment default audit level (L0/L1/L2) for event tagging.
+    default_audit_level: String,
     /// Result read mode from security.streaming (A1).
     stream_mode: ExecuteMode,
     /// When true and same-protocol + no obligations, prefer wire passthrough (A3).
@@ -83,6 +85,7 @@ impl CoreGatewayConnection {
             translation_policy: None,
             frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
             security: None,
+            default_audit_level: "L0".into(),
             stream_mode: ExecuteMode::Materialized,
             passthrough_enabled: false,
             metrics: MySQLServerMetricsCollector,
@@ -101,6 +104,7 @@ impl CoreGatewayConnection {
         security: Option<gateway_core::LocalPdp>,
         stream_mode: ExecuteMode,
         passthrough_enabled: bool,
+        default_audit_level: String,
     ) -> Self {
         let frontend_protocol = frontend.protocol();
         Self {
@@ -114,6 +118,7 @@ impl CoreGatewayConnection {
             translation_policy,
             frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
             security,
+            default_audit_level,
             stream_mode,
             passthrough_enabled,
             metrics: MySQLServerMetricsCollector,
@@ -407,6 +412,22 @@ impl CoreGatewayConnection {
 
             // S1/S2/S3: data-plane Local PDP (table/statement/column/mask/row) before backend execute.
             let mut command = command;
+            // F32: capture SQL (+ tables) for audit payload before rewrite/execute.
+            let (audit_sql, audit_tables) = match &command {
+                GatewayCommand::Query { sql } | GatewayCommand::Prepare { sql } => {
+                    let set = crate::object_extract::extract_object_set(
+                        sql,
+                        self.frontend.protocol().as_str(),
+                    );
+                    let tables = set
+                        .objects
+                        .iter()
+                        .map(|o| o.table.clone())
+                        .collect::<Vec<_>>();
+                    (Some(sql.clone()), tables)
+                }
+                _ => (None, Vec::new()),
+            };
             let mut pending_obligations = gateway_core::Obligations::default();
             if let Some(pdp) = &self.security {
                 let subject = gateway_core::Subject::from_protocol_user(
@@ -503,7 +524,10 @@ impl CoreGatewayConnection {
                             code: Some("security_require_ticket".into()),
                             message: Some(message.clone()),
                             rule: Some(rule.clone()),
-                            audit_level: Some("L0".into()),
+                            audit_level: Some(self.default_audit_level.clone()),
+                            sql_fingerprint: audit_sql.as_deref().map(gateway_core::sql_fingerprint),
+                            sql_text: audit_sql.clone(),
+                            tables: audit_tables.clone(),
                             ..gateway_core::AuditEvent::default()
                         });
                         let response = GatewayResponse::Error {
@@ -575,7 +599,10 @@ impl CoreGatewayConnection {
                             code: Some("security_deny".into()),
                             message: Some(message.clone()),
                             rule: Some(rule.clone()),
-                            audit_level: Some("L0".into()),
+                            audit_level: Some(self.default_audit_level.clone()),
+                            sql_fingerprint: audit_sql.as_deref().map(gateway_core::sql_fingerprint),
+                            sql_text: audit_sql.clone(),
+                            tables: audit_tables.clone(),
                             ..gateway_core::AuditEvent::default()
                         });
                         let response = GatewayResponse::Error {
@@ -744,7 +771,10 @@ impl CoreGatewayConnection {
                         database: self.session.database.clone(),
                         outcome: Some("resultset".into()),
                         latency_ms: Some(started_at.elapsed().as_millis() as u64),
-                        audit_level: Some("L0".into()),
+                        audit_level: Some(self.default_audit_level.clone()),
+                        sql_fingerprint: audit_sql.as_deref().map(gateway_core::sql_fingerprint),
+                        sql_text: audit_sql.clone(),
+                        tables: audit_tables.clone(),
                         ..gateway_core::AuditEvent::default()
                     });
                     if let (Some(plugins), Some(idx)) =
@@ -879,7 +909,10 @@ impl CoreGatewayConnection {
                 database: self.session.database.clone(),
                 outcome: Some(outcome.clone()),
                 latency_ms: Some(started_at.elapsed().as_millis() as u64),
-                audit_level: Some("L0".into()),
+                audit_level: Some(self.default_audit_level.clone()),
+                sql_fingerprint: audit_sql.as_deref().map(gateway_core::sql_fingerprint),
+                sql_text: audit_sql,
+                tables: audit_tables,
                 ..gateway_core::AuditEvent::default()
             });
 
@@ -1039,7 +1072,7 @@ impl CoreGatewayRuntimePlan {
     pub fn from_config(config: &GatewayConfig) -> GatewayResult<Self> {
         config.validate()?;
         // S4: install process-wide audit pipeline from security.audit (idempotent).
-        let _ = gateway_core::install_audit_pipeline(&config.security.audit);
+        let _ = gateway_core::install_audit_pipeline(&config.security.audit, &config.security.default_audit_level);
 
         let listeners = config
             .listeners
@@ -1084,6 +1117,8 @@ pub struct CoreGatewayListenerPlan {
     /// Result read mode derived from security.streaming.
     stream_mode: ExecuteMode,
     passthrough_enabled: bool,
+    /// F32: copy of security.default_audit_level for event tagging.
+    default_audit_level: String,
 }
 
 impl PartialEq for CoreGatewayListenerPlan {
@@ -1169,6 +1204,7 @@ impl CoreGatewayListenerPlan {
         }
         // Passthrough only for same-protocol; default true from security.streaming.
         let passthrough_enabled = config.security.streaming.passthrough;
+        let default_audit_level = config.security.default_audit_level.clone();
 
         Ok(Self {
             listener: listener.clone(),
@@ -1182,6 +1218,7 @@ impl CoreGatewayListenerPlan {
             security,
             stream_mode,
             passthrough_enabled,
+            default_audit_level,
         })
     }
 
@@ -1231,6 +1268,7 @@ impl CoreGatewayListenerPlan {
             self.security.clone(),
             self.stream_mode,
             self.passthrough_enabled,
+            self.default_audit_level.clone(),
         );
         if let Some(plugin_config) = &self.plugin_config {
             connection = connection.with_plugins(PluginPhase::new(plugin_config.clone()));

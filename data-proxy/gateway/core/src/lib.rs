@@ -35,7 +35,8 @@ pub use admin_auth::{
     AdminRole,
 };
 pub use audit::{
-    fields as audit_fields, AuditAction, AuditDecision, AuditEvent, AuditLevel, AUDIT_TARGET,
+    fields as audit_fields, apply_audit_level_payload, AuditAction, AuditDecision, AuditEvent,
+    AuditLevel, AUDIT_TARGET,
 };
 pub use audit_index::{AuditIndex, AuditQueryFilter};
 #[cfg(feature = "audit-opendal")]
