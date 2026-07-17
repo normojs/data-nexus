@@ -124,6 +124,7 @@ examples/        smoke + gateway config 样例
 | chore | Claude skills/rules/commands | `91abab3` |
 | A09 | portal NDJSON backend 窗口流（部分） | feat(a09) |
 | A06 | PG 非事务 Streaming yield（部分） | feat(a06) |
+| A10 | prepared 注册表 + encode（部分） | feat(a10) |
 
 ---
 
@@ -142,7 +143,7 @@ examples/        smoke + gateway config 样例
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | 同协议无义务时 `GatewayResponse::Wire` | 非 TCP 帧中继 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
-| **A10** | 预处理 / 事务透传矩阵 | MySQL prepared encode 仍偏 legacy；**PG prepared encode not implemented** | 易把流量打进慢路径或直接报错 | **待做** |
+| **A10** | 预处理 / 事务透传矩阵 | gateway 注册表 + MySQL COM_STMT_PREPARE OK encode；Execute→text Query | 参数绑定未实现；PG 扩展协议 Parse/Bind 未解码 | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
 
@@ -190,7 +191,7 @@ examples/        smoke + gateway config 样例
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG 非事务 Streaming 真窗口 yield + A07 socket 写出；**事务路径仍物化** |
 | PG passthrough | A08：前端 wire 消息包（Wire），**非** backend TCP 帧中继 |
-| 预处理语句 | PG prepared encode 未实现；MySQL 部分仍偏 legacy |
+| 预处理语句 | A10：网关侧 Prepare/Close + MySQL prepare OK encode；**参数绑定未实现**；PG 扩展查询消息未解码 |
 | 多副本 | 票据/金库/SQLite 索引/LocalPdp **非**共享状态 |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
@@ -199,24 +200,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A10 prepared 语句 或 A06 事务路径流式 <<<**
+**>>> A10 续：参数绑定 / PG Parse-Bind 或 A06 事务路径流式 <<<**
 
-本轮（A06 PG Streaming）：
+本轮（A10 部分）：
 
-- PostgreSQL `execute_outcome`：非事务 `Streaming` → `simple_query_raw` + channel `RowStream`
-- 与 MySQL 对齐：事务 lease 路径仍 `Complete` 物化（诚实）
-- 单测：`backend::postgresql` 14 项
+- MySQL/PG backend：`Prepare`/`Execute`(无参)/`CloseStatement` 网关注册表；Execute 改写为 text Query
+- MySQL frontend：`COM_STMT_PREPARE` OK payload encode（不再 Unsupported）
+- PG frontend：`Prepared` → CommandComplete（扩展协议仍未解码）
 
 ```bash
-cargo test -p runtime_gateway --lib backend::postgresql
-# smoke：security-extended（含 xproto-stream）
+cargo test -p runtime_gateway --lib a10_
+# smoke：default / security-core（回归）
 ```
 
 建议下一刀：
 
-1. **A10** — prepared 语句（PG encode 未实现；MySQL legacy）  
-2. **A06 续** — 事务路径流式（需 redesign lease/producer 共享）  
-3. **A09 续** — portal json/csv 窗口（若产品需要）
+1. **A10 续** — COM_STMT_EXECUTE 参数解析 / PG Parse·Bind·Describe  
+2. **A06 续** — 事务路径流式  
+3. **H06** — 发布与 origin 同步
 
 ---
 

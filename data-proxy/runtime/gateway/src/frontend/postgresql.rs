@@ -107,9 +107,19 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             ]),
             GatewayResponse::ResultSet { columns, rows } => encode_resultset(columns, rows, ready),
             GatewayResponse::Wire { packets } => Ok(packets),
-            GatewayResponse::Prepared { .. } => Err(GatewayError::Unsupported(
-                "postgresql prepared response encoding is not implemented yet".into(),
-            )),
+            // A10: gateway-owned prepared registry is not the PG extended protocol.
+            // Clients using Parse/Bind still need extended-query decode (not in this
+            // slice). When a Prepared response is produced (e.g. via IR), answer with
+            // CommandComplete + Ready so the session does not hang on Unsupported.
+            GatewayResponse::Prepared {
+                statement_id,
+                parameter_count,
+            } => Ok(vec![
+                encode_command_complete(&format!(
+                    "PREPARE {statement_id} params={parameter_count}"
+                )),
+                ready,
+            ]),
         }
     }
 
@@ -523,6 +533,29 @@ mod tests {
             Ok(vec![GatewayCommand::Quit])
         );
         assert_eq!(protocol.decode(&encode_sync_message(), &mut session), Ok(vec![]));
+    }
+
+    #[test]
+    fn a10_encodes_prepared_as_command_complete() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState::default();
+        let packets = protocol
+            .encode(
+                GatewayResponse::Prepared {
+                    statement_id: "1".into(),
+                    parameter_count: 0,
+                },
+                &session,
+            )
+            .unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0][0], b'C');
+        assert_eq!(packets[1], encode_ready_for_query(TransactionStatus::Idle));
+        assert!(
+            String::from_utf8_lossy(&packets[0]).contains("PREPARE 1"),
+            "{:?}",
+            packets[0]
+        );
     }
 
     #[test]

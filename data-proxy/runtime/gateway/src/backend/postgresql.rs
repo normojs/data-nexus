@@ -1,4 +1,11 @@
-use std::{fmt, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool, PoolConn};
@@ -18,11 +25,48 @@ use tracing::error;
 
 const DEFAULT_POSTGRESQL_POOL_SIZE: usize = 16;
 
+/// A10: session-scoped prepared statement registry (gateway-owned id → SQL).
+///
+/// Does not use PG extended query protocol yet; Execute rewrites to simple Query.
+#[derive(Debug, Default)]
+struct PreparedRegistry {
+    next_id: AtomicU32,
+    sql_by_id: Mutex<HashMap<String, String>>,
+}
+
+impl Clone for PreparedRegistry {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PreparedRegistry {
+    fn prepare(&self, sql: String) -> (String, u16) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let statement_id = id.to_string();
+        self.sql_by_id.lock().insert(statement_id.clone(), sql);
+        (statement_id, 0)
+    }
+
+    fn take_sql(&self, statement_id: &str) -> Option<String> {
+        self.sql_by_id.lock().get(statement_id).cloned()
+    }
+
+    fn close(&self, statement_id: &str) -> bool {
+        self.sql_by_id.lock().remove(statement_id).is_some()
+    }
+
+    fn clear(&self) {
+        self.sql_by_id.lock().clear();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PostgreSqlBackendConnector {
     endpoints: Arc<Mutex<Vec<EndpointConfig>>>,
     pool: Pool<PostgreSqlBackendConnection>,
     txn_lease: Arc<Mutex<Option<PoolConn<PostgreSqlBackendConnection>>>>,
+    prepared: Arc<PreparedRegistry>,
 }
 
 impl Default for PostgreSqlBackendConnector {
@@ -52,6 +96,7 @@ impl PostgreSqlBackendConnector {
             endpoints: Arc::new(Mutex::new(endpoints)),
             pool,
             txn_lease: Arc::new(Mutex::new(None)),
+            prepared: Arc::new(PreparedRegistry::default()),
         }
     }
 
@@ -331,6 +376,7 @@ impl BackendConnector for PostgreSqlBackendConnector {
             GatewayCommand::Ping => Ok(GatewayResponse::Pong),
             GatewayCommand::Quit => {
                 *self.txn_lease.lock() = None;
+                self.prepared.clear();
                 Ok(GatewayResponse::Bye)
             }
             GatewayCommand::UseDatabase { database } => {
@@ -369,10 +415,44 @@ impl BackendConnector for PostgreSqlBackendConnector {
                     self.execute_simple_query(endpoint, &sql, session, mode).await
                 }
             }
-            command => Err(GatewayError::Unsupported(format!(
-                "postgresql backend connector cannot execute {:?} yet",
-                command
-            ))),
+            // A10: gateway-owned prepared registry; Execute rewrites to text Query.
+            GatewayCommand::Prepare { sql } => {
+                let (statement_id, parameter_count) = self.prepared.prepare(sql);
+                Ok(GatewayResponse::Prepared {
+                    statement_id,
+                    parameter_count,
+                })
+            }
+            GatewayCommand::Execute {
+                statement_id,
+                parameters,
+            } => {
+                if !parameters.is_empty() {
+                    return Err(GatewayError::Unsupported(
+                        "postgresql prepared Execute with bound parameters is not implemented yet"
+                            .into(),
+                    ));
+                }
+                let sql = self.prepared.take_sql(&statement_id).ok_or_else(|| {
+                    GatewayError::Backend(format!(
+                        "unknown postgresql prepared statement id '{statement_id}'"
+                    ))
+                })?;
+                let endpoint = self.select_endpoint(session)?;
+                if matches!(mode, ExecuteMode::Passthrough) {
+                    return self
+                        .execute_simple_query_wire(endpoint, &sql, session)
+                        .await;
+                }
+                self.execute_simple_query(endpoint, &sql, session, mode).await
+            }
+            GatewayCommand::CloseStatement { statement_id } => {
+                let _ = self.prepared.close(&statement_id);
+                Ok(GatewayResponse::Ok {
+                    affected_rows: 0,
+                    last_insert_id: None,
+                })
+            }
         }
     }
 
@@ -943,6 +1023,80 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn a10_prepare_execute_close_registry() {
+        let connector = PostgreSqlBackendConnector::new();
+        let mut session = SessionState::default();
+
+        let prepared = connector
+            .execute(
+                GatewayCommand::Prepare {
+                    sql: "SELECT 1".into(),
+                },
+                &mut session,
+            )
+            .await
+            .unwrap();
+        let statement_id = match prepared {
+            GatewayResponse::Prepared {
+                statement_id,
+                parameter_count,
+            } => {
+                assert_eq!(parameter_count, 0);
+                statement_id
+            }
+            other => panic!("expected Prepared, got {other:?}"),
+        };
+
+        let err = connector
+            .execute(
+                GatewayCommand::Execute {
+                    statement_id: "99999".into(),
+                    parameters: vec![],
+                },
+                &mut session,
+            )
+            .await;
+        assert!(matches!(err, Err(GatewayError::Backend(_))));
+
+        let err = connector
+            .execute(
+                GatewayCommand::Execute {
+                    statement_id: statement_id.clone(),
+                    parameters: vec![GatewayValue::Integer(1)],
+                },
+                &mut session,
+            )
+            .await;
+        assert!(matches!(err, Err(GatewayError::Unsupported(_))));
+
+        assert_eq!(
+            connector
+                .execute(
+                    GatewayCommand::CloseStatement {
+                        statement_id: statement_id.clone(),
+                    },
+                    &mut session,
+                )
+                .await,
+            Ok(GatewayResponse::Ok {
+                affected_rows: 0,
+                last_insert_id: None
+            })
+        );
+
+        let err = connector
+            .execute(
+                GatewayCommand::Execute {
+                    statement_id,
+                    parameters: vec![],
+                },
+                &mut session,
+            )
+            .await;
+        assert!(matches!(err, Err(GatewayError::Backend(_))));
     }
 
     #[test]

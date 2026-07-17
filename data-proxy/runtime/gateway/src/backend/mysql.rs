@@ -1,4 +1,11 @@
-use std::{fmt, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
@@ -22,12 +29,55 @@ use parking_lot::Mutex;
 
 const DEFAULT_MYSQL_POOL_SIZE: usize = 16;
 
+/// A10: session-scoped prepared statement registry (gateway-owned id → SQL).
+///
+/// Does **not** proxy COM_STMT_* to the backend binary protocol yet; Execute
+/// rewrites to a text Query of the stored SQL. Parameters are not substituted
+/// (honest: parameter binding still incomplete).
+#[derive(Debug, Default)]
+struct PreparedRegistry {
+    next_id: AtomicU32,
+    /// statement_id (decimal string) → SQL text
+    sql_by_id: Mutex<HashMap<String, String>>,
+}
+
+impl Clone for PreparedRegistry {
+    fn clone(&self) -> Self {
+        // New connection-scoped registry per connector clone (each session backend).
+        Self::default()
+    }
+}
+
+impl PreparedRegistry {
+    fn prepare(&self, sql: String) -> (String, u16) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let statement_id = id.to_string();
+        self.sql_by_id.lock().insert(statement_id.clone(), sql);
+        // parameter_count unknown without full COM_STMT_PREPARE; advertise 0.
+        (statement_id, 0)
+    }
+
+    fn take_sql(&self, statement_id: &str) -> Option<String> {
+        self.sql_by_id.lock().get(statement_id).cloned()
+    }
+
+    fn close(&self, statement_id: &str) -> bool {
+        self.sql_by_id.lock().remove(statement_id).is_some()
+    }
+
+    fn clear(&self) {
+        self.sql_by_id.lock().clear();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MySqlBackendConnector {
     endpoints: Arc<Mutex<Vec<EndpointConfig>>>,
     pool: Pool<MySqlBackendConnection>,
     // Held across BEGIN..COMMIT/ROLLBACK so all statements share one backend conn.
     txn_lease: Arc<Mutex<Option<PoolConn<MySqlBackendConnection>>>>,
+    /// A10 prepared registry (per connector instance / client session).
+    prepared: Arc<PreparedRegistry>,
 }
 
 impl Default for MySqlBackendConnector {
@@ -56,6 +106,7 @@ impl MySqlBackendConnector {
             endpoints: Arc::new(Mutex::new(endpoints)),
             pool,
             txn_lease: Arc::new(Mutex::new(None)),
+            prepared: Arc::new(PreparedRegistry::default()),
         }
     }
 
@@ -381,6 +432,7 @@ impl BackendConnector for MySqlBackendConnector {
             GatewayCommand::Ping => Ok(GatewayResponse::Pong),
             GatewayCommand::Quit => {
                 *self.txn_lease.lock() = None;
+                self.prepared.clear();
                 Ok(GatewayResponse::Bye)
             }
             GatewayCommand::UseDatabase { database } => {
@@ -421,10 +473,39 @@ impl BackendConnector for MySqlBackendConnector {
                 let endpoint = self.select_endpoint(session)?;
                 self.execute_simple_query(endpoint, &sql, session, mode).await
             }
-            command => Err(GatewayError::Unsupported(format!(
-                "mysql backend connector cannot execute {:?} yet",
-                command
-            ))),
+            // A10: gateway-owned prepared registry; Execute rewrites to text Query.
+            GatewayCommand::Prepare { sql } => {
+                let (statement_id, parameter_count) = self.prepared.prepare(sql);
+                Ok(GatewayResponse::Prepared {
+                    statement_id,
+                    parameter_count,
+                })
+            }
+            GatewayCommand::Execute {
+                statement_id,
+                parameters,
+            } => {
+                if !parameters.is_empty() {
+                    return Err(GatewayError::Unsupported(
+                        "mysql prepared Execute with bound parameters is not implemented yet"
+                            .into(),
+                    ));
+                }
+                let sql = self.prepared.take_sql(&statement_id).ok_or_else(|| {
+                    GatewayError::Backend(format!(
+                        "unknown mysql prepared statement id '{statement_id}'"
+                    ))
+                })?;
+                let endpoint = self.select_endpoint(session)?;
+                self.execute_simple_query(endpoint, &sql, session, mode).await
+            }
+            GatewayCommand::CloseStatement { statement_id } => {
+                let _ = self.prepared.close(&statement_id);
+                Ok(GatewayResponse::Ok {
+                    affected_rows: 0,
+                    last_insert_id: None,
+                })
+            }
         }
     }
 
@@ -1201,5 +1282,82 @@ mod tests {
             err_packet_to_gateway_response(b"\xff\x28\x04#HY000syntax error"),
             GatewayResponse::Error { code: "1064".into(), message: "syntax error".into() }
         );
+    }
+
+    #[tokio::test]
+    async fn a10_prepare_execute_close_registry() {
+        let connector = MySqlBackendConnector::new();
+        let mut session = SessionState::default();
+
+        let prepared = connector
+            .execute(
+                GatewayCommand::Prepare {
+                    sql: "SELECT 1".into(),
+                },
+                &mut session,
+            )
+            .await
+            .unwrap();
+        let statement_id = match prepared {
+            GatewayResponse::Prepared {
+                statement_id,
+                parameter_count,
+            } => {
+                assert_eq!(parameter_count, 0);
+                statement_id
+            }
+            other => panic!("expected Prepared, got {other:?}"),
+        };
+
+        // Unknown id errors without hitting backend.
+        let err = connector
+            .execute(
+                GatewayCommand::Execute {
+                    statement_id: "99999".into(),
+                    parameters: vec![],
+                },
+                &mut session,
+            )
+            .await;
+        assert!(matches!(err, Err(GatewayError::Backend(_))));
+
+        // Parameters not yet supported.
+        let err = connector
+            .execute(
+                GatewayCommand::Execute {
+                    statement_id: statement_id.clone(),
+                    parameters: vec![GatewayValue::Integer(1)],
+                },
+                &mut session,
+            )
+            .await;
+        assert!(matches!(err, Err(GatewayError::Unsupported(_))));
+
+        assert_eq!(
+            connector
+                .execute(
+                    GatewayCommand::CloseStatement {
+                        statement_id: statement_id.clone(),
+                    },
+                    &mut session,
+                )
+                .await,
+            Ok(GatewayResponse::Ok {
+                affected_rows: 0,
+                last_insert_id: None
+            })
+        );
+
+        // After close, Execute fails as unknown.
+        let err = connector
+            .execute(
+                GatewayCommand::Execute {
+                    statement_id,
+                    parameters: vec![],
+                },
+                &mut session,
+            )
+            .await;
+        assert!(matches!(err, Err(GatewayError::Backend(_))));
     }
 }

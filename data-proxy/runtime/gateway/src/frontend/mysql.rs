@@ -162,10 +162,13 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
             }
             GatewayResponse::ResultSet { columns, rows } => encode_text_resultset(columns, rows),
             GatewayResponse::Wire { packets } => Ok(packets),
-            GatewayResponse::Prepared { .. } => Err(GatewayError::Unsupported(
-                "mysql prepared response encoding is still handled by the legacy packet stream"
-                    .into(),
-            )),
+            // A10: COM_STMT_PREPARE OK payload (no 4-byte frame header).
+            // parameter_count/column_count from backend registry; column defs omitted
+            // when both counts are 0 (matches MySQL wire for param-less prepare).
+            GatewayResponse::Prepared {
+                statement_id,
+                parameter_count,
+            } => Ok(vec![encode_mysql_prepare_ok(&statement_id, parameter_count)?]),
         }
     }
 
@@ -234,6 +237,25 @@ fn decode_statement_id(payload: &[u8]) -> GatewayResult<String> {
     }
 
     Ok(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]).to_string())
+}
+
+/// COM_STMT_PREPARE OK body (without packet header):
+/// status(1)=0, statement_id(4 LE), num_columns(2 LE), num_params(2 LE),
+/// filler(1)=0, warning_count(2 LE)=0.
+fn encode_mysql_prepare_ok(statement_id: &str, parameter_count: u16) -> GatewayResult<Vec<u8>> {
+    let stmt_id: u32 = statement_id.parse().map_err(|_| {
+        GatewayError::Protocol(format!(
+            "mysql prepared statement_id '{statement_id}' is not a u32"
+        ))
+    })?;
+    let mut payload = Vec::with_capacity(12);
+    payload.push(0); // OK
+    payload.extend_from_slice(&stmt_id.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes()); // num_columns
+    payload.extend_from_slice(&parameter_count.to_le_bytes());
+    payload.push(0); // filler
+    payload.extend_from_slice(&0u16.to_le_bytes()); // warnings
+    Ok(payload)
 }
 
 
@@ -607,6 +629,53 @@ mod tests {
         );
 
         assert!(matches!(error, Ok(packets) if packets[0].first() == Some(&0xff)));
+    }
+
+    #[test]
+    fn a10_encodes_prepare_ok_payload() {
+        let mut adapter = adapter();
+        let session = SessionState::default();
+        let packets = adapter
+            .encode(
+                GatewayResponse::Prepared {
+                    statement_id: "42".into(),
+                    parameter_count: 0,
+                },
+                &session,
+            )
+            .unwrap();
+        assert_eq!(packets.len(), 1);
+        let p = &packets[0];
+        assert_eq!(p[0], 0); // OK
+        assert_eq!(u32::from_le_bytes([p[1], p[2], p[3], p[4]]), 42);
+        assert_eq!(u16::from_le_bytes([p[5], p[6]]), 0); // columns
+        assert_eq!(u16::from_le_bytes([p[7], p[8]]), 0); // params
+        assert_eq!(p[9], 0); // filler
+        assert_eq!(u16::from_le_bytes([p[10], p[11]]), 0); // warnings
+    }
+
+    #[test]
+    fn a10_decodes_stmt_prepare_and_execute() {
+        let mut adapter = adapter();
+        let mut session = SessionState::default();
+        let mut prep = vec![COM_STMT_PREPARE];
+        prep.extend_from_slice(b"SELECT 1");
+        assert_eq!(
+            adapter.decode(&prep, &mut session),
+            Ok(vec![GatewayCommand::Prepare {
+                sql: "SELECT 1".into()
+            }])
+        );
+
+        let mut exec = vec![COM_STMT_EXECUTE];
+        exec.extend_from_slice(&7u32.to_le_bytes());
+        assert_eq!(
+            adapter.decode(&exec, &mut session),
+            Ok(vec![GatewayCommand::Execute {
+                statement_id: "7".into(),
+                parameters: vec![],
+            }])
+        );
     }
 
     #[test]
