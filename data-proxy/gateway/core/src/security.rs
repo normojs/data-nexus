@@ -317,6 +317,11 @@ impl Default for SecurityStreamingConfig {
 pub struct SecurityAuditConfig {
     #[serde(default = "default_queue_capacity")]
     pub queue_capacity: u32,
+    /// Bounded queue for high-priority decisions (`deny` / `require_approval`). B07.
+    /// Independent of `queue_capacity` so `drop_new` floods cannot discard critical events.
+    /// `0` disables the separate queue (all events share the main queue).
+    #[serde(default = "default_priority_queue_capacity")]
+    pub priority_queue_capacity: u32,
     #[serde(default = "default_overflow")]
     pub overflow: String,
     #[serde(default = "default_audit_sinks")]
@@ -369,6 +374,10 @@ fn default_queue_capacity() -> u32 {
     65_536
 }
 
+fn default_priority_queue_capacity() -> u32 {
+    1_024
+}
+
 fn default_overflow() -> String {
     "drop_new".into()
 }
@@ -389,6 +398,7 @@ impl Default for SecurityAuditConfig {
     fn default() -> Self {
         Self {
             queue_capacity: default_queue_capacity(),
+            priority_queue_capacity: default_priority_queue_capacity(),
             overflow: default_overflow(),
             sinks: default_audit_sinks(),
             file_path: String::new(),

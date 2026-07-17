@@ -1146,7 +1146,14 @@ impl AxumServer {
                 "written": 0,
                 "dropped": 0,
                 "queue_capacity": 0,
+                "priority_queue_capacity": 0,
+                "priority_accepted": 0,
+                "priority_dropped": 0,
+                "queue_len": 0,
+                "priority_queue_len": 0,
                 "recent_len": 0,
+                "rotated": 0,
+                "pruned": 0,
                 "installed": false
             })),
         }

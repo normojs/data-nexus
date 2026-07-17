@@ -59,6 +59,8 @@ passthrough = true
 
 [security.audit]
 queue_capacity = 65536
+# B07: independent queue for deny/require_approval (0 disables split).
+priority_queue_capacity = 1024
 overflow = "drop_new"
 sinks = ["tracing", "file"]
 file_path = "/var/log/data-nexus/audit/events.jsonl"

@@ -4,6 +4,8 @@
 //! and optionally drops oldest/newest per config.
 //!
 //! B04: optional size-based rotation, age prune, and keep-N for JSONL files.
+//! B07: deny / require_approval use a separate bounded priority queue so a
+//! flood of allow/execute under `drop_new` cannot discard critical events.
 
 use crate::audit::AuditEvent;
 use crate::security::SecurityAuditConfig;
@@ -87,6 +89,14 @@ impl OverflowPolicy {
     }
 }
 
+/// Critical security decisions that must not lose to allow/execute floods. B07.
+fn is_priority_decision(decision: Option<&str>) -> bool {
+    matches!(
+        decision.map(|d| d.trim().to_ascii_lowercase()).as_deref(),
+        Some("deny") | Some("require_approval") | Some("require_ticket")
+    )
+}
+
 #[derive(Debug, Clone)]
 struct FileSinkPolicy {
     max_file_bytes: u64,
@@ -114,13 +124,18 @@ impl FileSinkPolicy {
 }
 
 struct SharedState {
+    /// Normal priority (allow / execute / …).
     queue: VecDeque<AuditEvent>,
+    /// High priority (deny / require_approval). Drained before `queue`. B07.
+    priority_queue: VecDeque<AuditEvent>,
     recent: VecDeque<AuditEvent>,
     closed: bool,
 }
 
 pub struct AuditPipeline {
     capacity: usize,
+    /// Separate capacity for priority events; 0 → priority uses main queue only.
+    priority_capacity: usize,
     recent_capacity: usize,
     overflow: OverflowPolicy,
     file_path: Mutex<Option<PathBuf>>,
@@ -130,7 +145,11 @@ pub struct AuditPipeline {
     state: Mutex<SharedState>,
     cv: Condvar,
     dropped: AtomicU64,
+    /// Drops from the priority queue only (still counted in `dropped`).
+    priority_dropped: AtomicU64,
     accepted: AtomicU64,
+    /// Accepted into the priority queue.
+    priority_accepted: AtomicU64,
     written: AtomicU64,
     rotated: AtomicU64,
     pruned: AtomicU64,
@@ -140,6 +159,7 @@ pub struct AuditPipeline {
 impl AuditPipeline {
     pub fn new(config: &SecurityAuditConfig) -> Self {
         let capacity = config.queue_capacity.max(1) as usize;
+        let priority_capacity = config.priority_queue_capacity as usize;
         let recent_capacity = capacity.min(4096).max(64);
         let sinks = config
             .sinks
@@ -155,6 +175,7 @@ impl AuditPipeline {
         };
         Self {
             capacity,
+            priority_capacity,
             recent_capacity,
             overflow: OverflowPolicy::parse(&config.overflow),
             file_path: Mutex::new(file_path),
@@ -163,12 +184,15 @@ impl AuditPipeline {
             write_tracing: AtomicBool::new(write_tracing),
             state: Mutex::new(SharedState {
                 queue: VecDeque::with_capacity(capacity),
+                priority_queue: VecDeque::with_capacity(priority_capacity.max(1)),
                 recent: VecDeque::with_capacity(recent_capacity),
                 closed: false,
             }),
             cv: Condvar::new(),
             dropped: AtomicU64::new(0),
+            priority_dropped: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
+            priority_accepted: AtomicU64::new(0),
             written: AtomicU64::new(0),
             rotated: AtomicU64::new(0),
             pruned: AtomicU64::new(0),
@@ -225,33 +249,68 @@ impl AuditPipeline {
             state.recent.push_back(event.clone());
         }
 
+        let priority = self.priority_capacity > 0
+            && is_priority_decision(event.decision.as_deref());
+
         let mut state = self.state.lock().expect("audit state");
         if state.closed {
             return;
         }
-        if state.queue.len() >= self.capacity {
+
+        if priority {
+            if !self.enqueue(
+                &mut state.priority_queue,
+                self.priority_capacity,
+                event,
+                true,
+            ) {
+                return;
+            }
+            self.priority_accepted.fetch_add(1, Ordering::Relaxed);
+        } else if !self.enqueue(&mut state.queue, self.capacity, event, false) {
+            return;
+        }
+        self.accepted.fetch_add(1, Ordering::Relaxed);
+        self.cv.notify_one();
+    }
+
+    /// Push into a bounded queue applying overflow policy. Returns false if dropped.
+    fn enqueue(
+        &self,
+        queue: &mut VecDeque<AuditEvent>,
+        capacity: usize,
+        event: AuditEvent,
+        is_priority: bool,
+    ) -> bool {
+        if queue.len() >= capacity {
             match self.overflow {
                 OverflowPolicy::DropOld => {
-                    let _ = state.queue.pop_front();
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    let _ = queue.pop_front();
+                    self.record_drop(is_priority);
                 }
                 OverflowPolicy::Sample => {
                     if now_unix_ms() % 2 == 0 {
-                        self.dropped.fetch_add(1, Ordering::Relaxed);
-                        return;
+                        self.record_drop(is_priority);
+                        return false;
                     }
-                    let _ = state.queue.pop_front();
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    let _ = queue.pop_front();
+                    self.record_drop(is_priority);
                 }
                 OverflowPolicy::DropNew | OverflowPolicy::Block => {
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
-                    return;
+                    self.record_drop(is_priority);
+                    return false;
                 }
             }
         }
-        state.queue.push_back(event);
-        self.accepted.fetch_add(1, Ordering::Relaxed);
-        self.cv.notify_one();
+        queue.push_back(event);
+        true
+    }
+
+    fn record_drop(&self, is_priority: bool) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        if is_priority {
+            self.priority_dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn query(
@@ -284,16 +343,27 @@ impl AuditPipeline {
     }
 
     pub fn stats(&self) -> AuditPipelineStats {
-        let recent_len = self
+        let (recent_len, queue_len, priority_queue_len) = self
             .state
             .lock()
-            .map(|s| s.recent.len() as u64)
-            .unwrap_or(0);
+            .map(|s| {
+                (
+                    s.recent.len() as u64,
+                    s.queue.len() as u64,
+                    s.priority_queue.len() as u64,
+                )
+            })
+            .unwrap_or((0, 0, 0));
         AuditPipelineStats {
             accepted: self.accepted.load(Ordering::Relaxed),
             written: self.written.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             queue_capacity: self.capacity as u64,
+            priority_queue_capacity: self.priority_capacity as u64,
+            priority_accepted: self.priority_accepted.load(Ordering::Relaxed),
+            priority_dropped: self.priority_dropped.load(Ordering::Relaxed),
+            queue_len,
+            priority_queue_len,
             recent_len,
             rotated: self.rotated.load(Ordering::Relaxed),
             pruned: self.pruned.load(Ordering::Relaxed),
@@ -323,13 +393,20 @@ impl AuditPipeline {
         loop {
             let event = {
                 let mut state = self.state.lock().expect("audit state");
-                while state.queue.is_empty() && !state.closed {
+                while state.queue.is_empty()
+                    && state.priority_queue.is_empty()
+                    && !state.closed
+                {
                     state = self.cv.wait(state).expect("audit wait");
                 }
-                if state.queue.is_empty() && state.closed {
+                if state.queue.is_empty() && state.priority_queue.is_empty() && state.closed {
                     break;
                 }
-                state.queue.pop_front()
+                // Drain priority first so deny/require_approval write ahead of allow floods.
+                state
+                    .priority_queue
+                    .pop_front()
+                    .or_else(|| state.queue.pop_front())
             };
             let Some(event) = event else {
                 continue;
@@ -392,6 +469,12 @@ pub struct AuditPipelineStats {
     pub written: u64,
     pub dropped: u64,
     pub queue_capacity: u64,
+    /// B07: capacity of the independent deny/require_approval queue (0 = disabled).
+    pub priority_queue_capacity: u64,
+    pub priority_accepted: u64,
+    pub priority_dropped: u64,
+    pub queue_len: u64,
+    pub priority_queue_len: u64,
     pub recent_len: u64,
     pub rotated: u64,
     pub pruned: u64,
@@ -634,6 +717,105 @@ mod tests {
         let stats = pipe.stats();
         assert!(stats.dropped >= 3, "{stats:?}");
         assert_eq!(stats.accepted + stats.dropped, 5);
+    }
+
+    #[test]
+    fn priority_deny_survives_main_queue_flood() {
+        // B07: main queue full under drop_new must not drop deny / require_approval.
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.queue_capacity = 2;
+        cfg.priority_queue_capacity = 8;
+        cfg.overflow = "drop_new".into();
+        cfg.sinks = vec!["tracing".into()];
+        let pipe = AuditPipeline::new(&cfg);
+
+        for i in 0..10 {
+            let mut e = AuditEvent::default();
+            e.decision = Some("execute".into());
+            e.message = Some(format!("exec-{i}"));
+            pipe.try_send(e);
+        }
+        let after_flood = pipe.stats();
+        assert!(after_flood.dropped >= 8, "{after_flood:?}");
+        assert_eq!(after_flood.priority_accepted, 0);
+
+        let mut deny = AuditEvent::default();
+        deny.decision = Some("deny".into());
+        deny.rule = Some("secret-table".into());
+        pipe.try_send(deny);
+
+        let mut ticket = AuditEvent::default();
+        ticket.decision = Some("require_approval".into());
+        ticket.rule = Some("ddl".into());
+        pipe.try_send(ticket);
+
+        let stats = pipe.stats();
+        assert_eq!(stats.priority_accepted, 2, "{stats:?}");
+        assert_eq!(stats.priority_dropped, 0, "{stats:?}");
+        assert_eq!(stats.priority_queue_len, 2, "{stats:?}");
+        // Main queue still only holds capacity execute events.
+        assert!(stats.queue_len <= 2, "{stats:?}");
+
+        let denies = pipe.query(Some("deny"), None, None, 10);
+        assert_eq!(denies.len(), 1);
+        assert_eq!(denies[0].rule.as_deref(), Some("secret-table"));
+        let tickets = pipe.query(Some("require_approval"), None, None, 10);
+        assert_eq!(tickets.len(), 1);
+    }
+
+    #[test]
+    fn worker_drains_priority_before_normal() {
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.queue_capacity = 64;
+        cfg.priority_queue_capacity = 16;
+        cfg.sinks = vec!["tracing".into()];
+        // Do not spawn worker yet — fill both queues, then drain order via pop logic.
+        let pipe = AuditPipeline::new(&cfg);
+        for _ in 0..3 {
+            let mut e = AuditEvent::default();
+            e.decision = Some("execute".into());
+            pipe.try_send(e);
+        }
+        let mut deny = AuditEvent::default();
+        deny.decision = Some("deny".into());
+        deny.message = Some("critical".into());
+        pipe.try_send(deny);
+
+        // Manually exercise drain order the worker uses.
+        let mut state = pipe.state.lock().unwrap();
+        let first = state
+            .priority_queue
+            .pop_front()
+            .or_else(|| state.queue.pop_front())
+            .unwrap();
+        assert_eq!(first.decision.as_deref(), Some("deny"));
+        assert_eq!(first.message.as_deref(), Some("critical"));
+        let second = state
+            .priority_queue
+            .pop_front()
+            .or_else(|| state.queue.pop_front())
+            .unwrap();
+        assert_eq!(second.decision.as_deref(), Some("execute"));
+    }
+
+    #[test]
+    fn priority_queue_zero_disables_split() {
+        let mut cfg = SecurityAuditConfig::default();
+        cfg.queue_capacity = 2;
+        cfg.priority_queue_capacity = 0;
+        cfg.overflow = "drop_new".into();
+        cfg.sinks = vec!["tracing".into()];
+        let pipe = AuditPipeline::new(&cfg);
+        for i in 0..4 {
+            let mut e = AuditEvent::default();
+            e.decision = Some(if i == 3 { "deny" } else { "execute" }.into());
+            pipe.try_send(e);
+        }
+        let stats = pipe.stats();
+        // With priority disabled, deny competes on the main queue under drop_new.
+        assert_eq!(stats.priority_queue_capacity, 0);
+        assert_eq!(stats.priority_accepted, 0);
+        assert!(stats.dropped >= 2, "{stats:?}");
     }
 
     #[test]
