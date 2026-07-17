@@ -1,12 +1,16 @@
+use std::collections::HashMap;
+
 use gateway_core::{
     Column as GatewayColumn, FrontendProtocolAdapter, GatewayCommand, GatewayError,
     GatewayResponse, GatewayResult, GatewayValue, ProtocolKind, SessionState, TransactionState,
 };
 use postgresql_protocol::{
     decode_frontend_message, decode_startup_packet, encode_authentication_ok,
-    encode_backend_key_data, encode_command_complete, encode_data_row, encode_error_response,
-    encode_parameter_status, encode_ready_for_query, encode_row_description, FieldDescription,
-    FrontendMessage, StartupMessage, StartupPacket, TransactionStatus, MAX_STARTUP_PACKET_LEN,
+    encode_backend_key_data, encode_bind_complete, encode_close_complete, encode_command_complete,
+    encode_data_row, encode_error_response, encode_no_data, encode_parameter_status,
+    encode_parse_complete, encode_ready_for_query, encode_row_description,
+    FieldDescription, FrontendMessage, StartupMessage, StartupPacket, TransactionStatus,
+    MAX_STARTUP_PACKET_LEN,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -17,15 +21,31 @@ pub struct PostgreSqlFrontendProtocol {
     server_version: String,
     process_id: i32,
     secret_key: i32,
+    /// A10: named prepared statements (Parse).
+    prepared: HashMap<String, String>,
+    /// A10: portals (Bind) → bound SQL ready for Query rewrite.
+    portals: HashMap<String, String>,
 }
 
 impl PostgreSqlFrontendProtocol {
     pub fn new(server_version: String) -> Self {
-        Self { server_version, process_id: 0, secret_key: 0 }
+        Self {
+            server_version,
+            process_id: 0,
+            secret_key: 0,
+            prepared: HashMap::new(),
+            portals: HashMap::new(),
+        }
     }
 
     pub fn with_backend_key(server_version: String, process_id: i32, secret_key: i32) -> Self {
-        Self { server_version, process_id, secret_key }
+        Self {
+            server_version,
+            process_id,
+            secret_key,
+            prepared: HashMap::new(),
+            portals: HashMap::new(),
+        }
     }
 
     pub fn protocol(&self) -> ProtocolKind {
@@ -85,7 +105,67 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
         match decode_frontend_message(frame).map_err(postgresql_protocol_error)? {
             FrontendMessage::Query(sql) => Ok(vec![decode_query_command(sql, session)]),
             FrontendMessage::Terminate => Ok(vec![GatewayCommand::Quit]),
-            FrontendMessage::Sync => Ok(vec![]),
+            FrontendMessage::Sync => Ok(vec![GatewayCommand::ClientWire {
+                packets: vec![encode_ready_for_query(transaction_status(session))],
+            }]),
+            FrontendMessage::Flush => Ok(vec![]),
+            FrontendMessage::Parse {
+                statement,
+                query,
+                param_types: _,
+            } => {
+                self.prepared.insert(statement, query);
+                Ok(vec![GatewayCommand::ClientWire {
+                    packets: vec![encode_parse_complete()],
+                }])
+            }
+            FrontendMessage::Bind {
+                portal,
+                statement,
+                parameters,
+            } => {
+                let sql = self.prepared.get(&statement).cloned().ok_or_else(|| {
+                    GatewayError::Protocol(format!(
+                        "postgresql Bind: unknown statement '{statement}'"
+                    ))
+                })?;
+                let params: Vec<GatewayValue> = parameters
+                    .into_iter()
+                    .map(|p| match p {
+                        None => GatewayValue::Null,
+                        Some(s) => GatewayValue::String(s),
+                    })
+                    .collect();
+                let bound = bind_pg_text_params(&sql, &params)?;
+                self.portals.insert(portal, bound);
+                Ok(vec![GatewayCommand::ClientWire {
+                    packets: vec![encode_bind_complete()],
+                }])
+            }
+            FrontendMessage::Describe { target, name } => {
+                let _ = (target, name);
+                Ok(vec![GatewayCommand::ClientWire {
+                    packets: vec![encode_no_data()],
+                }])
+            }
+            FrontendMessage::Execute { portal, max_rows: _ } => {
+                let sql = self.portals.get(&portal).cloned().ok_or_else(|| {
+                    GatewayError::Protocol(format!(
+                        "postgresql Execute: unknown portal '{portal}'"
+                    ))
+                })?;
+                Ok(vec![GatewayCommand::Query { sql }])
+            }
+            FrontendMessage::Close { target, name } => {
+                if target == b'S' {
+                    self.prepared.remove(&name);
+                } else {
+                    self.portals.remove(&name);
+                }
+                Ok(vec![GatewayCommand::ClientWire {
+                    packets: vec![encode_close_complete()],
+                }])
+            }
         }
     }
 
@@ -248,6 +328,67 @@ fn decode_query_command(sql: String, session: &mut SessionState) -> GatewayComma
         }
         _ => GatewayCommand::Query { sql },
     }
+}
+
+/// Substitute `$n` placeholders with SQL literals (text-format Bind params).
+fn bind_pg_text_params(sql: &str, parameters: &[GatewayValue]) -> GatewayResult<String> {
+    let mut max = 0usize;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            let mut n = 0usize;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n.saturating_mul(10).saturating_add((bytes[j] - b'0') as usize);
+                j += 1;
+            }
+            if n > max {
+                max = n;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    if max != parameters.len() {
+        return Err(GatewayError::Protocol(format!(
+            "postgresql Bind expects {max} parameters, got {}",
+            parameters.len()
+        )));
+    }
+    if max == 0 {
+        return Ok(sql.to_owned());
+    }
+    let mut out = sql.to_owned();
+    for n in (1..=max).rev() {
+        let lit = match &parameters[n - 1] {
+            GatewayValue::Null => "NULL".to_string(),
+            GatewayValue::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            GatewayValue::Integer(i) => i.to_string(),
+            GatewayValue::UnsignedInteger(u) => u.to_string(),
+            GatewayValue::Float(f) => {
+                if f.is_finite() {
+                    f.to_string()
+                } else {
+                    "NULL".into()
+                }
+            }
+            GatewayValue::Decimal(s) | GatewayValue::String(s) => {
+                format!("'{}'", s.replace('\'', "''"))
+            }
+            GatewayValue::Bytes(b) => {
+                let mut hex = String::from("E'\\\\x");
+                for byte in b {
+                    hex.push_str(&format!("{byte:02x}"));
+                }
+                hex.push('\'');
+                hex
+            }
+        };
+        out = out.replace(&format!("${n}"), &lit);
+    }
+    Ok(out)
 }
 
 fn client_encoding_from_set_query(sql: &str) -> Option<String> {

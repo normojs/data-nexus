@@ -105,7 +105,8 @@ pub fn prepare_cross_protocol_command(
         | GatewayCommand::Commit
         | GatewayCommand::Rollback
         | GatewayCommand::Ping
-        | GatewayCommand::Quit => Ok(command),
+        | GatewayCommand::Quit
+        | GatewayCommand::ClientWire { .. } => Ok(command),
     }
 }
 

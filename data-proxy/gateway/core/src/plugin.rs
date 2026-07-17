@@ -10,6 +10,7 @@ pub enum CommandSummary {
     Prepare { sql: String },
     Execute { statement_id: String },
     CloseStatement { statement_id: String },
+    ClientWire,
     UseDatabase { database: String },
     Begin,
     Commit,
@@ -29,6 +30,7 @@ impl CommandSummary {
             GatewayCommand::CloseStatement { statement_id } => {
                 Self::CloseStatement { statement_id: statement_id.clone() }
             }
+            GatewayCommand::ClientWire { .. } => Self::ClientWire,
             GatewayCommand::UseDatabase { database } => {
                 Self::UseDatabase { database: database.clone() }
             }
@@ -48,6 +50,7 @@ impl CommandSummary {
                 statement_id.as_str()
             }
             Self::UseDatabase { database } => database.as_str(),
+            Self::ClientWire => "CLIENT_WIRE",
             Self::Begin => "BEGIN",
             Self::Commit => "COMMIT",
             Self::Rollback => "ROLLBACK",

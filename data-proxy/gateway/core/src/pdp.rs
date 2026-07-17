@@ -468,9 +468,10 @@ impl LocalPdp {
     ) -> SecurityDecision {
         let __p = self.inner();
         match command {
-            GatewayCommand::Ping | GatewayCommand::Quit | GatewayCommand::CloseStatement { .. } => {
-                SecurityDecision::allow_empty()
-            }
+            GatewayCommand::Ping
+            | GatewayCommand::Quit
+            | GatewayCommand::CloseStatement { .. }
+            | GatewayCommand::ClientWire { .. } => SecurityDecision::allow_empty(),
             GatewayCommand::Begin | GatewayCommand::Commit | GatewayCommand::Rollback => {
                 let request = AccessRequest {
                     subject,

@@ -50,11 +50,11 @@ impl Clone for PreparedRegistry {
 
 impl PreparedRegistry {
     fn prepare(&self, sql: String) -> (String, u16) {
+        let param_count = count_mysql_placeholders(&sql);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let statement_id = id.to_string();
         self.sql_by_id.lock().insert(statement_id.clone(), sql);
-        // parameter_count unknown without full COM_STMT_PREPARE; advertise 0.
-        (statement_id, 0)
+        (statement_id, param_count)
     }
 
     fn take_sql(&self, statement_id: &str) -> Option<String> {
@@ -67,6 +67,97 @@ impl PreparedRegistry {
 
     fn clear(&self) {
         self.sql_by_id.lock().clear();
+    }
+}
+
+/// Count `?` placeholders outside single-quoted string literals (MySQL text protocol style).
+fn count_mysql_placeholders(sql: &str) -> u16 {
+    let mut count = 0u16;
+    let mut in_str = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if in_str {
+                if chars.peek() == Some(&'\'') {
+                    chars.next(); // escaped ''
+                    continue;
+                }
+                in_str = false;
+            } else {
+                in_str = true;
+            }
+            continue;
+        }
+        if !in_str && c == '?' {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+/// Substitute `?` placeholders with literal values for text Query rewrite (A10).
+fn bind_mysql_placeholders(sql: &str, parameters: &[GatewayValue]) -> GatewayResult<String> {
+    let need = count_mysql_placeholders(sql) as usize;
+    if need != parameters.len() {
+        return Err(GatewayError::Protocol(format!(
+            "mysql prepared Execute expects {need} parameters, got {}",
+            parameters.len()
+        )));
+    }
+    if need == 0 {
+        return Ok(sql.to_owned());
+    }
+    let mut out = String::with_capacity(sql.len() + parameters.len() * 8);
+    let mut in_str = false;
+    let mut pi = 0usize;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            out.push(c);
+            if in_str {
+                if chars.peek() == Some(&'\'') {
+                    out.push(chars.next().unwrap());
+                    continue;
+                }
+                in_str = false;
+            } else {
+                in_str = true;
+            }
+            continue;
+        }
+        if !in_str && c == '?' {
+            out.push_str(&gateway_value_sql_literal(&parameters[pi]));
+            pi += 1;
+            continue;
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+
+fn gateway_value_sql_literal(v: &GatewayValue) -> String {
+    match v {
+        GatewayValue::Null => "NULL".into(),
+        GatewayValue::Boolean(b) => if *b { "1" } else { "0" }.into(),
+        GatewayValue::Integer(i) => i.to_string(),
+        GatewayValue::UnsignedInteger(u) => u.to_string(),
+        GatewayValue::Float(f) => {
+            if f.is_finite() {
+                f.to_string()
+            } else {
+                "NULL".into()
+            }
+        }
+        GatewayValue::Decimal(s) => s.clone(),
+        GatewayValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+        GatewayValue::Bytes(b) => {
+            let mut hex = String::with_capacity(2 + b.len() * 2);
+            hex.push_str("0x");
+            for byte in b {
+                hex.push_str(&format!("{byte:02X}"));
+            }
+            hex
+        }
     }
 }
 
@@ -485,17 +576,12 @@ impl BackendConnector for MySqlBackendConnector {
                 statement_id,
                 parameters,
             } => {
-                if !parameters.is_empty() {
-                    return Err(GatewayError::Unsupported(
-                        "mysql prepared Execute with bound parameters is not implemented yet"
-                            .into(),
-                    ));
-                }
                 let sql = self.prepared.take_sql(&statement_id).ok_or_else(|| {
                     GatewayError::Backend(format!(
                         "unknown mysql prepared statement id '{statement_id}'"
                     ))
                 })?;
+                let sql = bind_mysql_placeholders(&sql, &parameters)?;
                 let endpoint = self.select_endpoint(session)?;
                 self.execute_simple_query(endpoint, &sql, session, mode).await
             }
@@ -506,6 +592,7 @@ impl BackendConnector for MySqlBackendConnector {
                     last_insert_id: None,
                 })
             }
+            GatewayCommand::ClientWire { packets } => Ok(GatewayResponse::Wire { packets }),
         }
     }
 
@@ -1321,7 +1408,7 @@ mod tests {
             .await;
         assert!(matches!(err, Err(GatewayError::Backend(_))));
 
-        // Parameters not yet supported.
+        // Param count mismatch (SQL has no `?`).
         let err = connector
             .execute(
                 GatewayCommand::Execute {
@@ -1331,7 +1418,24 @@ mod tests {
                 &mut session,
             )
             .await;
-        assert!(matches!(err, Err(GatewayError::Unsupported(_))));
+        assert!(matches!(err, Err(GatewayError::Protocol(_))), "{err:?}");
+
+        // Prepare with placeholders reports count.
+        let prepared2 = connector
+            .execute(
+                GatewayCommand::Prepare {
+                    sql: "SELECT ? + ?".into(),
+                },
+                &mut session,
+            )
+            .await
+            .unwrap();
+        match prepared2 {
+            GatewayResponse::Prepared {
+                parameter_count, ..
+            } => assert_eq!(parameter_count, 2),
+            other => panic!("{other:?}"),
+        }
 
         assert_eq!(
             connector
@@ -1359,5 +1463,20 @@ mod tests {
             )
             .await;
         assert!(matches!(err, Err(GatewayError::Backend(_))));
+    }
+
+    #[test]
+    fn a10_bind_mysql_placeholders() {
+        assert_eq!(count_mysql_placeholders("SELECT ? FROM t WHERE a=?"), 2);
+        assert_eq!(count_mysql_placeholders("SELECT '?'"), 0);
+        let sql = bind_mysql_placeholders(
+            "SELECT ? FROM t WHERE id=?",
+            &[
+                GatewayValue::String("x".into()),
+                GatewayValue::Integer(3),
+            ],
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT 'x' FROM t WHERE id=3");
     }
 }

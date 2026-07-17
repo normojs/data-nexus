@@ -29,7 +29,7 @@ backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 
 - Portal NDJSON（A09）：backend 返回 `Streaming` 时窗口 yield → HTTP chunk（`stream=backend_window`）；`Complete` 回退 B05b chunked；**json/csv 仍物化**有界 ResultSet。
 - PG Passthrough：前端 Wire 消息，非 backend TCP 帧中继（A08 部分）。
 - A07：`handle_frame_to_writer` + socket `ResponseWriter` 已接。
-- A10 prepared：网关注册表 + MySQL prepare OK；**无参 Execute→text**；参数绑定 / PG 扩展协议仍未实现。
+- A10 prepared：网关注册表 + MySQL `?` 绑定→text；PG Parse/Bind/Execute（text 参数）→Query；Describe=NoData；非完整 binary 透传。
 
 ## 实现检查清单
 

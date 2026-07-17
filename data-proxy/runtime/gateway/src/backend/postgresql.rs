@@ -42,10 +42,11 @@ impl Clone for PreparedRegistry {
 
 impl PreparedRegistry {
     fn prepare(&self, sql: String) -> (String, u16) {
+        let param_count = count_pg_placeholders(&sql);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let statement_id = id.to_string();
         self.sql_by_id.lock().insert(statement_id.clone(), sql);
-        (statement_id, 0)
+        (statement_id, param_count)
     }
 
     fn take_sql(&self, statement_id: &str) -> Option<String> {
@@ -58,6 +59,79 @@ impl PreparedRegistry {
 
     fn clear(&self) {
         self.sql_by_id.lock().clear();
+    }
+}
+
+/// Count distinct `$n` placeholders (PostgreSQL extended/simple prepared style).
+fn count_pg_placeholders(sql: &str) -> u16 {
+    let mut max = 0u16;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            let mut n: u16 = 0;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n
+                    .saturating_mul(10)
+                    .saturating_add((bytes[j] - b'0') as u16);
+                j += 1;
+            }
+            if n > max {
+                max = n;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    max
+}
+
+fn bind_pg_placeholders(sql: &str, parameters: &[GatewayValue]) -> GatewayResult<String> {
+    let need = count_pg_placeholders(sql) as usize;
+    if need != parameters.len() {
+        return Err(GatewayError::Protocol(format!(
+            "postgresql prepared Execute expects {need} parameters, got {}",
+            parameters.len()
+        )));
+    }
+    if need == 0 {
+        return Ok(sql.to_owned());
+    }
+    // Replace $n (highest first) so $10 is not partially matched by $1.
+    let mut out = sql.to_owned();
+    for n in (1..=need).rev() {
+        let lit = gateway_value_sql_literal(&parameters[n - 1]);
+        out = out.replace(&format!("${n}"), &lit);
+    }
+    Ok(out)
+}
+
+fn gateway_value_sql_literal(v: &GatewayValue) -> String {
+    match v {
+        GatewayValue::Null => "NULL".into(),
+        GatewayValue::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.into(),
+        GatewayValue::Integer(i) => i.to_string(),
+        GatewayValue::UnsignedInteger(u) => u.to_string(),
+        GatewayValue::Float(f) => {
+            if f.is_finite() {
+                f.to_string()
+            } else {
+                "NULL".into()
+            }
+        }
+        GatewayValue::Decimal(s) => s.clone(),
+        GatewayValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+        GatewayValue::Bytes(b) => {
+            let mut hex = String::with_capacity(4 + b.len() * 2);
+            hex.push_str("E'\\\\x");
+            for byte in b {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex.push('\'');
+            hex
+        }
     }
 }
 
@@ -427,17 +501,12 @@ impl BackendConnector for PostgreSqlBackendConnector {
                 statement_id,
                 parameters,
             } => {
-                if !parameters.is_empty() {
-                    return Err(GatewayError::Unsupported(
-                        "postgresql prepared Execute with bound parameters is not implemented yet"
-                            .into(),
-                    ));
-                }
                 let sql = self.prepared.take_sql(&statement_id).ok_or_else(|| {
                     GatewayError::Backend(format!(
                         "unknown postgresql prepared statement id '{statement_id}'"
                     ))
                 })?;
+                let sql = bind_pg_placeholders(&sql, &parameters)?;
                 let endpoint = self.select_endpoint(session)?;
                 if matches!(mode, ExecuteMode::Passthrough) {
                     return self
@@ -453,6 +522,7 @@ impl BackendConnector for PostgreSqlBackendConnector {
                     last_insert_id: None,
                 })
             }
+            GatewayCommand::ClientWire { packets } => Ok(GatewayResponse::Wire { packets }),
         }
     }
 
@@ -1070,7 +1140,23 @@ mod tests {
                 &mut session,
             )
             .await;
-        assert!(matches!(err, Err(GatewayError::Unsupported(_))));
+        assert!(matches!(err, Err(GatewayError::Protocol(_))), "{err:?}");
+
+        let prepared2 = connector
+            .execute(
+                GatewayCommand::Prepare {
+                    sql: "SELECT $1, $2".into(),
+                },
+                &mut session,
+            )
+            .await
+            .unwrap();
+        match prepared2 {
+            GatewayResponse::Prepared {
+                parameter_count, ..
+            } => assert_eq!(parameter_count, 2),
+            other => panic!("{other:?}"),
+        }
 
         assert_eq!(
             connector
@@ -1097,6 +1183,21 @@ mod tests {
             )
             .await;
         assert!(matches!(err, Err(GatewayError::Backend(_))));
+    }
+
+    #[test]
+    fn a10_bind_pg_placeholders() {
+        assert_eq!(count_pg_placeholders("SELECT $1, $2"), 2);
+        assert_eq!(count_pg_placeholders("SELECT $10, $2"), 10);
+        let sql = bind_pg_placeholders(
+            "SELECT $1 WHERE id=$2",
+            &[
+                GatewayValue::String("x".into()),
+                GatewayValue::Integer(3),
+            ],
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT 'x' WHERE id=3");
     }
 
     #[test]

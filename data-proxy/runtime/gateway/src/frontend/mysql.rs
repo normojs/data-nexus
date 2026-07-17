@@ -128,10 +128,7 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
             COM_QUERY => decode_query_command(payload, session)?,
             COM_PING => GatewayCommand::Ping,
             COM_STMT_PREPARE => GatewayCommand::Prepare { sql: decode_text_payload(payload)? },
-            COM_STMT_EXECUTE => GatewayCommand::Execute {
-                statement_id: decode_statement_id(payload)?,
-                parameters: vec![],
-            },
+            COM_STMT_EXECUTE => decode_stmt_execute(payload)?,
             COM_STMT_CLOSE => {
                 GatewayCommand::CloseStatement { statement_id: decode_statement_id(payload)? }
             }
@@ -237,6 +234,233 @@ fn decode_statement_id(payload: &[u8]) -> GatewayResult<String> {
     }
 
     Ok(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]).to_string())
+}
+
+/// Decode COM_STMT_EXECUTE payload (without command byte).
+///
+/// Supports null-bitmap + type table + binary values for common scalar types.
+/// `new_params_bound_flag` must be 1 when parameters are present (client rebinds types).
+fn decode_stmt_execute(payload: &[u8]) -> GatewayResult<GatewayCommand> {
+    if payload.len() < 9 {
+        return Err(GatewayError::Protocol(
+            "mysql COM_STMT_EXECUTE payload too short".into(),
+        ));
+    }
+    let statement_id =
+        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]).to_string();
+    // flags(1), iteration_count(4)
+    let offset = 9;
+    // Heuristic: if nothing left, zero-parameter execute.
+    if offset >= payload.len() {
+        return Ok(GatewayCommand::Execute {
+            statement_id,
+            parameters: vec![],
+        });
+    }
+    // We do not know param_count from the packet alone; read new_params_bound_flag then
+    // infer param count from remaining length when flag==1 via type table size.
+    // Layout when params exist: null-bitmap((n+7)/8) + new_params_bound_flag(1) + [type(2)*n] + values.
+    // Strategy: try flag at end of null-bitmap for increasing n until types fit.
+    let rest = &payload[offset..];
+    let (parameters, _) = decode_stmt_execute_params(rest)?;
+    Ok(GatewayCommand::Execute {
+        statement_id,
+        parameters,
+    })
+}
+
+fn decode_stmt_execute_params(rest: &[u8]) -> GatewayResult<(Vec<GatewayValue>, usize)> {
+    if rest.is_empty() {
+        return Ok((vec![], 0));
+    }
+    // Try parameter counts 0..=64 (practical cap for gateway rewrite).
+    for n in 0u16..=64 {
+        if let Some(params) = try_decode_params_with_count(rest, n as usize) {
+            return Ok((params, n as usize));
+        }
+    }
+    Err(GatewayError::Protocol(
+        "mysql COM_STMT_EXECUTE: unable to decode bound parameters".into(),
+    ))
+}
+
+fn try_decode_params_with_count(rest: &[u8], n: usize) -> Option<Vec<GatewayValue>> {
+    if n == 0 {
+        // Only valid if rest is empty or single zero flag with no types (some clients send flag=0).
+        if rest.is_empty() {
+            return Some(vec![]);
+        }
+        if rest.len() == 1 && rest[0] == 0 {
+            return Some(vec![]);
+        }
+        return None;
+    }
+    let null_len = (n + 7) / 8;
+    if rest.len() < null_len + 1 {
+        return None;
+    }
+    let null_bitmap = &rest[..null_len];
+    let new_params_bound = rest[null_len];
+    let mut offset = null_len + 1;
+    let types: Vec<u8> = if new_params_bound == 1 {
+        if rest.len() < offset + n * 2 {
+            return None;
+        }
+        let mut t = Vec::with_capacity(n);
+        for i in 0..n {
+            t.push(rest[offset + i * 2]); // type byte; ignore unsigned flag
+        }
+        offset += n * 2;
+        t
+    } else if new_params_bound == 0 {
+        // Without type rebind we cannot safely decode binary values.
+        return None;
+    } else {
+        return None;
+    };
+
+    let mut values = Vec::with_capacity(n);
+    for i in 0..n {
+        let byte = null_bitmap[i / 8];
+        let bit = 1 << (i % 8);
+        if byte & bit != 0 {
+            values.push(GatewayValue::Null);
+            continue;
+        }
+        let (v, consumed) = decode_binary_param_value(&rest[offset..], types[i])?;
+        offset += consumed;
+        values.push(v);
+    }
+    // Must consume exact remainder for a successful heuristic match.
+    if offset != rest.len() {
+        return None;
+    }
+    Some(values)
+}
+
+fn decode_binary_param_value(data: &[u8], type_byte: u8) -> Option<(GatewayValue, usize)> {
+    use ColumnType::*;
+    let ty = ColumnType::from(type_byte);
+    match ty {
+        MYSQL_TYPE_TINY => {
+            if data.is_empty() {
+                return None;
+            }
+            Some((GatewayValue::Integer(data[0] as i8 as i64), 1))
+        }
+        MYSQL_TYPE_SHORT | MYSQL_TYPE_YEAR => {
+            if data.len() < 2 {
+                return None;
+            }
+            let v = i16::from_le_bytes([data[0], data[1]]) as i64;
+            Some((GatewayValue::Integer(v), 2))
+        }
+        MYSQL_TYPE_LONG | MYSQL_TYPE_INT24 => {
+            if data.len() < 4 {
+                return None;
+            }
+            let v = i32::from_le_bytes([data[0], data[1], data[2], data[3]]) as i64;
+            Some((GatewayValue::Integer(v), 4))
+        }
+        MYSQL_TYPE_LONGLONG => {
+            if data.len() < 8 {
+                return None;
+            }
+            let v = i64::from_le_bytes(data[..8].try_into().ok()?);
+            Some((GatewayValue::Integer(v), 8))
+        }
+        MYSQL_TYPE_FLOAT => {
+            if data.len() < 4 {
+                return None;
+            }
+            let v = f32::from_bits(u32::from_le_bytes([data[0], data[1], data[2], data[3]])) as f64;
+            Some((GatewayValue::Float(v), 4))
+        }
+        MYSQL_TYPE_DOUBLE => {
+            if data.len() < 8 {
+                return None;
+            }
+            let bits = u64::from_le_bytes(data[..8].try_into().ok()?);
+            Some((GatewayValue::Float(f64::from_bits(bits)), 8))
+        }
+        MYSQL_TYPE_NULL => Some((GatewayValue::Null, 0)),
+        // Date/time binary forms: length-prefixed.
+        MYSQL_TYPE_DATE
+        | MYSQL_TYPE_DATETIME
+        | MYSQL_TYPE_TIMESTAMP
+        | MYSQL_TYPE_TIME
+        | MYSQL_TYPE_NEWDATE => {
+            if data.is_empty() {
+                return None;
+            }
+            let len = data[0] as usize;
+            if data.len() < 1 + len {
+                return None;
+            }
+            let hex: String = data[1..1 + len]
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect();
+            Some((GatewayValue::String(hex), 1 + len))
+        }
+        // String-like / decimal / binary blobs as length-encoded strings.
+        MYSQL_TYPE_STRING
+        | MYSQL_TYPE_VAR_STRING
+        | MYSQL_TYPE_VARCHAR
+        | MYSQL_TYPE_BLOB
+        | MYSQL_TYPE_TINY_BLOB
+        | MYSQL_TYPE_MEDIUM_BLOB
+        | MYSQL_TYPE_LONG_BLOB
+        | MYSQL_TYPE_DECIMAL
+        | MYSQL_TYPE_NEWDECIMAL
+        | MYSQL_TYPE_ENUM
+        | MYSQL_TYPE_SET
+        | MYSQL_TYPE_BIT
+        | MYSQL_TYPE_GEOMETRY => {
+            let (s, n) = read_lenc_string(data)?;
+            Some((GatewayValue::String(s), n))
+        }
+    }
+}
+
+fn read_lenc_string(data: &[u8]) -> Option<(String, usize)> {
+    if data.is_empty() {
+        return None;
+    }
+    let (len, hdr) = match data[0] {
+        0xfc => {
+            if data.len() < 3 {
+                return None;
+            }
+            (u16::from_le_bytes([data[1], data[2]]) as usize, 3)
+        }
+        0xfd => {
+            if data.len() < 4 {
+                return None;
+            }
+            (
+                u32::from_le_bytes([data[1], data[2], data[3], 0]) as usize,
+                4,
+            )
+        }
+        0xfe => {
+            if data.len() < 9 {
+                return None;
+            }
+            let len = u64::from_le_bytes(data[1..9].try_into().ok()?) as usize;
+            (len, 9)
+        }
+        0xfb => return Some((String::new(), 1)), // NULL as empty for safety
+        n => (n as usize, 1),
+    };
+    if data.len() < hdr + len {
+        return None;
+    }
+    let s = std::str::from_utf8(&data[hdr..hdr + len])
+        .ok()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| String::from_utf8_lossy(&data[hdr..hdr + len]).into_owned());
+    Some((s, hdr + len))
 }
 
 /// COM_STMT_PREPARE OK body (without packet header):
@@ -655,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn a10_decodes_stmt_prepare_and_execute() {
+    fn a10_decodes_stmt_prepare_and_zero_param_execute() {
         let mut adapter = adapter();
         let mut session = SessionState::default();
         let mut prep = vec![COM_STMT_PREPARE];
@@ -669,12 +893,41 @@ mod tests {
 
         let mut exec = vec![COM_STMT_EXECUTE];
         exec.extend_from_slice(&7u32.to_le_bytes());
+        exec.push(0); // flags
+        exec.extend_from_slice(&1u32.to_le_bytes()); // iteration
         assert_eq!(
             adapter.decode(&exec, &mut session),
             Ok(vec![GatewayCommand::Execute {
                 statement_id: "7".into(),
                 parameters: vec![],
             }])
+        );
+    }
+
+    #[test]
+        fn a10_decodes_stmt_execute_with_int_params() {
+        let mut adapter = adapter();
+        let mut session = SessionState::default();
+        // stmt_id=7, flags=0, iteration=1, null_bitmap for 2 params (1 byte=0),
+        // new_params_bound=1, types LONG+LONG, values 1 and 2 as i32 LE.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        payload.push(0); // flags
+        payload.extend_from_slice(&1u32.to_le_bytes()); // iteration
+        payload.push(0); // null bitmap
+        payload.push(1); // new_params_bound
+        payload.extend_from_slice(&[3, 0, 3, 0]); // MYSQL_TYPE_LONG x2
+        payload.extend_from_slice(&1i32.to_le_bytes());
+        payload.extend_from_slice(&2i32.to_le_bytes());
+        let mut frame = vec![COM_STMT_EXECUTE];
+        frame.extend_from_slice(&payload);
+        let cmd = adapter.decode(&frame, &mut session).unwrap();
+        assert_eq!(
+            cmd,
+            vec![GatewayCommand::Execute {
+                statement_id: "7".into(),
+                parameters: vec![GatewayValue::Integer(1), GatewayValue::Integer(2)],
+            }]
         );
     }
 

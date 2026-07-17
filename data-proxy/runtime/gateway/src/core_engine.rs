@@ -965,6 +965,7 @@ fn command_metric_type(command: &GatewayCommand) -> &'static str {
         GatewayCommand::Prepare { .. } => "PREPARE",
         GatewayCommand::Execute { .. } => "EXECUTE",
         GatewayCommand::CloseStatement { .. } => "CLOSE",
+        GatewayCommand::ClientWire { .. } => "CLIENT_WIRE",
         GatewayCommand::UseDatabase { .. } => "USE",
         GatewayCommand::Begin => "BEGIN",
         GatewayCommand::Commit => "COMMIT",

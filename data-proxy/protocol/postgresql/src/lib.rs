@@ -71,6 +71,26 @@ pub enum FrontendMessage {
     Query(String),
     Terminate,
     Sync,
+    /// Extended query: Parse (statement name, query, param type oids).
+    Parse {
+        statement: String,
+        query: String,
+        param_types: Vec<i32>,
+    },
+    /// Extended query: Bind (portal, statement, text-format params only for A10).
+    Bind {
+        portal: String,
+        statement: String,
+        parameters: Vec<Option<String>>,
+    },
+    /// Extended query: Describe statement ('S') or portal ('P').
+    Describe { target: u8, name: String },
+    /// Extended query: Execute portal.
+    Execute { portal: String, max_rows: i32 },
+    /// Extended query: Close statement ('S') or portal ('P').
+    Close { target: u8, name: String },
+    /// Extended query: Flush (no-op for gateway; treated like empty).
+    Flush,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,8 +151,205 @@ pub fn decode_frontend_message(frame: &[u8]) -> Result<FrontendMessage, Protocol
             require_empty_body(body)?;
             Ok(FrontendMessage::Sync)
         }
+        b'H' => {
+            require_empty_body(body)?;
+            Ok(FrontendMessage::Flush)
+        }
+        b'P' => decode_parse_body(body),
+        b'B' => decode_bind_body(body),
+        b'D' => decode_describe_or_close_body(body, true),
+        b'E' => decode_execute_body(body),
+        b'C' => decode_describe_or_close_body(body, false),
         tag => Err(ProtocolError::UnsupportedFrontendMessage(tag)),
     }
+}
+
+fn decode_parse_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
+    let (statement, rest) = split_cstring(body)?;
+    let (query, rest) = split_cstring(rest)?;
+    if rest.len() < 2 {
+        return Err(ProtocolError::InvalidLength {
+            expected: Some(2),
+            actual: rest.len(),
+        });
+    }
+    let nparams = BigEndian::read_i16(&rest[0..2]) as usize;
+    let mut offset = 2;
+    let mut param_types = Vec::with_capacity(nparams);
+    for _ in 0..nparams {
+        if rest.len() < offset + 4 {
+            return Err(ProtocolError::InvalidLength {
+                expected: Some(offset + 4),
+                actual: rest.len(),
+            });
+        }
+        param_types.push(BigEndian::read_i32(&rest[offset..offset + 4]));
+        offset += 4;
+    }
+    if offset != rest.len() {
+        return Err(ProtocolError::InvalidLength {
+            expected: Some(offset),
+            actual: rest.len(),
+        });
+    }
+    Ok(FrontendMessage::Parse {
+        statement,
+        query,
+        param_types,
+    })
+}
+
+fn decode_bind_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
+    let (portal, rest) = split_cstring(body)?;
+    let (statement, rest) = split_cstring(rest)?;
+    if rest.len() < 2 {
+        return Err(ProtocolError::InvalidLength {
+            expected: Some(2),
+            actual: rest.len(),
+        });
+    }
+    let nformats = BigEndian::read_i16(&rest[0..2]) as usize;
+    let mut offset = 2;
+    for _ in 0..nformats {
+        if rest.len() < offset + 2 {
+            return Err(ProtocolError::InvalidLength {
+                expected: Some(offset + 2),
+                actual: rest.len(),
+            });
+        }
+        let fmt = BigEndian::read_i16(&rest[offset..offset + 2]);
+        if fmt != 0 {
+            return Err(ProtocolError::UnsupportedFrontendMessage(b'B'));
+        }
+        offset += 2;
+    }
+    if rest.len() < offset + 2 {
+        return Err(ProtocolError::InvalidLength {
+            expected: Some(offset + 2),
+            actual: rest.len(),
+        });
+    }
+    let nparams = BigEndian::read_i16(&rest[offset..offset + 2]) as usize;
+    offset += 2;
+    let mut parameters = Vec::with_capacity(nparams);
+    for _ in 0..nparams {
+        if rest.len() < offset + 4 {
+            return Err(ProtocolError::InvalidLength {
+                expected: Some(offset + 4),
+                actual: rest.len(),
+            });
+        }
+        let len = BigEndian::read_i32(&rest[offset..offset + 4]);
+        offset += 4;
+        if len < 0 {
+            parameters.push(None);
+            continue;
+        }
+        let len = len as usize;
+        if rest.len() < offset + len {
+            return Err(ProtocolError::InvalidLength {
+                expected: Some(offset + len),
+                actual: rest.len(),
+            });
+        }
+        let s = std::str::from_utf8(&rest[offset..offset + len])
+            .map_err(|e| ProtocolError::InvalidUtf8(e.to_string()))?
+            .to_string();
+        parameters.push(Some(s));
+        offset += len;
+    }
+    if rest.len() < offset + 2 {
+        return Err(ProtocolError::InvalidLength {
+            expected: Some(offset + 2),
+            actual: rest.len(),
+        });
+    }
+    let nresult_formats = BigEndian::read_i16(&rest[offset..offset + 2]) as usize;
+    offset += 2 + nresult_formats * 2;
+    if offset != rest.len() {
+        return Err(ProtocolError::InvalidLength {
+            expected: Some(offset),
+            actual: rest.len(),
+        });
+    }
+    Ok(FrontendMessage::Bind {
+        portal,
+        statement,
+        parameters,
+    })
+}
+
+fn decode_describe_or_close_body(
+    body: &[u8],
+    is_describe: bool,
+) -> Result<FrontendMessage, ProtocolError> {
+    if body.is_empty() {
+        return Err(ProtocolError::InvalidLength {
+            expected: Some(1),
+            actual: 0,
+        });
+    }
+    let target = body[0];
+    let (name, rest) = split_cstring(&body[1..])?;
+    if !rest.is_empty() {
+        return Err(ProtocolError::InvalidLength {
+            expected: Some(0),
+            actual: rest.len(),
+        });
+    }
+    if is_describe {
+        Ok(FrontendMessage::Describe { target, name })
+    } else {
+        Ok(FrontendMessage::Close { target, name })
+    }
+}
+
+fn decode_execute_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
+    let (portal, rest) = split_cstring(body)?;
+    if rest.len() != 4 {
+        return Err(ProtocolError::InvalidLength {
+            expected: Some(4),
+            actual: rest.len(),
+        });
+    }
+    let max_rows = BigEndian::read_i32(rest);
+    Ok(FrontendMessage::Execute { portal, max_rows })
+}
+
+fn split_cstring(input: &[u8]) -> Result<(String, &[u8]), ProtocolError> {
+    let nul = input
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(ProtocolError::MalformedCString)?;
+    let s = std::str::from_utf8(&input[..nul])
+        .map_err(|e| ProtocolError::InvalidUtf8(e.to_string()))?
+        .to_string();
+    Ok((s, &input[nul + 1..]))
+}
+
+pub fn encode_parse_complete() -> Vec<u8> {
+    encode_message(b'1', &[])
+}
+
+pub fn encode_bind_complete() -> Vec<u8> {
+    encode_message(b'2', &[])
+}
+
+pub fn encode_close_complete() -> Vec<u8> {
+    encode_message(b'3', &[])
+}
+
+pub fn encode_no_data() -> Vec<u8> {
+    encode_message(b'n', &[])
+}
+
+pub fn encode_parameter_description(type_oids: &[i32]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(2 + type_oids.len() * 4);
+    body.extend_from_slice(&(type_oids.len() as i16).to_be_bytes());
+    for oid in type_oids {
+        body.extend_from_slice(&oid.to_be_bytes());
+    }
+    encode_message(b't', &body)
 }
 
 pub fn decode_startup_packet(frame: &[u8]) -> Result<StartupPacket, ProtocolError> {
@@ -464,8 +681,26 @@ mod tests {
     #[test]
     fn rejects_unsupported_frontend_message() {
         assert_eq!(
-            decode_frontend_message(&[b'P', 0, 0, 0, 4]),
-            Err(ProtocolError::UnsupportedFrontendMessage(b'P'))
+            decode_frontend_message(&[b'Z', 0, 0, 0, 4]),
+            Err(ProtocolError::UnsupportedFrontendMessage(b'Z'))
+        );
+    }
+
+    #[test]
+    fn decodes_empty_parse_message() {
+        let mut body = vec![0, 0]; // statement="", query=""
+        body.extend_from_slice(&0i16.to_be_bytes());
+        let mut frame = vec![b'P'];
+        let len = (body.len() + 4) as i32;
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&body);
+        assert_eq!(
+            decode_frontend_message(&frame),
+            Ok(FrontendMessage::Parse {
+                statement: String::new(),
+                query: String::new(),
+                param_types: vec![],
+            })
         );
     }
 

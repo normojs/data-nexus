@@ -141,6 +141,9 @@ pub enum GatewayCommand {
     Prepare { sql: String },
     Execute { statement_id: String, parameters: Vec<GatewayValue> },
     CloseStatement { statement_id: String },
+    /// Frontend-only wire packets (A10 extended protocol acks: ParseComplete, BindComplete, Sync…).
+    /// Backend must return these unchanged as [`GatewayResponse::Wire`].
+    ClientWire { packets: Vec<Vec<u8>> },
     UseDatabase { database: String },
     Begin,
     Commit,
