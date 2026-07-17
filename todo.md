@@ -127,6 +127,7 @@ examples/        smoke + gateway config 样例
 | A10 | prepared 注册表 + encode（部分） | feat(a10) |
 | A10 | 参数绑定 + PG 扩展协议解码（部分） | feat(a10) |
 | A06 | 事务内 Streaming 还 lease（部分） | feat(a06) |
+| H06 | 全量 smoke 就绪待 push | all+cedar green |
 
 ---
 
@@ -163,7 +164,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
 | **H05** | 多实例状态外置 | ticket / vault / LocalPdp / SQLite 索引现为**进程内** | 水平扩展需粘性或外置 store | **待做** |
-| **H06** | 发布与 origin 同步 | `main` 长期领先 origin；发布 checklist + 默认 smoke | 本机 default/all/cedar 已绿 | **待做** |
+| **H06** | 发布与 origin 同步 | `main` 长期领先 origin；发布 checklist + 默认 smoke | 本机 **all + cedar 已绿**；领先 origin **104** commits；**未 push**（待确认） | **就绪/待 push** |
 | **H07** | CI 矩阵加深 | PR 已 default；extended / cedar job 可选或 nightly | workflow_dispatch 可选手动 | **可选** |
 | **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | H03 已声明后置 | **延后** |
 
@@ -202,24 +203,25 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> H06 发布同步 或 A10 binary 结果集 / Describe 元数据 <<<**
+**>>> H06 push origin（需用户确认） 或 A10 binary/Describe / A08 TCP 透传 <<<**
 
-本轮（A06 事务流式）：
+本轮（H06 验证）：
 
-- MySQL/PG `execute_simple_query_streaming(..., in_transaction)`
-- 事务内：`take_or_acquire_lease` → stream → producer 结束后写回 `txn_lease`
-- 非事务：行为不变（conn drop → pool）
+- smoke `all`：**17/17**
+- smoke `cedar`：**2/2**，并已 `cargo build -p data-proxy --bin proxy` 恢复默认二进制
+- 工作区干净；`main` ahead of `origin/main` by **104**
+- **未执行 `git push`**（dn-release：须用户明确同意）
 
 ```bash
-cargo test -p runtime_gateway --lib backend::
-# smoke：security-extended
+# 用户确认后再：
+git push origin HEAD
 ```
 
 建议下一刀：
 
-1. **H06** — 发布与 origin 同步  
+1. **H06 push** — 用户确认后同步 origin  
 2. **A10 续** — binary resultset / Describe 真元数据  
-3. **A08 续** — PG TCP 帧级透传（若需要）
+3. **A08 续** — PG TCP 帧级透传
 
 ---
 
