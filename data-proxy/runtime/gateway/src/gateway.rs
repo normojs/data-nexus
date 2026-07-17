@@ -19,7 +19,7 @@ use std::{
 };
 
 use conn_pool::Pool;
-use gateway_core::{GatewayConfig, GatewayError, GatewayResult, ProtocolKind};
+use gateway_core::{GatewayConfig, GatewayError, GatewayResult, ProtocolKind, ResponseWriter};
 use mysql_protocol::client::conn::ClientConn;
 use parking_lot::Mutex;
 use pisa_error::error::{Error, ErrorKind};
@@ -299,6 +299,64 @@ fn runtime_configuration_error(message: impl Into<String>) -> Error {
 const MAX_POSTGRESQL_FRONTEND_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 const MAX_MYSQL_FRONTEND_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
+/// A07: progressive MySQL frontend writer (PacketSend::Encode per window).
+struct MySqlSocketWriter<'a, T>
+where
+    T: futures::SinkExt<
+            mysql_protocol::server::codec::PacketSend<Box<[u8]>>,
+            Error = mysql_protocol::err::ProtocolError,
+        > + Unpin,
+{
+    framed: &'a mut T,
+}
+
+#[async_trait::async_trait]
+impl<'a, T> ResponseWriter for MySqlSocketWriter<'a, T>
+where
+    T: futures::SinkExt<
+            mysql_protocol::server::codec::PacketSend<Box<[u8]>>,
+            Error = mysql_protocol::err::ProtocolError,
+        > + Unpin
+        + Send,
+{
+    async fn write_packets(&mut self, packets: Vec<Vec<u8>>) -> GatewayResult<()> {
+        use mysql_protocol::server::codec::PacketSend;
+        for packet in packets {
+            self.framed
+                .send(PacketSend::Encode::<Box<[u8]>>(packet.into()))
+                .await
+                .map_err(|e| GatewayError::Protocol(format!("mysql response write error: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
+/// A07: progressive PostgreSQL frontend writer (raw message frames).
+struct PgSocketWriter<'a, S> {
+    stream: &'a mut S,
+}
+
+#[async_trait::async_trait]
+impl<'a, S> ResponseWriter for PgSocketWriter<'a, S>
+where
+    S: AsyncWriteExt + Unpin + Send,
+{
+    async fn write_packets(&mut self, packets: Vec<Vec<u8>>) -> GatewayResult<()> {
+        for packet in packets {
+            self.stream
+                .write_all(&packet)
+                .await
+                .map_err(|e| {
+                    GatewayError::Protocol(format!("postgresql response write error: {e}"))
+                })?;
+        }
+        self.stream.flush().await.map_err(|e| {
+            GatewayError::Protocol(format!("postgresql response flush error: {e}"))
+        })?;
+        Ok(())
+    }
+}
+
 async fn run_mysql_core_session(
     socket: tokio::net::TcpStream,
     core_plan: CoreGatewayRuntimePlan,
@@ -384,33 +442,24 @@ async fn run_mysql_core_session(
 
         let terminate = frame.first() == Some(&mysql_protocol::mysql_const::COM_QUIT);
 
-        // Command metrics are recorded inside CoreGatewayConnection::handle_frame.
-        let packets = match connection.handle_frame(&frame).await {
-            Ok(packets) => packets,
-            Err(error) => {
-                let err_info = make_err_packet(MySQLError::new(
-                    1105,
-                    b"HY000".to_vec(),
-                    error.to_string(),
-                ));
-                if let Err(send_error) = framed
-                    .send(PacketSend::Encode::<Box<[u8]>>(err_info[4..].into()))
-                    .await
-                {
-                    error!("mysql error response write failed {:?}", send_error);
-                }
-                framed.codec_mut().reset_seq();
-                continue;
-            }
+        // A07: progressive encode → socket (windowed ResultSet with back-pressure).
+        let mut writer = MySqlSocketWriter {
+            framed: &mut framed,
         };
-
-        for packet in packets {
-            if let Err(error) =
-                framed.send(PacketSend::Encode::<Box<[u8]>>(packet.into())).await
+        if let Err(error) = connection.handle_frame_to_writer(&frame, &mut writer).await {
+            let err_info = make_err_packet(MySQLError::new(
+                1105,
+                b"HY000".to_vec(),
+                error.to_string(),
+            ));
+            if let Err(send_error) = framed
+                .send(PacketSend::Encode::<Box<[u8]>>(err_info[4..].into()))
+                .await
             {
-                error!("mysql response write error {:?}", error);
-                return;
+                error!("mysql error response write failed {:?}", send_error);
             }
+            framed.codec_mut().reset_seq();
+            continue;
         }
         framed.codec_mut().reset_seq();
 
@@ -473,24 +522,13 @@ async fn run_postgresql_core_session(
         };
         let terminate = frame.first() == Some(&b'X');
 
-        // Command metrics are recorded inside CoreGatewayConnection::handle_frame.
-        let packets = match connection.handle_frame(&frame).await {
-            Ok(packets) => packets,
-            Err(error) => {
-                error!("postgresql core frame handling error {:?}", error);
-                break;
-            }
+        // A07: progressive encode → socket.
+        let mut writer = PgSocketWriter {
+            stream: &mut stream,
         };
-
-        for packet in packets {
-            if let Err(error) = stream.write_all(&packet).await {
-                error!("postgresql response write error {:?}", error);
-                return;
-            }
-        }
-        if let Err(error) = stream.flush().await {
-            error!("postgresql response flush error {:?}", error);
-            return;
+        if let Err(error) = connection.handle_frame_to_writer(&frame, &mut writer).await {
+            error!("postgresql core frame handling error {:?}", error);
+            break;
         }
 
         if terminate {

@@ -20,8 +20,8 @@ use gateway_core::{
         map_response_types, prepare_cross_protocol_command, BackendConnector, CommandSummary,
         DialectParser, EndpointConfig, EndpointRef, EndpointRole, FrontendProtocolAdapter,
         ExecuteMode, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse, GatewayResult,
-        ListenerConfig, Obligations, PluginContext, PluginDecision, ProtocolKind, RoutePlan,
-        ServiceConfig, SessionState, TransactionState, TranslationPolicyConfig,
+        ListenerConfig, Obligations, PluginContext, PluginDecision, ProtocolKind, ResponseWriter,
+        RoutePlan, ServiceConfig, SessionState, TransactionState, TranslationPolicyConfig,
     };
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
 use parking_lot::Mutex;
@@ -134,10 +134,12 @@ impl CoreGatewayConnection {
         self
     }
 
-    async fn encode_response_packets(
+    /// A07: encode a response through a progressive writer (socket or collector).
+    async fn encode_response_to_writer(
         &mut self,
         response: GatewayResponse,
-    ) -> GatewayResult<Vec<Vec<u8>>> {
+        writer: &mut dyn ResponseWriter,
+    ) -> GatewayResult<()> {
         let deferred_obl = self.pending_encode_obligations.take();
         match response {
             GatewayResponse::ResultSet { columns, rows } => {
@@ -160,7 +162,6 @@ impl CoreGatewayConnection {
                     || has_obl
                     || matches!(self.stream_mode, ExecuteMode::Streaming { .. });
                 if use_windowed {
-                    let mut writer = CollectingWriter::new();
                     write_resultset_windowed_with_obligations(
                         self.frontend.as_mut(),
                         &self.session,
@@ -168,10 +169,9 @@ impl CoreGatewayConnection {
                         rows,
                         window,
                         deferred_obl.as_ref(),
-                        &mut writer,
+                        writer,
                     )
-                    .await?;
-                    Ok(writer.into_packets())
+                    .await
                 } else {
                     let response = if let Some(obl) = deferred_obl.as_ref() {
                         gateway_core::apply_obligations_to_response(
@@ -181,21 +181,22 @@ impl CoreGatewayConnection {
                     } else {
                         GatewayResponse::ResultSet { columns, rows }
                     };
-                    self.frontend.encode(response, &self.session)
+                    let packets = self.frontend.encode(response, &self.session)?;
+                    writer.write_packets(packets).await
                 }
             }
-            GatewayResponse::Wire { packets } => Ok(packets),
+            GatewayResponse::Wire { packets } => writer.write_packets(packets).await,
             other => {
                 let other = if let Some(obl) = deferred_obl.as_ref() {
                     gateway_core::apply_obligations_to_response(other, obl)
                 } else {
                     other
                 };
-                self.frontend.encode(other, &self.session)
+                let packets = self.frontend.encode(other, &self.session)?;
+                writer.write_packets(packets).await
             }
         }
     }
-
 
     pub fn frontend_protocol(&self) -> ProtocolKind {
         self.frontend.protocol()
@@ -214,6 +215,20 @@ impl CoreGatewayConnection {
     }
 
     pub async fn handle_frame(&mut self, frame: &[u8]) -> GatewayResult<Vec<Vec<u8>>> {
+        let mut writer = CollectingWriter::new();
+        self.handle_frame_to_writer(frame, &mut writer).await?;
+        Ok(writer.into_packets())
+    }
+
+    /// A07: process one frontend frame, writing response packets progressively.
+    ///
+    /// Large ResultSets with Streaming / obligations are encoded window-by-window
+    /// into `writer` (socket back-pressure) instead of buffering all packets first.
+    pub async fn handle_frame_to_writer(
+        &mut self,
+        frame: &[u8],
+        writer: &mut dyn ResponseWriter,
+    ) -> GatewayResult<()> {
         let frame_span = info_span!(
             "gateway.handle_frame",
             listener = %self.listener_name,
@@ -222,17 +237,20 @@ impl CoreGatewayConnection {
             backend_protocol = %protocol_metric_name(&self.backend.protocol()),
         );
         async {
-            self.handle_frame_inner(frame).await
+            self.handle_frame_inner(frame, writer).await
         }
         .instrument(frame_span)
         .await
     }
 
-    async fn handle_frame_inner(&mut self, frame: &[u8]) -> GatewayResult<Vec<Vec<u8>>> {
+    async fn handle_frame_inner(
+        &mut self,
+        frame: &[u8],
+        writer: &mut dyn ResponseWriter,
+    ) -> GatewayResult<()> {
         // Drop any deferred obligations from a previous command that failed mid-path.
         self.pending_encode_obligations = None;
         let commands = self.frontend.decode(frame, &mut self.session)?;
-        let mut packets = Vec::with_capacity(commands.len());
 
         for mut command in commands {
             let command_type = command_metric_type(&command);
@@ -309,7 +327,7 @@ impl CoreGatewayConnection {
                             "gateway command rejected by plugin"
                         );
                         let response = GatewayResponse::Error { code, message };
-                        packets.extend(self.encode_response_packets(response).await?);
+                        self.encode_response_to_writer(response, writer).await?;
                         record_otel_command(
                             &self.listener_name,
                             &self.service_name,
@@ -367,7 +385,7 @@ impl CoreGatewayConnection {
                             "gateway command rejected by translation policy"
                         );
                         command_span.record("outcome", "translation_reject");
-                        packets.extend(self.encode_response_packets(response).await?);
+                        self.encode_response_to_writer(response, writer).await?;
                         record_otel_command(
                             &self.listener_name,
                             &self.service_name,
@@ -494,7 +512,7 @@ impl CoreGatewayConnection {
                         let rule_class = crate::otel_metrics::classify_security_rule(&rule);
                         command_span.record("security_decision", "require_ticket");
                         command_span.record("security_rule_class", rule_class);
-                        packets.extend(self.encode_response_packets(response).await?);
+                        self.encode_response_to_writer(response, writer).await?;
                         record_otel_command(
                             &self.listener_name,
                             &self.service_name,
@@ -566,7 +584,7 @@ impl CoreGatewayConnection {
                         let rule_class = crate::otel_metrics::classify_security_rule(&rule);
                         command_span.record("security_decision", "deny");
                         command_span.record("security_rule_class", rule_class);
-                        packets.extend(self.encode_response_packets(response).await?);
+                        self.encode_response_to_writer(response, writer).await?;
                         record_otel_command(
                             &self.listener_name,
                             &self.service_name,
@@ -747,7 +765,7 @@ impl CoreGatewayConnection {
                 plugins.release_concurrency(idx);
             }
 
-            packets.extend(self.encode_response_packets(response).await?);
+            self.encode_response_to_writer(response, writer).await?;
             record_otel_command(
                 &self.listener_name,
                 &self.service_name,
@@ -770,7 +788,7 @@ impl CoreGatewayConnection {
             );
         }
 
-        Ok(packets)
+        Ok(())
     }
 }
 

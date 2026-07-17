@@ -135,8 +135,8 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
 | **A06** | Backend→PEP 真行流 | 窗口 mask + encode 合一；有义务强制 Streaming | 边 encode 边 mask 已落地；backend 真行 yield 仍待续 | **部分** |
-| **A07** | 编码直写 socket | 减少 `handle_frame → Vec<Vec<u8>>` 二次缓冲 | 仍 CollectingWriter；encode 路径已窗口化可接 socket writer | **部分** |
-| **A08** | PostgreSQL 真 wire 透传 | 同协议无义务时对齐 MySQL wire 路径 | `GatewayResponse::Wire` 编码 PG 消息（非 TCP 帧中继） | **部分** |
+| **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
+| **A08** | PostgreSQL wire 透传 | 同协议无义务时 `GatewayResponse::Wire` | 非 TCP 帧中继 | **部分** |
 | **A09** | Portal 端到端流式 | B05b 仅 HTTP chunk；`portal_execute_logical` 仍先物化逻辑结果 | 注释已标明边界 | **待做**（依赖 A06 续） |
 | **A10** | 预处理 / 事务透传矩阵 | MySQL prepared encode 仍偏 legacy；**PG prepared encode not implemented** | 易把流量打进慢路径或直接报错 | **待做** |
 
@@ -184,7 +184,7 @@ examples/        smoke + gateway config 样例
 | 主题 | 限制 |
 |------|------|
 | Portal「流式」 | B05b = **HTTP** 边写；backend 逻辑结果仍可能全量进内存 |
-| 脱敏大数据 | A06 窗口 mask 已落地；结果集整体仍在 encode 前组装（续 A06/A07） |
+| 脱敏大数据 | A06 窗口 mask + A07 socket 写出已落地；backend 仍可能先组装 ResultSet（A06 续） |
 | PG passthrough | A08：前端 wire 消息包（Wire），**非** backend TCP 帧中继 |
 | 预处理语句 | PG prepared encode 未实现；MySQL 部分仍偏 legacy |
 | 多副本 | 票据/金库/SQLite 索引/LocalPdp **非**共享状态 |
@@ -195,25 +195,23 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A07 socket ResponseWriter 或 A06 续 backend 真行 yield <<<**
+**>>> A06 续：backend 真行 yield（或 A09 portal 共用流） <<<**
 
-本轮（A06/A07 续）：
+本轮（A07 完成）：
 
-- `write_resultset_windowed_with_obligations`：encode 时按窗口 mask，不保留未脱敏全量副本
-- 义务延迟到 encode（`pending_encode_obligations`）
-- 测试 PDP 用 `from_config_isolated` 避免全局 store 竞态
-- A08 PG Wire 仍为消息级（非 TCP 帧中继）
+- `handle_frame_to_writer`：结果经 `ResponseWriter` 渐进写出
+- MySQL `MySqlSocketWriter` / PG `PgSocketWriter` 按窗口写 socket
+- 测试仍可用 `handle_frame` + CollectingWriter
 
 ```bash
-cargo test -p gateway_core --lib transport
 cargo test -p runtime_gateway --lib core_engine
 ```
 
 建议下一刀：
 
-1. **A07** — gateway 循环用 socket `ResponseWriter` 替换 `CollectingWriter`  
-2. **A06 续** — backend 按窗口 yield（真降峰值内存）  
-3. **A09** — portal 共用 encode 流式路径
+1. **A06 续** — backend 按窗口 yield（真降峰值内存）  
+2. **A09** — portal 共用 encode 流式路径  
+3. **A10** — prepared 语句矩阵
 
 ---
 
