@@ -17,14 +17,14 @@
 ```text
 v1 = L0   数据库协议中转站 + 管理面鉴权 + 运维 UI + 观测     ✅ 已完成（M0–M10）
 v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   ✅ MVP + P1/P2 增强已完成
-v2.1      生产化 / 运维硬化 / 审计与策略深化                 ⏳ 下一阶段（P3）
+v2.1      生产化 / 运维硬化 / 审计与策略深化                 ✅ P3 主线完成（延后项见下）
 ```
 
 | 版本 | 一句话 | 状态 |
 |------|--------|:----:|
 | **v1** | 客户端 ↔ 网关 ↔ MySQL/PG；路由/池/跨协议/Admin | **完成** |
 | **v2 MVP** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **完成** |
-| **v2.1** | 可上线：CI、密钥、对象冷归档、审计检索、策略运维 | **规划中** |
+| **v2.1** | 可上线：CI、密钥、冷归档、审计检索、策略运维、UI | **主线完成** |
 
 **原则（不变）**
 
@@ -157,32 +157,29 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> P3 主线 + 本机 smoke 全绿；余项均为延后（F29/F30/F31/B08/P03）<<<**
+**>>> 规则已入库；审计修复已落地；P0 真流式仍为下一大工程 <<<**
 
-生产联调（本机，`ff88c73` + 本轮）：
+开发规则：`.claude/rules/data-nexus-development.md` + 根 `CLAUDE.md`。
 
-| 组 | 结果 |
-|----|------|
-| `l0` | **4/4 OK** |
-| `security-core` | **7/7 OK** |
-| `security-extended` | **6/6 OK** |
-| `cedar`（`--features security-cedar`） | **2/2 OK** |
+本轮修复：
 
-- `rust-toolchain.toml` 钉 **1.94.1**
-- smoke 优先 1.94.1 + `RUSTUP_TOOLCHAIN`
-- column seed `DROP+CREATE`；启动前 `pkill` 防脏进程
+- 拒绝未实现的 `security.pdp.backend=remote`（防静默 no-op）
+- 审计索引 `index_rows` O(1) 维护，去掉 stats 热路径 `COUNT(*)`
+- LocalPdp `swap` 少一次 load；`with_rules` 避免无谓 clone
+- Audit UI 接 B06：`event_id` / subject / 时间窗 / `source`
+- CI 默认 `default`（l0+security-core）
+- 文档版本状态与 portal/PG 透传债务标注
 
 ```bash
-cd data-proxy
-./examples/run-smoke-matrix.sh all          # l0 + core + extended
-./examples/run-smoke-matrix.sh cedar        # needs prebuild --features security-cedar
+cargo test -p gateway_core --lib security
+cargo test -p gateway_core --lib audit_index
 ```
 
-建议下一任务（均为延后 / 部署侧）：
+大工程（P0，未在本轮做完）：
 
-1. **F29** Cedar 实体属性  
-2. **B08** L2 样本  
-3. 真 IdP OIDC 联调（H04 部署侧）
+1. Backend→PEP→Client 真流式 + 有义务禁止全量物化  
+2. PostgreSQL 真 wire 透传  
+3. F29 / B08 / F31 等延后项
 
 ---
 

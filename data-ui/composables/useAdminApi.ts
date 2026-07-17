@@ -73,12 +73,22 @@ export type AdminLoginResponse = {
 
 export type AdminAuditEvent = {
   event_id?: string
+  ts_unix_ms?: number
   decision?: string
   subject_id?: string
   service?: string
   outcome?: string
   message?: string
   rule?: string
+  listener?: string
+  command_type?: string
+}
+
+export type AdminAuditEventsResponse = {
+  events: AdminAuditEvent[]
+  source?: string
+  note?: string
+  stats?: Record<string, unknown>
 }
 
 export type AdminProject = {
@@ -283,14 +293,25 @@ export function useAdminApi() {
       ),
     sessions: (base?: string) =>
       getJson<AdminSession[]>('/admin/sessions', base).catch(() => [] as AdminSession[]),
-    auditEvents: (params?: { decision?: string, subject_id?: string, service?: string, limit?: number }, base?: string) => {
+    auditEvents: (params?: {
+      decision?: string
+      subject_id?: string
+      service?: string
+      event_id?: string
+      from_ms?: number
+      to_ms?: number
+      limit?: number
+    }, base?: string) => {
       const q = new URLSearchParams()
       if (params?.decision) q.set('decision', params.decision)
       if (params?.subject_id) q.set('subject_id', params.subject_id)
       if (params?.service) q.set('service', params.service)
+      if (params?.event_id) q.set('event_id', params.event_id)
+      if (params?.from_ms != null) q.set('from_ms', String(params.from_ms))
+      if (params?.to_ms != null) q.set('to_ms', String(params.to_ms))
       if (params?.limit) q.set('limit', String(params.limit))
       const qs = q.toString()
-      return getJson<{ events: AdminAuditEvent[] }>(`/admin/audit/events${qs ? `?${qs}` : ''}`, base)
+      return getJson<AdminAuditEventsResponse>(`/admin/audit/events${qs ? `?${qs}` : ''}`, base)
     },
     projects: (base?: string) => getJson<AdminProject[]>('/admin/projects', base),
     vaultLeases: (base?: string) => getJson<AdminVaultLease[]>('/admin/vault/leases', base),

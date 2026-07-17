@@ -104,7 +104,7 @@ impl SecurityPolicyConfig {
         }
 
         match self.pdp.backend.as_str() {
-            "local" | "remote" => {}
+            "local" => {}
             "cedar" => {
                 #[cfg(not(feature = "security-cedar"))]
                 {
@@ -123,9 +123,16 @@ impl SecurityPolicyConfig {
                     }
                 }
             }
+            // F31 not implemented: reject early so configs cannot "pass validate and no-op".
+            "remote" => {
+                return Err(GatewayError::Configuration(
+                    "security.pdp.backend=remote is not implemented yet (F31 Remote PDP); use local or cedar"
+                        .into(),
+                ));
+            }
             other => {
                 return Err(GatewayError::Configuration(format!(
-                    "security.pdp.backend must be local, cedar, or remote, got '{other}'"
+                    "security.pdp.backend must be local or cedar (remote reserved for F31), got '{other}'"
                 )));
             }
         }
@@ -575,6 +582,18 @@ mod tests {
         let mut cfg = SecurityPolicyConfig::default();
         cfg.pdp.backend = "opa".into();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_remote_pdp_until_f31() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.pdp.backend = "remote".into();
+        let err = cfg.validate().expect_err("remote must fail closed until F31");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remote") && msg.contains("F31"),
+            "unexpected message: {msg}"
+        );
     }
 
     #[test]

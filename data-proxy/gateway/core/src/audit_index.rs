@@ -59,6 +59,8 @@ pub struct AuditIndex {
     inserted: AtomicU64,
     errors: AtomicU64,
     pruned: AtomicU64,
+    /// Live row count (maintained on insert/prune; avoids COUNT(*) on stats).
+    rows: AtomicU64,
 }
 
 impl AuditIndex {
@@ -82,12 +84,17 @@ impl AuditIndex {
         .map_err(|e| format!("pragma audit index: {e}"))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("schema audit index: {e}"))?;
+        let existing_rows: u64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get::<_, i64>(0))
+            .map(|n| n as u64)
+            .unwrap_or(0);
         Ok(Self {
             path,
             conn: Mutex::new(conn),
             inserted: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             pruned: AtomicU64::new(0),
+            rows: AtomicU64::new(existing_rows),
         })
     }
 
@@ -107,13 +114,9 @@ impl AuditIndex {
         self.pruned.load(Ordering::Relaxed)
     }
 
+    /// O(1) row estimate maintained by insert/prune (refreshed once at open).
     pub fn row_count(&self) -> u64 {
-        let Ok(conn) = self.conn.lock() else {
-            return 0;
-        };
-        conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get::<_, i64>(0))
-            .map(|n| n as u64)
-            .unwrap_or(0)
+        self.rows.load(Ordering::Relaxed)
     }
 
     /// Insert or replace one event. Failures are counted and logged by the caller.
@@ -132,6 +135,15 @@ impl AuditIndex {
             .conn
             .lock()
             .map_err(|_| "audit index lock poisoned".to_string())?;
+        let existed: bool = conn
+            .query_row(
+                "SELECT 1 FROM audit_events WHERE event_id = ?1",
+                params![event_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| format!("probe audit index: {e}"))?
+            .unwrap_or(false);
         conn.execute(
             r#"
             INSERT INTO audit_events (
@@ -164,6 +176,9 @@ impl AuditIndex {
         )
         .map_err(|e| format!("insert audit index: {e}"))?;
         self.inserted.fetch_add(1, Ordering::Relaxed);
+        if !existed {
+            self.rows.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -275,6 +290,20 @@ impl AuditIndex {
                 let n = n as u64;
                 if n > 0 {
                     self.pruned.fetch_add(n, Ordering::Relaxed);
+                    // Saturating sub on atomic rows.
+                    let mut cur = self.rows.load(Ordering::Relaxed);
+                    loop {
+                        let next = cur.saturating_sub(n);
+                        match self.rows.compare_exchange_weak(
+                            cur,
+                            next,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => cur = actual,
+                        }
+                    }
                 }
                 n
             }

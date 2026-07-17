@@ -253,14 +253,17 @@ impl LocalPdpStore {
     }
 
     fn swap(&self, inner: LocalPdpInner) -> LocalPdpReloadInfo {
-        let previous_rule_count = self.load().rules.len();
+        let previous = self.load();
+        let previous_rule_count = previous.rules.len();
         let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
-        *self.current.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(inner);
+        let next = Arc::new(inner);
+        let rule_count = next.rules.len();
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = next;
         LocalPdpReloadInfo {
             epoch,
             swapped: true,
             previous_rule_count,
-            rule_count: self.load().rules.len(),
+            rule_count,
         }
     }
 }
@@ -377,8 +380,15 @@ impl LocalPdp {
         self.inner().star_policy
     }
 
+    /// Snapshot of rule list for Admin/debug (clones; not for hot path).
     pub fn rules(&self) -> Vec<SecurityRuleConfig> {
         self.inner().rules.clone()
+    }
+
+    /// Borrow-style access without cloning the rule vector.
+    pub fn with_rules<R>(&self, f: impl FnOnce(&[SecurityRuleConfig]) -> R) -> R {
+        let inner = self.inner();
+        f(&inner.rules)
     }
 
     pub fn has_column_rules(&self) -> bool {

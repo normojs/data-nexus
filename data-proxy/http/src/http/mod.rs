@@ -838,7 +838,8 @@ impl AxumServer {
     }
 
     async fn healthz(_state: State<Self>) -> StatusCode {
-        // TODO: add checking logic
+        // Liveness only: process is up and Admin router is serving.
+        // Readiness (backends/listeners) is covered by topology/pools endpoints.
         StatusCode::OK
     }
 
@@ -2307,6 +2308,10 @@ async fn portal_execute_logical(
     subject_id: &str,
     max_rows: Option<u64>,
 ) -> Result<AdminPortalQueryResponse, (String, String)> {
+    // NOTE (performance honesty / B05b boundary):
+    // This path still materializes a full logical ResultSet from the backend plan,
+    // then encodes. B05b only streams the *HTTP* NDJSON body in windows — it does
+    // not make backend execution row-streaming end-to-end.
     use gateway_core::{
         apply_obligations_to_response, default_dialect_parser, map_response_types, BackendConnector,
         ExecuteMode, GatewayCommand, GatewayResponse, LocalPdp, Subject,

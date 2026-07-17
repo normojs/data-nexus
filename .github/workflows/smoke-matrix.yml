@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       group:
-        description: "Smoke group: l0 | security-core | default | all"
+        description: "Smoke group: l0 | security-core | default | security-extended | all | cedar"
         required: false
-        default: "l0"
+        default: "default"
   push:
     branches: [main, master]
     paths:
@@ -65,4 +65,5 @@ jobs:
           DN_SMOKE_TIMEOUT_SECS: "1200"
         run: |
           chmod +x examples/run-smoke-matrix.sh examples/smoke-*.sh
-          ./examples/run-smoke-matrix.sh "${{ github.event.inputs.group || 'l0' }}"
+          # PR/push: l0 + security-core. Dispatch may override (extended/cedar/all).
+          ./examples/run-smoke-matrix.sh "${{ github.event.inputs.group || 'default' }}"

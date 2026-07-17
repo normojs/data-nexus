@@ -221,6 +221,10 @@ impl BackendConnector for PostgreSqlBackendConnector {
                     // tokio-postgres does not expose raw backend frames; fall back
                     // to logical materialization for Passthrough (MySQL has true wire).
                     let mode = if matches!(mode, ExecuteMode::Passthrough) {
+                        tracing::debug!(
+                            target: "data_nexus::gateway",
+                            "postgresql Passthrough degraded to Materialized (no wire frames)"
+                        );
                         ExecuteMode::Materialized
                     } else {
                         mode
