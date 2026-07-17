@@ -7,7 +7,7 @@ set -euo pipefail
 export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${HOME}/.cargo/bin:/Volumes/fushilu/.rustup/toolchains/nightly-2025-01-07-aarch64-apple-darwin/bin:${PATH:-}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Users/fushilu/workspace/revocloud/data-nexus/.cargo-target}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/fushilu/.caches/data-nexus/cargo-target}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_FILE="$ROOT/examples/admin-auth-gateway-config.toml"
@@ -43,8 +43,7 @@ echo "==> building and starting gateway (admin auth enabled; data-plane security
 PROXY_BIN=""
 for candidate in \
   "${CARGO_TARGET_DIR}/debug/proxy" \
-  /Users/fushilu/workspace/revocloud/data-nexus/.cargo-target/debug/proxy \
-  /Volumes/fushilu/.caches/data-nexus-target/debug/proxy \
+  /Volumes/fushilu/.caches/data-nexus/cargo-target/debug/proxy \
   "$ROOT/target/debug/proxy"
 do
   if [[ -n "$candidate" && -x "$candidate" ]]; then

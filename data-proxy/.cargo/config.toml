@@ -1,2 +1,8 @@
+# Cargo build artifacts live on the external cache volume to keep the
+# workspace (often on a smaller internal disk) free of multi‑GB target dirs.
+#
+# Override anytime with: CARGO_TARGET_DIR=/path cargo build ...
+# Or for a one-off feature build, still use the same dir (features share artifacts).
+
 [build]
-target-dir = "/Volumes/fushilu/.caches/data-nexus-target"
+target-dir = "/Volumes/fushilu/.caches/data-nexus/cargo-target"

@@ -47,7 +47,7 @@ echo "==> building and starting gateway (security.enabled=true)"
 PROXY_BIN=""
 for candidate in \
   "${CARGO_TARGET_DIR:-}/debug/proxy" \
-  /Volumes/fushilu/.caches/data-nexus-target/debug/proxy \
+  /Volumes/fushilu/.caches/data-nexus/cargo-target/debug/proxy \
   "$ROOT/target/debug/proxy"
 do
   if [[ -n "$candidate" && -x "$candidate" ]]; then
@@ -65,7 +65,7 @@ done
       cargo build -p data-proxy --bin proxy
       PROXY_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/proxy"
       if [[ ! -x "$PROXY_BIN" ]]; then
-        PROXY_BIN="/Volumes/fushilu/.caches/data-nexus-target/debug/proxy"
+        PROXY_BIN="/Volumes/fushilu/.caches/data-nexus/cargo-target/debug/proxy"
       fi
     fi
     "$PROXY_BIN" daemon -c "$CONFIG_FILE"

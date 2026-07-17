@@ -7,7 +7,7 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 # Prefer local disk when external target volume is full.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Users/fushilu/workspace/revocloud/data-nexus/.cargo-target}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/fushilu/.caches/data-nexus/cargo-target}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE_FILE="$ROOT/examples/docker-compose.dev.yml"
@@ -66,8 +66,7 @@ echo "==> building and starting gateway (security column ACL)"
 PROXY_BIN=""
 for candidate in \
   "${CARGO_TARGET_DIR}/debug/proxy" \
-  /Users/fushilu/workspace/revocloud/data-nexus/.cargo-target/debug/proxy \
-  /Volumes/fushilu/.caches/data-nexus-target/debug/proxy \
+  /Volumes/fushilu/.caches/data-nexus/cargo-target/debug/proxy \
   "$ROOT/target/debug/proxy"
 do
   if [[ -n "$candidate" && -x "$candidate" ]]; then

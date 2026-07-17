@@ -1,0 +1,5 @@
+# Repo-root Cargo config (also applies when building from the monorepo root).
+# Primary workspace is under data-proxy/; that crate has the same target-dir.
+
+[build]
+target-dir = "/Volumes/fushilu/.caches/data-nexus/cargo-target"

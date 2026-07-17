@@ -5,7 +5,8 @@ target
 .cache
 .DS_Store
 *.p12
+
+# Local Cargo targets (use /Volumes/fushilu/.caches/data-nexus/cargo-target via .cargo/config.toml)
 .cargo-target/
-.cargo-target-a1/
-.cargo-target-cedar/
-.cargo-target-r194/
+.cargo-target-*/
+data-proxy/target/
