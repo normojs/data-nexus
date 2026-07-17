@@ -96,7 +96,8 @@ examples/        smoke + gateway config 样例
 | B05b | portal 真流式 NDJSON | `b0343be` |
 | B07 | Deny 高优审计队列 | `26ce55c` |
 | B06 | 审计 SQLite 检索索引 | `bc88b36` |
-| F28 | Local 规则热更新 | 本提交 |
+| F28 | Local 规则热更新 | `b642c29` |
+| A05 | 透传路径观测补齐 | 本提交 |
 | F26b | Cedar 热更新 | `82974f9` |
 | chore | target 外置缓存 | `2700698` |
 
@@ -138,7 +139,7 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 依赖/备注 | 状态 |
 |----|----|------|-----------|:----:|
 | **B05b** | portal 真流式 NDJSON | 边读边写 HTTP chunk，避免大结果全量进内存 | portal_execute | **完成** |
-| **A05** | 透传路径观测补齐 | passthrough 命中率/字节 metrics；与 B03 属性对齐 | otel/prometheus | 待做 |
+| **A05** | 透传路径观测补齐 | passthrough 命中率/字节 metrics；与 B03 属性对齐 | otel/prometheus | **完成** |
 | **UI01** | 票据/金库管理页 | data-ui 发票、双人审批、列表（现多靠 API） | F18、tickets API | 待做 |
 | **UI02** | Cedar 状态页 | 展示 epoch/files/reload 按钮 | F26b API | 延后 |
 
@@ -154,19 +155,20 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A05 透传路径观测补齐 / 或 UI01 票据页 <<<**
+**>>> UI01 票据/金库管理页 / 或 UI02 Cedar 状态页 <<<**
 
-F28 已交付：`LocalPdp` 持有进程级 snapshot store；`security.rules` / mask / time / watermark / audit / fail_closed / star_policy / max_rows 变更走热替换（`security_local_hot_reload`），**不**把全部 listener 标为 changed。`enabled` / `subject` / `pdp` / `streaming.window_rows|passthrough|max_bytes` 仍触发 listener 重建。
+A05 已交付：Prometheus `gateway_execute_path_total{execute_path}` + `gateway_passthrough_bytes_total`；OTel `data_nexus.gateway.execute_path` / `passthrough_bytes`；与 B03 `execute_path` 属性对齐。
 
 ```bash
-cargo test -p gateway_core --lib pdp
+cargo test -p runtime_gateway --lib server::metrics
+cargo test -p runtime_gateway --lib otel_metrics
 ```
 
 建议下一任务（P3-D）：
 
-1. **A05** — 透传路径观测补齐  
-2. **UI01** — 票据/金库管理页  
-3. **UI02** — Cedar 状态页（延后）
+1. **UI01** — 票据/金库管理页  
+2. **UI02** — Cedar 状态页（延后）  
+3. **F29** — Cedar 实体属性（延后）
 
 ---
 

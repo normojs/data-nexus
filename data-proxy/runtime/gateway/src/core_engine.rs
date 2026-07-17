@@ -294,7 +294,7 @@ impl CoreGatewayConnection {
                             started_at,
                             &crate::otel_metrics::CommandOtelAttrs::none(),
                         );
-                        finish_command_metrics(&self.metrics, &labels, started_at);
+                        finish_command_metrics(&self.metrics, &labels, started_at, "n/a", 0);
                         continue;
                     }
                     Ok(PluginDecision::Rewrite { sql }) => {
@@ -305,7 +305,7 @@ impl CoreGatewayConnection {
                         }
                     }
                     Err(error) => {
-                        finish_command_metrics(&self.metrics, &labels, started_at);
+                        finish_command_metrics(&self.metrics, &labels, started_at, "n/a", 0);
                         return Err(error);
                     }
                 }
@@ -352,7 +352,7 @@ impl CoreGatewayConnection {
                             started_at,
                             &crate::otel_metrics::CommandOtelAttrs::none(),
                         );
-                        finish_command_metrics(&self.metrics, &labels, started_at);
+                        finish_command_metrics(&self.metrics, &labels, started_at, "n/a", 0);
                         continue;
                     }
                 }
@@ -482,7 +482,7 @@ impl CoreGatewayConnection {
                                 rule_class,
                             ),
                         );
-                        finish_command_metrics(&self.metrics, &labels, started_at);
+                        finish_command_metrics(&self.metrics, &labels, started_at, "n/a", 0);
                         if let (Some(plugins), Some(idx)) =
                             (self.plugins.as_mut(), concurrency_rule_idx)
                         {
@@ -551,7 +551,7 @@ impl CoreGatewayConnection {
                             started_at,
                             &crate::otel_metrics::CommandOtelAttrs::security("deny", rule_class),
                         );
-                        finish_command_metrics(&self.metrics, &labels, started_at);
+                        finish_command_metrics(&self.metrics, &labels, started_at, "n/a", 0);
                         if let (Some(plugins), Some(idx)) =
                             (self.plugins.as_mut(), concurrency_rule_idx)
                         {
@@ -618,6 +618,12 @@ impl CoreGatewayConnection {
                 },
             };
 
+            let wire_bytes = match &response {
+                GatewayResponse::Wire { packets } => {
+                    packets.iter().map(|p| p.len() as u64).sum::<u64>()
+                }
+                _ => 0,
+            };
             let outcome = match &response {
                 GatewayResponse::Error { code, .. } => format!("error:{code}"),
                 GatewayResponse::ResultSet { .. } if self.translation_policy.is_some() => {
@@ -704,9 +710,16 @@ impl CoreGatewayConnection {
                 &outcome,
                 started_at,
                 &crate::otel_metrics::CommandOtelAttrs::security(sec_decision, "none")
-                    .with_execute_path(execute_path),
+                    .with_execute_path(execute_path)
+                    .with_wire_bytes(wire_bytes),
             );
-            finish_command_metrics(&self.metrics, &labels, started_at);
+            finish_command_metrics(
+                &self.metrics,
+                &labels,
+                started_at,
+                execute_path,
+                wire_bytes,
+            );
         }
 
         Ok(packets)
@@ -717,10 +730,14 @@ fn finish_command_metrics(
     metrics: &MySQLServerMetricsCollector,
     labels: &[&str],
     started_at: Instant,
+    execute_path: &str,
+    wire_bytes: u64,
 ) {
     metrics.set_sql_under_processing_dec(labels);
     metrics.set_sql_processed_total(labels);
     metrics.set_sql_processed_duration(labels, started_at.elapsed().as_secs_f64());
+    // A05: path hit-rate + passthrough bytes (Prometheus, always on).
+    metrics.record_execute_path(labels, execute_path, wire_bytes);
 }
 
 fn record_otel_command(

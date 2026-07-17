@@ -61,6 +61,43 @@ pub static SQL_UNDER_PROCESSING: Lazy<GaugeVec> = Lazy::new(|| {
     .expect("Cound not create SQL_UNDER_PROCESSING")
 });
 
+// A05: execute path + passthrough bytes (Prometheus; always available).
+// Labels match B03 execute_path: passthrough | streaming | materialized | xproto_stream | n/a
+const LABEL_NAME_EXECUTE_PATH: &str = "execute_path";
+const EXECUTE_PATH_LABELS: &[&str] = &[
+    LABEL_NAME_DOMAIN,
+    LABEL_NAME_SERVICE,
+    LABEL_NAME_FRONTEND_PROTOCOL,
+    LABEL_NAME_BACKEND_PROTOCOL,
+    LABEL_NAME_TYPE,
+    LABEL_NAME_ENDPOINT,
+    LABEL_NAME_EXECUTE_PATH,
+];
+
+/// Commands finished, labeled by execute_path (A05 hit-rate numerator/denominator).
+pub static GATEWAY_EXECUTE_PATH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "gateway_execute_path_total",
+            "Gateway commands by execute_path (passthrough|streaming|materialized|xproto_stream|n/a)"
+        ),
+        EXECUTE_PATH_LABELS,
+    )
+    .expect("Could not create GATEWAY_EXECUTE_PATH_TOTAL")
+});
+
+/// Wire bytes on same-protocol passthrough responses (A05).
+pub static GATEWAY_PASSTHROUGH_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "gateway_passthrough_bytes_total",
+            "Total payload bytes relayed on wire passthrough path"
+        ),
+        SQL_METRIC_LABELS,
+    )
+    .expect("Could not create GATEWAY_PASSTHROUGH_BYTES_TOTAL")
+});
+
 #[derive(Clone, Copy)]
 pub struct MySQLServerMetricsCollector;
 
@@ -82,6 +119,83 @@ impl MySQLServerMetricsCollector {
 
     pub fn set_sql_under_processing_dec(&self, labels: &[&str]) {
         SQL_UNDER_PROCESSING.with_label_values(labels).dec();
+    }
+
+    /// A05: record execute_path (+ optional passthrough bytes).
+    /// `labels` are the 6 SQL metric labels; `execute_path` is appended.
+    pub fn record_execute_path(&self, labels: &[&str], execute_path: &str, wire_bytes: u64) {
+        if labels.len() != 6 {
+            return;
+        }
+        let path = normalize_execute_path(execute_path);
+        let mut path_labels = [""; 7];
+        path_labels[..6].copy_from_slice(labels);
+        path_labels[6] = path;
+        GATEWAY_EXECUTE_PATH_TOTAL
+            .with_label_values(&path_labels)
+            .inc();
+        if path == "passthrough" && wire_bytes > 0 {
+            GATEWAY_PASSTHROUGH_BYTES_TOTAL
+                .with_label_values(labels)
+                .inc_by(wire_bytes);
+        }
+    }
+}
+
+/// Collapse free-form path strings to the B03/A05 controlled set.
+pub fn normalize_execute_path(path: &str) -> &'static str {
+    match path.trim().to_ascii_lowercase().as_str() {
+        "passthrough" | "pass_through" | "wire" => "passthrough",
+        "streaming" | "stream" => "streaming",
+        "materialized" | "materialise" | "full" => "materialized",
+        "xproto_stream" | "xproto" | "cross_protocol" => "xproto_stream",
+        _ => "n/a",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_execute_path_values() {
+        assert_eq!(normalize_execute_path("passthrough"), "passthrough");
+        assert_eq!(normalize_execute_path("STREAMING"), "streaming");
+        assert_eq!(normalize_execute_path("materialized"), "materialized");
+        assert_eq!(normalize_execute_path("xproto_stream"), "xproto_stream");
+        assert_eq!(normalize_execute_path("other"), "n/a");
+    }
+
+    #[test]
+    fn record_execute_path_increments_counters() {
+        let m = MySQLServerMetricsCollector::new();
+        let labels = [
+            "listener-a05",
+            "svc",
+            "mysql",
+            "mysql",
+            "query",
+            "ep",
+        ];
+        m.record_execute_path(&labels, "passthrough", 42);
+        m.record_execute_path(&labels, "streaming", 0);
+        // Prometheus registry is process-global; just ensure no panic and values move.
+        let pt = GATEWAY_EXECUTE_PATH_TOTAL
+            .with_label_values(&[
+                "listener-a05",
+                "svc",
+                "mysql",
+                "mysql",
+                "query",
+                "ep",
+                "passthrough",
+            ])
+            .get();
+        assert!(pt >= 1, "passthrough path counter={pt}");
+        let bytes = GATEWAY_PASSTHROUGH_BYTES_TOTAL
+            .with_label_values(&labels)
+            .get();
+        assert!(bytes >= 42, "passthrough bytes={bytes}");
     }
 }
 

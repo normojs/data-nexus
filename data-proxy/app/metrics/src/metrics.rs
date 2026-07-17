@@ -14,7 +14,8 @@
 
 use prometheus::{Encoder, Registry};
 use runtime_gateway::server::metrics::{
-    SQL_PROCESSED_DURATION, SQL_PROCESSED_TOTAL, SQL_UNDER_PROCESSING,
+    GATEWAY_EXECUTE_PATH_TOTAL, GATEWAY_PASSTHROUGH_BYTES_TOTAL, SQL_PROCESSED_DURATION,
+    SQL_PROCESSED_TOTAL, SQL_UNDER_PROCESSING,
 };
 
 const METRICS_NAMESPACE: &str = "unisql_proxy";
@@ -40,6 +41,13 @@ impl MetricsManager {
         registry.register(Box::new(SQL_PROCESSED_TOTAL.clone())).unwrap();
         registry.register(Box::new(SQL_PROCESSED_DURATION.clone())).unwrap();
         registry.register(Box::new(SQL_UNDER_PROCESSING.clone())).unwrap();
+        // A05: execute_path hit-rate + passthrough wire bytes.
+        registry
+            .register(Box::new(GATEWAY_EXECUTE_PATH_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(GATEWAY_PASSTHROUGH_BYTES_TOTAL.clone()))
+            .unwrap();
     }
 
     pub fn gather(&self) -> Vec<u8> {

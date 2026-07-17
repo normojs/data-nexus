@@ -40,6 +40,24 @@ GET /metrics
 
 Command metrics labels include listener, service, frontend protocol, backend protocol, command type, endpoint.
 
+### Prometheus path metrics (A05, always on)
+
+| Metric | Type | Labels | Notes |
+|--------|------|--------|-------|
+| `unisql_proxy_gateway_execute_path_total` | counter | base + `execute_path` | hit-rate: passthrough / sum(all paths) |
+| `unisql_proxy_gateway_passthrough_bytes_total` | counter | base SQL labels | wire payload bytes on `GatewayResponse::Wire` |
+
+`execute_path` values match B03: `passthrough` / `streaming` / `materialized` / `xproto_stream` / `n/a`.
+
+Example PromQL:
+
+```text
+# passthrough hit rate (5m)
+sum(rate(unisql_proxy_gateway_execute_path_total{execute_path="passthrough"}[5m]))
+/
+sum(rate(unisql_proxy_gateway_execute_path_total[5m]))
+```
+
 ## OpenTelemetry / OTLP (optional feature)
 
 Default builds stay free of the OTel SDK. Enable export with:
@@ -89,6 +107,8 @@ When `otel` is built and metrics are enabled:
 | `data_nexus.gateway.command_duration_ms` | histogram | same |
 | `data_nexus.gateway.errors` | counter | same (`error:*`, `translation_reject`, `plugin_reject`) |
 | `data_nexus.gateway.security_denies` | counter | same (only `security_deny` / `security_require_ticket`) |
+| `data_nexus.gateway.execute_path` | counter | same (A05 path hit-rate) |
+| `data_nexus.gateway.passthrough_bytes` | counter | base labels without outcome (A05 wire bytes) |
 
 Base labels: `listener`, `service`, `frontend_protocol`, `backend_protocol`, `command_type`, `endpoint`, `outcome`.
 
@@ -97,6 +117,7 @@ Base labels: `listener`, `service`, `frontend_protocol`, `backend_protocol`, `co
 | `security_decision` | `none` / `allow` / `allow_obligations` / `deny` / `require_ticket` |
 | `security_rule_class` | `none` / `table` / `column` / `row` / `cedar` / `time` / `ticket` / `fail_closed` / `other` |
 | `execute_path` | `n/a` / `passthrough` / `streaming` / `materialized` / `xproto_stream` |
+| `wire_bytes` | recorded on passthrough only (OTel counter; Prometheus has dedicated series) |
 
 Prometheus text metrics on `/metrics` remain available regardless of OTel.
 

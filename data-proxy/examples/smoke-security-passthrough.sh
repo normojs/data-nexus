@@ -91,4 +91,21 @@ if rg -q 'passthrough' "$PROXY_LOG"; then
   echo "log contains passthrough outcome"
 fi
 
+echo "==> A05 Prometheus execute_path + passthrough_bytes"
+curl -fsS "http://127.0.0.1:8082/metrics" | tee /tmp/dn-pt-metrics.txt >/dev/null
+python3 - <<'PY'
+text=open("/tmp/dn-pt-metrics.txt").read()
+assert "gateway_execute_path_total" in text, "missing gateway_execute_path_total"
+assert 'execute_path="passthrough"' in text or "execute_path=\"passthrough\"" in text, text[:2000]
+# bytes counter present (may be 0 if wire path not taken under this build, but series should exist after traffic)
+assert "gateway_passthrough_bytes_total" in text, "missing gateway_passthrough_bytes_total"
+print("A05 metrics ok")
+# print matching lines for debug
+for line in text.splitlines():
+    if "gateway_execute_path_total" in line or "gateway_passthrough_bytes_total" in line:
+        if line.startswith("#"):
+            continue
+        print(line)
+PY
+
 echo "smoke-security-passthrough: OK"

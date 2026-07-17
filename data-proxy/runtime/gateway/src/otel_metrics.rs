@@ -14,7 +14,7 @@ use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::KeyValue;
 use tracing::debug;
 
-/// Extra command attributes (B03). Keep values low-cardinality.
+/// Extra command attributes (B03 + A05). Keep values low-cardinality.
 #[derive(Debug, Clone, Default)]
 pub struct CommandOtelAttrs {
     /// allow | deny | require_ticket | none
@@ -23,6 +23,8 @@ pub struct CommandOtelAttrs {
     pub security_rule_class: &'static str,
     /// passthrough | streaming | materialized | n/a
     pub execute_path: &'static str,
+    /// A05: wire payload bytes on passthrough (0 otherwise).
+    pub wire_bytes: u64,
 }
 
 impl CommandOtelAttrs {
@@ -31,6 +33,7 @@ impl CommandOtelAttrs {
             security_decision: "none",
             security_rule_class: "none",
             execute_path: "n/a",
+            wire_bytes: 0,
         }
     }
 
@@ -39,11 +42,17 @@ impl CommandOtelAttrs {
             security_decision: decision,
             security_rule_class: rule_class,
             execute_path: "n/a",
+            wire_bytes: 0,
         }
     }
 
     pub fn with_execute_path(mut self, path: &'static str) -> Self {
         self.execute_path = path;
+        self
+    }
+
+    pub fn with_wire_bytes(mut self, bytes: u64) -> Self {
+        self.wire_bytes = bytes;
         self
     }
 }
@@ -83,6 +92,10 @@ struct GatewayOtelInstruments {
     command_duration_ms: Histogram<f64>,
     errors_total: Counter<u64>,
     security_denies_total: Counter<u64>,
+    /// A05: commands by execute_path (hit-rate).
+    execute_path_total: Counter<u64>,
+    /// A05: wire bytes on passthrough path.
+    passthrough_bytes_total: Counter<u64>,
 }
 
 static INSTRUMENTS: OnceLock<Option<GatewayOtelInstruments>> = OnceLock::new();
@@ -112,6 +125,16 @@ fn instruments() -> Option<&'static GatewayOtelInstruments> {
                     .with_description(
                         "Security deny / require_ticket outcomes (low-cardinality rule class)",
                     )
+                    .build(),
+                execute_path_total: meter
+                    .u64_counter("data_nexus.gateway.execute_path")
+                    .with_description(
+                        "Gateway commands by execute_path (passthrough hit-rate denominator)",
+                    )
+                    .build(),
+                passthrough_bytes_total: meter
+                    .u64_counter("data_nexus.gateway.passthrough_bytes")
+                    .with_description("Wire payload bytes relayed on passthrough path")
                     .build(),
             })
         })
@@ -196,6 +219,20 @@ pub fn record_command(
     if outcome == "security_deny" || outcome == "security_require_ticket" {
         inst.security_denies_total.add(1, &kv);
     }
+    // A05: path counter (same label set as commands; execute_path already in kv).
+    inst.execute_path_total.add(1, &kv);
+    if exec_path == "passthrough" && attrs.wire_bytes > 0 {
+        let byte_kv = [
+            KeyValue::new("listener", listener.to_owned()),
+            KeyValue::new("service", service.to_owned()),
+            KeyValue::new("frontend_protocol", frontend_protocol.to_owned()),
+            KeyValue::new("backend_protocol", backend_protocol.to_owned()),
+            KeyValue::new("command_type", command_type.to_owned()),
+            KeyValue::new("endpoint", endpoint.to_owned()),
+        ];
+        inst.passthrough_bytes_total
+            .add(attrs.wire_bytes, &byte_kv);
+    }
     debug!(
         target: "data_nexus::otel",
         command_type,
@@ -203,6 +240,7 @@ pub fn record_command(
         security_decision = sec_decision,
         security_rule_class = sec_rule,
         execute_path = exec_path,
+        wire_bytes = attrs.wire_bytes,
         "otel business metrics recorded"
     );
 }

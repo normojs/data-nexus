@@ -8,6 +8,7 @@ pub struct CommandOtelAttrs {
     pub security_decision: &'static str,
     pub security_rule_class: &'static str,
     pub execute_path: &'static str,
+    pub wire_bytes: u64,
 }
 
 impl CommandOtelAttrs {
@@ -16,6 +17,7 @@ impl CommandOtelAttrs {
             security_decision: "none",
             security_rule_class: "none",
             execute_path: "n/a",
+            wire_bytes: 0,
         }
     }
 
@@ -24,11 +26,17 @@ impl CommandOtelAttrs {
             security_decision: decision,
             security_rule_class: rule_class,
             execute_path: "n/a",
+            wire_bytes: 0,
         }
     }
 
     pub fn with_execute_path(mut self, path: &'static str) -> Self {
         self.execute_path = path;
+        self
+    }
+
+    pub fn with_wire_bytes(mut self, bytes: u64) -> Self {
+        self.wire_bytes = bytes;
         self
     }
 }
@@ -90,5 +98,14 @@ mod tests {
         assert_eq!(classify_security_rule("deny-employee-pii"), "column");
         assert_eq!(classify_security_rule("row_filter"), "row");
         assert_eq!(classify_security_rule("custom-xyz"), "other");
+    }
+
+    #[test]
+    fn wire_bytes_builder() {
+        let a = CommandOtelAttrs::none()
+            .with_execute_path("passthrough")
+            .with_wire_bytes(128);
+        assert_eq!(a.execute_path, "passthrough");
+        assert_eq!(a.wire_bytes, 128);
     }
 }
