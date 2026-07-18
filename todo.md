@@ -146,6 +146,7 @@ examples/        smoke + gateway config 样例
 | H05 | audit SQLite multi-writer + LocalPdp policy_path（部分） | feat(h05) |
 | H05 | LocalPdp policy_path mtime 轮询热更（部分） | feat(h05) |
 | H05 | vault 文件 AES-GCM 加密 + 密钥恢复 secret（部分 / H08） | feat(h05) |
+| H05 | ticket 文件 AES-GCM 加密（`ticket_encrypt_key`） | feat(h05) |
 
 ---
 
@@ -181,7 +182,7 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
 | **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
-| **H05** | 多实例状态外置 | ticket/vault JSON+lock；审计 SQLite；`policy_path`+mtime；**vault AES-GCM**（`vault_encrypt_key`） | 全文件替换非 CRDT；轮询默认 1s；密钥 64 hex；无密钥仍不落盘密码 | **部分** |
+| **H05** | 多实例状态外置 | ticket/vault JSON+lock+**AES-GCM**；审计 SQLite；`policy_path`+mtime | 全文件替换非 CRDT；轮询默认 1s；密钥 64 hex；vault 无密钥仍不落盘密码 | **部分** |
 | **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `223f2c0` → origin/main | **完成** |
 | **H07** | CI 矩阵加深 | PR 已 default；extended / cedar job 可选或 nightly | workflow_dispatch 可选手动 | **可选** |
 | **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | **H05 已交付 AES-GCM 文件信封**（`vault_encrypt_key`）；进程内存仍明文 | **部分→见 H05** |
@@ -213,7 +214,7 @@ examples/        smoke + gateway config 样例
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：非事务 idle pool（cap+TTL 30s）+ 事务 `tcp_txn`；无 SSL |
 | 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；MySQL 仍 text 改写；binary 结果含 date/ts/time；非 TCP passthrough |
-| 多副本 | H05：ticket/vault file+lock；vault 可选 AES-GCM（可恢复 secret）；审计 SQLite；LocalPdp mtime 轮询；非 CRDT |
+| 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；非 CRDT |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
 
@@ -221,24 +222,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> H05 ticket 加密 或 A08 SSL/健康探测 或 A06/A09 收口 <<<**
+**>>> A08 SSL/健康探测 或 A06/A09 收口 或 H07 CI 加深 <<<**
 
-本轮（A08 idle pool TTL）：
+本轮（H05 ticket 文件加密）：
 
-- 默认 idle TTL **30s**（`DEFAULT_TCP_IDLE_TTL`）；`with_ttl` 可配
-- `take` / `put` 丢弃过期条目；`purge_expired` 可主动清理
-- TTL=0 → 不复用（put 后立即过期）
+- 抽出 `state_crypto`（AES-256-GCM 信封，vault/ticket 共用）
+- `security.state.ticket_encrypt_key`（64 hex）→ `DNTICKET1:` 密封；保护 sql_sample 等
+- 无密钥仍明文 JSON；错密钥 fail-closed
 
 ```bash
-cargo test -p runtime_gateway --lib a08_
+cargo test -p gateway_core --lib h05_
 ./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **H05 续** — ticket 文件加密  
-2. **A08 续** — SSL / 主动健康探测  
-3. **A06/A09** — 边界收口 / smoke 加深
+1. **A08 续** — SSL / 主动健康探测  
+2. **A06/A09** — 边界收口 / smoke 加深  
+3. **H07** — CI extended/cedar 矩阵
 
 ---
 

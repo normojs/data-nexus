@@ -1168,6 +1168,7 @@ impl CoreGatewayRuntimePlan {
         if let Err(e) = gateway_core::install_ticket_store(
             &config.security.state.backend,
             &config.security.state.ticket_path,
+            &config.security.state.ticket_encrypt_key,
         ) {
             tracing::error!(target: "data_nexus::security", error = %e, "install ticket store failed");
         }

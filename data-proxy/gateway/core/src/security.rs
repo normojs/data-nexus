@@ -80,6 +80,10 @@ pub struct SecurityStateConfig {
     /// Prefer injecting via env at deploy; do not commit real keys.
     #[serde(default)]
     pub vault_encrypt_key: String,
+    /// Optional 32-byte ticket file encryption key as **64 hex chars** (H05).
+    /// Empty = plaintext ticket JSON. Protects sql_sample / subject metadata at rest.
+    #[serde(default)]
+    pub ticket_encrypt_key: String,
     /// Optional Local PDP hot-reloadable snapshot path (H05).
     /// When set (typically with `backend=file`), rules/mask/time/watermark are
     /// shared across processes via JSON + advisory lock. Empty = process-local only.
@@ -98,6 +102,7 @@ impl Default for SecurityStateConfig {
             ticket_path: String::new(),
             vault_path: String::new(),
             vault_encrypt_key: String::new(),
+            ticket_encrypt_key: String::new(),
             policy_path: String::new(),
             policy_poll_ms: default_policy_poll_ms(),
         }
@@ -341,20 +346,17 @@ impl SecurityPolicyConfig {
             }
         }
 
-        // H05/H08: optional vault file encrypt key must be 64 hex chars (32 bytes).
-        let vek = self.state.vault_encrypt_key.trim();
-        if !vek.is_empty() {
-            if vek.len() != 64 || !vek.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(GatewayError::Configuration(
-                    "security.state.vault_encrypt_key must be empty or 64 hex characters (AES-256 key)"
-                        .into(),
-                ));
-            }
-            if !self.state.backend.trim().eq_ignore_ascii_case("file")
-                && !self.state.backend.trim().is_empty()
-                && !self.state.backend.trim().eq_ignore_ascii_case("memory")
+        // H05/H08: optional encrypt keys must be 64 hex chars (32 bytes).
+        for (name, key) in [
+            ("vault_encrypt_key", self.state.vault_encrypt_key.trim()),
+            ("ticket_encrypt_key", self.state.ticket_encrypt_key.trim()),
+        ] {
+            if !key.is_empty()
+                && (key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit()))
             {
-                // key only meaningful with file backend; allow memory+key as no-op
+                return Err(GatewayError::Configuration(format!(
+                    "security.state.{name} must be empty or 64 hex characters (AES-256 key)"
+                )));
             }
         }
 
@@ -796,6 +798,11 @@ mod tests {
         cfg.state.vault_encrypt_key = "short".into();
         assert!(cfg.validate().is_err());
         cfg.state.vault_encrypt_key =
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into();
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.state.ticket_encrypt_key = "nope".into();
+        assert!(cfg.validate().is_err());
+        cfg.state.ticket_encrypt_key =
             "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into();
         assert_eq!(cfg.validate(), Ok(()));
     }

@@ -24,6 +24,7 @@ mod policy_file;
 mod route;
 mod security;
 mod sharding;
+mod state_crypto;
 mod ticket;
 mod time_rules;
 mod translation;
@@ -75,6 +76,9 @@ pub use security::{
     SecurityAuditConfig, SecurityColumnTagConfig, SecurityHighRiskRuleConfig,
     SecurityMaskRuleConfig, SecurityPdpConfig, SecurityPolicyConfig, SecurityRuleConfig,
     SecurityStateConfig, SecurityStreamingConfig, SecuritySubjectConfig, SecurityWatermarkConfig,
+};
+pub use state_crypto::{
+    decode_maybe_encrypted, decrypt_blob, encrypt_blob, parse_encrypt_key,
 };
 pub use time_rules::{
     is_inside_window, parse_hhmm, security_now_unix_secs, SecurityTimeRuleConfig,

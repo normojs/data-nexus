@@ -9,7 +9,12 @@
 //!
 //! **H05**: optional file backend (`security.state.backend=file`) persists tickets as
 //! JSON so multiple gateway processes on shared storage can share ticket state.
+//! With `security.state.ticket_encrypt_key` the file is AES-GCM sealed (sql_sample
+//! and metadata at rest).
 
+use crate::state_crypto::{
+    decode_maybe_encrypted, encrypt_blob, parse_encrypt_key,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -23,6 +28,8 @@ use fs2::FileExt;
 
 static GLOBAL: OnceLock<Arc<TicketStore>> = OnceLock::new();
 
+const TICKET_ENC_MAGIC: &str = "DNTICKET1:";
+
 /// Process-wide ticket store (memory or file-backed per install).
 pub fn global_ticket_store() -> Arc<TicketStore> {
     GLOBAL
@@ -31,10 +38,17 @@ pub fn global_ticket_store() -> Arc<TicketStore> {
 }
 
 /// H05: install / reconfigure ticket store backend. Safe to call on reload.
-pub fn install_ticket_store(backend: &str, path: &str) -> Result<Arc<TicketStore>, String> {
+///
+/// `encrypt_key_hex`: empty → plaintext JSON; 64 hex → AES-256-GCM envelope.
+pub fn install_ticket_store(
+    backend: &str,
+    path: &str,
+    encrypt_key_hex: &str,
+) -> Result<Arc<TicketStore>, String> {
+    let key = parse_encrypt_key(encrypt_key_hex)?;
     let store = match backend.trim().to_ascii_lowercase().as_str() {
         "memory" | "" => Arc::new(TicketStore::new()),
-        "file" => Arc::new(TicketStore::with_file(PathBuf::from(path))?),
+        "file" => Arc::new(TicketStore::with_file(PathBuf::from(path), key)?),
         other => {
             return Err(format!(
                 "ticket store backend '{other}' not supported (use memory or file)"
@@ -196,6 +210,8 @@ pub struct TicketStore {
     seq: AtomicU64,
     /// H05: optional JSON file path for durable shared state.
     path: Mutex<Option<PathBuf>>,
+    /// H05: AES-256 key for sealed file (None = plaintext).
+    encrypt_key: Mutex<Option<[u8; 32]>>,
 }
 
 impl TicketStore {
@@ -204,14 +220,16 @@ impl TicketStore {
             inner: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
             path: Mutex::new(None),
+            encrypt_key: Mutex::new(None),
         }
     }
 
-    pub fn with_file(path: PathBuf) -> Result<Self, String> {
+    pub fn with_file(path: PathBuf, encrypt_key: Option<[u8; 32]>) -> Result<Self, String> {
         let store = Self {
             inner: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
             path: Mutex::new(Some(path.clone())),
+            encrypt_key: Mutex::new(encrypt_key),
         };
         store.load_from_disk()?;
         Ok(store)
@@ -221,9 +239,11 @@ impl TicketStore {
     fn reconfigure_from(&self, other: &TicketStore) -> Result<(), String> {
         let map = other.inner.lock().map_err(|e| e.to_string())?.clone();
         let path = other.path.lock().map_err(|e| e.to_string())?.clone();
+        let key = *other.encrypt_key.lock().map_err(|e| e.to_string())?;
         let seq = other.seq.load(Ordering::Relaxed);
         *self.inner.lock().map_err(|e| e.to_string())? = map;
         *self.path.lock().map_err(|e| e.to_string())? = path;
+        *self.encrypt_key.lock().map_err(|e| e.to_string())? = key;
         self.seq.store(seq, Ordering::Relaxed);
         Ok(())
     }
@@ -253,7 +273,9 @@ impl TicketStore {
         if raw.trim().is_empty() {
             return Ok(());
         }
-        let file: TicketFile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let key = *self.encrypt_key.lock().map_err(|e| e.to_string())?;
+        let bytes = decode_maybe_encrypted(TICKET_ENC_MAGIC, &raw, key.as_ref())?;
+        let file: TicketFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         let mut map = HashMap::new();
         let mut max_seq = 1u64;
         for t in file.tickets {
@@ -288,12 +310,22 @@ impl TicketStore {
         Ok(())
     }
 
-    fn write_file_locked(&self, path: &std::path::Path, map: &HashMap<String, Ticket>) -> Result<(), String> {
+    fn write_file_locked(
+        &self,
+        path: &std::path::Path,
+        map: &HashMap<String, Ticket>,
+    ) -> Result<(), String> {
         let mut tickets: Vec<Ticket> = map.values().cloned().collect();
         tickets.sort_by(|a, b| b.issued_at_unix_ms.cmp(&a.issued_at_unix_ms));
         let file = TicketFile { tickets };
+        let plain = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+        let key = *self.encrypt_key.lock().map_err(|e| e.to_string())?;
+        let data = if let Some(key) = key {
+            encrypt_blob(TICKET_ENC_MAGIC, &key, &plain)?
+        } else {
+            plain
+        };
         let tmp = path.with_extension("json.tmp");
-        let data = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
         fs::write(&tmp, data).map_err(|e| e.to_string())?;
         fs::rename(&tmp, path).map_err(|e| e.to_string())?;
         Ok(())
@@ -762,7 +794,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dn-h05-tkt-{}", now_unix_ms()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("tickets.json");
-        let store = TicketStore::with_file(path.clone()).unwrap();
+        let store = TicketStore::with_file(path.clone(), None).unwrap();
         let t = store.issue(IssueTicketRequest {
             subject_id: "alice".into(),
             sql: "DELETE FROM t".into(),
@@ -774,7 +806,7 @@ mod tests {
             dual_control: false,
         });
         drop(store);
-        let store2 = TicketStore::with_file(path).unwrap();
+        let store2 = TicketStore::with_file(path, None).unwrap();
         let got = store2.get(&t.id).expect("reloaded");
         assert_eq!(got.subject_id, "alice");
         assert_eq!(got.sql_fingerprint, t.sql_fingerprint);
@@ -787,8 +819,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dn-h05-lock-{}", now_unix_ms()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("tickets.json");
-        let a = TicketStore::with_file(path.clone()).unwrap();
-        let b = TicketStore::with_file(path.clone()).unwrap();
+        let a = TicketStore::with_file(path.clone(), None).unwrap();
+        let b = TicketStore::with_file(path.clone(), None).unwrap();
         let t1 = a.issue(IssueTicketRequest {
             subject_id: "a".into(),
             sql: "SELECT 1".into(),
@@ -811,7 +843,7 @@ mod tests {
         });
         // Last exclusive write wins for full-file replace semantics; both must succeed
         // without panicking under lock. Reload sees a consistent JSON file.
-        let c = TicketStore::with_file(path).unwrap();
+        let c = TicketStore::with_file(path, None).unwrap();
         let list = c.list(10);
         assert!(!list.is_empty());
         // At least the last writer's ticket is present.
@@ -819,4 +851,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn h05_ticket_encrypted_file_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("dn-h05-tkt-enc-{}", now_unix_ms()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("tickets.json");
+        let key_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let key = parse_encrypt_key(key_hex).unwrap();
+        let store = TicketStore::with_file(path.clone(), key).unwrap();
+        let t = store.issue(IssueTicketRequest {
+            subject_id: "alice".into(),
+            sql: "DELETE FROM secret_table WHERE id=1".into(),
+            ticket_type: "high_risk".into(),
+            ttl_secs: 600,
+            max_uses: 1,
+            note: Some("sensitive".into()),
+            issued_by: Some("admin".into()),
+            dual_control: false,
+        });
+        drop(store);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with(TICKET_ENC_MAGIC));
+        assert!(!raw.contains("secret_table"));
+        assert!(!raw.contains("alice"));
+
+        let store2 = TicketStore::with_file(path.clone(), key).unwrap();
+        let got = store2.get(&t.id).expect("reloaded");
+        assert_eq!(got.subject_id, "alice");
+        assert_eq!(got.sql_fingerprint, t.sql_fingerprint);
+        assert!(got.sql_sample.as_deref().unwrap_or("").contains("secret_table"));
+
+        assert!(TicketStore::with_file(path.clone(), None).is_err());
+        let bad = parse_encrypt_key(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .unwrap();
+        assert!(TicketStore::with_file(path, bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

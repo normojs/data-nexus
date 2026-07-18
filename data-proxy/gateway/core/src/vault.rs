@@ -10,9 +10,9 @@
 //! stores sealed lease metadata **and** backend secrets for multi-instance
 //! recovery. Without a key, file backend remains plaintext metadata only.
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use crate::state_crypto::{
+    decode_maybe_encrypted, encrypt_blob, parse_encrypt_key,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -60,24 +60,6 @@ pub fn install_vault_store(
     }
     let _ = GLOBAL.set(store.clone());
     Ok(store)
-}
-
-fn parse_encrypt_key(hex: &str) -> Result<Option<[u8; 32]>, String> {
-    let hex = hex.trim();
-    if hex.is_empty() {
-        return Ok(None);
-    }
-    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(
-            "vault_encrypt_key must be empty or 64 hex characters (32-byte AES key)".into(),
-        );
-    }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|e| format!("vault_encrypt_key hex parse: {e}"))?;
-    }
-    Ok(Some(out))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,7 +327,7 @@ impl VaultStore {
                 sealed_leases: sealed,
             };
             let plain = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-            encrypt_vault_blob(&key, &plain)?
+            encrypt_blob(VAULT_ENC_MAGIC, &key, &plain)?
         } else {
             let mut leases: Vec<VaultLease> =
                 leases_map.values().map(|r| r.lease.clone()).collect();
@@ -559,15 +541,9 @@ impl Default for VaultStore {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn simple_nonce(seed: u64) -> u64 {
-    seed.wrapping_mul(0x9e3779b97f4a7c15) ^ 0xdeadbeef
+fn decode_vault_file(raw: &str, key: Option<&[u8; 32]>) -> Result<VaultFile, String> {
+    let bytes = decode_maybe_encrypted(VAULT_ENC_MAGIC, raw, key)?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
 fn open_state_lock(path: &std::path::Path) -> Result<File, String> {
@@ -580,62 +556,15 @@ fn open_state_lock(path: &std::path::Path) -> Result<File, String> {
         .map_err(|e| e.to_string())
 }
 
-fn decode_vault_file(raw: &str, key: Option<&[u8; 32]>) -> Result<VaultFile, String> {
-    let raw = raw.trim();
-    if let Some(rest) = raw.strip_prefix(VAULT_ENC_MAGIC) {
-        let key = key.ok_or_else(|| {
-            "vault file is encrypted but security.state.vault_encrypt_key is not set".to_string()
-        })?;
-        let plain = decrypt_vault_blob(key, rest)?;
-        serde_json::from_slice(&plain).map_err(|e| e.to_string())
-    } else {
-        // Plaintext JSON (legacy / no key).
-        serde_json::from_str(raw).map_err(|e| e.to_string())
-    }
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
-fn encrypt_vault_blob(key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>, String> {
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
-    // 96-bit nonce from time + simple mix (not CSPRNG; adequate for low-rate vault writes).
-    let mut nonce_bytes = [0u8; 12];
-    let t = now_ms().to_le_bytes();
-    nonce_bytes[..8].copy_from_slice(&t);
-    let mix = simple_nonce(now_ms()).to_le_bytes();
-    nonce_bytes[8..].copy_from_slice(&mix[..4]);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ct = cipher
-        .encrypt(nonce, plain)
-        .map_err(|e| format!("vault encrypt: {e}"))?;
-    let mut out = Vec::with_capacity(VAULT_ENC_MAGIC.len() + 16 + ct.len());
-    out.extend_from_slice(VAULT_ENC_MAGIC.as_bytes());
-    out.extend_from_slice(B64.encode(nonce_bytes).as_bytes());
-    out.push(b':');
-    out.extend_from_slice(B64.encode(ct).as_bytes());
-    Ok(out)
-}
-
-fn decrypt_vault_blob(key: &[u8; 32], body: &str) -> Result<Vec<u8>, String> {
-    // body = base64(nonce):base64(ciphertext)
-    let (n_b64, c_b64) = body
-        .split_once(':')
-        .ok_or_else(|| "vault ciphertext missing nonce separator".to_string())?;
-    let nonce_bytes = B64
-        .decode(n_b64.trim())
-        .map_err(|e| format!("vault nonce b64: {e}"))?;
-    if nonce_bytes.len() != 12 {
-        return Err(format!(
-            "vault nonce must be 12 bytes, got {}",
-            nonce_bytes.len()
-        ));
-    }
-    let ct = B64
-        .decode(c_b64.trim())
-        .map_err(|e| format!("vault ciphertext b64: {e}"))?;
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    cipher
-        .decrypt(nonce, ct.as_ref())
-        .map_err(|e| format!("vault decrypt failed (wrong key?): {e}"))
+fn simple_nonce(seed: u64) -> u64 {
+    seed.wrapping_mul(0x9e3779b97f4a7c15) ^ 0xdeadbeef
 }
 
 #[cfg(test)]

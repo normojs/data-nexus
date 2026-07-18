@@ -2209,6 +2209,7 @@ impl AxumServer {
             if let Err(e) = gateway_core::install_ticket_store(
                 &next_config.gateway.security.state.backend,
                 &next_config.gateway.security.state.ticket_path,
+                &next_config.gateway.security.state.ticket_encrypt_key,
             ) {
                 tracing::error!(target: "data_nexus::security", error = %e, "reload ticket store failed");
             }
