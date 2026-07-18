@@ -130,6 +130,7 @@ examples/        smoke + gateway config 样例
 | H06 | origin 同步完成 | 223f2c0 |
 | A10 | prepare param defs + PG ParameterDescription（部分） | feat(a10) |
 | A08 | PG 非事务 TCP 帧中继 + WireRelay | feat(a08) |
+| A08 | PG 事务内 TCP 帧中继（tcp_txn 复用） | feat(a08) |
 | F32 | 审计 L0/L1 SQL 载荷裁剪 | feat(f32) |
 | A10 | MySQL binary resultset after Execute（部分） | feat(a10) |
 | H05 | ticket/vault file state backend（部分） | feat(h05) |
@@ -153,7 +154,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
-| **A08** | PostgreSQL wire 透传 | 同协议无义务时非事务 **TCP 帧中继**（`WireRelay`）；事务内仍 `simple_query_raw`→Wire 再编码 | 事务内非 TCP 帧中继；专用连接不进池 | **部分** |
+| **A08** | PostgreSQL wire 透传 | 同协议无义务：**非事务 + 事务内** TCP 帧中继（`tcp_txn` 复用）；`WireRelay` 边写 | 专用 TCP 不进池；无 SSL；非 extended；与 Streaming 池 lease 并行 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
 | **A10** | 预处理 / 事务透传矩阵 | 注册表 + 参数绑定；MySQL binary 行；PG ParameterDescription + **Bind result_format→binary DataRow** | PG 参数仍 text Bind；date/timestamp 原生 binary 未做；Execute 仍改写 simple Query | **部分** |
 
@@ -202,7 +203,7 @@ examples/        smoke + gateway config 样例
 |------|------|
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
-| PG passthrough | A08：非事务 **TCP 帧中继**（startup/auth + Query → 原帧至 ReadyForQuery，`WireRelay` 边写）；事务内仍 re-encode Wire |
+| PG passthrough | A08：非事务 + **事务内** TCP 帧中继（`tcp_txn` 跨语句复用；COMMIT/ROLLBACK 同 socket）；专用连接不进池 |
 | 预处理语句 | A10：MySQL binary 行（含 DATE/TIME）；PG Bind `result_format=1` → binary DataRow（int/bool/float/text/bytea）；参数仍 text；无 date/ts 原生 binary |
 | 多副本 | H05：ticket/vault `file`+lock；审计 SQLite 共享文件（WAL+busy）；LocalPdp 可选 `policy_path` 快照（需 reload）；file vault 无密码；非 CRDT |
 | L2 样本合规 | **未实现**（B08） |
@@ -212,25 +213,26 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A08 事务内中继 或 H05 策略 mtime 轮询 或 A10 PG date binary / 真 extended Execute <<<**
+**>>> H05 策略 mtime 轮询 或 A10 PG date binary / 真 extended Execute 或 A08 池化/SSL <<<**
 
-本轮（A10 PG binary portal 结果）：
+本轮（A08 事务内 TCP 中继）：
 
-- Bind 解析 `result_formats`（0=text / 1=binary）
-- Execute 设 `session.prefer_binary_result`；RowDescription format=1 + binary DataRow
-- 原生 binary：bool / int2·4·8 / float4·8 / text·bytea；date/timestamp 仍 UTF-8 回退
+- `PgTcpSession` 可复用：`simple_query_relay_into` + `return_slot`
+- connector `tcp_txn`：事务内 BEGIN 后复用同一 TCP；COMMIT/ROLLBACK 同 socket 后关闭
+- 非事务仍 one-shot；Streaming/Materialized 仍用 pool `txn_lease`
 
 ```bash
-cargo test -p postgresql_protocol --lib a10_
-cargo test -p runtime_gateway --lib a10_
+cargo test -p runtime_gateway --lib a08_
 ./examples/run-smoke-matrix.sh default
+# dual-listener 覆盖 PG 事务
+./examples/smoke-dual-listener.sh
 ```
 
 建议下一刀：
 
-1. **A08 续** — 事务内/池化 TCP 中继  
-2. **H05 续** — policy_path mtime 轮询  
-3. **A10 续** — PG date/timestamp binary 或真 extended backend Execute
+1. **H05 续** — policy_path mtime 轮询  
+2. **A10 续** — PG date/timestamp binary 或真 extended Execute  
+3. **A08 续** — SSL / 池化 TCP 会话
 
 ---
 

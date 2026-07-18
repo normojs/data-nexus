@@ -1,20 +1,22 @@
-//! A08: PostgreSQL same-protocol TCP frame relay (non-transaction).
+//! A08: PostgreSQL same-protocol TCP frame relay.
 //!
-//! Opens a dedicated backend TCP session (startup + auth), sends a simple Query,
-//! and yields raw backend messages (tag + length + body) until ReadyForQuery.
-//! Peak retained bytes ≈ one read buffer / batch, not a full ResultSet.
+//! Opens a dedicated backend TCP session (startup + auth), sends simple Query
+//! frames, and yields raw backend messages (tag + length + body) until
+//! ReadyForQuery. Peak retained bytes ≈ one read buffer / batch.
 //!
 //! Scope (honest):
 //! - simple Query only (not extended protocol)
-//! - non-transaction only (no txn lease sharing with pool)
+//! - reusable session for in-transaction multi-statement passthrough
 //! - cleartext / MD5 / SCRAM-SHA-256 auth; no SSL to backend
+//! - not shared with the tokio-postgres pool (parallel lease)
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
-use gateway_core::{
-    EndpointConfig, GatewayError, GatewayResult, WireStream,
-};
+use gateway_core::{EndpointConfig, GatewayError, GatewayResult, WireStream};
+use parking_lot::Mutex;
 use postgres_protocol::authentication::md5_hash;
 use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256, SCRAM_SHA_256};
 use postgres_protocol::message::backend::Message;
@@ -22,10 +24,25 @@ use postgres_protocol::message::frontend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Authenticated backend socket ready for one simple-query relay.
+/// Authenticated backend socket ready for simple-query relay (reusable).
 pub struct PgTcpSession {
     stream: TcpStream,
     read_buf: BytesMut,
+}
+
+impl std::fmt::Debug for PgTcpSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgTcpSession")
+            .field("read_buf_len", &self.read_buf.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Slot for holding a TCP session across transaction statements (A08).
+pub type PgTcpTxnSlot = Arc<Mutex<Option<PgTcpSession>>>;
+
+pub fn new_tcp_txn_slot() -> PgTcpTxnSlot {
+    Arc::new(Mutex::new(None))
 }
 
 impl PgTcpSession {
@@ -191,7 +208,20 @@ impl PgTcpSession {
     }
 
     /// Send simple Query and return a stream that yields raw frames until ReadyForQuery.
-    pub async fn simple_query_relay(mut self, sql: &str) -> GatewayResult<PgTcpWireStream> {
+    ///
+    /// Consumes `self`. Prefer [`simple_query_relay_into`] when the session must
+    /// be returned to a txn slot after drain.
+    pub async fn simple_query_relay(self, sql: &str) -> GatewayResult<PgTcpWireStream> {
+        self.simple_query_relay_into(sql, None).await
+    }
+
+    /// Send simple Query; when the response ends, return the session to `return_slot`
+    /// (if set) instead of dropping the TCP connection.
+    pub async fn simple_query_relay_into(
+        mut self,
+        sql: &str,
+        return_slot: Option<PgTcpTxnSlot>,
+    ) -> GatewayResult<PgTcpWireStream> {
         let mut out = BytesMut::new();
         frontend::query(sql, &mut out)
             .map_err(|e| GatewayError::Backend(format!("pg query encode: {e}")))?;
@@ -201,8 +231,29 @@ impl PgTcpSession {
             .map_err(|e| GatewayError::Backend(format!("pg query write: {e}")))?;
         Ok(PgTcpWireStream {
             session: Some(self),
+            return_slot,
             done: false,
         })
+    }
+
+    /// Run a simple query and fully drain frames into a packet vec (keeps session).
+    pub async fn simple_query_collect_reuse(
+        self,
+        sql: &str,
+    ) -> GatewayResult<(Self, Vec<Vec<u8>>)> {
+        let slot = new_tcp_txn_slot();
+        let mut stream = self.simple_query_relay_into(sql, Some(slot.clone())).await?;
+        let mut packets = Vec::new();
+        loop {
+            match stream.poll_packets(64).await? {
+                None => break,
+                Some(batch) => packets.extend(batch),
+            }
+        }
+        let session = slot.lock().take().ok_or_else(|| {
+            GatewayError::Backend("pg tcp collect_reuse: session not returned".into())
+        })?;
+        Ok((session, packets))
     }
 
     /// Read the next complete backend message and return its raw frame bytes.
@@ -260,7 +311,27 @@ impl PgTcpSession {
 /// Progressive wire frames for one simple-query response (ends at ReadyForQuery).
 pub struct PgTcpWireStream {
     session: Option<PgTcpSession>,
+    /// When set, session is returned here after ReadyForQuery (txn reuse).
+    return_slot: Option<PgTcpTxnSlot>,
     done: bool,
+}
+
+impl PgTcpWireStream {
+    fn finish_session(&mut self) {
+        if let Some(sess) = self.session.take() {
+            if let Some(slot) = self.return_slot.as_ref() {
+                *slot.lock() = Some(sess);
+            }
+            // else: drop → TCP close (one-shot non-txn relay)
+        }
+    }
+}
+
+impl Drop for PgTcpWireStream {
+    fn drop(&mut self) {
+        // Mid-stream abort still returns the session so COMMIT/ROLLBACK can run.
+        self.finish_session();
+    }
 }
 
 #[async_trait]
@@ -284,7 +355,7 @@ impl WireStream for PgTcpWireStream {
                 Some(f) => f,
                 None => {
                     self.done = true;
-                    let _ = self.session.take();
+                    self.finish_session();
                     break;
                 }
             };
@@ -292,8 +363,7 @@ impl WireStream for PgTcpWireStream {
             batch.push(frame);
             if is_ready {
                 self.done = true;
-                // Drop session (TCP close); no pool return — dedicated relay conn.
-                let _ = self.session.take();
+                self.finish_session();
                 break;
             }
         }
@@ -397,5 +467,14 @@ mod tests {
         let mut out = BytesMut::new();
         frontend::query("SELECT 1", &mut out).unwrap();
         assert_eq!(out[0], b'Q');
+    }
+
+    #[test]
+    fn a08_tcp_txn_slot_roundtrip() {
+        let slot = new_tcp_txn_slot();
+        assert!(slot.lock().is_none());
+        // Slot type is usable as Arc shared across connector + stream.
+        let slot2 = slot.clone();
+        assert!(slot2.lock().is_none());
     }
 }
