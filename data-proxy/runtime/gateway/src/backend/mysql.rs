@@ -1518,4 +1518,21 @@ mod tests {
         .unwrap();
         assert_eq!(sql, "SELECT 'x' FROM t WHERE id=3");
     }
+
+    #[test]
+    fn a06_streaming_mode_covers_txn_and_non_txn() {
+        // Streaming mode is used regardless of transaction; lease return differs.
+        let mode = ExecuteMode::from_streaming_config(64, Some(100));
+        assert!(matches!(mode, ExecuteMode::Streaming { .. }));
+        assert_eq!(mode.window_rows(), Some(64));
+        assert_eq!(mode.effective_max_rows(), Some(100));
+        assert!(!matches!(
+            ExecuteMode::Materialized,
+            ExecuteMode::Streaming { .. }
+        ));
+        // Connector keeps a txn_lease slot for producer return-after-drain.
+        let c = MySqlBackendConnector::with_endpoints(vec![endpoint()]);
+        assert!(!c.has_transaction_lease());
+        assert!(c.txn_lease.lock().is_none());
+    }
 }

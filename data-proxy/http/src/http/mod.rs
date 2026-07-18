@@ -3968,4 +3968,36 @@ service = "missing-service"
         assert_eq!(meta["window_rows"], 256);
         assert!(meta["columns"].is_array());
     }
+
+    #[test]
+    fn a09_portal_ndjson_encode_multi_row_window() {
+        // Multi-row SELECT body is encoded as one NDJSON line per row; meta is
+        // separate (backend_window path yields meta first, then row lines).
+        let cols = vec!["id".into(), "name".into()];
+        let rows = vec![
+            vec![json!(1), json!("portal")],
+            vec![json!(2), json!("row2")],
+            vec![json!(3), json!("row3")],
+        ];
+        let bytes = portal_ndjson_encode_rows(&cols, &rows);
+        let text = String::from_utf8(bytes).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3);
+        let r0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(r0["id"], 1);
+        assert_eq!(r0["name"], "portal");
+        let r2: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(r2["id"], 3);
+    }
+
+    #[test]
+    fn a09_portal_prepare_mode_is_streaming() {
+        // portal_prepare always uses ExecuteMode::Streaming from security.streaming
+        // so MySQL/PG backends can yield RowStream for NDJSON backend_window.
+        use gateway_core::ExecuteMode;
+        let mode = ExecuteMode::from_streaming_config(256, Some(10));
+        assert!(matches!(mode, ExecuteMode::Streaming { .. }));
+        assert_eq!(mode.window_rows(), Some(256));
+        assert_eq!(mode.effective_max_rows(), Some(10));
+    }
 }

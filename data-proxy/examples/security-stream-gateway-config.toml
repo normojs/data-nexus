@@ -1,4 +1,4 @@
-# A1 streaming window + max_rows smoke (security on for streaming config path).
+# A1/A06 streaming window + max_rows smoke (MySQL + PostgreSQL listeners).
 version = "2"
 
 [admin]
@@ -29,11 +29,25 @@ protocol = "mysql"
 service = "orders"
 auth_policy = "local-users"
 
+[[listeners]]
+name = "analytics-postgresql"
+listen_addr = "0.0.0.0:9089"
+protocol = "postgresql"
+service = "analytics"
+auth_policy = "local-users"
+
 [[services]]
 name = "orders"
 backend_protocol = "mysql"
 endpoints = ["orders-primary"]
 route_policy = "orders-balance"
+plugin_policies = []
+
+[[services]]
+name = "analytics"
+backend_protocol = "postgresql"
+endpoints = ["analytics-primary"]
+route_policy = "analytics-balance"
 plugin_policies = []
 
 [[endpoints]]
@@ -45,8 +59,21 @@ username = "root"
 password = "root"
 weight = 1
 
+[[endpoints]]
+name = "analytics-primary"
+protocol = "postgresql"
+address = "127.0.0.1:15433"
+database = "analytics"
+username = "postgres"
+password = "postgres"
+weight = 1
+
 [[route_policies]]
 name = "orders-balance"
+kind = "simple_load_balance"
+
+[[route_policies]]
+name = "analytics-balance"
 kind = "simple_load_balance"
 
 [[auth_policies]]

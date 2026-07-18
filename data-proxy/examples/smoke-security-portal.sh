@@ -39,8 +39,9 @@ echo "==> seed"
 "${COMPOSE[@]}" exec -T mysql-primary mysql -uroot -proot -e "
 CREATE DATABASE IF NOT EXISTS orders;
 USE orders;
-CREATE TABLE IF NOT EXISTS portal_t (id INT PRIMARY KEY, name VARCHAR(32));
-INSERT INTO portal_t VALUES (1,'portal') ON DUPLICATE KEY UPDATE name=VALUES(name);
+DROP TABLE IF EXISTS portal_t;
+CREATE TABLE portal_t (id INT PRIMARY KEY, name VARCHAR(32));
+INSERT INTO portal_t VALUES (1,'portal'),(2,'row2'),(3,'row3');
 "
 
 echo "==> gateway"
@@ -176,6 +177,35 @@ assert meta.get("stream") in ("backend_window", "chunked"), meta
 row=json.loads(lines[1])
 assert "id" in row and "name" in row
 print("ndjson stream export ok", meta.get("stream"), meta.get("row_count"), row)
+PY
+
+echo "==> portal multi-row NDJSON requires backend_window (A09)"
+curl -fsS -D /tmp/dn-portal-ndjson2.hdr -o /tmp/dn-portal2.ndjson \
+  -X POST "http://127.0.0.1:8082/admin/portal/query" \
+  -H 'content-type: application/json' \
+  -d '{"service":"orders","sql":"SELECT id, name FROM portal_t ORDER BY id","subject_id":"portal-user","format":"ndjson","max_rows":10}'
+python3 - <<'PY'
+import json
+hdr=open("/tmp/dn-portal-ndjson2.hdr").read().lower()
+# A09: multi-row MySQL SELECT via portal must use backend Streaming → HTTP chunk,
+# not B05b materialize-then-chunk fallback.
+assert "x-data-nexus-stream: backend_window" in hdr, hdr
+lines=[ln for ln in open("/tmp/dn-portal2.ndjson") if ln.strip()]
+assert len(lines) >= 2, lines
+meta=json.loads(lines[0])
+assert meta.get("_meta") is True
+assert meta.get("stream") == "backend_window", meta
+assert meta.get("window_rows", 0) >= 1, meta
+rows=[]
+for ln in lines[1:]:
+    obj=json.loads(ln)
+    if obj.get("_meta"):
+        continue
+    rows.append(obj)
+assert len(rows) >= 2, ("expected multi-row backend_window", rows)
+ids=sorted(int(r["id"]) for r in rows if "id" in r)
+assert ids[:3] == [1, 2, 3] or ids[:2] == [1, 2], ids
+print("ndjson multi-row backend_window ok", "rows", len(rows), "window", meta.get("window_rows"))
 PY
 
 echo "==> portal invalid format rejected"

@@ -149,6 +149,9 @@ examples/        smoke + gateway config 样例
 | H05 | LocalPdp policy_path mtime 轮询热更（部分） | feat(h05) |
 | H05 | vault 文件 AES-GCM 加密 + 密钥恢复 secret（部分 / H08） | feat(h05) |
 | H05 | ticket 文件 AES-GCM 加密（`ticket_encrypt_key`） | feat(h05) |
+| A08 | backend SSL `ssl_mode` disable/prefer/require | feat(a08) |
+| A06 | smoke 双协议 max_rows + streaming metrics（部分） | feat(a06) |
+| A09 | portal multi-row NDJSON 强制 backend_window（部分） | feat(a09) |
 
 ---
 
@@ -163,10 +166,10 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
-| **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease | **部分** |
+| **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease；**smoke max_rows 双协议 + metrics streaming** | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | idle pool（cap+TTL+健康探测）+ 事务 `tcp_txn`；**ssl_mode** disable/prefer/require | 证书校验 danger_accept_invalid（无自定义 CA）；非 extended | **部分** |
-| **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
+| **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | multi-row smoke **强制** `backend_window`；json/csv 仍物化；Complete 回退 B05b | **部分** |
 | **A10** | 预处理 / 事务透传矩阵 | MySQL binary；PG binary portal；QueryParams + prepare/bind + **Statement 缓存** + **Streaming 窗口** | 参数仍 text ToSql；缓存 per-conn 上限 64；QueryParams 非 TCP passthrough；MySQL QueryParams 仍 text 改写 | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
@@ -212,8 +215,8 @@ examples/        smoke + gateway config 样例
 
 | 主题 | 限制 |
 |------|------|
-| Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
-| 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
+| Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP（smoke 强制 multi-row `backend_window`）；json/csv 与 Complete 回退仍物化 |
+| 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；smoke 双协议 max_rows + `execute_path=streaming`；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：idle pool（TTL+探测）+ 事务 tcp_txn；`ssl_mode` prefer/require；证书校验未钉 CA |
 | 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；MySQL 仍 text 改写；binary 结果含 date/ts/time；非 TCP passthrough |
 | 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；非 CRDT |
@@ -224,25 +227,28 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A06/A09 收口 或 H07 CI 加深 或 A08 证书钉扎 <<<**
+**>>> H07 CI 加深 或 A08 证书钉扎 或 A10 MySQL QueryParams <<<**
 
-本轮（A08 backend SSL）：
+本轮（A06/A09 smoke 收口）：
 
-- `endpoints[].ssl_mode`：`disable`（默认）/ `prefer` / `require`
-- TCP 中继：SSLRequest → native-tls 握手
-- 池路径：`tokio-postgres` + `postgres-native-tls` 同策略
-- MVP：`danger_accept_invalid_certs`（自定义 CA 后置）
+- `smoke-security-stream`：MySQL + PG 双协议 `max_rows=1`；metrics `execute_path=streaming`
+- `smoke-security-portal`：multi-row NDJSON **强制** `x-data-nexus-stream: backend_window`
+- 单测：`a06_*`（transport/mysql/pg）、`a09_*`（portal NDJSON encode / Streaming mode）
 
 ```bash
-cargo test -p runtime_gateway --lib a08_
+cargo test -p gateway_core --lib a06_
+cargo test -p runtime_gateway --lib a06_
+cargo test -p http@0.1.0 --lib a09_
+./examples/smoke-security-stream.sh
+./examples/smoke-security-portal.sh
 ./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **A06/A09** — 边界收口 / smoke 加深  
-2. **H07** — CI extended/cedar  
-3. **A08** — 证书钉扎 / 自定义 CA
+1. **H07** — CI extended/cedar  
+2. **A08** — 证书钉扎 / 自定义 CA  
+3. **A10** — MySQL QueryParams 去 text 改写  
 
 ---
 

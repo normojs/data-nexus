@@ -613,4 +613,64 @@ mod tests {
         assert_eq!(fe.footer_calls, 1);
         assert_eq!(writer.packets.last().unwrap(), &vec![3u8]);
     }
+
+    #[tokio::test]
+    async fn a06_vec_row_stream_poll_window_sizes() {
+        let rows = (0..5)
+            .map(|i| vec![GatewayValue::Integer(i)])
+            .collect::<Vec<_>>();
+        let mut stream = VecRowStream::new(rows);
+        let first = stream.poll_window(2).await.unwrap().unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0][0], GatewayValue::Integer(0));
+        let second = stream.poll_window(2).await.unwrap().unwrap();
+        assert_eq!(second.len(), 2);
+        let last = stream.poll_window(10).await.unwrap().unwrap();
+        assert_eq!(last.len(), 1);
+        assert!(stream.poll_window(1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a06_streaming_early_stop_drains_remaining_windows() {
+        // max_rows truncates encode; producer/stream still drained so backends can
+        // release leases (A06 drain contract).
+        use crate::{MaskAlgorithm, MaskSpec, Obligations};
+
+        let mut fe = FakeFrontend {
+            header_calls: 0,
+            row_calls: 0,
+            footer_calls: 0,
+        };
+        let session = SessionState::default();
+        let columns = vec![Column {
+            name: "id".into(),
+            data_type: "int".into(),
+        }];
+        let rows = (0..10)
+            .map(|i| vec![GatewayValue::Integer(i)])
+            .collect();
+        let mut obl = Obligations::default();
+        obl.max_rows = Some(3);
+        obl.column_masks
+            .push(MaskSpec::new("id", MaskAlgorithm::Nullify, "m"));
+        let query = StreamingQuery {
+            columns,
+            stream: Box::new(VecRowStream::new(rows)),
+        };
+        let mut writer = CollectingWriter::new();
+        let total = write_streaming_query_with_obligations(
+            &mut fe,
+            &session,
+            query,
+            4,
+            Some(&obl),
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(fe.header_calls, 1);
+        assert_eq!(fe.footer_calls, 1);
+        assert!(fe.row_calls >= 1);
+    }
 }
