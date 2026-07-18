@@ -53,12 +53,12 @@ pub struct SecurityPolicyConfig {
     pub state: SecurityStateConfig,
 }
 
-/// H05: shared state for ticket / vault across gateway processes.
+/// H05: shared state for ticket / vault / Local PDP snapshot across gateway processes.
 ///
-/// | backend | ticket | vault |
-/// |---------|--------|-------|
-/// | `memory` (default) | process HashMap | process HashMap |
-/// | `file` | JSON file at `ticket_path` | JSON file at `vault_path` (lease metadata only; **no** backend passwords) |
+/// | backend | ticket | vault | Local PDP snapshot |
+/// |---------|--------|-------|--------------------|
+/// | `memory` (default) | process HashMap | process HashMap | process Arc only |
+/// | `file` | JSON + lock | JSON + lock (no passwords) | optional `policy_path` JSON + lock |
 ///
 /// `redis` / remote backends are **rejected** until implemented (no silent no-op).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -73,6 +73,11 @@ pub struct SecurityStateConfig {
     /// Stores public lease fields + projects only — never backend passwords (H03/H08).
     #[serde(default)]
     pub vault_path: String,
+    /// Optional Local PDP hot-reloadable snapshot path (H05).
+    /// When set (typically with `backend=file`), rules/mask/time/watermark are
+    /// shared across processes via JSON + advisory lock. Empty = process-local only.
+    #[serde(default)]
+    pub policy_path: String,
 }
 
 fn default_state_backend() -> String {
@@ -277,7 +282,10 @@ impl SecurityPolicyConfig {
 
         // H05 state backend
         match self.state.backend.trim().to_ascii_lowercase().as_str() {
-            "memory" | "" => {}
+            "memory" | "" => {
+                // policy_path may still be set for optional shared Local PDP snapshot
+                // even on memory ticket/vault (ops choice).
+            }
             "file" => {
                 if self.state.ticket_path.trim().is_empty() {
                     return Err(GatewayError::Configuration(

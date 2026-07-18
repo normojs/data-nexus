@@ -20,6 +20,7 @@ mod object_set;
 mod obligations;
 mod pdp;
 mod plugin;
+mod policy_file;
 mod route;
 mod security;
 mod sharding;
@@ -66,10 +67,14 @@ pub use pdp::{
     security_requires_listener_rebuild, sql_from_command, AccessRequest, LocalPdp,
     LocalPdpReloadInfo, LocalPdpStore, SecurityDecision, StatementAction, Subject,
 };
+pub use policy_file::{
+    load_local_pdp_policy_file, merge_local_pdp_from_file, persist_local_pdp_to_file,
+    save_local_pdp_policy_file, LocalPdpPolicyFile,
+};
 pub use security::{
     SecurityAuditConfig, SecurityColumnTagConfig, SecurityHighRiskRuleConfig,
     SecurityMaskRuleConfig, SecurityPdpConfig, SecurityPolicyConfig, SecurityRuleConfig,
-    SecurityStreamingConfig, SecuritySubjectConfig, SecurityWatermarkConfig,
+    SecurityStateConfig, SecurityStreamingConfig, SecuritySubjectConfig, SecurityWatermarkConfig,
 };
 pub use time_rules::{
     is_inside_window, parse_hhmm, security_now_unix_secs, SecurityTimeRuleConfig,

@@ -291,16 +291,33 @@ pub fn global_local_pdp_store() -> Option<Arc<LocalPdpStore>> {
 }
 
 /// Install/replace the global Local PDP snapshot.
+///
+/// H05: when `security.state.policy_path` is set, merge hot-reloadable fields from
+/// the shared policy file (or seed the file from this config on first boot).
 pub fn install_local_pdp(config: &SecurityPolicyConfig) -> Option<LocalPdp> {
     if !config.enabled {
         return None;
     }
+    let effective = match crate::policy_file::merge_local_pdp_from_file(config) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                target: "data_nexus::security",
+                error = %e,
+                "H05 local PDP policy file merge failed; using process config"
+            );
+            config.clone()
+        }
+    };
     let store = global_store();
-    let _ = store.swap(LocalPdpInner::from_config(config));
+    let _ = store.swap(LocalPdpInner::from_config(&effective));
     Some(LocalPdp { store })
 }
 
 /// Hot-swap Local rules/mask/time/watermark (F28).
+///
+/// H05: after swapping the process snapshot, persist hot-reloadable fields to
+/// `security.state.policy_path` when configured so peer processes can load them.
 pub fn reload_global_local_pdp(config: &SecurityPolicyConfig) -> Option<LocalPdpReloadInfo> {
     if !config.enabled {
         return None;
@@ -309,11 +326,19 @@ pub fn reload_global_local_pdp(config: &SecurityPolicyConfig) -> Option<LocalPdp
     let previous = store.load();
     let inner = LocalPdpInner::from_config_preserving_cedar(config, &previous);
     let info = store.swap(inner);
+    if let Err(e) = crate::policy_file::persist_local_pdp_to_file(config) {
+        tracing::error!(
+            target: "data_nexus::security",
+            error = %e,
+            "H05 persist local PDP policy file failed"
+        );
+    }
     tracing::info!(
         target: "data_nexus::security",
         epoch = info.epoch,
         rules = info.rule_count,
         previous_rules = info.previous_rule_count,
+        policy_path = %config.state.policy_path,
         "local PDP snapshot hot-reloaded"
     );
     Some(info)

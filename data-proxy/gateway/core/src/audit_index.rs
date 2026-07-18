@@ -12,7 +12,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// H05: multi-process writers share one SQLite file (WAL). Wait up to this long
+/// for locks before failing an insert/query.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const BUSY_RETRIES: u32 = 8;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -76,10 +82,15 @@ impl AuditIndex {
         }
         let conn = Connection::open(&path)
             .map_err(|e| format!("open audit index {}: {e}", path.display()))?;
+        // H05: multi-instance / multi-worker writers on shared disk.
+        // WAL allows concurrent readers; busy_timeout backs off on writer locks.
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .map_err(|e| format!("busy_timeout audit index: {e}"))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             PRAGMA temp_store=MEMORY;",
+             PRAGMA temp_store=MEMORY;
+             PRAGMA foreign_keys=OFF;",
         )
         .map_err(|e| format!("pragma audit index: {e}"))?;
         conn.execute_batch(SCHEMA)
@@ -135,46 +146,47 @@ impl AuditIndex {
             .conn
             .lock()
             .map_err(|_| "audit index lock poisoned".to_string())?;
-        let existed: bool = conn
-            .query_row(
+        let existed: bool = with_busy_retry("probe audit index", || {
+            conn.query_row(
                 "SELECT 1 FROM audit_events WHERE event_id = ?1",
                 params![event_id],
                 |_| Ok(true),
             )
             .optional()
-            .map_err(|e| format!("probe audit index: {e}"))?
-            .unwrap_or(false);
-        conn.execute(
-            r#"
-            INSERT INTO audit_events (
-                event_id, ts_unix_ms, decision, subject_id, service,
-                action, listener, rule, outcome, payload
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            ON CONFLICT(event_id) DO UPDATE SET
-                ts_unix_ms=excluded.ts_unix_ms,
-                decision=excluded.decision,
-                subject_id=excluded.subject_id,
-                service=excluded.service,
-                action=excluded.action,
-                listener=excluded.listener,
-                rule=excluded.rule,
-                outcome=excluded.outcome,
-                payload=excluded.payload
-            "#,
-            params![
-                event_id,
-                ts,
-                event.decision.as_deref(),
-                event.subject_id.as_deref(),
-                event.service.as_deref(),
-                event.action.as_deref(),
-                event.listener.as_deref(),
-                event.rule.as_deref(),
-                event.outcome.as_deref(),
-                payload,
-            ],
-        )
-        .map_err(|e| format!("insert audit index: {e}"))?;
+        })?
+        .unwrap_or(false);
+        with_busy_retry("insert audit index", || {
+            conn.execute(
+                r#"
+                INSERT INTO audit_events (
+                    event_id, ts_unix_ms, decision, subject_id, service,
+                    action, listener, rule, outcome, payload
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    ts_unix_ms=excluded.ts_unix_ms,
+                    decision=excluded.decision,
+                    subject_id=excluded.subject_id,
+                    service=excluded.service,
+                    action=excluded.action,
+                    listener=excluded.listener,
+                    rule=excluded.rule,
+                    outcome=excluded.outcome,
+                    payload=excluded.payload
+                "#,
+                params![
+                    event_id,
+                    ts,
+                    event.decision.as_deref(),
+                    event.subject_id.as_deref(),
+                    event.service.as_deref(),
+                    event.action.as_deref(),
+                    event.listener.as_deref(),
+                    event.rule.as_deref(),
+                    event.outcome.as_deref(),
+                    payload,
+                ],
+            )
+        })?;
         self.inserted.fetch_add(1, Ordering::Relaxed);
         if !existed {
             self.rows.fetch_add(1, Ordering::Relaxed);
@@ -326,6 +338,35 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Retry on SQLITE_BUSY / locked (H05 multi-writer). `busy_timeout` already waits
+/// inside SQLite; this covers residual races between probe + insert.
+fn with_busy_retry<T, F>(label: &str, mut f: F) -> Result<T, String>
+where
+    F: FnMut() -> Result<T, rusqlite::Error>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let busy = matches!(
+                    e.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                        | Some(rusqlite::ErrorCode::DatabaseLocked)
+                );
+                if busy && attempt < BUSY_RETRIES {
+                    attempt += 1;
+                    // Exponential-ish backoff: 1,2,4,8… ms capped.
+                    let ms = (1u64 << attempt.min(6)).min(50);
+                    thread::sleep(Duration::from_millis(ms));
+                    continue;
+                }
+                return Err(format!("{label}: {e}"));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +492,35 @@ mod tests {
         assert_eq!(got.outcome.as_deref(), Some("updated"));
         assert_eq!(got.ts_unix_ms, Some(2));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// H05: two AuditIndex handles on the same file (multi-process / multi-worker).
+    #[test]
+    fn h05_two_handles_share_wal_file() {
+        let path = tmp_path("h05-mp");
+        let a = AuditIndex::open(&path).unwrap();
+        let b = AuditIndex::open(&path).unwrap();
+        a.insert(&sample("deny", "a", "svc", 10)).unwrap();
+        b.insert(&sample("execute", "b", "svc", 11)).unwrap();
+        // Cross-read: each handle sees the other's rows.
+        let from_a = a
+            .query(&AuditQueryFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let from_b = b
+            .query(&AuditQueryFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(from_a.len(), 2);
+        assert_eq!(from_b.len(), 2);
+        assert!(a.get_by_id("ae-execute-b-11").unwrap().is_some());
+        assert!(b.get_by_id("ae-deny-a-10").unwrap().is_some());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }
