@@ -20,7 +20,7 @@ use postgresql_protocol::{
     encode_command_complete, encode_data_row, encode_ready_for_query, encode_row_description,
     FieldDescription, TransactionStatus,
 };
-use tokio_postgres::{types::ToSql, Client, NoTls, Row, SimpleQueryMessage};
+use tokio_postgres::{types::ToSql, Client, NoTls, Row, SimpleQueryMessage, Statement};
 use tracing::error;
 
 use super::pg_tcp_relay::{
@@ -28,6 +28,8 @@ use super::pg_tcp_relay::{
 };
 
 const DEFAULT_POSTGRESQL_POOL_SIZE: usize = 16;
+/// A10: max cached `Statement`s per pooled TCP connection (prepare once, bind many).
+const MAX_STMT_CACHE_PER_CONN: usize = 64;
 
 /// A10: session-scoped prepared statement registry (gateway-owned id → SQL).
 ///
@@ -409,9 +411,6 @@ impl PostgreSqlBackendConnector {
         parameters: &[GatewayValue],
         mode: ExecuteMode,
     ) -> GatewayResult<GatewayResponse> {
-        let client = conn.client.as_ref().ok_or_else(|| {
-            GatewayError::Backend("postgresql backend connection is not open".into())
-        })?;
         let text_params: Vec<Option<String>> = parameters
             .iter()
             .map(gateway_value_to_pg_param_text)
@@ -421,24 +420,43 @@ impl PostgreSqlBackendConnector {
             .map(|p| p as &(dyn ToSql + Sync))
             .collect();
 
-        match client.query(sql, to_sql.as_slice()).await {
-            Ok(rows) => rows_to_gateway_response(rows, mode),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("does not return rows")
-                    || msg.contains("no field")
-                    || msg.contains("statement that returns")
-                {
-                    let n = client
-                        .execute(sql, to_sql.as_slice())
-                        .await
-                        .map_err(postgresql_backend_error)?;
-                    Ok(GatewayResponse::Ok {
-                        affected_rows: n,
-                        last_insert_id: None,
-                    })
-                } else {
-                    Err(postgresql_backend_error(e))
+        // A10: prepare-once cache on this connection; retry once if cache is stale.
+        let mut retried = false;
+        loop {
+            let stmt = conn.get_or_prepare(sql).await?;
+            match conn
+                .client()?
+                .query(&stmt, to_sql.as_slice())
+                .await
+            {
+                Ok(rows) => return rows_to_gateway_response(rows, mode),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("does not return rows")
+                        || msg.contains("no field")
+                        || msg.contains("statement that returns")
+                    {
+                        let n = conn
+                            .client()?
+                            .execute(&stmt, to_sql.as_slice())
+                            .await
+                            .map_err(postgresql_backend_error)?;
+                        return Ok(GatewayResponse::Ok {
+                            affected_rows: n,
+                            last_insert_id: None,
+                        });
+                    }
+                    // Cached plan may be invalid after DDL; drop and re-prepare once.
+                    if !retried
+                        && (msg.contains("cached plan")
+                            || msg.contains("prepared statement")
+                            || msg.contains("does not exist"))
+                    {
+                        conn.invalidate_prepared(sql);
+                        retried = true;
+                        continue;
+                    }
+                    return Err(postgresql_backend_error(e));
                 }
             }
         }
@@ -893,6 +911,8 @@ struct PostgreSqlBackendConnection {
     database: String,
     client_encoding: Option<String>,
     client: Option<Client>,
+    /// A10: per-connection prepared Statement cache (not shared across pool conns).
+    stmt_cache: Mutex<HashMap<String, Statement>>,
 }
 
 impl Clone for PostgreSqlBackendConnection {
@@ -903,6 +923,8 @@ impl Clone for PostgreSqlBackendConnection {
             database: self.database.clone(),
             client_encoding: self.client_encoding.clone(),
             client: None,
+            // Fresh connection factory must not inherit another conn's Statements.
+            stmt_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -924,6 +946,7 @@ impl Default for PostgreSqlBackendConnection {
             database: String::new(),
             client_encoding: None,
             client: None,
+            stmt_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -931,7 +954,14 @@ impl Default for PostgreSqlBackendConnection {
 impl PostgreSqlBackendConnection {
     fn factory(endpoint: EndpointConfig, database: String) -> Self {
         let pool_key = postgresql_pool_key(&endpoint, &database);
-        Self { endpoint, pool_key, database, client_encoding: None, client: None }
+        Self {
+            endpoint,
+            pool_key,
+            database,
+            client_encoding: None,
+            client: None,
+            stmt_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     async fn simple_query(&self, sql: &str) -> GatewayResult<Vec<SimpleQueryMessage>> {
@@ -953,6 +983,34 @@ impl PostgreSqlBackendConnection {
         self.client.as_ref().ok_or_else(|| {
             GatewayError::Backend("postgresql backend connection is not open".into())
         })
+    }
+
+    /// A10: return a cached Statement or prepare and insert (connection-local).
+    async fn get_or_prepare(&self, sql: &str) -> GatewayResult<Statement> {
+        if let Some(stmt) = self.stmt_cache.lock().get(sql).cloned() {
+            return Ok(stmt);
+        }
+        let stmt = self
+            .client()?
+            .prepare(sql)
+            .await
+            .map_err(postgresql_backend_error)?;
+        let mut cache = self.stmt_cache.lock();
+        if cache.len() >= MAX_STMT_CACHE_PER_CONN {
+            // Simple bound: drop entire cache rather than LRU bookkeeping.
+            cache.clear();
+        }
+        cache.insert(sql.to_owned(), stmt.clone());
+        Ok(stmt)
+    }
+
+    fn invalidate_prepared(&self, sql: &str) {
+        self.stmt_cache.lock().remove(sql);
+    }
+
+    #[cfg(test)]
+    fn stmt_cache_len(&self) -> usize {
+        self.stmt_cache.lock().len()
     }
 }
 
@@ -981,6 +1039,7 @@ impl ConnLike for PostgreSqlBackendConnection {
             database: self.database.clone(),
             client_encoding: None,
             client: Some(client),
+            stmt_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1721,6 +1780,25 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a10_stmt_cache_is_connection_local_and_bounded() {
+        let mut conn = PostgreSqlBackendConnection::factory(endpoint(), "analytics".into());
+        assert_eq!(conn.stmt_cache_len(), 0);
+        // Without a live client, get_or_prepare fails closed.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt.block_on(conn.get_or_prepare("SELECT $1"));
+        assert!(err.is_err());
+        conn.invalidate_prepared("SELECT $1");
+        assert_eq!(conn.stmt_cache_len(), 0);
+        // Clone for pool factory must not inherit statements from another conn.
+        let clone = conn.clone();
+        assert_eq!(clone.stmt_cache_len(), 0);
+        assert_eq!(MAX_STMT_CACHE_PER_CONN, 64);
     }
 
     #[test]
