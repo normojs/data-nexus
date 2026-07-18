@@ -138,6 +138,7 @@ examples/        smoke + gateway config 样例
 | A10 | PG Bind result_format binary portal 结果（部分） | feat(a10) |
 | H05 | ticket/vault file advisory locks（部分） | feat(h05) |
 | H05 | audit SQLite multi-writer + LocalPdp policy_path（部分） | feat(h05) |
+| H05 | LocalPdp policy_path mtime 轮询热更（部分） | feat(h05) |
 
 ---
 
@@ -173,7 +174,7 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
 | **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
-| **H05** | 多实例状态外置 | ticket/vault JSON + lock；审计 SQLite WAL+busy；可选 `policy_path` Local PDP 快照 | file vault 无密码；全文件替换非 CRDT；策略文件需各进程 reload 才可见 | **部分** |
+| **H05** | 多实例状态外置 | ticket/vault JSON+lock；审计 SQLite WAL+busy；`policy_path` 快照 + **mtime 轮询**（`policy_poll_ms`） | file vault 无密码；全文件替换非 CRDT；轮询节流默认 1s | **部分** |
 | **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `223f2c0` → origin/main | **完成** |
 | **H07** | CI 矩阵加深 | PR 已 default；extended / cedar job 可选或 nightly | workflow_dispatch 可选手动 | **可选** |
 | **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | H03 已声明后置 | **延后** |
@@ -205,7 +206,7 @@ examples/        smoke + gateway config 样例
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：非事务 + **事务内** TCP 帧中继（`tcp_txn` 跨语句复用；COMMIT/ROLLBACK 同 socket）；专用连接不进池 |
 | 预处理语句 | A10：MySQL binary 行（含 DATE/TIME）；PG Bind `result_format=1` → binary DataRow（int/bool/float/text/bytea）；参数仍 text；无 date/ts 原生 binary |
-| 多副本 | H05：ticket/vault `file`+lock；审计 SQLite 共享文件（WAL+busy）；LocalPdp 可选 `policy_path` 快照（需 reload）；file vault 无密码；非 CRDT |
+| 多副本 | H05：ticket/vault `file`+lock；审计 SQLite WAL+busy；LocalPdp `policy_path` + mtime 轮询（`policy_poll_ms`，0=关）；file vault 无密码；非 CRDT |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
 
@@ -213,26 +214,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> H05 策略 mtime 轮询 或 A10 PG date binary / 真 extended Execute 或 A08 池化/SSL <<<**
+**>>> A10 PG date binary / 真 extended Execute 或 A08 池化/SSL 或 H05 vault 加密 <<<**
 
-本轮（A08 事务内 TCP 中继）：
+本轮（H05 policy mtime 轮询）：
 
-- `PgTcpSession` 可复用：`simple_query_relay_into` + `return_slot`
-- connector `tcp_txn`：事务内 BEGIN 后复用同一 TCP；COMMIT/ROLLBACK 同 socket 后关闭
-- 非事务仍 one-shot；Streaming/Materialized 仍用 pool `txn_lease`
+- `security.state.policy_poll_ms`（默认 1000；0=关）
+- `LocalPdpStore::load` 节流 `stat`；mtime 变则合并 policy 文件并 swap epoch
+- install/reload 同步 mtime 基线；peer 写文件后无需 admin reload
 
 ```bash
-cargo test -p runtime_gateway --lib a08_
+cargo test -p gateway_core --lib h05_
 ./examples/run-smoke-matrix.sh default
-# dual-listener 覆盖 PG 事务
-./examples/smoke-dual-listener.sh
 ```
 
 建议下一刀：
 
-1. **H05 续** — policy_path mtime 轮询  
-2. **A10 续** — PG date/timestamp binary 或真 extended Execute  
-3. **A08 续** — SSL / 池化 TCP 会话
+1. **A10 续** — PG date/timestamp binary 或真 extended Execute  
+2. **A08 续** — SSL / 池化 TCP 会话  
+3. **H05 续** — vault 文件加密 / CRDT
 
 ---
 

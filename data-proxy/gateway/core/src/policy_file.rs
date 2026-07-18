@@ -76,6 +76,20 @@ impl LocalPdpPolicyFile {
     }
 }
 
+/// mtime of policy file as nanoseconds since UNIX_EPOCH (H05 poll). Missing → `None`.
+pub fn policy_file_mtime_ns(path: &str) -> Option<u64> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_nanos() as u64)
+}
+
 /// Load policy snapshot from disk (shared lock). Missing file → `None`.
 pub fn load_local_pdp_policy_file(path: &str) -> Result<Option<LocalPdpPolicyFile>, String> {
     let path = path.trim();

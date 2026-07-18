@@ -6,9 +6,15 @@
 //!
 //! F28: fields live behind a process-wide `Arc` snapshot. Connections hold a
 //! store handle; admin reload swaps the snapshot without listener rebuild.
+//!
+//! H05: when `security.state.policy_path` is set, `LocalPdpStore` may `stat` the
+//! file on a throttled interval and hot-swap if mtime changed (cross-process).
 
 use crate::object_set::{ColumnAclOutcome, ObjectSet, StarPolicy};
 use crate::obligations::{inject_row_filter, MaskAlgorithm, MaskSpec, Obligations, WatermarkMode, WatermarkSpec};
+use crate::policy_file::{
+    load_local_pdp_policy_file, policy_file_mtime_ns, LocalPdpPolicyFile,
+};
 use crate::ticket::{
     extract_ticket_id, global_ticket_store, is_write_without_where, strip_ticket_comment,
 };
@@ -18,7 +24,8 @@ use crate::{
     SecurityTimeRuleConfig, SecurityWatermarkConfig,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Data-plane identity (not Admin JWT).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +166,19 @@ struct LocalPdpInner {
 }
 
 impl LocalPdpInner {
+    /// Overlay H05 policy-file fields while keeping Cedar (and non-shared) state.
+    fn apply_policy_file(&mut self, file: &LocalPdpPolicyFile) {
+        self.fail_closed = file.fail_closed;
+        self.star_policy = StarPolicy::from_config(&file.star_policy);
+        self.rules = file.rules.clone();
+        self.mask_rules = file.mask_rules.clone();
+        self.column_tags = file.column_tags.clone();
+        self.high_risk_rules = file.high_risk_rules.clone();
+        self.time_rules = file.time_rules.clone();
+        self.watermark = file.watermark.clone();
+        self.default_max_rows = file.default_max_rows;
+    }
+
     fn from_config(config: &SecurityPolicyConfig) -> Self {
         #[cfg(feature = "security-cedar")]
         let (cedar, cedar_required) = if config.pdp.backend.eq_ignore_ascii_case("cedar") {
@@ -211,11 +231,19 @@ impl LocalPdpInner {
     }
 }
 
-/// Process-wide Local PDP store (F28).
+/// Process-wide Local PDP store (F28 + H05 mtime poll).
 #[derive(Debug)]
 pub struct LocalPdpStore {
     epoch: AtomicU64,
     current: RwLock<Arc<LocalPdpInner>>,
+    /// Shared policy file path (empty = no poll).
+    policy_path: Mutex<String>,
+    /// Last applied file mtime (ns since epoch); 0 = unknown / not loaded.
+    policy_mtime_ns: AtomicU64,
+    /// Last `stat` time (unix ms).
+    policy_last_check_ms: AtomicU64,
+    /// Poll interval ms; 0 = disabled.
+    policy_poll_ms: AtomicU64,
 }
 
 impl LocalPdpStore {
@@ -241,6 +269,10 @@ impl LocalPdpStore {
         Self {
             epoch: AtomicU64::new(0),
             current: RwLock::new(Arc::new(Self::empty_inner())),
+            policy_path: Mutex::new(String::new()),
+            policy_mtime_ns: AtomicU64::new(0),
+            policy_last_check_ms: AtomicU64::new(0),
+            policy_poll_ms: AtomicU64::new(1000),
         }
     }
 
@@ -248,12 +280,91 @@ impl LocalPdpStore {
         self.epoch.load(Ordering::Relaxed)
     }
 
+    /// Configure H05 file poll after install/reload.
+    fn configure_policy_poll(&self, path: &str, poll_ms: u64, mtime_ns: u64) {
+        if let Ok(mut g) = self.policy_path.lock() {
+            *g = path.trim().to_owned();
+        }
+        self.policy_poll_ms.store(poll_ms, Ordering::Relaxed);
+        self.policy_mtime_ns.store(mtime_ns, Ordering::Relaxed);
+        self.policy_last_check_ms
+            .store(now_unix_ms(), Ordering::Relaxed);
+    }
+
     fn load(&self) -> Arc<LocalPdpInner> {
+        self.maybe_refresh_from_policy_file();
         self.current.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Throttled mtime check; swap snapshot when peer process rewrote the file.
+    fn maybe_refresh_from_policy_file(&self) {
+        let poll_ms = self.policy_poll_ms.load(Ordering::Relaxed);
+        if poll_ms == 0 {
+            return;
+        }
+        let path = match self.policy_path.lock() {
+            Ok(g) if !g.is_empty() => g.clone(),
+            _ => return,
+        };
+        let now = now_unix_ms();
+        let last = self.policy_last_check_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < poll_ms {
+            return;
+        }
+        // Best-effort CAS so concurrent authorize only one stats.
+        if self
+            .policy_last_check_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let Some(mtime) = policy_file_mtime_ns(&path) else {
+            return;
+        };
+        let prev_mtime = self.policy_mtime_ns.load(Ordering::Relaxed);
+        if mtime == prev_mtime {
+            return;
+        }
+        match load_local_pdp_policy_file(&path) {
+            Ok(Some(file)) => {
+                let previous = self
+                    .current
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let mut next = (*previous).clone();
+                next.apply_policy_file(&file);
+                let info = self.swap(next);
+                self.policy_mtime_ns.store(mtime, Ordering::Relaxed);
+                tracing::info!(
+                    target: "data_nexus::security",
+                    epoch = info.epoch,
+                    rules = info.rule_count,
+                    previous_rules = info.previous_rule_count,
+                    policy_path = %path,
+                    mtime_ns = mtime,
+                    "H05 local PDP reloaded from policy file mtime change"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "data_nexus::security",
+                    error = %e,
+                    policy_path = %path,
+                    "H05 policy file mtime reload failed; keeping previous snapshot"
+                );
+            }
+        }
+    }
+
     fn swap(&self, inner: LocalPdpInner) -> LocalPdpReloadInfo {
-        let previous = self.load();
+        let previous = self
+            .current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let previous_rule_count = previous.rules.len();
         let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         let next = Arc::new(inner);
@@ -266,6 +377,13 @@ impl LocalPdpStore {
             rule_count,
         }
     }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Result of a Local PDP hot-reload (F28).
@@ -311,19 +429,33 @@ pub fn install_local_pdp(config: &SecurityPolicyConfig) -> Option<LocalPdp> {
     };
     let store = global_store();
     let _ = store.swap(LocalPdpInner::from_config(&effective));
+    let mtime = policy_file_mtime_ns(&effective.state.policy_path).unwrap_or(0);
+    store.configure_policy_poll(
+        &effective.state.policy_path,
+        effective.state.policy_poll_ms,
+        mtime,
+    );
     Some(LocalPdp { store })
 }
 
 /// Hot-swap Local rules/mask/time/watermark (F28).
 ///
 /// H05: after swapping the process snapshot, persist hot-reloadable fields to
-/// `security.state.policy_path` when configured so peer processes can load them.
+/// `security.state.policy_path` when configured so peer processes can load them
+/// via mtime poll.
 pub fn reload_global_local_pdp(config: &SecurityPolicyConfig) -> Option<LocalPdpReloadInfo> {
     if !config.enabled {
         return None;
     }
     let store = global_store();
-    let previous = store.load();
+    let previous = {
+        // Bypass mtime refresh while applying admin-driven config.
+        store
+            .current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    };
     let inner = LocalPdpInner::from_config_preserving_cedar(config, &previous);
     let info = store.swap(inner);
     if let Err(e) = crate::policy_file::persist_local_pdp_to_file(config) {
@@ -333,12 +465,15 @@ pub fn reload_global_local_pdp(config: &SecurityPolicyConfig) -> Option<LocalPdp
             "H05 persist local PDP policy file failed"
         );
     }
+    let mtime = policy_file_mtime_ns(&config.state.policy_path).unwrap_or(0);
+    store.configure_policy_poll(&config.state.policy_path, config.state.policy_poll_ms, mtime);
     tracing::info!(
         target: "data_nexus::security",
         epoch = info.epoch,
         rules = info.rule_count,
         previous_rules = info.previous_rule_count,
         policy_path = %config.state.policy_path,
+        policy_poll_ms = config.state.policy_poll_ms,
         "local PDP snapshot hot-reloaded"
     );
     Some(info)
@@ -402,6 +537,12 @@ impl LocalPdp {
     #[inline]
     fn inner(&self) -> Arc<LocalPdpInner> {
         self.store.load()
+    }
+
+    /// H05 test helper: force next authorize to re-stat policy file.
+    #[cfg(test)]
+    fn force_policy_poll_due(&self) {
+        self.store.policy_last_check_ms.store(0, Ordering::Relaxed);
     }
 
     pub fn epoch(&self) -> u64 {
@@ -2314,5 +2455,80 @@ mod tests {
         let mut d = a.clone();
         d.enabled = false;
         assert!(security_requires_listener_rebuild(&a, &d));
+    }
+
+    #[test]
+    fn h05_policy_mtime_poll_swaps_rules() {
+        use crate::policy_file::{save_local_pdp_policy_file, LocalPdpPolicyFile};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let path = std::env::temp_dir().join(format!("dn-h05-mtime-{ms}.json"));
+        let path_s = path.to_string_lossy().to_string();
+
+        // Process A: install with deny rule, seed file.
+        let mut cfg_a = SecurityPolicyConfig::default();
+        cfg_a.enabled = true;
+        cfg_a.fail_closed = true;
+        cfg_a.star_policy = "deny".into();
+        cfg_a.rules.push(SecurityRuleConfig {
+            name: "deny-all".into(),
+            effect: "deny".into(),
+            actions: vec!["select".into()],
+            tables: vec!["*".into()],
+            columns: vec![],
+            subjects: vec![],
+            row_filter: None,
+        });
+        cfg_a.state.policy_path = path_s.clone();
+        cfg_a.state.policy_poll_ms = 1; // aggressive for test
+
+        let pdp = LocalPdp::from_config(&cfg_a).expect("pdp");
+        let dialect = HeuristicDialectParser::new(crate::ProtocolKind::MySql);
+        let sub = Subject {
+            subject_id: "u".into(),
+            db_user: Some("u".into()),
+            database: Some("db".into()),
+        };
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT 1 FROM t".into(),
+        };
+        assert!(
+            pdp.authorize_command(&sub, "svc", &cmd, &dialect).is_deny(),
+            "initial should deny"
+        );
+        let epoch0 = pdp.epoch();
+
+        // Peer process writes allow-all snapshot.
+        let mut cfg_b = cfg_a.clone();
+        cfg_b.rules = vec![SecurityRuleConfig {
+            name: "allow-all".into(),
+            effect: "allow".into(),
+            actions: vec!["select".into()],
+            tables: vec!["*".into()],
+            columns: vec![],
+            subjects: vec![],
+            row_filter: None,
+        }];
+        // Ensure mtime advances on filesystems with 1s resolution.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        save_local_pdp_policy_file(&path_s, &LocalPdpPolicyFile::from_security(&cfg_b)).unwrap();
+
+        pdp.force_policy_poll_due();
+        // Trigger load() via authorize.
+        let dec = pdp.authorize_command(&sub, "svc", &cmd, &dialect);
+        assert!(
+            !dec.is_deny(),
+            "after mtime poll should allow; epoch {} -> {}",
+            epoch0,
+            pdp.epoch()
+        );
+        assert!(pdp.epoch() > epoch0);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.lock"));
     }
 }

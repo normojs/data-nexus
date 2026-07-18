@@ -61,7 +61,7 @@ pub struct SecurityPolicyConfig {
 /// | `file` | JSON + lock | JSON + lock (no passwords) | optional `policy_path` JSON + lock |
 ///
 /// `redis` / remote backends are **rejected** until implemented (no silent no-op).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityStateConfig {
     /// `memory` | `file`. Default `memory`.
     #[serde(default = "default_state_backend")]
@@ -78,6 +78,26 @@ pub struct SecurityStateConfig {
     /// shared across processes via JSON + advisory lock. Empty = process-local only.
     #[serde(default)]
     pub policy_path: String,
+    /// H05: how often (ms) to `stat` `policy_path` for cross-process mtime reload.
+    /// `0` disables polling (admin reload / install only). Default `1000`.
+    #[serde(default = "default_policy_poll_ms")]
+    pub policy_poll_ms: u64,
+}
+
+impl Default for SecurityStateConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_state_backend(),
+            ticket_path: String::new(),
+            vault_path: String::new(),
+            policy_path: String::new(),
+            policy_poll_ms: default_policy_poll_ms(),
+        }
+    }
+}
+
+fn default_policy_poll_ms() -> u64 {
+    1000
 }
 
 fn default_state_backend() -> String {
