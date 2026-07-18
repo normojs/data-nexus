@@ -154,6 +154,7 @@ examples/        smoke + gateway config 样例
 | A09 | portal multi-row NDJSON 强制 backend_window（部分） | feat(a09) |
 | H07 | CI extended/cedar jobs + nightly schedule + rustc 1.94.1 | feat(h07) |
 | A08 | backend TLS `ssl_ca_file` + `ssl_accept_invalid_certs`（部分） | feat(a08) |
+| A10 | MySQL QueryParams COM_STMT prepare/bind（部分） | feat(a10) |
 
 ---
 
@@ -172,7 +173,7 @@ examples/        smoke + gateway config 样例
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | idle pool（cap+TTL+健康探测）+ 事务 `tcp_txn`；**ssl_mode** + **ssl_ca_file / ssl_accept_invalid_certs** | 默认仍 accept_invalid=true（兼容）；非 extended；MySQL TLS 未做 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | multi-row smoke **强制** `backend_window`；json/csv 仍物化；Complete 回退 B05b | **部分** |
-| **A10** | 预处理 / 事务透传矩阵 | MySQL binary；PG binary portal；QueryParams + prepare/bind + **Statement 缓存** + **Streaming 窗口** | 参数仍 text ToSql；缓存 per-conn 上限 64；QueryParams 非 TCP passthrough；MySQL QueryParams 仍 text 改写 | **部分** |
+| **A10** | 预处理 / 事务透传矩阵 | MySQL **prepare/bind** + binary 行解码 + 连接 stmt 缓存；PG QueryParams + Statement 缓存 + Streaming | 参数类型仍为通用 scalar 映射；MySQL QueryParams **未 Streaming 窗口**；date/time binary 结果 hex MVP；非 TCP passthrough | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
 
@@ -220,7 +221,7 @@ examples/        smoke + gateway config 样例
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP（smoke 强制 multi-row `backend_window`）；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；smoke 双协议 max_rows + `execute_path=streaming`；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：idle pool（TTL+探测）+ 事务 tcp_txn；`ssl_mode` prefer/require；**可配 `ssl_ca_file` + `ssl_accept_invalid_certs=false` 钉 CA**（默认仍 accept_invalid=true）；非 extended |
-| 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；MySQL 仍 text 改写；binary 结果含 date/ts/time；非 TCP passthrough |
+| 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；**MySQL QueryParams 走 COM_STMT_PREPARE/EXECUTE 绑定**（非 text 改写）+ binary 行解码 + 连接缓存；date/time binary 结果 hex MVP；非 TCP passthrough |
 | 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；非 CRDT |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
@@ -229,32 +230,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A10 MySQL QueryParams 或 O01 观测 或 A06/A09 再收口 <<<**
+**>>> O01 观测 或 A10 MySQL Streaming QueryParams 或 A06/A09 事务 smoke <<<**
 
-本轮（A08 证书钉扎）：
+本轮（A10 MySQL QueryParams 绑定）：
 
-- `endpoints[].ssl_ca_file`：PEM CA（可多证 bundle）
-- `endpoints[].ssl_accept_invalid_certs`：默认 **true**（兼容）；生产设 **false** 启用校验
-- 共用 `backend/pg_tls.rs`：TCP 中继 + 池连接
-- SNI host 从 `address` 解析；校验关闭时仍跳过 hostname
-
-```toml
-[[endpoints]]
-ssl_mode = "require"
-ssl_ca_file = "/etc/ssl/certs/pg-ca.pem"
-ssl_accept_invalid_certs = false
-```
+- `QueryParams` / `Execute` → 后端 `COM_STMT_PREPARE` + `COM_STMT_EXECUTE`（连接级 stmt 缓存 cap 64）
+- binary 结果行解码（null-bitmap bit offset 2）
+- `bind_mysql_placeholders` 仍保留作工具/回退参考，热路径不再 text 改写
+- 单测：payload encode、binary row、registry；live MySQL `SELECT ?+?`
 
 ```bash
-cargo test -p gateway_core --lib a08_
-cargo test -p runtime_gateway --lib a08_
+cargo test -p runtime_gateway --lib 'backend::mysql::tests::a10_'
 ./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **A10** — MySQL QueryParams 去 text 改写  
-2. **O01** — Secure 路径观测  
+1. **O01** — Secure 路径观测  
+2. **A10** — MySQL QueryParams Streaming 窗口  
 3. **A06/A09** — 事务 smoke / json-csv 边界  
 
 ---
