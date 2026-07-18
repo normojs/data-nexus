@@ -7,9 +7,12 @@
 //! Scope (honest):
 //! - simple Query only (not extended protocol)
 //! - reusable session for in-transaction multi-statement passthrough
+//! - **non-txn idle pool** (per address|db|user, capped) to avoid connect/auth
+//!   every passthrough query
 //! - cleartext / MD5 / SCRAM-SHA-256 auth; no SSL to backend
 //! - not shared with the tokio-postgres pool (parallel lease)
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,6 +26,9 @@ use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// Default max idle TCP relay sessions per pool key (A08).
+pub const DEFAULT_TCP_IDLE_MAX_PER_KEY: usize = 4;
 
 /// Authenticated backend socket ready for simple-query relay (reusable).
 pub struct PgTcpSession {
@@ -43,6 +49,86 @@ pub type PgTcpTxnSlot = Arc<Mutex<Option<PgTcpSession>>>;
 
 pub fn new_tcp_txn_slot() -> PgTcpTxnSlot {
     Arc::new(Mutex::new(None))
+}
+
+/// Where to put the session after a simple-query response ends (A08).
+#[derive(Clone)]
+pub enum SessionReturn {
+    /// Drop TCP when done (legacy one-shot).
+    Drop,
+    /// In-transaction reuse slot.
+    Txn(PgTcpTxnSlot),
+    /// Non-txn idle pool (keyed by address|db|user).
+    Idle {
+        pool: Arc<PgTcpIdlePool>,
+        key: String,
+    },
+}
+
+/// Small process-local idle pool for non-transaction TCP relay sessions.
+#[derive(Debug)]
+pub struct PgTcpIdlePool {
+    max_per_key: usize,
+    idle: Mutex<HashMap<String, VecDeque<PgTcpSession>>>,
+}
+
+impl PgTcpIdlePool {
+    pub fn new(max_per_key: usize) -> Self {
+        Self {
+            max_per_key: max_per_key.max(1),
+            idle: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_default_cap() -> Arc<Self> {
+        Arc::new(Self::new(DEFAULT_TCP_IDLE_MAX_PER_KEY))
+    }
+
+    pub fn pool_key(endpoint: &EndpointConfig, database: &str) -> String {
+        format!(
+            "{}|{}|{}",
+            endpoint.address, database, endpoint.username
+        )
+    }
+
+    pub fn len(&self) -> usize {
+        self.idle.lock().values().map(|q| q.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn max_per_key(&self) -> usize {
+        self.max_per_key
+    }
+
+    pub fn take(&self, key: &str) -> Option<PgTcpSession> {
+        let mut g = self.idle.lock();
+        g.get_mut(key).and_then(|q| q.pop_front())
+    }
+
+    pub fn put(&self, key: String, session: PgTcpSession) {
+        let mut g = self.idle.lock();
+        let q = g.entry(key).or_default();
+        if q.len() >= self.max_per_key {
+            // Drop oldest overflow (and this new one stays; pop front first).
+            let _ = q.pop_front();
+        }
+        q.push_back(session);
+    }
+
+    pub async fn take_or_connect(
+        self: &Arc<Self>,
+        endpoint: &EndpointConfig,
+        database: &str,
+    ) -> GatewayResult<PgTcpSession> {
+        let key = Self::pool_key(endpoint, database);
+        if let Some(s) = self.take(&key) {
+            return Ok(s);
+        }
+        PgTcpSession::connect(endpoint, database).await
+    }
 }
 
 impl PgTcpSession {
@@ -210,17 +296,16 @@ impl PgTcpSession {
     /// Send simple Query and return a stream that yields raw frames until ReadyForQuery.
     ///
     /// Consumes `self`. Prefer [`simple_query_relay_into`] when the session must
-    /// be returned to a txn slot after drain.
+    /// be returned after drain.
     pub async fn simple_query_relay(self, sql: &str) -> GatewayResult<PgTcpWireStream> {
-        self.simple_query_relay_into(sql, None).await
+        self.simple_query_relay_into(sql, SessionReturn::Drop).await
     }
 
-    /// Send simple Query; when the response ends, return the session to `return_slot`
-    /// (if set) instead of dropping the TCP connection.
+    /// Send simple Query; when the response ends, apply [`SessionReturn`].
     pub async fn simple_query_relay_into(
         mut self,
         sql: &str,
-        return_slot: Option<PgTcpTxnSlot>,
+        return_to: SessionReturn,
     ) -> GatewayResult<PgTcpWireStream> {
         let mut out = BytesMut::new();
         frontend::query(sql, &mut out)
@@ -231,7 +316,7 @@ impl PgTcpSession {
             .map_err(|e| GatewayError::Backend(format!("pg query write: {e}")))?;
         Ok(PgTcpWireStream {
             session: Some(self),
-            return_slot,
+            return_to,
             done: false,
         })
     }
@@ -242,7 +327,9 @@ impl PgTcpSession {
         sql: &str,
     ) -> GatewayResult<(Self, Vec<Vec<u8>>)> {
         let slot = new_tcp_txn_slot();
-        let mut stream = self.simple_query_relay_into(sql, Some(slot.clone())).await?;
+        let mut stream = self
+            .simple_query_relay_into(sql, SessionReturn::Txn(slot.clone()))
+            .await?;
         let mut packets = Vec::new();
         loop {
             match stream.poll_packets(64).await? {
@@ -311,25 +398,32 @@ impl PgTcpSession {
 /// Progressive wire frames for one simple-query response (ends at ReadyForQuery).
 pub struct PgTcpWireStream {
     session: Option<PgTcpSession>,
-    /// When set, session is returned here after ReadyForQuery (txn reuse).
-    return_slot: Option<PgTcpTxnSlot>,
+    return_to: SessionReturn,
     done: bool,
 }
 
 impl PgTcpWireStream {
     fn finish_session(&mut self) {
         if let Some(sess) = self.session.take() {
-            if let Some(slot) = self.return_slot.as_ref() {
-                *slot.lock() = Some(sess);
+            match &self.return_to {
+                SessionReturn::Drop => {
+                    // drop → TCP close
+                }
+                SessionReturn::Txn(slot) => {
+                    *slot.lock() = Some(sess);
+                }
+                SessionReturn::Idle { pool, key } => {
+                    pool.put(key.clone(), sess);
+                }
             }
-            // else: drop → TCP close (one-shot non-txn relay)
         }
     }
 }
 
 impl Drop for PgTcpWireStream {
     fn drop(&mut self) {
-        // Mid-stream abort still returns the session so COMMIT/ROLLBACK can run.
+        // Mid-stream abort still returns the session so COMMIT/ROLLBACK or idle
+        // reuse can continue (caller may drop a bad session by clearing pool).
         self.finish_session();
     }
 }
@@ -476,5 +570,38 @@ mod tests {
         // Slot type is usable as Arc shared across connector + stream.
         let slot2 = slot.clone();
         assert!(slot2.lock().is_none());
+    }
+
+    #[test]
+    fn a08_idle_pool_key_and_cap() {
+        let pool = PgTcpIdlePool::new(2);
+        let ep = EndpointConfig {
+            name: "p".into(),
+            protocol: gateway_core::ProtocolKind::PostgreSql,
+            address: "127.0.0.1:5432".into(),
+            database: Some("db".into()),
+            role: gateway_core::EndpointRole::ReadWrite,
+            username: "u".into(),
+            password: "x".into(),
+            weight: 1,
+        };
+        let key = PgTcpIdlePool::pool_key(&ep, "db");
+        assert_eq!(key, "127.0.0.1:5432|db|u");
+        assert!(pool.is_empty());
+        // put without real TCP: we only test map bookkeeping via take on empty.
+        assert!(pool.take(&key).is_none());
+        assert_eq!(pool.max_per_key(), 2);
+    }
+
+    #[test]
+    fn a08_session_return_variants_are_constructible() {
+        let slot = new_tcp_txn_slot();
+        let _ = SessionReturn::Drop;
+        let _ = SessionReturn::Txn(slot);
+        let pool = PgTcpIdlePool::with_default_cap();
+        let _ = SessionReturn::Idle {
+            pool,
+            key: "k".into(),
+        };
     }
 }

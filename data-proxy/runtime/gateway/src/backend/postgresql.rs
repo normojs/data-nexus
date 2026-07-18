@@ -23,7 +23,9 @@ use postgresql_protocol::{
 use tokio_postgres::{types::ToSql, Client, NoTls, Row, SimpleQueryMessage};
 use tracing::error;
 
-use super::pg_tcp_relay::{new_tcp_txn_slot, PgTcpSession, PgTcpTxnSlot};
+use super::pg_tcp_relay::{
+    new_tcp_txn_slot, PgTcpIdlePool, PgTcpSession, PgTcpTxnSlot, SessionReturn,
+};
 
 const DEFAULT_POSTGRESQL_POOL_SIZE: usize = 16;
 
@@ -146,6 +148,8 @@ pub struct PostgreSqlBackendConnector {
     /// Parallel to `txn_lease` (pool) so Streaming/Materialized still use
     /// tokio-postgres; Passthrough reuses this socket across statements.
     tcp_txn: PgTcpTxnSlot,
+    /// A08: idle non-txn TCP relay sessions (keyed by address|db|user).
+    tcp_idle: Arc<PgTcpIdlePool>,
     prepared: Arc<PreparedRegistry>,
 }
 
@@ -177,6 +181,7 @@ impl PostgreSqlBackendConnector {
             pool,
             txn_lease: Arc::new(Mutex::new(None)),
             tcp_txn: new_tcp_txn_slot(),
+            tcp_idle: PgTcpIdlePool::with_default_cap(),
             prepared: Arc::new(PreparedRegistry::default()),
         }
     }
@@ -302,8 +307,17 @@ impl PostgreSqlBackendConnector {
         session: &SessionState,
     ) -> GatewayResult<GatewayResponse> {
         let database = effective_database(endpoint, session)?;
-        let session_tcp = PgTcpSession::connect(endpoint, &database).await?;
-        let mut stream = session_tcp.simple_query_relay(sql).await?;
+        let key = PgTcpIdlePool::pool_key(endpoint, &database);
+        let session_tcp = self.tcp_idle.take_or_connect(endpoint, &database).await?;
+        let mut stream = session_tcp
+            .simple_query_relay_into(
+                sql,
+                SessionReturn::Idle {
+                    pool: self.tcp_idle.clone(),
+                    key,
+                },
+            )
+            .await?;
         let mut packets = Vec::new();
         loop {
             match stream.poll_packets(64).await? {
@@ -314,7 +328,7 @@ impl PostgreSqlBackendConnector {
         Ok(GatewayResponse::Wire { packets })
     }
 
-    /// A08: progressive TCP frame relay (non-transaction).
+    /// A08: progressive TCP frame relay (non-transaction, idle-pool reuse).
     async fn execute_simple_query_tcp_relay(
         &self,
         endpoint: EndpointConfig,
@@ -322,8 +336,17 @@ impl PostgreSqlBackendConnector {
         session: &SessionState,
     ) -> GatewayResult<ExecuteOutcome> {
         let database = effective_database(&endpoint, session)?;
-        let session_tcp = PgTcpSession::connect(&endpoint, &database).await?;
-        let stream = session_tcp.simple_query_relay(sql).await?;
+        let key = PgTcpIdlePool::pool_key(&endpoint, &database);
+        let session_tcp = self.tcp_idle.take_or_connect(&endpoint, &database).await?;
+        let stream = session_tcp
+            .simple_query_relay_into(
+                sql,
+                SessionReturn::Idle {
+                    pool: self.tcp_idle.clone(),
+                    key,
+                },
+            )
+            .await?;
         Ok(ExecuteOutcome::WireRelay(WireRelay {
             stream: Box::new(stream),
         }))
@@ -489,7 +512,7 @@ impl PostgreSqlBackendConnector {
             sess
         };
         let stream = sess
-            .simple_query_relay_into(sql, Some(self.tcp_txn.clone()))
+            .simple_query_relay_into(sql, SessionReturn::Txn(self.tcp_txn.clone()))
             .await?;
         Ok(ExecuteOutcome::WireRelay(WireRelay {
             stream: Box::new(stream),
@@ -1531,6 +1554,11 @@ mod tests {
         let c = PostgreSqlBackendConnector::with_endpoints(vec![endpoint()]);
         assert!(c.tcp_txn.lock().is_none());
         assert!(!c.has_transaction_lease());
+        assert!(c.tcp_idle.is_empty());
+        assert_eq!(
+            PgTcpIdlePool::pool_key(&endpoint(), "analytics"),
+            "127.0.0.1:5432|analytics|postgres"
+        );
     }
 
     #[test]
