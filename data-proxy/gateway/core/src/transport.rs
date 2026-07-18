@@ -226,10 +226,25 @@ pub async fn write_wire_relay<W: ResponseWriter + ?Sized>(
     Ok(total)
 }
 
+/// O01: stats from windowed encode (Secure path observability).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamingEncodeStats {
+    /// Rows encoded after max_rows truncation.
+    pub total_rows: u64,
+    /// Number of row windows encoded (mask applied per window when present).
+    pub windows: u64,
+    /// Approximate payload bytes of encoded row packets (not wire framing).
+    pub encoded_bytes: u64,
+    /// Rows that passed through a non-empty mask index.
+    pub masked_rows: u64,
+}
+
 /// Encode a progressive [`StreamingQuery`] through `writer` (A06+A07).
 ///
 /// Masks each window in place before encode; never holds a full unmasked copy
 /// alongside encoded packets. Peak retained rows ≈ one window.
+///
+/// Returns [`StreamingEncodeStats`] for O01 Secure-path metrics.
 pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
     frontend: &mut dyn FrontendProtocolAdapter,
     session: &SessionState,
@@ -237,7 +252,7 @@ pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
     window_rows: usize,
     obligations: Option<&Obligations>,
     writer: &mut W,
-) -> GatewayResult<u64> {
+) -> GatewayResult<StreamingEncodeStats> {
     let window = window_rows.max(1);
     let mut columns = query.columns;
 
@@ -253,29 +268,31 @@ pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
         .unwrap_or_default();
     let max_total = obligations.and_then(|o| o.max_rows);
     let header_width = columns.len();
+    let has_masks = !mask_idx.is_empty();
 
     writer
         .write_packets(frontend.encode_resultset_header(&columns, session)?)
         .await?;
 
-    let mut total: u64 = 0;
+    let mut stats = StreamingEncodeStats::default();
 
     loop {
         if let Some(max) = max_total {
-            if total >= max {
+            if stats.total_rows >= max {
                 while query.stream.poll_window(window).await?.is_some() {}
                 break;
             }
         }
         let want = match max_total {
-            Some(max) => ((max - total) as usize).min(window).max(1),
+            Some(max) => ((max - stats.total_rows) as usize).min(window).max(1),
             None => window,
         };
         let Some(mut chunk) = query.stream.poll_window(want).await? else {
             break;
         };
-        if !mask_idx.is_empty() {
+        if has_masks {
             apply_masks_to_rows(&mut chunk, &mask_idx);
+            stats.masked_rows += chunk.len() as u64;
         }
         if let Some(wm) = wm {
             // Per-window stamp so Column mode tokens align with expanded header.
@@ -302,16 +319,24 @@ pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
                 }
             }
         }
-        total += chunk.len() as u64;
+        stats.total_rows += chunk.len() as u64;
+        stats.windows = stats.windows.saturating_add(1);
         let packets = frontend.encode_resultset_rows(&columns, &chunk, session)?;
+        for p in &packets {
+            stats.encoded_bytes = stats.encoded_bytes.saturating_add(p.len() as u64);
+        }
         drop(chunk);
         writer.write_packets(packets).await?;
     }
 
     writer
-        .write_packets(frontend.encode_resultset_footer(&columns, total as usize, session)?)
+        .write_packets(frontend.encode_resultset_footer(
+            &columns,
+            stats.total_rows as usize,
+            session,
+        )?)
         .await?;
-    Ok(total)
+    Ok(stats)
 }
 
 /// Encode a result set in windows, writing each phase through `writer` (A2).
@@ -327,7 +352,7 @@ pub async fn write_resultset_windowed<W: ResponseWriter + ?Sized>(
     window_rows: usize,
     writer: &mut W,
 ) -> GatewayResult<()> {
-    write_resultset_windowed_with_obligations(
+    let _ = write_resultset_windowed_with_obligations(
         frontend,
         session,
         columns,
@@ -336,7 +361,8 @@ pub async fn write_resultset_windowed<W: ResponseWriter + ?Sized>(
         None,
         writer,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// A06/A07: windowed encode with **in-place mask per window** before encoding.
@@ -347,6 +373,7 @@ pub async fn write_resultset_windowed<W: ResponseWriter + ?Sized>(
 /// - watermark applied once before encoding (may add a column)
 ///
 /// Peak temporary growth is ~window-sized for mask work, not 2× full result.
+/// Returns O01 [`StreamingEncodeStats`].
 pub async fn write_resultset_windowed_with_obligations<W: ResponseWriter + ?Sized>(
     frontend: &mut dyn FrontendProtocolAdapter,
     session: &SessionState,
@@ -355,7 +382,7 @@ pub async fn write_resultset_windowed_with_obligations<W: ResponseWriter + ?Size
     window_rows: usize,
     obligations: Option<&Obligations>,
     writer: &mut W,
-) -> GatewayResult<()> {
+) -> GatewayResult<StreamingEncodeStats> {
     let window = window_rows.max(1);
 
     if let Some(obl) = obligations {
@@ -373,8 +400,12 @@ pub async fn write_resultset_windowed_with_obligations<W: ResponseWriter + ?Size
     let mask_idx = obligations
         .map(|o| build_mask_index(&columns, &o.column_masks))
         .unwrap_or_default();
+    let has_masks = !mask_idx.is_empty();
 
-    let total = rows.len();
+    let mut stats = StreamingEncodeStats {
+        total_rows: rows.len() as u64,
+        ..Default::default()
+    };
     writer
         .write_packets(frontend.encode_resultset_header(&columns, session)?)
         .await?;
@@ -382,19 +413,28 @@ pub async fn write_resultset_windowed_with_obligations<W: ResponseWriter + ?Size
     while !rows.is_empty() {
         let take = window.min(rows.len());
         let mut chunk: Vec<Vec<GatewayValue>> = rows.drain(..take).collect();
-        if !mask_idx.is_empty() {
+        if has_masks {
             apply_masks_to_rows(&mut chunk, &mask_idx);
+            stats.masked_rows += chunk.len() as u64;
         }
+        stats.windows = stats.windows.saturating_add(1);
         let packets = frontend.encode_resultset_rows(&columns, &chunk, session)?;
+        for p in &packets {
+            stats.encoded_bytes = stats.encoded_bytes.saturating_add(p.len() as u64);
+        }
         // Drop chunk after encode so peak is header+one window of packets.
         drop(chunk);
         writer.write_packets(packets).await?;
     }
 
     writer
-        .write_packets(frontend.encode_resultset_footer(&columns, total, session)?)
+        .write_packets(frontend.encode_resultset_footer(
+            &columns,
+            stats.total_rows as usize,
+            session,
+        )?)
         .await?;
-    Ok(())
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -606,7 +646,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(total, 3);
+        assert_eq!(total.total_rows, 3);
+        assert_eq!(total.windows, 2);
+        assert_eq!(total.masked_rows, 3);
+        assert!(total.encoded_bytes > 0);
         assert_eq!(fe.header_calls, 1);
         // windows of 2 then 1
         assert_eq!(fe.row_calls, 2);
@@ -668,7 +711,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(total, 3);
+        assert_eq!(total.total_rows, 3);
+        assert_eq!(total.masked_rows, 3);
         assert_eq!(fe.header_calls, 1);
         assert_eq!(fe.footer_calls, 1);
         assert!(fe.row_calls >= 1);

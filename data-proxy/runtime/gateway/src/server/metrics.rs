@@ -98,6 +98,70 @@ pub static GATEWAY_PASSTHROUGH_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("Could not create GATEWAY_PASSTHROUGH_BYTES_TOTAL")
 });
 
+// O01: Secure / streaming encode path observability (always-on Prometheus).
+/// Rows that passed through a non-empty mask obligation during encode.
+pub static GATEWAY_MASK_ROWS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "gateway_mask_rows_total",
+            "Rows masked on Secure encode path (per window mask application)"
+        ),
+        SQL_METRIC_LABELS,
+    )
+    .expect("Could not create GATEWAY_MASK_ROWS_TOTAL")
+});
+
+/// Number of encode windows written (streaming or windowed ResultSet).
+pub static GATEWAY_ENCODE_WINDOWS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "gateway_encode_windows_total",
+            "Result encode windows written (windowed streaming / ResultSet path)"
+        ),
+        SQL_METRIC_LABELS,
+    )
+    .expect("Could not create GATEWAY_ENCODE_WINDOWS_TOTAL")
+});
+
+/// Approximate encoded row-packet bytes (frontend encode payload, not TCP framing).
+pub static GATEWAY_ENCODE_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "gateway_encode_bytes_total",
+            "Approximate encoded result payload bytes on windowed encode path"
+        ),
+        SQL_METRIC_LABELS,
+    )
+    .expect("Could not create GATEWAY_ENCODE_BYTES_TOTAL")
+});
+
+/// Audit pipeline queue depth snapshot (main + priority), refreshed on /metrics gather.
+pub static GATEWAY_AUDIT_QUEUE_LEN: Lazy<GaugeVec> = Lazy::new(|| {
+    GaugeVec::new(
+        opts!(
+            "gateway_audit_queue_len",
+            "Audit pipeline in-memory queue depth (queue=main|priority)"
+        ),
+        &["queue"],
+    )
+    .expect("Could not create GATEWAY_AUDIT_QUEUE_LEN")
+});
+
+/// Audit worker process latency samples (seconds), observed on worker drain.
+pub static GATEWAY_AUDIT_PROCESS_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    let opt = HistogramOpts {
+        common_opts: opts!(
+            "gateway_audit_process_duration_seconds",
+            "Audit worker per-event process latency (sink + optional index insert)"
+        ),
+        // Sub-ms to multi-second: cover hot path worker + slow disk/index.
+        buckets: vec![
+            0.000_1, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+        ],
+    };
+    HistogramVec::new(opt, &["sink"]).expect("Could not create GATEWAY_AUDIT_PROCESS_DURATION")
+});
+
 #[derive(Clone, Copy)]
 pub struct MySQLServerMetricsCollector;
 
@@ -140,6 +204,34 @@ impl MySQLServerMetricsCollector {
                 .inc_by(wire_bytes);
         }
     }
+
+    /// O01: Secure encode path counters (mask / windows / encoded bytes).
+    pub fn record_secure_encode(
+        &self,
+        labels: &[&str],
+        masked_rows: u64,
+        windows: u64,
+        encoded_bytes: u64,
+    ) {
+        if labels.len() != 6 {
+            return;
+        }
+        if masked_rows > 0 {
+            GATEWAY_MASK_ROWS_TOTAL
+                .with_label_values(labels)
+                .inc_by(masked_rows);
+        }
+        if windows > 0 {
+            GATEWAY_ENCODE_WINDOWS_TOTAL
+                .with_label_values(labels)
+                .inc_by(windows);
+        }
+        if encoded_bytes > 0 {
+            GATEWAY_ENCODE_BYTES_TOTAL
+                .with_label_values(labels)
+                .inc_by(encoded_bytes);
+        }
+    }
 }
 
 /// Collapse free-form path strings to the B03/A05 controlled set.
@@ -151,6 +243,35 @@ pub fn normalize_execute_path(path: &str) -> &'static str {
         "xproto_stream" | "xproto" | "cross_protocol" => "xproto_stream",
         _ => "n/a",
     }
+}
+
+/// O01: refresh audit queue depth gauges from the live pipeline (call from /metrics).
+pub fn refresh_audit_queue_metrics() {
+    if let Some(pipe) = gateway_core::global_audit_pipeline() {
+        let s = pipe.stats();
+        GATEWAY_AUDIT_QUEUE_LEN
+            .with_label_values(&["main"])
+            .set(s.queue_len as f64);
+        GATEWAY_AUDIT_QUEUE_LEN
+            .with_label_values(&["priority"])
+            .set(s.priority_queue_len as f64);
+    }
+}
+
+/// O01: observe one audit worker process sample (seconds).
+pub fn observe_audit_process_duration(seconds: f64) {
+    if seconds.is_finite() && seconds >= 0.0 {
+        GATEWAY_AUDIT_PROCESS_DURATION
+            .with_label_values(&["pipeline"])
+            .observe(seconds);
+    }
+}
+
+/// Install audit worker latency hook once (idempotent).
+pub fn install_audit_metrics_hooks() {
+    gateway_core::set_audit_process_latency_hook(|secs| {
+        observe_audit_process_duration(secs);
+    });
 }
 
 #[cfg(test)]
@@ -196,6 +317,32 @@ mod tests {
             .with_label_values(&labels)
             .get();
         assert!(bytes >= 42, "passthrough bytes={bytes}");
+    }
+
+    #[test]
+    fn record_secure_encode_increments() {
+        let m = MySQLServerMetricsCollector::new();
+        let labels = [
+            "listener-o01",
+            "svc",
+            "mysql",
+            "mysql",
+            "query",
+            "ep",
+        ];
+        m.record_secure_encode(&labels, 3, 2, 100);
+        let masked = GATEWAY_MASK_ROWS_TOTAL.with_label_values(&labels).get();
+        assert!(masked >= 3, "masked={masked}");
+        let windows = GATEWAY_ENCODE_WINDOWS_TOTAL.with_label_values(&labels).get();
+        assert!(windows >= 2, "windows={windows}");
+        let bytes = GATEWAY_ENCODE_BYTES_TOTAL.with_label_values(&labels).get();
+        assert!(bytes >= 100, "bytes={bytes}");
+    }
+
+    #[test]
+    fn observe_audit_process_duration_accepts_sample() {
+        observe_audit_process_duration(0.001);
+        // no panic; histogram is process-global
     }
 }
 

@@ -169,7 +169,7 @@ impl CoreGatewayConnection {
                     || has_obl
                     || matches!(self.stream_mode, ExecuteMode::Streaming { .. });
                 if use_windowed {
-                    write_resultset_windowed_with_obligations(
+                    let stats = write_resultset_windowed_with_obligations(
                         self.frontend.as_mut(),
                         &self.session,
                         columns,
@@ -178,7 +178,28 @@ impl CoreGatewayConnection {
                         deferred_obl.as_ref(),
                         writer,
                     )
-                    .await
+                    .await?;
+                    // O01: windowed Complete path (labels: listener/service/protocols/type/endpoint).
+                    let ep = self
+                        .session
+                        .backend_endpoint
+                        .as_deref()
+                        .unwrap_or("n/a");
+                    let labels = [
+                        self.listener_name.as_str(),
+                        self.service_name.as_str(),
+                        protocol_metric_name(&self.frontend.protocol()),
+                        protocol_metric_name(&self.backend.protocol()),
+                        "QUERY",
+                        ep,
+                    ];
+                    self.metrics.record_secure_encode(
+                        &labels,
+                        stats.masked_rows,
+                        stats.windows,
+                        stats.encoded_bytes,
+                    );
+                    Ok(())
                 } else {
                     let response = if let Some(obl) = deferred_obl.as_ref() {
                         gateway_core::apply_obligations_to_response(
@@ -797,7 +818,7 @@ impl CoreGatewayConnection {
                     } else {
                         None
                     };
-                    let total = write_streaming_query_with_obligations(
+                    let encode_stats = write_streaming_query_with_obligations(
                         self.frontend.as_mut(),
                         &self.session,
                         query,
@@ -808,8 +829,13 @@ impl CoreGatewayConnection {
                     .await?;
                     // A10: binary flag is one-shot per Execute response.
                     self.session.prefer_binary_result = false;
-                    // Synthetic ResultSet metadata for metrics/audit only (no rows).
-                    let _ = total;
+                    // O01: mask / window / encode-byte counters on Secure streaming path.
+                    self.metrics.record_secure_encode(
+                        &labels,
+                        encode_stats.masked_rows,
+                        encode_stats.windows,
+                        encode_stats.encoded_bytes,
+                    );
                     let execute_path = if self.translation_policy.is_some() {
                         "xproto_stream"
                     } else {

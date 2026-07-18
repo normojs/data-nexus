@@ -14,8 +14,10 @@
 
 use prometheus::{Encoder, Registry};
 use runtime_gateway::server::metrics::{
-    GATEWAY_EXECUTE_PATH_TOTAL, GATEWAY_PASSTHROUGH_BYTES_TOTAL, SQL_PROCESSED_DURATION,
-    SQL_PROCESSED_TOTAL, SQL_UNDER_PROCESSING,
+    install_audit_metrics_hooks, refresh_audit_queue_metrics, GATEWAY_AUDIT_PROCESS_DURATION,
+    GATEWAY_AUDIT_QUEUE_LEN, GATEWAY_ENCODE_BYTES_TOTAL, GATEWAY_ENCODE_WINDOWS_TOTAL,
+    GATEWAY_EXECUTE_PATH_TOTAL, GATEWAY_MASK_ROWS_TOTAL, GATEWAY_PASSTHROUGH_BYTES_TOTAL,
+    SQL_PROCESSED_DURATION, SQL_PROCESSED_TOTAL, SQL_UNDER_PROCESSING,
 };
 
 const METRICS_NAMESPACE: &str = "unisql_proxy";
@@ -48,9 +50,27 @@ impl MetricsManager {
         registry
             .register(Box::new(GATEWAY_PASSTHROUGH_BYTES_TOTAL.clone()))
             .unwrap();
+        // O01: Secure path + audit queue/latency.
+        registry
+            .register(Box::new(GATEWAY_MASK_ROWS_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(GATEWAY_ENCODE_WINDOWS_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(GATEWAY_ENCODE_BYTES_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(GATEWAY_AUDIT_QUEUE_LEN.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(GATEWAY_AUDIT_PROCESS_DURATION.clone()))
+            .unwrap();
+        install_audit_metrics_hooks();
     }
 
     pub fn gather(&self) -> Vec<u8> {
+        refresh_audit_queue_metrics();
         let mut buf: Vec<u8> = vec![];
         let encoder = prometheus::TextEncoder::new();
         encoder.encode(&self.registry.gather(), &mut buf).unwrap();

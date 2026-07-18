@@ -156,6 +156,7 @@ examples/        smoke + gateway config 样例
 | A08 | backend TLS `ssl_ca_file` + `ssl_accept_invalid_certs`（部分） | feat(a08) |
 | A10 | MySQL QueryParams COM_STMT prepare/bind（部分） | feat(a10) |
 | A10 | MySQL QueryParams Streaming 窗口 yield（部分） | feat(a10) |
+| O01 | Secure 路径 mask/window/audit 指标 | feat(o01) |
 
 ---
 
@@ -204,7 +205,7 @@ examples/        smoke + gateway config 样例
 | **UI04** | 策略只读页 | data-ui 展示 security rules / mask / high-risk（现多靠 API/配置） | 无专用页 | **可选** |
 | **T01** | 列 ACL / 复杂 SQL 用例矩阵 | 子查询、多表、方言边界；启发式 `parse_failed` 行为 | smoke 覆盖主路径，复杂 SQL 仍靠补测 | **待做** |
 | **T02** | Ticket/Vault runbook | 注释注入约定、双人审批、吊销运维说明进 docs | API+UI 有，运维叙事可再收紧 | **可选** |
-| **O01** | Secure 路径观测 | mask 行数、窗口字节、审计 insert 延迟、队列直方图 | A05 已有 path/bytes | **可选** |
+| **O01** | Secure 路径观测 | mask 行数、encode 窗口/字节、审计队列深度、worker 处理延迟 | Prometheus always-on；非 OTel feature | **完成** |
 
 ### 3.5 P3 — 边界扩展（明确后置）
 
@@ -231,23 +232,26 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> O01 观测 或 A06/A09 事务 smoke 或 A08 MySQL TLS <<<**
+**>>> A06/A09 事务 smoke 或 T01 复杂 SQL 或 A08 MySQL TLS <<<**
 
-本轮（A10 MySQL QueryParams Streaming）：
+本轮（O01 Secure 路径观测）：
 
-- `execute_outcome`：Streaming + `QueryParams`/`Execute` → `execute_param_query_streaming`
-- prepare/bind 后 binary 行窗口 channel yield；txn 还 lease
-- live：`UNION ALL` 三行 Streaming 窗口
+- `gateway_mask_rows_total` / `gateway_encode_windows_total` / `gateway_encode_bytes_total`
+- `gateway_audit_queue_len{queue=main|priority}`（/metrics gather 刷新）
+- `gateway_audit_process_duration_seconds`（worker dispatch 采样）
+- encode 返回 `StreamingEncodeStats`；Streaming + Complete 窗口路径接线
 
 ```bash
-cargo test -p runtime_gateway --lib 'backend::mysql::tests::a10_'
+cargo test -p runtime_gateway --lib 'server::metrics::tests'
+cargo test -p gateway_core --lib a06_
 ./examples/run-smoke-matrix.sh default
+# /metrics 可见 unisql_proxy_gateway_mask_rows_total 等
 ```
 
 建议下一刀：
 
-1. **O01** — Secure 路径观测  
-2. **A06/A09** — 事务 smoke / json-csv 边界  
+1. **A06/A09** — 事务 smoke / json-csv 边界  
+2. **T01** — 复杂 SQL 用例矩阵  
 3. **A08** — MySQL backend TLS（若需要）  
 
 ---

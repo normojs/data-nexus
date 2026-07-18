@@ -19,9 +19,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static GLOBAL: OnceLock<Arc<AuditPipeline>> = OnceLock::new();
+
+/// O01: optional hook for worker process latency (seconds). Set from runtime metrics.
+static PROCESS_LATENCY_HOOK: OnceLock<fn(f64)> = OnceLock::new();
+
+/// Install a process-global callback invoked after each audit worker `dispatch`.
+/// Idempotent: first install wins.
+pub fn set_audit_process_latency_hook(hook: fn(f64)) {
+    let _ = PROCESS_LATENCY_HOOK.set(hook);
+}
 
 pub fn install_audit_pipeline(
     config: &SecurityAuditConfig,
@@ -545,7 +554,11 @@ impl AuditPipeline {
             let Some(event) = event else {
                 continue;
             };
+            let started = Instant::now();
             self.dispatch(&event);
+            if let Some(hook) = PROCESS_LATENCY_HOOK.get() {
+                hook(started.elapsed().as_secs_f64());
+            }
             self.written.fetch_add(1, Ordering::Relaxed);
             since_prune += 1;
             if since_prune >= 256 {

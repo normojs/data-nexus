@@ -44,8 +44,8 @@ pub use audit_index::{AuditIndex, AuditQueryFilter};
 #[cfg(feature = "audit-opendal")]
 pub use audit_opendal::OpendalArchive;
 pub use audit_pipeline::{
-    data_plane_event, global_audit_pipeline, install_audit_pipeline, try_audit, AuditPipeline,
-    AuditPipelineStats,
+    data_plane_event, global_audit_pipeline, install_audit_pipeline, set_audit_process_latency_hook,
+    try_audit, AuditPipeline, AuditPipelineStats,
 };
 #[cfg(feature = "security-cedar")]
 pub use cedar_pdp::{
@@ -110,6 +110,7 @@ pub use translation::{
 };
 pub use transport::{
     write_resultset_windowed, write_resultset_windowed_with_obligations, write_streaming_query_with_obligations,
+    StreamingEncodeStats,
     write_wire_relay, BackendConnector, CollectingWriter, ExecuteOutcome, FrontendProtocolAdapter,
     ResponseWriter, RowStream, StreamingQuery, VecRowStream, WireRelay, WireStream,
 };

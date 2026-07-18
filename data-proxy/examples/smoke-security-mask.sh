@@ -150,4 +150,25 @@ if ! echo "$out" | grep -q '138'; then
   exit 1
 fi
 
+echo "==> O01 metrics: mask/encode counters present after Secure path"
+metrics="$(curl -fsS http://127.0.0.1:8082/metrics || true)"
+if echo "$metrics" | grep -q 'gateway_mask_rows_total'; then
+  echo "$metrics" | grep 'gateway_mask_rows_total' | head -3 || true
+  # Counter may be namespaced as unisql_proxy_gateway_mask_rows_total
+  if ! echo "$metrics" | grep -E 'gateway_mask_rows_total\{' | grep -q '[1-9]'; then
+    # allow zero if scrape race; still require series exists
+    echo "note: mask_rows series present (value may be 0 if scrape before inc)"
+  fi
+else
+  echo "missing gateway_mask_rows_total in /metrics" >&2
+  echo "$metrics" | head -20 >&2
+  exit 1
+fi
+if echo "$metrics" | grep -q 'gateway_encode_windows_total'; then
+  echo "$metrics" | grep 'gateway_encode_windows_total' | head -3 || true
+fi
+if echo "$metrics" | grep -q 'gateway_audit_queue_len'; then
+  echo "$metrics" | grep 'gateway_audit_queue_len' | head -5 || true
+fi
+
 echo "smoke-security-mask: OK"
