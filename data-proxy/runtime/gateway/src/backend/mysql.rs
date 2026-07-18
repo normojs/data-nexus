@@ -707,6 +707,8 @@ impl Default for MySqlBackendConnection {
                 password: String::new(),
                 weight: 0,
                 ssl_mode: Default::default(),
+                ssl_ca_file: None,
+                ssl_accept_invalid_certs: true,
             },
             pool_key: String::new(),
             database: String::new(),
@@ -1255,6 +1257,8 @@ mod tests {
             password: "secret".into(),
             weight: 1,
             ssl_mode: Default::default(),
+            ssl_ca_file: None,
+            ssl_accept_invalid_certs: true,
         }
     }
 

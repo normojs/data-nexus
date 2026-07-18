@@ -1183,6 +1183,8 @@ impl Default for PostgreSqlBackendConnection {
                 password: String::new(),
                 weight: 0,
                 ssl_mode: Default::default(),
+                ssl_ca_file: None,
+                ssl_accept_invalid_certs: true,
             },
             pool_key: String::new(),
             database: String::new(),
@@ -1367,10 +1369,7 @@ async fn connect_endpoint(endpoint: &EndpointConfig, database: &str) -> GatewayR
     };
 
     if endpoint.ssl_mode.wants_tls() {
-        let connector = native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(|e| GatewayError::Backend(format!("pg tls connector: {e}")))?;
+        let connector = crate::backend::pg_tls::build_native_tls_connector(endpoint)?;
         let connector = MakeTlsConnector::new(connector);
         let (client, connection) = config
             .connect(connector)
@@ -1782,6 +1781,8 @@ mod tests {
             password: "secret".into(),
             weight: 1,
             ssl_mode: Default::default(),
+            ssl_ca_file: None,
+            ssl_accept_invalid_certs: true,
         }
     }
 

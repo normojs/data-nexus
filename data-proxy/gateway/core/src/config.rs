@@ -50,10 +50,24 @@ pub struct EndpointConfig {
     /// | `require` | must negotiate TLS; fail if server says no |
     #[serde(default)]
     pub ssl_mode: EndpointSslMode,
+    /// A08: optional PEM file of extra CA cert(s) trusted for backend TLS.
+    /// Used when `ssl_mode` is prefer/require. Production should pair with
+    /// `ssl_accept_invalid_certs = false`.
+    #[serde(default)]
+    pub ssl_ca_file: Option<String>,
+    /// A08: when true (default, MVP-compat), skip certificate / hostname
+    /// verification. Set false to enforce system roots + optional `ssl_ca_file`.
+    #[serde(default = "default_ssl_accept_invalid_certs")]
+    pub ssl_accept_invalid_certs: bool,
 }
 
 fn default_endpoint_weight() -> u32 {
     1
+}
+
+fn default_ssl_accept_invalid_certs() -> bool {
+    // Backward-compatible MVP default; pin CA via ssl_ca_file + false for prod.
+    true
 }
 
 impl Default for EndpointConfig {
@@ -68,6 +82,8 @@ impl Default for EndpointConfig {
             password: String::new(),
             weight: 1,
             ssl_mode: EndpointSslMode::Disable,
+            ssl_ca_file: None,
+            ssl_accept_invalid_certs: default_ssl_accept_invalid_certs(),
         }
     }
 }
@@ -227,6 +243,29 @@ impl GatewayConfig {
             "translation policy",
             self.translation_policies.iter().map(|item| &item.name),
         )?;
+
+        for endpoint in &self.endpoints {
+            if let Some(ca) = endpoint.ssl_ca_file.as_deref() {
+                if ca.trim().is_empty() {
+                    return Err(GatewayError::Configuration(format!(
+                        "endpoint '{}' ssl_ca_file must be a non-empty path when set",
+                        endpoint.name
+                    )));
+                }
+            }
+            if endpoint.ssl_mode == EndpointSslMode::Disable
+                && (endpoint.ssl_ca_file.is_some() || !endpoint.ssl_accept_invalid_certs)
+            {
+                // Soft: allow config but warn via validation fail only if CA set with disable
+                // (accept_invalid=false without TLS is meaningless noise — reject CA-only).
+                if endpoint.ssl_ca_file.is_some() {
+                    return Err(GatewayError::Configuration(format!(
+                        "endpoint '{}' sets ssl_ca_file but ssl_mode=disable (TLS not used)",
+                        endpoint.name
+                    )));
+                }
+            }
+        }
 
         let services: HashSet<&str> = self.services.iter().map(|item| item.name.as_str()).collect();
         let endpoints: HashSet<&str> =
@@ -417,7 +456,9 @@ mod tests {
                 username: "app".into(),
                 password: "secret".into(),
                 weight: 1,
-            ssl_mode: Default::default(),
+                ssl_mode: Default::default(),
+                ssl_ca_file: None,
+                ssl_accept_invalid_certs: true,
             }],
             route_policies: vec![RoutePolicyConfig {
                 name: "primary-only".into(),
@@ -569,5 +610,59 @@ mod tests {
                 "gateway config must define at least one listener".into()
             ))
         );
+    }
+
+    #[test]
+    fn a08_ssl_fields_default_and_serde() {
+        let ep: EndpointConfig = serde_json::from_str(
+            r#"{
+              "name": "pg",
+              "protocol": "postgresql",
+              "address": "127.0.0.1:5432",
+              "username": "u",
+              "password": "p",
+              "ssl_mode": "require",
+              "ssl_ca_file": "/etc/ssl/certs/pg-ca.pem",
+              "ssl_accept_invalid_certs": false
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(ep.ssl_mode, EndpointSslMode::Require);
+        assert_eq!(ep.ssl_ca_file.as_deref(), Some("/etc/ssl/certs/pg-ca.pem"));
+        assert!(!ep.ssl_accept_invalid_certs);
+
+        let bare: EndpointConfig = serde_json::from_str(
+            r#"{
+              "name": "pg",
+              "protocol": "postgresql",
+              "address": "127.0.0.1:5432"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(bare.ssl_mode, EndpointSslMode::Disable);
+        assert!(bare.ssl_ca_file.is_none());
+        assert!(bare.ssl_accept_invalid_certs);
+    }
+
+    #[test]
+    fn a08_rejects_ssl_ca_file_when_tls_disabled() {
+        let mut config = config();
+        config.endpoints[0].ssl_mode = EndpointSslMode::Disable;
+        config.endpoints[0].ssl_ca_file = Some("/tmp/ca.pem".into());
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("ssl_ca_file") && err.to_string().contains("disable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a08_accepts_ssl_ca_file_with_require() {
+        let mut config = config();
+        // Keep topology consistent: mysql listener/service/endpoint.
+        config.endpoints[0].ssl_mode = EndpointSslMode::Require;
+        config.endpoints[0].ssl_ca_file = Some("/tmp/ca.pem".into());
+        config.endpoints[0].ssl_accept_invalid_certs = false;
+        assert_eq!(config.validate(), Ok(()));
     }
 }

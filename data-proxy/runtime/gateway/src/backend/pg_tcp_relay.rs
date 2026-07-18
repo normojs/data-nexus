@@ -9,10 +9,10 @@
 //! - reusable session for in-transaction multi-statement passthrough
 //! - **non-txn idle pool** (per address|db|user, capped + **idle TTL**) to avoid
 //!   connect/auth every passthrough query
-//! - cleartext / MD5 / SCRAM-SHA-256 auth; no SSL to backend
+//! - cleartext / MD5 / SCRAM-SHA-256 auth; TLS via ssl_mode + optional CA pin
 //! - not shared with the tokio-postgres pool (parallel lease)
 //! - idle TTL + **optional active health probe** (SELECT 1) on take
-//! - cleartext / MD5 / SCRAM-SHA-256 auth; no SSL to backend
+//! - cleartext / MD5 / SCRAM-SHA-256 auth; TLS via ssl_mode + optional CA pin
 //! - not shared with the tokio-postgres pool (parallel lease)
 
 use std::collections::{HashMap, VecDeque};
@@ -290,7 +290,7 @@ impl PgTcpSession {
         tcp.set_nodelay(true)
             .map_err(|e| GatewayError::Backend(format!("pg tcp nodelay: {e}")))?;
 
-        let stream = maybe_upgrade_tls(tcp, endpoint.ssl_mode).await?;
+        let stream = maybe_upgrade_tls(tcp, endpoint).await?;
 
         let mut params: Vec<(&str, &str)> = vec![
             ("user", endpoint.username.as_str()),
@@ -675,12 +675,15 @@ impl WireStream for PgTcpWireStream {
 /// A08: optional TLS upgrade after TCP connect (PostgreSQL SSLRequest).
 ///
 /// `disable` → plain. `prefer` → try SSL, fall back to plain on server "N".
-/// `require` → must get "S" and complete TLS handshake (danger_accept_invalid_certs
-/// for MVP — custom CA pinning deferred).
+/// `require` → must get "S" and complete TLS handshake.
+///
+/// Certificate policy comes from `endpoint.ssl_accept_invalid_certs` /
+/// `endpoint.ssl_ca_file` (see [`crate::backend::pg_tls`]).
 async fn maybe_upgrade_tls(
     mut tcp: TcpStream,
-    mode: EndpointSslMode,
+    endpoint: &EndpointConfig,
 ) -> GatewayResult<PgBackendStream> {
+    let mode = endpoint.ssl_mode;
     if !mode.wants_tls() {
         return Ok(PgBackendStream::Plain(tcp));
     }
@@ -694,18 +697,11 @@ async fn maybe_upgrade_tls(
         .map_err(|e| GatewayError::Backend(format!("pg SSLRequest read: {e}")))?;
     match ans[0] {
         b'S' => {
-            let connector = native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .map_err(|e| GatewayError::Backend(format!("pg tls connector: {e}")))?;
+            let connector = crate::backend::pg_tls::build_native_tls_connector(endpoint)?;
             let connector = tokio_native_tls::TlsConnector::from(connector);
-            // SNI host from address (strip port).
-            let host = {
-                // not used for validation when danger_accept_invalid_certs
-                "localhost"
-            };
+            let host = crate::backend::pg_tls::tls_server_name(endpoint);
             let tls = connector
-                .connect(host, tcp)
+                .connect(&host, tcp)
                 .await
                 .map_err(|e| GatewayError::Backend(format!("pg tls handshake: {e}")))?;
             Ok(PgBackendStream::Tls(Box::new(tls)))
@@ -839,7 +835,9 @@ mod tests {
             username: "u".into(),
             password: "x".into(),
             weight: 1,
-        ssl_mode: Default::default(),
+            ssl_mode: Default::default(),
+            ssl_ca_file: None,
+            ssl_accept_invalid_certs: true,
         };
         let key = PgTcpIdlePool::pool_key(&ep, "db");
         assert_eq!(key, "127.0.0.1:5432|db|u");
@@ -973,7 +971,10 @@ mod tests {
             drop(s);
         });
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let stream = maybe_upgrade_tls(tcp, EndpointSslMode::Prefer).await.unwrap();
+        let mut ep = endpoint();
+        ep.ssl_mode = EndpointSslMode::Prefer;
+        ep.address = addr.to_string();
+        let stream = maybe_upgrade_tls(tcp, &ep).await.unwrap();
         assert!(matches!(stream, PgBackendStream::Plain(_)));
         let _ = server.await;
     }
@@ -993,11 +994,29 @@ mod tests {
             drop(s);
         });
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let err = maybe_upgrade_tls(tcp, EndpointSslMode::Require).await;
+        let mut ep = endpoint();
+        ep.ssl_mode = EndpointSslMode::Require;
+        ep.address = addr.to_string();
+        let err = maybe_upgrade_tls(tcp, &ep).await;
         assert!(err.is_err(), "require must fail");
         let msg = err.err().unwrap().to_string();
         assert!(msg.contains("require") || msg.contains("refused"), "err={msg}");
         let _ = server.await;
     }
 
+    fn endpoint() -> EndpointConfig {
+        EndpointConfig {
+            name: "analytics-primary".into(),
+            protocol: gateway_core::ProtocolKind::PostgreSql,
+            address: "127.0.0.1:5432".into(),
+            database: Some("analytics".into()),
+            role: gateway_core::EndpointRole::ReadWrite,
+            username: "postgres".into(),
+            password: "postgres".into(),
+            weight: 1,
+            ssl_mode: Default::default(),
+            ssl_ca_file: None,
+            ssl_accept_invalid_certs: true,
+        }
+    }
 }

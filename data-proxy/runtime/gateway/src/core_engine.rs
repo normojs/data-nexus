@@ -1981,6 +1981,8 @@ mod tests {
                 password: "backend-secret".into(),
                 weight: 1,
             ssl_mode: Default::default(),
+            ssl_ca_file: None,
+            ssl_accept_invalid_certs: true,
             }],
             ..GatewayConfig::default()
         }
@@ -2000,6 +2002,8 @@ mod tests {
             password: "backend-secret".into(),
             weight: 1,
         ssl_mode: Default::default(),
+        ssl_ca_file: None,
+        ssl_accept_invalid_certs: true,
         });
         config.route_policies = vec![gateway_core::RoutePolicyConfig {
             name: "orders-balance".into(),
@@ -2022,6 +2026,8 @@ mod tests {
             password: "backend-secret".into(),
             weight: 1,
         ssl_mode: Default::default(),
+        ssl_ca_file: None,
+        ssl_accept_invalid_certs: true,
         });
         config.route_policies = vec![gateway_core::RoutePolicyConfig {
             name: "orders-read-write".into(),
