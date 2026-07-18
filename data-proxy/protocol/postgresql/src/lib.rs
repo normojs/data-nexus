@@ -77,11 +77,16 @@ pub enum FrontendMessage {
         query: String,
         param_types: Vec<i32>,
     },
-    /// Extended query: Bind (portal, statement, text-format params only for A10).
+    /// Extended query: Bind (portal, statement, params).
+    ///
+    /// A10: text params always; `result_formats` records client-requested column
+    /// formats (0=text, 1=binary). Empty/`[0]` → all text; `[1]` → all binary;
+    /// per-column list of length N applies to N columns.
     Bind {
         portal: String,
         statement: String,
         parameters: Vec<Option<String>>,
+        result_formats: Vec<i16>,
     },
     /// Extended query: Describe statement ('S') or portal ('P').
     Describe { target: u8, name: String },
@@ -265,7 +270,22 @@ fn decode_bind_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
         });
     }
     let nresult_formats = BigEndian::read_i16(&rest[offset..offset + 2]) as usize;
-    offset += 2 + nresult_formats * 2;
+    offset += 2;
+    let mut result_formats = Vec::with_capacity(nresult_formats);
+    for _ in 0..nresult_formats {
+        if rest.len() < offset + 2 {
+            return Err(ProtocolError::InvalidLength {
+                expected: Some(offset + 2),
+                actual: rest.len(),
+            });
+        }
+        let fmt = BigEndian::read_i16(&rest[offset..offset + 2]);
+        if fmt != 0 && fmt != 1 {
+            return Err(ProtocolError::UnsupportedFrontendMessage(b'B'));
+        }
+        result_formats.push(fmt);
+        offset += 2;
+    }
     if offset != rest.len() {
         return Err(ProtocolError::InvalidLength {
             expected: Some(offset),
@@ -276,6 +296,7 @@ fn decode_bind_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
         portal,
         statement,
         parameters,
+        result_formats,
     })
 }
 
@@ -733,5 +754,48 @@ mod tests {
             encode_data_row(&[Some(b"42".to_vec()), None]).unwrap(),
             vec![b'D', 0, 0, 0, 16, 0, 2, 0, 0, 0, 2, b'4', b'2', 255, 255, 255, 255]
         );
+    }
+
+    #[test]
+    fn a10_decodes_bind_result_formats_binary() {
+        // portal="", statement="s", 0 param formats, 0 params, 1 result format = binary
+        let mut body = Vec::new();
+        body.push(0); // portal
+        body.extend_from_slice(b"s\0");
+        body.extend_from_slice(&0i16.to_be_bytes()); // nformats
+        body.extend_from_slice(&0i16.to_be_bytes()); // nparams
+        body.extend_from_slice(&1i16.to_be_bytes()); // nresult_formats
+        body.extend_from_slice(&1i16.to_be_bytes()); // binary
+        let mut frame = vec![b'B'];
+        let len = (body.len() + 4) as i32;
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&body);
+        assert_eq!(
+            decode_frontend_message(&frame),
+            Ok(FrontendMessage::Bind {
+                portal: String::new(),
+                statement: "s".into(),
+                parameters: vec![],
+                result_formats: vec![1],
+            })
+        );
+    }
+
+    #[test]
+    fn a10_decodes_bind_result_formats_text_default() {
+        let mut body = Vec::new();
+        body.push(0);
+        body.extend_from_slice(b"s\0");
+        body.extend_from_slice(&0i16.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes()); // no result formats
+        let mut frame = vec![b'B'];
+        let len = (body.len() + 4) as i32;
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&body);
+        match decode_frontend_message(&frame).unwrap() {
+            FrontendMessage::Bind { result_formats, .. } => assert!(result_formats.is_empty()),
+            other => panic!("{other:?}"),
+        }
     }
 }

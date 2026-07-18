@@ -29,6 +29,9 @@ pub struct PostgreSqlFrontendProtocol {
     portals: HashMap<String, String>,
     /// A10: portal → parameter count for Describe('P').
     portal_params: HashMap<String, u16>,
+    /// A10: portal → result format codes from Bind (0=text, 1=binary).
+    /// Empty / all-zero → text; single `[1]` or any `1` → prefer binary results.
+    portal_result_formats: HashMap<String, Vec<i16>>,
 }
 
 impl PostgreSqlFrontendProtocol {
@@ -41,6 +44,7 @@ impl PostgreSqlFrontendProtocol {
             prepared_params: HashMap::new(),
             portals: HashMap::new(),
             portal_params: HashMap::new(),
+            portal_result_formats: HashMap::new(),
         }
     }
 
@@ -53,6 +57,7 @@ impl PostgreSqlFrontendProtocol {
             prepared_params: HashMap::new(),
             portals: HashMap::new(),
             portal_params: HashMap::new(),
+            portal_result_formats: HashMap::new(),
         }
     }
 
@@ -133,6 +138,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 portal,
                 statement,
                 parameters,
+                result_formats,
             } => {
                 let sql = self.prepared.get(&statement).cloned().ok_or_else(|| {
                     GatewayError::Protocol(format!(
@@ -153,7 +159,9 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     .collect();
                 let bound = bind_pg_text_params(&sql, &params)?;
                 self.portals.insert(portal.clone(), bound);
-                self.portal_params.insert(portal, nparams);
+                self.portal_params.insert(portal.clone(), nparams);
+                self.portal_result_formats
+                    .insert(portal, result_formats);
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_bind_complete()],
                 }])
@@ -184,6 +192,13 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                         "postgresql Execute: unknown portal '{portal}'"
                     ))
                 })?;
+                // A10: honor Bind result_formats — any binary (1) requests binary rows.
+                let want_binary = self
+                    .portal_result_formats
+                    .get(&portal)
+                    .map(|fmts| fmts.iter().any(|f| *f == 1))
+                    .unwrap_or(false);
+                session.prefer_binary_result = want_binary;
                 Ok(vec![GatewayCommand::Query { sql }])
             }
             FrontendMessage::Close { target, name } => {
@@ -193,6 +208,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 } else {
                     self.portals.remove(&name);
                     self.portal_params.remove(&name);
+                    self.portal_result_formats.remove(&name);
                 }
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_close_complete()],
@@ -217,7 +233,13 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 encode_error_response("ERROR", postgresql_sqlstate(&code), &message),
                 ready,
             ]),
-            GatewayResponse::ResultSet { columns, rows } => encode_resultset(columns, rows, ready),
+            GatewayResponse::ResultSet { columns, rows } => {
+                if session.prefer_binary_result {
+                    encode_resultset_binary(columns, rows, ready)
+                } else {
+                    encode_resultset(columns, rows, ready)
+                }
+            }
             GatewayResponse::Wire { packets } => Ok(packets),
             // A10: gateway-owned prepared registry is not the PG extended protocol.
             // Clients using Parse/Bind still need extended-query decode (not in this
@@ -238,18 +260,26 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
     fn encode_resultset_header(
         &mut self,
         columns: &[GatewayColumn],
-        _session: &SessionState,
+        session: &SessionState,
     ) -> GatewayResult<Vec<Vec<u8>>> {
-        encode_pg_resultset_header(columns)
+        if session.prefer_binary_result {
+            encode_pg_resultset_header_formats(columns, 1)
+        } else {
+            encode_pg_resultset_header(columns)
+        }
     }
 
     fn encode_resultset_rows(
         &mut self,
         columns: &[GatewayColumn],
         rows: &[Vec<GatewayValue>],
-        _session: &SessionState,
+        session: &SessionState,
     ) -> GatewayResult<Vec<Vec<u8>>> {
-        encode_pg_resultset_rows(columns, rows)
+        if session.prefer_binary_result {
+            encode_pg_resultset_rows_binary(columns, rows)
+        } else {
+            encode_pg_resultset_rows(columns, rows)
+        }
     }
 
     fn encode_resultset_footer(
@@ -507,7 +537,21 @@ fn unquote(value: &str, quote: char) -> Option<&str> {
 
 
 fn encode_pg_resultset_header(columns: &[GatewayColumn]) -> GatewayResult<Vec<Vec<u8>>> {
-    let fields = columns.iter().map(gateway_column_to_postgresql_field).collect::<Vec<_>>();
+    encode_pg_resultset_header_formats(columns, 0)
+}
+
+fn encode_pg_resultset_header_formats(
+    columns: &[GatewayColumn],
+    format_code: i16,
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let fields = columns
+        .iter()
+        .map(|c| {
+            let mut f = gateway_column_to_postgresql_field(c);
+            f.format_code = format_code;
+            f
+        })
+        .collect::<Vec<_>>();
     Ok(vec![
         encode_row_description(&fields).map_err(postgresql_protocol_error)?,
     ])
@@ -532,6 +576,29 @@ fn encode_pg_resultset_rows(
     Ok(messages)
 }
 
+/// A10: binary-format DataRow values (int2/4/8, float4/8, bool, text/bytea as raw bytes).
+fn encode_pg_resultset_rows_binary(
+    columns: &[GatewayColumn],
+    rows: &[Vec<GatewayValue>],
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut messages = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.len() != columns.len() {
+            return Err(GatewayError::Protocol(format!(
+                "postgresql binary resultset row has {} values for {} columns",
+                row.len(),
+                columns.len()
+            )));
+        }
+        let mut values = Vec::with_capacity(row.len());
+        for (i, v) in row.iter().enumerate() {
+            values.push(gateway_value_to_pg_binary(v, &columns[i].data_type)?);
+        }
+        messages.push(encode_data_row(&values).map_err(postgresql_protocol_error)?);
+    }
+    Ok(messages)
+}
+
 fn encode_resultset(
     columns: Vec<GatewayColumn>,
     rows: Vec<Vec<GatewayValue>>,
@@ -539,6 +606,18 @@ fn encode_resultset(
 ) -> GatewayResult<Vec<Vec<u8>>> {
     let mut messages = encode_pg_resultset_header(&columns)?;
     messages.extend(encode_pg_resultset_rows(&columns, &rows)?);
+    messages.push(encode_command_complete(&format!("SELECT {}", rows.len())));
+    messages.push(ready);
+    Ok(messages)
+}
+
+fn encode_resultset_binary(
+    columns: Vec<GatewayColumn>,
+    rows: Vec<Vec<GatewayValue>>,
+    ready: Vec<u8>,
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut messages = encode_pg_resultset_header_formats(&columns, 1)?;
+    messages.extend(encode_pg_resultset_rows_binary(&columns, &rows)?);
     messages.push(encode_command_complete(&format!("SELECT {}", rows.len())));
     messages.push(ready);
     Ok(messages)
@@ -585,6 +664,58 @@ fn gateway_value_to_text(value: &GatewayValue) -> Option<Vec<u8>> {
             Some(value.as_bytes().to_vec())
         }
         GatewayValue::Bytes(value) => Some(value.clone()),
+    }
+}
+
+/// A10: encode one cell in PostgreSQL binary format.
+///
+/// Supported native binary layouts: bool, int2/4/8, float4/8, text/varchar,
+/// bytea. Other types fall back to UTF-8 text bytes (still marked binary in
+/// RowDescription — clients that requested binary for text-like OIDs accept
+/// this; true date/timestamp binary is deferred).
+fn gateway_value_to_pg_binary(
+    value: &GatewayValue,
+    data_type: &str,
+) -> GatewayResult<Option<Vec<u8>>> {
+    if matches!(value, GatewayValue::Null) {
+        return Ok(None);
+    }
+    let dt = data_type.to_ascii_lowercase();
+    match value {
+        GatewayValue::Null => Ok(None),
+        GatewayValue::Boolean(b) => Ok(Some(vec![if *b { 1 } else { 0 }])),
+        GatewayValue::Integer(i) => Ok(Some(encode_pg_int_binary(*i, &dt))),
+        GatewayValue::UnsignedInteger(u) => {
+            if *u > i64::MAX as u64 {
+                return Err(GatewayError::Protocol(format!(
+                    "postgresql binary: unsigned value {u} exceeds i64"
+                )));
+            }
+            Ok(Some(encode_pg_int_binary(*u as i64, &dt)))
+        }
+        GatewayValue::Float(f) => {
+            if matches!(dt.as_str(), "float4" | "real") {
+                let bits = (*f as f32).to_bits();
+                Ok(Some(bits.to_be_bytes().to_vec()))
+            } else {
+                Ok(Some(f.to_bits().to_be_bytes().to_vec()))
+            }
+        }
+        GatewayValue::Decimal(s) | GatewayValue::String(s) => {
+            // Numeric binary is complex; send UTF-8 bytes (works for text OID;
+            // numeric OID clients may reject — honest partial).
+            Ok(Some(s.as_bytes().to_vec()))
+        }
+        GatewayValue::Bytes(b) => Ok(Some(b.clone())),
+    }
+}
+
+fn encode_pg_int_binary(i: i64, data_type: &str) -> Vec<u8> {
+    match data_type {
+        "int2" | "smallint" => (i as i16).to_be_bytes().to_vec(),
+        "int8" | "bigint" => i.to_be_bytes().to_vec(),
+        // int4 default
+        _ => (i as i32).to_be_bytes().to_vec(),
     }
 }
 
@@ -793,6 +924,140 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a10_bind_binary_result_format_sets_prefer_binary() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let mut session = SessionState::default();
+
+        // Parse s1 / SELECT 1
+        let mut body = Vec::new();
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(b"SELECT 1\0");
+        body.extend_from_slice(&0i16.to_be_bytes());
+        let mut parse = vec![b'P'];
+        let len = (body.len() + 4) as i32;
+        parse.extend_from_slice(&len.to_be_bytes());
+        parse.extend_from_slice(&body);
+        protocol.decode(&parse, &mut session).unwrap();
+
+        // Bind portal p1, statement s1, result_format=1 (binary)
+        let mut bbody = Vec::new();
+        bbody.extend_from_slice(b"p1\0");
+        bbody.extend_from_slice(b"s1\0");
+        bbody.extend_from_slice(&0i16.to_be_bytes()); // param formats
+        bbody.extend_from_slice(&0i16.to_be_bytes()); // nparams
+        bbody.extend_from_slice(&1i16.to_be_bytes()); // nresult_formats
+        bbody.extend_from_slice(&1i16.to_be_bytes()); // binary
+        let mut bind = vec![b'B'];
+        let blen = (bbody.len() + 4) as i32;
+        bind.extend_from_slice(&blen.to_be_bytes());
+        bind.extend_from_slice(&bbody);
+        protocol.decode(&bind, &mut session).unwrap();
+        assert!(!session.prefer_binary_result);
+
+        // Execute p1
+        let mut ebody = Vec::new();
+        ebody.extend_from_slice(b"p1\0");
+        ebody.extend_from_slice(&0i32.to_be_bytes());
+        let mut exec = vec![b'E'];
+        let elen = (ebody.len() + 4) as i32;
+        exec.extend_from_slice(&elen.to_be_bytes());
+        exec.extend_from_slice(&ebody);
+        let cmds = protocol.decode(&exec, &mut session).unwrap();
+        assert!(matches!(cmds[0], GatewayCommand::Query { .. }));
+        assert!(session.prefer_binary_result);
+    }
+
+    #[test]
+    fn a10_encodes_binary_resultset_when_prefer_binary() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState {
+            prefer_binary_result: true,
+            ..Default::default()
+        };
+        let packets = protocol
+            .encode(
+                GatewayResponse::ResultSet {
+                    columns: vec![
+                        GatewayColumn {
+                            name: "id".into(),
+                            data_type: "int4".into(),
+                        },
+                        GatewayColumn {
+                            name: "flag".into(),
+                            data_type: "bool".into(),
+                        },
+                    ],
+                    rows: vec![vec![
+                        GatewayValue::Integer(42),
+                        GatewayValue::Boolean(true),
+                    ]],
+                },
+                &session,
+            )
+            .unwrap();
+        // RowDescription + DataRow + CommandComplete + Ready
+        assert_eq!(packets.len(), 4);
+        assert_eq!(packets[0][0], b'T');
+        // format_code is last 2 bytes of each field; field ends with format 1.
+        // At least one format_code=1 appears in RowDescription.
+        assert!(
+            packets[0].windows(2).any(|w| w == [0, 1]),
+            "expected binary format_code in RowDescription: {:?}",
+            packets[0]
+        );
+        assert_eq!(packets[1][0], b'D');
+        // DataRow: ncols=2, int4 42 as 4 BE bytes, bool true as 1 byte
+        // D + len(4) + ncols(2) + len1(4) + val1(4) + len2(4) + val2(1)
+        let row = &packets[1];
+        assert_eq!(i16::from_be_bytes([row[5], row[6]]), 2);
+        assert_eq!(i32::from_be_bytes([row[7], row[8], row[9], row[10]]), 4);
+        assert_eq!(i32::from_be_bytes([row[11], row[12], row[13], row[14]]), 42);
+        assert_eq!(i32::from_be_bytes([row[15], row[16], row[17], row[18]]), 1);
+        assert_eq!(row[19], 1); // true
+        assert_eq!(packets[2][0], b'C');
+        assert_eq!(packets[3][0], b'Z');
+    }
+
+    #[test]
+    fn a10_binary_int8_and_null() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState {
+            prefer_binary_result: true,
+            ..Default::default()
+        };
+        let packets = protocol
+            .encode(
+                GatewayResponse::ResultSet {
+                    columns: vec![
+                        GatewayColumn {
+                            name: "big".into(),
+                            data_type: "int8".into(),
+                        },
+                        GatewayColumn {
+                            name: "n".into(),
+                            data_type: "int4".into(),
+                        },
+                    ],
+                    rows: vec![vec![GatewayValue::Integer(0x100000002), GatewayValue::Null]],
+                },
+                &session,
+            )
+            .unwrap();
+        let row = &packets[1];
+        assert_eq!(i16::from_be_bytes([row[5], row[6]]), 2);
+        assert_eq!(i32::from_be_bytes([row[7], row[8], row[9], row[10]]), 8);
+        let v = i64::from_be_bytes([
+            row[11], row[12], row[13], row[14], row[15], row[16], row[17], row[18],
+        ]);
+        assert_eq!(v, 0x100000002);
+        // NULL is -1 length
+        assert_eq!(
+            i32::from_be_bytes([row[19], row[20], row[21], row[22]]),
+            -1
+        );
     }
 
     #[test]
