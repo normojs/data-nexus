@@ -77,7 +77,7 @@ pub struct ClientAuth {
     pub charset: String,
     pub status: u16,
     pub auth_plugin_name: String,
-    pub tls_config: Option<()>,
+    pub tls_config: Option<crate::client::tls_opts::ClientTlsOpts>,
     pub user: String,
     pub password: String,
     pub db: String,
@@ -615,14 +615,28 @@ pub async fn handshake(
             Some(Ok(HandshakeDecoderReturn::InitialHandshake(auth))) => framed.send(auth).await?,
 
             Some(Ok(HandshakeDecoderReturn::WriteSslRequest(req))) => {
-                framed.send(req.clone()).await?;
+                // SSLRequest is the first 32 bytes of the handshake body (capability..reserved).
+                // Framed codec will add the 4-byte packet header.
+                let ssl_req = if req.len() >= 32 {
+                    bytes::BytesMut::from(&req[..32])
+                } else {
+                    req.clone()
+                };
+                framed.send(ssl_req).await?;
 
                 let mut parts = framed.into_parts();
 
-                // Create tls connection
-                parts.io.make_tls().await?;
+                // Create tls connection (A08: use connector + SNI from tls_opts).
+                let opts = parts
+                    .codec
+                    .tls_config
+                    .clone()
+                    .ok_or(ProtocolError::Tls)?;
+                let connector = opts.build_connector()?;
+                parts.io.make_tls(connector, &opts.server_name).await?;
                 framed = Framed::new(parts.io, parts.codec);
 
+                // Full HandshakeResponse after TLS.
                 framed.send(req).await?
             }
 
@@ -692,7 +706,11 @@ mod test {
         let mut auth_codec = ClientAuth::new();
         auth_codec.user = "root".to_string();
         auth_codec.password = "123456".to_string();
-        auth_codec.tls_config = Some(());
+        auth_codec.tls_config = Some(crate::client::tls_opts::ClientTlsOpts {
+            server_name: "localhost".into(),
+            accept_invalid_certs: true,
+            ca_file: None,
+        });
         assert_eq!(test_handshake_resp(auth_codec).await, true);
     }
 
@@ -710,7 +728,11 @@ mod test {
         let mut auth_codec = ClientAuth::new();
         auth_codec.user = "root".to_string();
         auth_codec.password = "1234567".to_string();
-        auth_codec.tls_config = Some(());
+        auth_codec.tls_config = Some(crate::client::tls_opts::ClientTlsOpts {
+            server_name: "localhost".into(),
+            accept_invalid_certs: true,
+            ca_file: None,
+        });
         assert_eq!(test_handshake_resp(auth_codec).await, false);
     }
 

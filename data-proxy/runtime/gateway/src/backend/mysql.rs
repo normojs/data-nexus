@@ -13,7 +13,7 @@ use bytes::BytesMut;
 use conn_pool::{ConnAttr, ConnAttrMut, ConnLike, Pool, PoolConn};
 use futures::StreamExt;
 use gateway_core::{
-    BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, ExecuteMode,
+    BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, EndpointSslMode, ExecuteMode,
     ExecuteOutcome, GatewayCommand, GatewayError, GatewayResponse, GatewayResult, GatewayValue,
     ProtocolKind, RowStream, SessionState, StreamingQuery, TransactionState,
 };
@@ -1319,10 +1319,12 @@ impl ConnLike for MySqlBackendConnection {
     type Error = GatewayError;
 
     async fn build_conn(&self) -> Result<Self, Self::Error> {
-        let mut client = ClientConn::with_opts(
+        let tls = mysql_client_tls_opts(&self.endpoint)?;
+        let mut client = ClientConn::with_opts_tls(
             self.endpoint.username.clone(),
             self.endpoint.password.clone(),
             self.endpoint.address.clone(),
+            tls,
         )
         .connect()
         .await
@@ -2069,6 +2071,39 @@ fn decode_fixed_lenc_int(
     Ok((LittleEndian::read_uint(&data[1..], value_len), false, total_len))
 }
 
+
+fn mysql_client_tls_opts(
+    endpoint: &EndpointConfig,
+) -> GatewayResult<Option<mysql_protocol::client::tls_opts::ClientTlsOpts>> {
+    use mysql_protocol::client::tls_opts::ClientTlsOpts;
+    match endpoint.ssl_mode {
+        EndpointSslMode::Disable => Ok(None),
+        EndpointSslMode::Prefer | EndpointSslMode::Require => {
+            // MySQL protocol path: CLIENT_SSL is requested when tls_config is Some.
+            // Prefer: if server lacks CLIENT_SSL, auth returns ProtocolError::Tls — map to
+            // a clear backend error (honest: no silent plain fallback on prefer yet;
+            // require and prefer both need server TLS for this MVP slice).
+            let server_name = {
+                let addr = endpoint.address.as_str();
+                match addr.rsplit_once(':') {
+                    Some((host, port))
+                        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
+                    {
+                        host.trim_matches(|c| c == '[' || c == ']').to_owned()
+                    }
+                    _ => addr.trim_matches(|c| c == '[' || c == ']').to_owned(),
+                }
+            };
+            Ok(Some(ClientTlsOpts {
+                server_name,
+                accept_invalid_certs: endpoint.ssl_accept_invalid_certs,
+                ca_file: endpoint.ssl_ca_file.clone(),
+            }))
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2539,5 +2574,40 @@ mod tests {
         let c = MySqlBackendConnector::with_endpoints(vec![endpoint()]);
         assert!(!c.has_transaction_lease());
         assert!(c.txn_lease.lock().is_none());
+    }
+
+    #[test]
+    fn a08_mysql_tls_opts_from_endpoint() {
+        let mut ep = endpoint();
+        ep.ssl_mode = EndpointSslMode::Disable;
+        assert!(mysql_client_tls_opts(&ep).unwrap().is_none());
+
+        ep.ssl_mode = EndpointSslMode::Require;
+        ep.address = "db.example.com:3306".into();
+        ep.ssl_accept_invalid_certs = false;
+        ep.ssl_ca_file = Some("/etc/ssl/certs/mysql-ca.pem".into());
+        let opts = mysql_client_tls_opts(&ep).unwrap().expect("tls");
+        assert_eq!(opts.server_name, "db.example.com");
+        assert!(!opts.accept_invalid_certs);
+        assert_eq!(opts.ca_file.as_deref(), Some("/etc/ssl/certs/mysql-ca.pem"));
+    }
+
+    #[test]
+    fn a08_mysql_tls_prefer_and_require_both_request_client_ssl() {
+        // Prefer currently also requires server CLIENT_SSL (no silent plain fallback).
+        for mode in [EndpointSslMode::Prefer, EndpointSslMode::Require] {
+            let mut ep = endpoint();
+            ep.ssl_mode = mode;
+            assert!(mysql_client_tls_opts(&ep).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn a08_mysql_tls_server_name_strips_port_and_ipv6_brackets() {
+        let mut ep = endpoint();
+        ep.ssl_mode = EndpointSslMode::Require;
+        ep.address = "[2001:db8::1]:3306".into();
+        let opts = mysql_client_tls_opts(&ep).unwrap().expect("tls");
+        assert_eq!(opts.server_name, "2001:db8::1");
     }
 }

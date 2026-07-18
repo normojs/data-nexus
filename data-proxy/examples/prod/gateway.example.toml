@@ -157,6 +157,11 @@ database = "__DN_MYSQL_DATABASE__"
 username = "__DN_MYSQL_USER__"
 password = "__DN_MYSQL_PASSWORD__"
 weight = 1
+# A08 backend TLS: disable | prefer | require
+# MySQL prefer does NOT fall back to plaintext if the server lacks SSL.
+ssl_mode = "disable"
+# ssl_ca_file = "/etc/ssl/certs/mysql-ca.pem"
+# ssl_accept_invalid_certs = false
 
 [[endpoints]]
 name = "analytics-primary"
@@ -166,6 +171,9 @@ database = "__DN_PG_DATABASE__"
 username = "__DN_PG_USER__"
 password = "__DN_PG_PASSWORD__"
 weight = 1
+ssl_mode = "disable"
+# ssl_ca_file = "/etc/ssl/certs/pg-ca.pem"
+# ssl_accept_invalid_certs = false
 
 [[route_policies]]
 name = "orders-balance"

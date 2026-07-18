@@ -161,6 +161,7 @@ examples/        smoke + gateway config 样例
 | A09 | portal json/csv 物化边界 smoke（部分） | feat(a09) |
 | T01 | 列 ACL / 复杂 SQL 矩阵（部分） | feat(t01) |
 | H05 | multi-instance file bundle + prod state template（部分） | feat(h05) |
+| A08 | MySQL backend TLS via ssl_mode/ssl_ca_file（部分） | feat(a08) |
 
 ---
 
@@ -177,7 +178,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease；**smoke max_rows 双协议（含 txn）+ metrics streaming** | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
-| **A08** | PostgreSQL wire 透传 | idle pool（cap+TTL+健康探测）+ 事务 `tcp_txn`；**ssl_mode** + **ssl_ca_file / ssl_accept_invalid_certs** | 默认仍 accept_invalid=true（兼容）；非 extended；MySQL TLS 未做 | **部分** |
+| **A08** | PostgreSQL wire 透传 + backend TLS | idle pool + 事务 `tcp_txn`；PG/MySQL **ssl_mode + ssl_ca_file / ssl_accept_invalid_certs** | 默认 accept_invalid=true；非 extended；MySQL prefer 不静默回落明文 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | multi-row NDJSON **强制** `backend_window`；**smoke 断言 json/csv 无 backend_window（仍物化）**；Complete 回退 B05b | **部分** |
 | **A10** | 预处理 / 事务透传矩阵 | MySQL **prepare/bind** + binary 行 + **Streaming 窗口** + 连接 stmt 缓存；PG QueryParams + Statement 缓存 + Streaming | 参数类型仍为通用 scalar 映射；date/time binary 结果 hex MVP；非 TCP passthrough | **部分** |
 
@@ -226,7 +227,7 @@ examples/        smoke + gateway config 样例
 |------|------|
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP（smoke 强制 multi-row `backend_window`）；**json/csv smoke 断言无 backend_window（物化）**；Complete 回退 B05b |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；smoke 双协议 max_rows（**含 txn**）+ `execute_path=streaming`；峰值 ≈ 窗口 |
-| PG passthrough | A08：idle pool（TTL+探测）+ 事务 tcp_txn；`ssl_mode` prefer/require；**可配 `ssl_ca_file` + `ssl_accept_invalid_certs=false` 钉 CA**（默认仍 accept_invalid=true）；非 extended |
+| PG/MySQL backend TLS | A08：PG idle pool+tcp_txn；双协议 `ssl_mode`/`ssl_ca_file`/`ssl_accept_invalid_certs`；默认 accept_invalid=true；MySQL prefer 无明文回落；非 extended |
 | 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；**MySQL QueryParams 走 COM_STMT_PREPARE/EXECUTE 绑定** + binary 行 + **Streaming 窗口** + 连接缓存；date/time binary 结果 hex MVP；非 TCP passthrough |
 | 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；**prod 模板已含 security.state**；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
 | L2 样本合规 | **未实现**（B08） |
@@ -237,25 +238,26 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A08 MySQL TLS 或 UI04 策略只读页 或 T02 Ticket/Vault runbook <<<**
+**>>> UI04 策略只读页 或 T02 Ticket/Vault runbook 或 A06 prefer 明文回落 <<<**
 
-本轮（H05 多实例收口）：
+本轮（A08 MySQL backend TLS）：
 
-- 交叉文件 bundle 单测：encrypted ticket+vault+policy 双句柄共享
-- 配置校验：policy_path 可选；`policy_poll_ms=0` 允许关轮询；redis 仍拒绝
-- prod：`security.state` 模板 + env encrypt keys + render-config 替换 + README 运维说明
-- 仍 **部分**：非 CRDT；进程内存 vault 密码明文；无 redis/remote
+- `endpoints.ssl_mode` prefer/require → MySQL `CLIENT_SSL` + native-tls
+- 修复 `LocalStream::make_tls` 丢弃 TLS 流的 bug；SSLRequest 仅发 32 字节
+- `ssl_ca_file` / `ssl_accept_invalid_certs` 与 PG 同语义
+- 诚实：prefer **不**静默回落明文（服务端无 SSL 则失败）
 
 ```bash
-cargo test -p gateway_core --lib h05_
+cargo test -p mysql_protocol --lib tls_opts
+cargo test -p runtime_gateway --lib 'backend::mysql::tests::a08_'
 ./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **A08** — MySQL backend TLS（若需要）  
-2. **UI04** — 策略只读页  
-3. **T02** — Ticket/Vault runbook  
+1. **UI04** — 策略只读页  
+2. **T02** — Ticket/Vault runbook  
+3. **A08** — MySQL prefer 明文回落（可选）  
 
 ---
 

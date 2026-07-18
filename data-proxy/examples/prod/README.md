@@ -63,6 +63,6 @@ cargo build -p data-proxy --bin proxy
 1. Replace all `replace-*` secrets; prefer OIDC `jwt_jwks` over long-lived HMAC break-glass  
 2. Backend accounts are least-privilege (not root)  
 3. Audit directory exists and is writable by the proxy user  
-4. TLS: terminate at LB or enable protocol TLS when available  
+4. TLS: terminate client TLS at LB; for backend MySQL/PG set `endpoints[].ssl_mode=require` + `ssl_ca_file` and `ssl_accept_invalid_certs=false` (MySQL prefer does **not** fall back to plaintext)
 5. Run `./examples/run-smoke-matrix.sh l0` against a staging stack  
 6. Multi-instance: shared `security.state.*` paths + encrypt keys; shared audit `index_path`  

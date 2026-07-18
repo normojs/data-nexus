@@ -47,30 +47,53 @@ impl LocalStream {
         }
     }
 
-    pub async fn make_tls(&mut self) -> Result<(), ProtocolError> {
-        let tlsconn = TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
-            .use_sni(false)
-            .build()?;
-
+    /// Upgrade a plain TCP stream to TLS using the given connector and SNI name.
+    ///
+    /// A08: previously built an accept-any connector and **discarded** the
+    /// resulting stream (assignment bug). Now replaces `self` with the secure
+    /// stream and surfaces handshake errors.
+    pub async fn make_tls(
+        &mut self,
+        connector: TlsConnector,
+        server_name: &str,
+    ) -> Result<(), ProtocolError> {
         match self {
             Self::Plain(ref mut try_plain) => {
-                let connector = tokio_native_tls::TlsConnector::from(tlsconn);
-                let plain_stream = try_plain.take().unwrap();
+                let connector = tokio_native_tls::TlsConnector::from(connector);
+                let plain_stream = try_plain.take().ok_or_else(|| {
+                    ProtocolError::InvalidPacket {
+                        method: "make_tls: plain stream already taken".into(),
+                        data: vec![],
+                    }
+                })?;
+
+                let host = if server_name.is_empty() {
+                    plain_stream
+                        .peer_addr()
+                        .map(|a| a.ip().to_string())
+                        .unwrap_or_else(|_| "localhost".into())
+                } else {
+                    server_name.to_owned()
+                };
 
                 let tls_stream = connector
-                    .connect(&plain_stream.peer_addr().unwrap().to_string(), plain_stream)
+                    .connect(&host, plain_stream)
                     .await
-                    .unwrap();
+                    .map_err(|e| {
+                        ProtocolError::InvalidPacket {
+                            method: format!("mysql tls handshake: {e}"),
+                            data: vec![],
+                        }
+                    })?;
 
-                LocalStream::from(tls_stream)
+                *self = LocalStream::from(tls_stream);
+                Ok(())
             }
-
-            _ => unreachable!(),
-        };
-
-        Ok(())
+            Self::Secure(_) => Err(ProtocolError::InvalidPacket {
+                method: "make_tls: stream already secure".into(),
+                data: vec![],
+            }),
+        }
     }
 }
 

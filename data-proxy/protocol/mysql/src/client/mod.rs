@@ -20,3 +20,4 @@ pub mod codec;
 pub mod conn;
 pub mod resultset;
 pub mod stream;
+pub mod tls_opts;

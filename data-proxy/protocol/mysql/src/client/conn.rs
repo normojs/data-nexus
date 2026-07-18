@@ -43,11 +43,29 @@ pub struct ClientConn {
     user: String,
     password: String,
     endpoint: String,
+    /// A08: when set, negotiate CLIENT_SSL and upgrade LocalStream.
+    tls_opts: Option<super::tls_opts::ClientTlsOpts>,
 }
 
 impl ClientConn {
     pub fn with_opts(user: String, password: String, endpoint: String) -> ClientConn {
         ClientConn { user, password, endpoint, ..Default::default() }
+    }
+
+    /// A08: connect with optional client TLS options for backend TLS.
+    pub fn with_opts_tls(
+        user: String,
+        password: String,
+        endpoint: String,
+        tls: Option<super::tls_opts::ClientTlsOpts>,
+    ) -> ClientConn {
+        ClientConn {
+            user,
+            password,
+            endpoint,
+            tls_opts: tls,
+            ..Default::default()
+        }
     }
 
     #[cfg(test)]
@@ -69,7 +87,7 @@ impl ClientConn {
         let mut auth_codec = ClientAuth::new();
         auth_codec.user = self.user.clone();
         auth_codec.password = self.password.clone();
-        auth_codec.tls_config = None;
+        auth_codec.tls_config = self.tls_opts.clone();
 
         let mut framed = Some(Box::new(ClientCodec::ClientAuth(Framed::with_capacity(
             local_stream,
@@ -88,6 +106,7 @@ impl ClientConn {
             user: self.user.clone(),
             password: self.password.clone(),
             endpoint: self.endpoint.clone(),
+            tls_opts: self.tls_opts.clone(),
             framed,
         })
     }
@@ -344,6 +363,7 @@ impl Clone for ClientConn {
             user: self.user.clone(),
             password: self.password.clone(),
             endpoint: self.endpoint.clone(),
+            tls_opts: self.tls_opts.clone(),
             framed: None,
         }
     }
