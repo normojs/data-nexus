@@ -140,6 +140,7 @@ examples/        smoke + gateway config 样例
 | A10 | PG date/timestamp/time binary encode（部分） | feat(a10) |
 | A10 | QueryParams + prepare/bind Execute（部分） | feat(a10) |
 | A10 | 连接级 Statement 缓存（QueryParams） | feat(a10) |
+| A10 | QueryParams Streaming 窗口 yield | feat(a10) |
 | H05 | ticket/vault file advisory locks（部分） | feat(h05) |
 | H05 | audit SQLite multi-writer + LocalPdp policy_path（部分） | feat(h05) |
 | H05 | LocalPdp policy_path mtime 轮询热更（部分） | feat(h05) |
@@ -162,7 +163,7 @@ examples/        smoke + gateway config 样例
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | 非事务 **idle pool** + 事务 `tcp_txn` 复用；`WireRelay` 边写 | 无 SSL；非 extended；idle 无健康检查/TTL；与 Streaming 池并行 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
-| **A10** | 预处理 / 事务透传矩阵 | MySQL binary；PG binary portal；QueryParams + prepare/bind；**连接级 Statement 缓存** | 参数仍 text ToSql；缓存 per-conn 上限 64；QueryParams 仍非 Streaming/Passthrough | **部分** |
+| **A10** | 预处理 / 事务透传矩阵 | MySQL binary；PG binary portal；QueryParams + prepare/bind + **Statement 缓存** + **Streaming 窗口** | 参数仍 text ToSql；缓存 per-conn 上限 64；QueryParams 非 TCP passthrough；MySQL QueryParams 仍 text 改写 | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
 
@@ -210,7 +211,7 @@ examples/        smoke + gateway config 样例
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：非事务 idle pool 复用 + 事务内 `tcp_txn`；COMMIT/ROLLBACK 同 socket；无 SSL |
-| 预处理语句 | A10：PG QueryParams + 连接级 Statement 缓存（prepare once）；MySQL 仍 text 改写；binary 结果含 date/ts/time |
+| 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；MySQL 仍 text 改写；binary 结果含 date/ts/time；非 TCP passthrough |
 | 多副本 | H05：ticket/vault file+lock；vault 可选 AES-GCM（可恢复 secret）；审计 SQLite；LocalPdp mtime 轮询；非 CRDT |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
@@ -219,13 +220,13 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A10 QueryParams Streaming 或 A08 SSL/idle TTL 或 H05 ticket 加密 <<<**
+**>>> A08 SSL/idle TTL 或 H05 ticket 加密 或 A06/A09 收口 <<<**
 
-本轮（A10 连接级 Statement 缓存）：
+本轮（A10 QueryParams Streaming）：
 
-- 每条池连接维护 SQL → `Statement` 缓存（上限 64，满则清空）
-- QueryParams / gateway Execute：`get_or_prepare` 后 bind；plan 失效可 invalidate 再试一次
-- Clone/factory 不继承他连接的 Statement
+- `ExecuteMode::Streaming` + `QueryParams` → `query_raw` 窗口 channel（与 A06 同形）
+- 复用连接级 Statement 缓存；非 SELECT 回落 Complete(Ok)
+- 事务内 producer 结束后还 `txn_lease`；空参走 simple streaming
 
 ```bash
 cargo test -p runtime_gateway --lib a10_
@@ -234,9 +235,9 @@ cargo test -p runtime_gateway --lib a10_
 
 建议下一刀：
 
-1. **A10 续** — QueryParams Streaming  
-2. **A08 续** — SSL / idle TTL  
-3. **H05 续** — ticket 文件加密
+1. **A08 续** — SSL / idle TTL  
+2. **H05 续** — ticket 文件加密  
+3. **A06/A09** — 诚实边界收口 / smoke 加深
 
 ---
 

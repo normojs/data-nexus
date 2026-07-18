@@ -696,6 +696,227 @@ impl PostgreSqlBackendConnector {
         }))
     }
 
+    /// A10: Streaming path for parameterized queries (`QueryParams` / prepared Execute).
+    ///
+    /// Uses connection-local Statement cache + `query_raw` so rows are windowed
+    /// without a full ResultSet. Peak retained rows ≈ one window per side.
+    /// Non-SELECT falls back to `execute` → Complete(Ok).
+    async fn execute_param_query_streaming(
+        &self,
+        endpoint: EndpointConfig,
+        sql: &str,
+        parameters: &[GatewayValue],
+        session: &SessionState,
+        mode: ExecuteMode,
+        in_transaction: bool,
+    ) -> GatewayResult<ExecuteOutcome> {
+        let need = count_pg_placeholders(sql) as usize;
+        if need != parameters.len() {
+            return Err(GatewayError::Protocol(format!(
+                "postgresql prepared Execute expects {need} parameters, got {}",
+                parameters.len()
+            )));
+        }
+        if parameters.is_empty() {
+            return self
+                .execute_simple_query_streaming(endpoint, sql, session, mode, in_transaction)
+                .await;
+        }
+
+        let window = mode.window_rows().unwrap_or(256).max(1);
+        let max_rows = mode.effective_max_rows();
+
+        let conn = if in_transaction {
+            let need_begin = self.txn_lease.lock().is_none();
+            let conn = self.take_or_acquire_lease(&endpoint, session).await?;
+            if need_begin {
+                let begin =
+                    Self::execute_on_conn(&conn, "BEGIN", ExecuteMode::Materialized).await?;
+                if !matches!(begin, GatewayResponse::Ok { .. }) {
+                    self.store_lease(conn);
+                    return Ok(ExecuteOutcome::Complete(begin));
+                }
+            }
+            conn
+        } else {
+            self.acquire_conn(&endpoint, session).await?
+        };
+
+        let text_params: Vec<Option<String>> = parameters
+            .iter()
+            .map(gateway_value_to_pg_param_text)
+            .collect();
+
+        let stmt = match conn.get_or_prepare(sql).await {
+            Ok(s) => s,
+            Err(e) => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(e);
+            }
+        };
+
+        let client = match conn.client() {
+            Ok(c) => c,
+            Err(e) => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(e);
+            }
+        };
+
+        let to_sql: Vec<&(dyn ToSql + Sync)> = text_params
+            .iter()
+            .map(|p| p as &(dyn ToSql + Sync))
+            .collect();
+
+        let raw = match client.query_raw(&stmt, to_sql.iter().copied()).await {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("does not return rows")
+                    || msg.contains("no field")
+                    || msg.contains("statement that returns")
+                {
+                    let n = match client.execute(&stmt, to_sql.as_slice()).await {
+                        Ok(n) => n,
+                        Err(e2) => {
+                            if in_transaction {
+                                self.store_lease(conn);
+                            }
+                            return Err(postgresql_backend_error(e2));
+                        }
+                    };
+                    if in_transaction {
+                        self.store_lease(conn);
+                    }
+                    return Ok(ExecuteOutcome::Complete(GatewayResponse::Ok {
+                        affected_rows: n,
+                        last_insert_id: None,
+                    }));
+                }
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(postgresql_backend_error(e));
+            }
+        };
+        let mut stream = Box::pin(raw);
+
+        // First row establishes columns; empty stream → empty ResultSet Complete.
+        let first = match stream.next().await {
+            None => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Ok(ExecuteOutcome::Complete(GatewayResponse::ResultSet {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                }));
+            }
+            Some(Err(e)) => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(postgresql_backend_error(e));
+            }
+            Some(Ok(row)) => row,
+        };
+
+        let columns: Vec<GatewayColumn> = first
+            .columns()
+            .iter()
+            .map(|c| GatewayColumn {
+                name: c.name().to_string(),
+                data_type: c.type_().name().to_string(),
+            })
+            .collect();
+        let first_values = match typed_row_to_gateway_values(&first) {
+            Ok(v) => v,
+            Err(e) => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(e);
+            }
+        };
+
+        let lease_slot = if in_transaction {
+            Some(self.txn_lease.clone())
+        } else {
+            None
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<Vec<GatewayValue>>>(2);
+        tokio::spawn(async move {
+            let run = async {
+                let mut window_buf: Vec<Vec<GatewayValue>> = Vec::with_capacity(window.min(256));
+                let mut total: u64 = 0;
+                let mut truncated = false;
+
+                // Seed with first row (already counted).
+                if max_rows.map(|m| total < m).unwrap_or(true) {
+                    window_buf.push(first_values);
+                    total = 1;
+                    if window_buf.len() >= window {
+                        let chunk: Vec<_> = window_buf.drain(..).collect();
+                        if tx.send(chunk).await.is_err() {
+                            while stream.next().await.is_some() {}
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    truncated = true;
+                }
+
+                while let Some(item) = stream.next().await {
+                    let row = item.map_err(postgresql_backend_error)?;
+                    if truncated {
+                        continue;
+                    }
+                    if let Some(max) = max_rows {
+                        if total >= max {
+                            truncated = true;
+                            continue;
+                        }
+                    }
+                    window_buf.push(typed_row_to_gateway_values(&row)?);
+                    total += 1;
+                    if window_buf.len() >= window {
+                        let chunk: Vec<_> = window_buf.drain(..).collect();
+                        if tx.send(chunk).await.is_err() {
+                            while stream.next().await.is_some() {}
+                            return Ok(());
+                        }
+                    }
+                }
+                if !window_buf.is_empty() {
+                    let _ = tx.send(window_buf).await;
+                }
+                Ok::<(), GatewayError>(())
+            }
+            .await;
+            if let Err(e) = run {
+                tracing::warn!(
+                    target: "data_nexus::gateway",
+                    error = %e,
+                    "postgresql QueryParams streaming producer failed"
+                );
+            }
+            if let Some(slot) = lease_slot {
+                *slot.lock() = Some(conn);
+            } else {
+                drop(conn);
+            }
+        });
+
+        Ok(ExecuteOutcome::Streaming(StreamingQuery {
+            columns,
+            stream: Box::new(ChannelRowStream { rx }),
+        }))
+    }
+
     async fn finish_transaction(&self, sql: &str) -> GatewayResult<GatewayResponse> {
         // Prefer TCP txn session when present (passthrough path held the lease).
         let tcp_sess = self.tcp_txn.lock().take();
@@ -857,11 +1078,13 @@ impl BackendConnector for PostgreSqlBackendConnector {
         // after draining so COMMIT/ROLLBACK still share the same backend conn.
         let streaming = matches!(mode, ExecuteMode::Streaming { .. });
         let is_query = matches!(command, GatewayCommand::Query { .. });
+        let is_query_params = matches!(command, GatewayCommand::QueryParams { .. });
         let in_txn = session.transaction_state == TransactionState::Active
             || self.txn_lease.lock().is_some()
             || self.tcp_txn.lock().is_some();
 
         // A08: progressive TCP frame relay for passthrough (txn + non-txn).
+        // QueryParams cannot TCP-relay bound params; never passthrough here.
         if matches!(mode, ExecuteMode::Passthrough) && is_query {
             if let GatewayCommand::Query { sql } = command {
                 let endpoint = self.select_endpoint(session)?;
@@ -881,6 +1104,23 @@ impl BackendConnector for PostgreSqlBackendConnector {
                 let endpoint = self.select_endpoint(session)?;
                 return self
                     .execute_simple_query_streaming(endpoint, &sql, session, mode, in_txn)
+                    .await;
+            }
+        }
+
+        // A10: Streaming for parameterized queries (Bind → QueryParams).
+        if streaming && is_query_params {
+            if let GatewayCommand::QueryParams { sql, parameters } = command {
+                let endpoint = self.select_endpoint(session)?;
+                return self
+                    .execute_param_query_streaming(
+                        endpoint,
+                        &sql,
+                        &parameters,
+                        session,
+                        mode,
+                        in_txn,
+                    )
                     .await;
             }
         }
@@ -1784,7 +2024,7 @@ mod tests {
 
     #[test]
     fn a10_stmt_cache_is_connection_local_and_bounded() {
-        let mut conn = PostgreSqlBackendConnection::factory(endpoint(), "analytics".into());
+        let conn = PostgreSqlBackendConnection::factory(endpoint(), "analytics".into());
         assert_eq!(conn.stmt_cache_len(), 0);
         // Without a live client, get_or_prepare fails closed.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1799,6 +2039,28 @@ mod tests {
         let clone = conn.clone();
         assert_eq!(clone.stmt_cache_len(), 0);
         assert_eq!(MAX_STMT_CACHE_PER_CONN, 64);
+    }
+
+    #[test]
+    fn a10_query_params_streaming_mode_is_selected() {
+        // execute_outcome routes Streaming + QueryParams to execute_param_query_streaming.
+        let mode = ExecuteMode::from_streaming_config(32, Some(100));
+        assert!(matches!(mode, ExecuteMode::Streaming { .. }));
+        assert!(matches!(
+            GatewayCommand::QueryParams {
+                sql: "SELECT $1".into(),
+                parameters: vec![GatewayValue::Integer(1)],
+            },
+            GatewayCommand::QueryParams { .. }
+        ));
+        // Still not Passthrough-eligible.
+        assert!(!matches!(
+            GatewayCommand::QueryParams {
+                sql: "SELECT $1".into(),
+                parameters: vec![],
+            },
+            GatewayCommand::Query { .. }
+        ));
     }
 
     #[test]
