@@ -129,11 +129,12 @@ examples/        smoke + gateway config 样例
 | A06 | 事务内 Streaming 还 lease（部分） | feat(a06) |
 | H06 | origin 同步完成 | 223f2c0 |
 | A10 | prepare param defs + PG ParameterDescription（部分） | feat(a10) |
-| A08 | PG wire 无 ResultSet 物化透传（部分） | feat(a08) |
+| A08 | PG 非事务 TCP 帧中继 + WireRelay | feat(a08) |
 | F32 | 审计 L0/L1 SQL 载荷裁剪 | feat(f32) |
 | A10 | MySQL binary resultset after Execute（部分） | feat(a10) |
 | H05 | ticket/vault file state backend（部分） | feat(h05) |
 | A10 | MySQL DATE/TIME/DATETIME binary encode（部分） | feat(a10) |
+| H05 | ticket/vault file advisory locks（部分） | feat(h05) |
 
 ---
 
@@ -150,7 +151,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
-| **A08** | PostgreSQL wire 透传 | 同协议无义务时 `simple_query_raw`→Wire（无 ResultSet 物化） | 仍非 backend TCP 帧中继；Wire 包仍汇总后写出 | **部分** |
+| **A08** | PostgreSQL wire 透传 | 同协议无义务时非事务 **TCP 帧中继**（`WireRelay`）；事务内仍 `simple_query_raw`→Wire 再编码 | 事务内非 TCP 帧中继；专用连接不进池 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
 | **A10** | 预处理 / 事务透传矩阵 | 注册表 + 参数绑定 + MySQL binary 行（含 DATE/TIME/DATETIME） + PG ParameterDescription | PG 仍 text Bind→Query；无 binary portal 结果 | **部分** |
 
@@ -169,7 +170,7 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
 | **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
-| **H05** | 多实例状态外置 | `security.state.backend=memory\|file`；ticket/vault JSON 文件后端 | LocalPdp / 审计 SQLite 仍进程内；file vault **不**持久化后端密码 | **部分** |
+| **H05** | 多实例状态外置 | `security.state.backend=memory|file`；ticket/vault JSON + **advisory file lock** | LocalPdp / 审计 SQLite 仍进程内；file vault 无密码；全文件替换非 CRDT | **部分** |
 | **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `223f2c0` → origin/main | **完成** |
 | **H07** | CI 矩阵加深 | PR 已 default；extended / cedar job 可选或 nightly | workflow_dispatch 可选手动 | **可选** |
 | **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | H03 已声明后置 | **延后** |
@@ -199,9 +200,9 @@ examples/        smoke + gateway config 样例
 |------|------|
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
-| PG passthrough | A08：`simple_query_raw` 边解码边编码 Wire（无逻辑 ResultSet）；**非** backend TCP 帧中继；包仍可汇总 |
+| PG passthrough | A08：非事务 **TCP 帧中继**（startup/auth + Query → 原帧至 ReadyForQuery，`WireRelay` 边写）；事务内仍 re-encode Wire |
 | 预处理语句 | A10：MySQL COM_STMT_EXECUTE → ProtocolBinary（含 DATE/DATETIME/TIME）；PG 仍 text Bind→Query |
-| 多副本 | H05：ticket/vault 可选 `file` 共享盘 JSON；LocalPdp 与审计 SQLite 索引仍**进程内**；file vault 重启后无后端密码（需重新 issue） |
+| 多副本 | H05：ticket/vault `file` + `.json.lock` 劝告锁；LocalPdp/审计 SQLite 仍进程内；file vault 无密码；全文件写非合并 |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
 
@@ -209,22 +210,25 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A08 TCP 真中继 或 H05 LocalPdp 外置 或 A10 PG binary 结果 <<<**
+**>>> H05 续 LocalPdp/审计索引外置 或 A10 PG binary 结果 或 A08 事务内中继 <<<**
 
-本轮（A10 日期 binary）：
+本轮（A08 TCP 真中继）：
 
-- MySQL binary 结果：`date` / `datetime` / `timestamp` / `time` 从字符串解析为原生 ProtocolBinary 布局
-- 支持微秒 DATETIME 与负 TIME（`days + hms`）
+- `ExecuteOutcome::WireRelay` + `write_wire_relay` 边写 socket
+- PG 非事务 Passthrough：专用 TCP session（SCRAM/MD5/cleartext）→ 原帧至 ReadyForQuery
+- 事务内仍 `stream_simple_query_to_pg_wire`（池连接不可拆）
 
 ```bash
-cargo test -p runtime_gateway --lib a10_
+cargo test -p runtime_gateway --lib a08_
+cargo test -p gateway_core --lib a08_
+./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **A08 续** — 真 TCP 帧中继  
-2. **H05 续** — LocalPdp / 审计索引外置  
-3. **A10 续** — PG binary portal 结果
+1. **H05 续** — LocalPdp / 审计索引外置  
+2. **A10 续** — PG binary portal 结果  
+3. **A08 续** — 事务内/池化 TCP 中继（需连接模型改造）
 
 ---
 

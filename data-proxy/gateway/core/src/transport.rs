@@ -128,12 +128,32 @@ pub struct StreamingQuery {
     pub stream: Box<dyn RowStream>,
 }
 
-/// Outcome of a backend execute that may stream rows (A06).
+/// A08: progressive same-protocol wire frames (backend TCP messages → client).
+///
+/// Each packet is a full frontend-ready frame (PostgreSQL: tag + len + body).
+/// Callers must drain until [`WireStream::poll_packets`] returns `None`.
+pub struct WireRelay {
+    pub stream: Box<dyn WireStream>,
+}
+
+/// Yields wire packet batches from a backend passthrough session (A08).
+#[async_trait]
+pub trait WireStream: Send {
+    /// Next batch of wire packets (up to `max_packets`). `None` = end of response.
+    async fn poll_packets(
+        &mut self,
+        max_packets: usize,
+    ) -> GatewayResult<Option<Vec<Vec<u8>>>>;
+}
+
+/// Outcome of a backend execute that may stream rows (A06) or wire frames (A08).
 pub enum ExecuteOutcome {
     /// Fully materialized / wire / error response.
     Complete(GatewayResponse),
     /// Progressive logical rows; caller must drain `stream` before next command.
     Streaming(StreamingQuery),
+    /// Progressive same-protocol wire frames (no logical ResultSet).
+    WireRelay(WireRelay),
 }
 
 /// Yields logical row windows from a backend result (A06).
@@ -183,6 +203,27 @@ impl RowStream for VecRowStream {
             Ok(Some(out))
         }
     }
+}
+
+/// Drain a progressive [`WireRelay`] to the client writer (A08).
+///
+/// Returns total payload bytes written (sum of packet lengths).
+pub async fn write_wire_relay<W: ResponseWriter + ?Sized>(
+    mut relay: WireRelay,
+    writer: &mut W,
+) -> GatewayResult<u64> {
+    let mut total = 0u64;
+    loop {
+        match relay.stream.poll_packets(32).await? {
+            None => break,
+            Some(batch) if batch.is_empty() => continue,
+            Some(batch) => {
+                total = total.saturating_add(batch.iter().map(|p| p.len() as u64).sum::<u64>());
+                writer.write_packets(batch).await?;
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Encode a progressive [`StreamingQuery`] through `writer` (A06+A07).
@@ -437,6 +478,38 @@ mod tests {
         assert_eq!(fe.footer_calls, 1);
         assert_eq!(writer.packets.len(), 5);
         assert_eq!(writer.packets.last().unwrap(), &vec![5u8]);
+    }
+
+    #[tokio::test]
+    async fn a08_write_wire_relay_drains_batches() {
+        struct FakeWire {
+            batches: std::vec::IntoIter<Vec<Vec<u8>>>,
+        }
+
+        #[async_trait]
+        impl WireStream for FakeWire {
+            async fn poll_packets(
+                &mut self,
+                _max_packets: usize,
+            ) -> GatewayResult<Option<Vec<Vec<u8>>>> {
+                Ok(self.batches.next())
+            }
+        }
+
+        let relay = WireRelay {
+            stream: Box::new(FakeWire {
+                batches: vec![
+                    vec![vec![b'Z', 0, 0, 0, 5, b'I']],
+                    vec![vec![1, 2, 3], vec![4, 5]],
+                ]
+                .into_iter(),
+            }),
+        };
+        let mut writer = CollectingWriter::new();
+        let bytes = write_wire_relay(relay, &mut writer).await.unwrap();
+        assert_eq!(bytes, 6 + 3 + 2);
+        assert_eq!(writer.packets.len(), 3);
+        assert_eq!(writer.packets[0][0], b'Z');
     }
 
     #[tokio::test]

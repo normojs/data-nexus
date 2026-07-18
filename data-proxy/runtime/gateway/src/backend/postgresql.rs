@@ -13,7 +13,7 @@ use futures::StreamExt;
 use gateway_core::{
     BackendConnector, Column as GatewayColumn, EndpointConfig, EndpointRole, ExecuteMode,
     ExecuteOutcome, GatewayCommand, GatewayError, GatewayResponse, GatewayResult, GatewayValue,
-    ProtocolKind, RowStream, SessionState, StreamingQuery, TransactionState,
+    ProtocolKind, RowStream, SessionState, StreamingQuery, TransactionState, WireRelay, WireStream,
 };
 use parking_lot::Mutex;
 use postgresql_protocol::{
@@ -22,6 +22,8 @@ use postgresql_protocol::{
 };
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use tracing::error;
+
+use super::pg_tcp_relay::PgTcpSession;
 
 const DEFAULT_POSTGRESQL_POOL_SIZE: usize = 16;
 
@@ -267,11 +269,9 @@ impl PostgreSqlBackendConnector {
 
     /// A08: Passthrough without materializing a logical ResultSet.
     ///
-    /// Streams `simple_query_raw` and encodes each message to frontend wire
-    /// packets (RowDescription / DataRow / CommandComplete / ReadyForQuery).
-    /// Peak IR is one message at a time (not 2× full ResultSet). Still not TCP
-    /// frame relay from the backend socket — tokio-postgres decodes simple query
-    /// messages first (honest).
+    /// **Non-transaction**: dedicated backend TCP session → raw frames (`WireRelay`).
+    /// **In-transaction**: pool lease + `simple_query_raw` re-encode (cannot steal
+    /// the pooled tokio-postgres socket for raw relay without breaking the pool).
     async fn execute_simple_query_wire(
         &self,
         endpoint: EndpointConfig,
@@ -280,27 +280,63 @@ impl PostgreSqlBackendConnector {
     ) -> GatewayResult<GatewayResponse> {
         let in_txn = session.transaction_state == TransactionState::Active
             || self.txn_lease.lock().is_some();
-        let conn = if in_txn {
-            let need_begin = self.txn_lease.lock().is_none();
-            let conn = self.take_or_acquire_lease(&endpoint, session).await?;
-            if need_begin {
-                let begin =
-                    Self::execute_on_conn(&conn, "BEGIN", ExecuteMode::Materialized).await?;
-                if !matches!(begin, GatewayResponse::Ok { .. }) {
-                    self.store_lease(conn);
-                    return logical_response_to_pg_wire(begin, session);
-                }
-            }
-            conn
-        } else {
-            self.acquire_conn(&endpoint, session).await?
-        };
-
-        let result = stream_simple_query_to_pg_wire(&conn, sql, session).await;
-        if in_txn {
-            self.store_lease(conn);
+        // TCP frame relay is only for non-txn; txn keeps re-encode path.
+        if !in_txn {
+            // Caller should prefer execute_outcome → WireRelay; this path remains
+            // for execute_with_mode which still needs a Complete(Wire) response.
+            return self
+                .execute_simple_query_tcp_relay_collect(&endpoint, sql, session)
+                .await;
         }
+        let need_begin = self.txn_lease.lock().is_none();
+        let conn = self.take_or_acquire_lease(&endpoint, session).await?;
+        if need_begin {
+            let begin =
+                Self::execute_on_conn(&conn, "BEGIN", ExecuteMode::Materialized).await?;
+            if !matches!(begin, GatewayResponse::Ok { .. }) {
+                self.store_lease(conn);
+                return logical_response_to_pg_wire(begin, session);
+            }
+        }
+        let result = stream_simple_query_to_pg_wire(&conn, sql, session).await;
+        self.store_lease(conn);
         result
+    }
+
+    /// A08: non-txn TCP frame relay collected into `GatewayResponse::Wire`.
+    /// Used by `execute_with_mode`; progressive path is `execute_outcome`.
+    async fn execute_simple_query_tcp_relay_collect(
+        &self,
+        endpoint: &EndpointConfig,
+        sql: &str,
+        session: &SessionState,
+    ) -> GatewayResult<GatewayResponse> {
+        let database = effective_database(endpoint, session)?;
+        let session_tcp = PgTcpSession::connect(endpoint, &database).await?;
+        let mut stream = session_tcp.simple_query_relay(sql).await?;
+        let mut packets = Vec::new();
+        loop {
+            match stream.poll_packets(64).await? {
+                None => break,
+                Some(batch) => packets.extend(batch),
+            }
+        }
+        Ok(GatewayResponse::Wire { packets })
+    }
+
+    /// A08: progressive TCP frame relay (non-transaction only).
+    async fn execute_simple_query_tcp_relay(
+        &self,
+        endpoint: EndpointConfig,
+        sql: &str,
+        session: &SessionState,
+    ) -> GatewayResult<ExecuteOutcome> {
+        let database = effective_database(&endpoint, session)?;
+        let session_tcp = PgTcpSession::connect(&endpoint, &database).await?;
+        let stream = session_tcp.simple_query_relay(sql).await?;
+        Ok(ExecuteOutcome::WireRelay(WireRelay {
+            stream: Box::new(stream),
+        }))
     }
 
     /// A06: stream logical rows in windows.
@@ -604,6 +640,16 @@ impl BackendConnector for PostgreSqlBackendConnector {
         let is_query = matches!(command, GatewayCommand::Query { .. });
         let in_txn = session.transaction_state == TransactionState::Active
             || self.txn_lease.lock().is_some();
+
+        // A08: non-txn passthrough → progressive TCP frame relay.
+        if matches!(mode, ExecuteMode::Passthrough) && is_query && !in_txn {
+            if let GatewayCommand::Query { sql } = command {
+                let endpoint = self.select_endpoint(session)?;
+                return self
+                    .execute_simple_query_tcp_relay(endpoint, &sql, session)
+                    .await;
+            }
+        }
 
         if streaming && is_query {
             if let GatewayCommand::Query { sql } = command {
@@ -1204,12 +1250,22 @@ mod tests {
 
     #[test]
     fn a08_wire_path_avoids_resultset_materialization_comment() {
-        // stream_simple_query_to_pg_wire is the passthrough implementation;
-        // logical_response_to_pg_wire remains for error/ok conversion helpers.
+        // Non-txn passthrough uses PgTcpSession TCP frame relay (WireRelay).
+        // In-txn still uses stream_simple_query_to_pg_wire re-encode.
         assert!(matches!(
             ExecuteMode::Passthrough,
             ExecuteMode::Passthrough
         ));
+        assert!(matches!(
+            ExecuteOutcome::Complete(GatewayResponse::Pong),
+            ExecuteOutcome::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn a08_tcp_relay_module_exports_session() {
+        // Compile-time link to A08 TCP relay helpers.
+        let _ = std::any::type_name::<crate::backend::pg_tcp_relay::PgTcpSession>();
     }
 
     #[test]

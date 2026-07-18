@@ -100,8 +100,8 @@ pub use translation::{
     TranslationStatementKind,
 };
 pub use transport::{
-    write_resultset_windowed, write_resultset_windowed_with_obligations,
-    write_streaming_query_with_obligations, BackendConnector, CollectingWriter, ExecuteOutcome,
-    FrontendProtocolAdapter, ResponseWriter, RowStream, StreamingQuery, VecRowStream,
+    write_resultset_windowed, write_resultset_windowed_with_obligations, write_streaming_query_with_obligations,
+    write_wire_relay, BackendConnector, CollectingWriter, ExecuteOutcome, FrontendProtocolAdapter,
+    ResponseWriter, RowStream, StreamingQuery, VecRowStream, WireRelay, WireStream,
 };
 pub use types::{map_column_type, parse_backend_type, CanonicalDataType};

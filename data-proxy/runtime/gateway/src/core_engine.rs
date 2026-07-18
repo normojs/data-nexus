@@ -17,7 +17,7 @@ use std::{sync::Arc, time::Instant};
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
         write_resultset_windowed, write_resultset_windowed_with_obligations,
-        write_streaming_query_with_obligations, CollectingWriter, map_response_types,
+        write_streaming_query_with_obligations, write_wire_relay, CollectingWriter, map_response_types,
         prepare_cross_protocol_command, BackendConnector, CommandSummary, DialectParser,
         EndpointConfig, EndpointRef, EndpointRole, ExecuteMode, ExecuteOutcome,
         FrontendProtocolAdapter, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse,
@@ -682,6 +682,82 @@ impl CoreGatewayConnection {
                 .instrument(command_span.clone())
                 .await
             {
+                Ok(ExecuteOutcome::WireRelay(relay)) => {
+                    // A08: progressive wire frames → socket (no logical ResultSet).
+                    // Only selected when passthrough is allowed (no result obligations).
+                    let wire_bytes = write_wire_relay(relay, writer).await?;
+                    let execute_path = "passthrough";
+                    command_span.record("outcome", "passthrough");
+                    command_span.record("security_decision", "allow");
+                    command_span.record("security_rule_class", "none");
+                    command_span.record("execute_path", execute_path);
+                    info!(
+                        target: gateway_core::AUDIT_TARGET,
+                        action = gateway_core::AuditAction::Query.as_str(),
+                        listener = %self.listener_name,
+                        service = %self.service_name,
+                        frontend_protocol = %protocol_metric_name(&self.frontend.protocol()),
+                        backend_protocol = %protocol_metric_name(&self.backend.protocol()),
+                        command_type = %command_type,
+                        endpoint = %label_owned[5],
+                        db_user = ?self.session.user,
+                        database = ?self.session.database,
+                        decision = gateway_core::AuditDecision::Execute.as_str(),
+                        outcome = "passthrough",
+                        latency_ms = started_at.elapsed().as_millis() as u64,
+                        "gateway command audited"
+                    );
+                    gateway_core::try_audit(gateway_core::AuditEvent {
+                        action: Some(gateway_core::AuditAction::Query.as_str().into()),
+                        decision: Some(gateway_core::AuditDecision::Execute.as_str().into()),
+                        subject_id: self.session.user.clone(),
+                        db_user: self.session.user.clone(),
+                        listener: Some(self.listener_name.clone()),
+                        service: Some(self.service_name.clone()),
+                        frontend_protocol: Some(
+                            protocol_metric_name(&self.frontend.protocol()).to_owned(),
+                        ),
+                        backend_protocol: Some(
+                            protocol_metric_name(&self.backend.protocol()).to_owned(),
+                        ),
+                        command_type: Some(command_type.to_owned()),
+                        endpoint: Some(label_owned[5].clone()),
+                        database: self.session.database.clone(),
+                        outcome: Some("passthrough".into()),
+                        latency_ms: Some(started_at.elapsed().as_millis() as u64),
+                        audit_level: Some(self.default_audit_level.clone()),
+                        sql_fingerprint: audit_sql.as_deref().map(gateway_core::sql_fingerprint),
+                        sql_text: audit_sql.clone(),
+                        tables: audit_tables.clone(),
+                        ..gateway_core::AuditEvent::default()
+                    });
+                    if let (Some(plugins), Some(idx)) =
+                        (self.plugins.as_mut(), concurrency_rule_idx)
+                    {
+                        plugins.release_concurrency(idx);
+                    }
+                    record_otel_command(
+                        &self.listener_name,
+                        &self.service_name,
+                        labels[2],
+                        labels[3],
+                        command_type,
+                        labels[5],
+                        "passthrough",
+                        started_at,
+                        &crate::otel_metrics::CommandOtelAttrs::security("allow", "none")
+                            .with_execute_path(execute_path)
+                            .with_wire_bytes(wire_bytes),
+                    );
+                    finish_command_metrics(
+                        &self.metrics,
+                        &labels,
+                        started_at,
+                        execute_path,
+                        wire_bytes,
+                    );
+                    continue;
+                }
                 Ok(ExecuteOutcome::Streaming(mut query)) => {
                     // A06: progressive rows — type-map column metadata, then encode
                     // window-by-window with optional obligations (no full ResultSet).

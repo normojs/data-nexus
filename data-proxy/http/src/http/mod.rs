@@ -2382,6 +2382,20 @@ async fn portal_execute_logical(
 
     let session = prepared.session;
     match response {
+        // Portal never requests Passthrough; if a WireRelay appears, drain and reject.
+        ExecuteOutcome::WireRelay(mut relay) => {
+            while relay
+                .stream
+                .poll_packets(64)
+                .await
+                .map_err(|e| ("backend".into(), e.to_string()))?
+                .is_some()
+            {}
+            Err((
+                "unsupported".into(),
+                "portal path does not support wire passthrough relay".into(),
+            ))
+        }
         ExecuteOutcome::Streaming(mut query) => {
             // Map column types for cross-protocol.
             if prepared.backend_protocol != prepared.frontend_protocol {
@@ -2694,6 +2708,19 @@ async fn portal_execute_ndjson_streaming(
     let (mut tx, body) = Body::channel();
 
     match outcome {
+        ExecuteOutcome::WireRelay(mut relay) => {
+            while relay
+                .stream
+                .poll_packets(64)
+                .await
+                .map_err(|e| ("backend".into(), e.to_string()))?
+                .is_some()
+            {}
+            Err((
+                "unsupported".into(),
+                "portal NDJSON path does not support wire passthrough relay".into(),
+            ))
+        }
         ExecuteOutcome::Streaming(mut query) => {
             if prepared.backend_protocol != prepared.frontend_protocol {
                 for col in &mut query.columns {
