@@ -132,6 +132,7 @@ examples/        smoke + gateway config 样例
 | A08 | PG 非事务 TCP 帧中继 + WireRelay | feat(a08) |
 | A08 | PG 事务内 TCP 帧中继（tcp_txn 复用） | feat(a08) |
 | A08 | 非事务 TCP idle pool（按 address\|db\|user） | feat(a08) |
+| A08 | idle pool TTL（默认 30s） | feat(a08) |
 | F32 | 审计 L0/L1 SQL 载荷裁剪 | feat(f32) |
 | A10 | MySQL binary resultset after Execute（部分） | feat(a10) |
 | H05 | ticket/vault file state backend（部分） | feat(h05) |
@@ -161,7 +162,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
-| **A08** | PostgreSQL wire 透传 | 非事务 **idle pool** + 事务 `tcp_txn` 复用；`WireRelay` 边写 | 无 SSL；非 extended；idle 无健康检查/TTL；与 Streaming 池并行 | **部分** |
+| **A08** | PostgreSQL wire 透传 | 非事务 idle pool（cap+**TTL**）+ 事务 `tcp_txn`；`WireRelay` 边写 | 无 SSL；非 extended；无主动健康探测；与 Streaming 池并行 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
 | **A10** | 预处理 / 事务透传矩阵 | MySQL binary；PG binary portal；QueryParams + prepare/bind + **Statement 缓存** + **Streaming 窗口** | 参数仍 text ToSql；缓存 per-conn 上限 64；QueryParams 非 TCP passthrough；MySQL QueryParams 仍 text 改写 | **部分** |
 
@@ -210,7 +211,7 @@ examples/        smoke + gateway config 样例
 |------|------|
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
-| PG passthrough | A08：非事务 idle pool 复用 + 事务内 `tcp_txn`；COMMIT/ROLLBACK 同 socket；无 SSL |
+| PG passthrough | A08：非事务 idle pool（cap+TTL 30s）+ 事务 `tcp_txn`；无 SSL |
 | 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；MySQL 仍 text 改写；binary 结果含 date/ts/time；非 TCP passthrough |
 | 多副本 | H05：ticket/vault file+lock；vault 可选 AES-GCM（可恢复 secret）；审计 SQLite；LocalPdp mtime 轮询；非 CRDT |
 | L2 样本合规 | **未实现**（B08） |
@@ -220,24 +221,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A08 SSL/idle TTL 或 H05 ticket 加密 或 A06/A09 收口 <<<**
+**>>> H05 ticket 加密 或 A08 SSL/健康探测 或 A06/A09 收口 <<<**
 
-本轮（A10 QueryParams Streaming）：
+本轮（A08 idle pool TTL）：
 
-- `ExecuteMode::Streaming` + `QueryParams` → `query_raw` 窗口 channel（与 A06 同形）
-- 复用连接级 Statement 缓存；非 SELECT 回落 Complete(Ok)
-- 事务内 producer 结束后还 `txn_lease`；空参走 simple streaming
+- 默认 idle TTL **30s**（`DEFAULT_TCP_IDLE_TTL`）；`with_ttl` 可配
+- `take` / `put` 丢弃过期条目；`purge_expired` 可主动清理
+- TTL=0 → 不复用（put 后立即过期）
 
 ```bash
-cargo test -p runtime_gateway --lib a10_
+cargo test -p runtime_gateway --lib a08_
 ./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **A08 续** — SSL / idle TTL  
-2. **H05 续** — ticket 文件加密  
-3. **A06/A09** — 诚实边界收口 / smoke 加深
+1. **H05 续** — ticket 文件加密  
+2. **A08 续** — SSL / 主动健康探测  
+3. **A06/A09** — 边界收口 / smoke 加深
 
 ---
 

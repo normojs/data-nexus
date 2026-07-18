@@ -7,13 +7,15 @@
 //! Scope (honest):
 //! - simple Query only (not extended protocol)
 //! - reusable session for in-transaction multi-statement passthrough
-//! - **non-txn idle pool** (per address|db|user, capped) to avoid connect/auth
-//!   every passthrough query
+//! - **non-txn idle pool** (per address|db|user, capped + **idle TTL**) to avoid
+//!   connect/auth every passthrough query
 //! - cleartext / MD5 / SCRAM-SHA-256 auth; no SSL to backend
 //! - not shared with the tokio-postgres pool (parallel lease)
+//! - idle TTL only (no active health probe / SSL yet)
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -29,6 +31,22 @@ use tokio::net::TcpStream;
 
 /// Default max idle TCP relay sessions per pool key (A08).
 pub const DEFAULT_TCP_IDLE_MAX_PER_KEY: usize = 4;
+/// Default max age of an idle TCP relay session before it is discarded (A08).
+pub const DEFAULT_TCP_IDLE_TTL: Duration = Duration::from_secs(30);
+
+struct IdleEntry {
+    session: PgTcpSession,
+    idle_since: Instant,
+}
+
+impl std::fmt::Debug for IdleEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdleEntry")
+            .field("idle_since", &self.idle_since)
+            .field("session", &self.session)
+            .finish()
+    }
+}
 
 /// Authenticated backend socket ready for simple-query relay (reusable).
 pub struct PgTcpSession {
@@ -69,13 +87,20 @@ pub enum SessionReturn {
 #[derive(Debug)]
 pub struct PgTcpIdlePool {
     max_per_key: usize,
-    idle: Mutex<HashMap<String, VecDeque<PgTcpSession>>>,
+    idle_ttl: Duration,
+    idle: Mutex<HashMap<String, VecDeque<IdleEntry>>>,
 }
 
 impl PgTcpIdlePool {
     pub fn new(max_per_key: usize) -> Self {
+        Self::with_ttl(max_per_key, DEFAULT_TCP_IDLE_TTL)
+    }
+
+    pub fn with_ttl(max_per_key: usize, idle_ttl: Duration) -> Self {
         Self {
             max_per_key: max_per_key.max(1),
+            // Zero TTL means "never reuse" (every put is immediately expired).
+            idle_ttl,
             idle: Mutex::new(HashMap::new()),
         }
     }
@@ -103,19 +128,75 @@ impl PgTcpIdlePool {
         self.max_per_key
     }
 
+    pub fn idle_ttl(&self) -> Duration {
+        self.idle_ttl
+    }
+
+    /// Pop the oldest non-expired session for `key`. Expired entries are dropped.
     pub fn take(&self, key: &str) -> Option<PgTcpSession> {
         let mut g = self.idle.lock();
-        g.get_mut(key).and_then(|q| q.pop_front())
+        let q = g.get_mut(key)?;
+        let now = Instant::now();
+        while let Some(entry) = q.pop_front() {
+            if now.duration_since(entry.idle_since) <= self.idle_ttl {
+                if q.is_empty() {
+                    g.remove(key);
+                }
+                return Some(entry.session);
+            }
+            // else: expired — drop and continue
+        }
+        g.remove(key);
+        None
     }
 
     pub fn put(&self, key: String, session: PgTcpSession) {
+        self.put_at(key, session, Instant::now());
+    }
+
+    fn put_at(&self, key: String, session: PgTcpSession, idle_since: Instant) {
         let mut g = self.idle.lock();
+        // Drop expired tails before inserting.
+        if let Some(q) = g.get_mut(&key) {
+            let now = Instant::now();
+            while let Some(front) = q.front() {
+                if now.duration_since(front.idle_since) > self.idle_ttl {
+                    let _ = q.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
         let q = g.entry(key).or_default();
         if q.len() >= self.max_per_key {
-            // Drop oldest overflow (and this new one stays; pop front first).
+            // Drop oldest overflow.
             let _ = q.pop_front();
         }
-        q.push_back(session);
+        q.push_back(IdleEntry {
+            session,
+            idle_since,
+        });
+    }
+
+    /// Test-only: insert with a custom idle_since (no real TCP required if session
+    /// is never used for IO — only for pool bookkeeping tests).
+    #[cfg(test)]
+    fn put_for_test(&self, key: String, session: PgTcpSession, idle_since: Instant) {
+        self.put_at(key, session, idle_since);
+    }
+
+    /// Drop all expired idle sessions across keys (best-effort housekeeping).
+    pub fn purge_expired(&self) -> usize {
+        let mut g = self.idle.lock();
+        let now = Instant::now();
+        let mut dropped = 0usize;
+        g.retain(|_, q| {
+            let before = q.len();
+            q.retain(|e| now.duration_since(e.idle_since) <= self.idle_ttl);
+            dropped += before.saturating_sub(q.len());
+            !q.is_empty()
+        });
+        dropped
     }
 
     pub async fn take_or_connect(
@@ -588,9 +669,58 @@ mod tests {
         let key = PgTcpIdlePool::pool_key(&ep, "db");
         assert_eq!(key, "127.0.0.1:5432|db|u");
         assert!(pool.is_empty());
-        // put without real TCP: we only test map bookkeeping via take on empty.
         assert!(pool.take(&key).is_none());
         assert_eq!(pool.max_per_key(), 2);
+        assert_eq!(pool.idle_ttl(), DEFAULT_TCP_IDLE_TTL);
+    }
+
+    #[test]
+    fn a08_idle_pool_ttl_expires_entries() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            async fn dummy_session() -> PgTcpSession {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let accept = tokio::spawn(async move {
+                    let _ = listener.accept().await;
+                });
+                let stream = TcpStream::connect(addr).await.unwrap();
+                let _ = accept.await;
+                PgTcpSession {
+                    stream,
+                    read_buf: BytesMut::new(),
+                }
+            }
+
+            // Zero TTL: put then take must miss (immediately expired).
+            let pool = PgTcpIdlePool::with_ttl(2, Duration::from_secs(0));
+            pool.put_for_test("k".into(), dummy_session().await, Instant::now());
+            assert!(
+                pool.take("k").is_none(),
+                "zero TTL must not reuse idle sessions"
+            );
+
+            // Non-zero TTL: fresh entry is reusable; aged entry is dropped.
+            let pool2 = PgTcpIdlePool::with_ttl(2, Duration::from_secs(60));
+            pool2.put_for_test("k".into(), dummy_session().await, Instant::now());
+            assert!(pool2.take("k").is_some());
+            assert!(pool2.is_empty());
+
+            let aged = Instant::now() - Duration::from_secs(120);
+            pool2.put_for_test("k".into(), dummy_session().await, aged);
+            assert!(
+                pool2.take("k").is_none(),
+                "entry older than TTL must be discarded"
+            );
+
+            // purge_expired drops without take
+            pool2.put_for_test("k".into(), dummy_session().await, aged);
+            assert_eq!(pool2.purge_expired(), 1);
+            assert!(pool2.is_empty());
+        });
     }
 
     #[test]
@@ -599,6 +729,7 @@ mod tests {
         let _ = SessionReturn::Drop;
         let _ = SessionReturn::Txn(slot);
         let pool = PgTcpIdlePool::with_default_cap();
+        assert_eq!(pool.idle_ttl(), DEFAULT_TCP_IDLE_TTL);
         let _ = SessionReturn::Idle {
             pool,
             key: "k".into(),
