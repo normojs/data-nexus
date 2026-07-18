@@ -142,6 +142,7 @@ examples/        smoke + gateway config 样例
 | H05 | ticket/vault file advisory locks（部分） | feat(h05) |
 | H05 | audit SQLite multi-writer + LocalPdp policy_path（部分） | feat(h05) |
 | H05 | LocalPdp policy_path mtime 轮询热更（部分） | feat(h05) |
+| H05 | vault 文件 AES-GCM 加密 + 密钥恢复 secret（部分 / H08） | feat(h05) |
 
 ---
 
@@ -177,10 +178,10 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
 | **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
-| **H05** | 多实例状态外置 | ticket/vault JSON+lock；审计 SQLite WAL+busy；`policy_path` 快照 + **mtime 轮询**（`policy_poll_ms`） | file vault 无密码；全文件替换非 CRDT；轮询节流默认 1s | **部分** |
+| **H05** | 多实例状态外置 | ticket/vault JSON+lock；审计 SQLite；`policy_path`+mtime；**vault AES-GCM**（`vault_encrypt_key`） | 全文件替换非 CRDT；轮询默认 1s；密钥 64 hex；无密钥仍不落盘密码 | **部分** |
 | **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `223f2c0` → origin/main | **完成** |
 | **H07** | CI 矩阵加深 | PR 已 default；extended / cedar job 可选或 nightly | workflow_dispatch 可选手动 | **可选** |
-| **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | H03 已声明后置 | **延后** |
+| **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | **H05 已交付 AES-GCM 文件信封**（`vault_encrypt_key`）；进程内存仍明文 | **部分→见 H05** |
 
 ### 3.4 P2 — 体验与正确性打磨
 
@@ -209,7 +210,7 @@ examples/        smoke + gateway config 样例
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：非事务 idle pool 复用 + 事务内 `tcp_txn`；COMMIT/ROLLBACK 同 socket；无 SSL |
 | 预处理语句 | A10：PG Bind 保留 `$n` → `QueryParams` → backend `query/execute` 绑定；MySQL 仍 text 改写；binary 结果含 date/ts/time |
-| 多副本 | H05：ticket/vault `file`+lock；审计 SQLite WAL+busy；LocalPdp `policy_path` + mtime 轮询（`policy_poll_ms`，0=关）；file vault 无密码；非 CRDT |
+| 多副本 | H05：ticket/vault file+lock；vault 可选 AES-GCM（可恢复 secret）；审计 SQLite；LocalPdp mtime 轮询；非 CRDT |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
 
@@ -217,24 +218,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> H05 vault 加密 或 A10 Statement 缓存/Streaming QueryParams 或 A08 SSL/idle TTL <<<**
+**>>> A10 Statement 缓存/Streaming QueryParams 或 A08 SSL/idle TTL 或 H05 ticket 加密 <<<**
 
-本轮（A08 非事务 TCP idle pool）：
+本轮（H05/H08 vault 文件加密）：
 
-- `PgTcpIdlePool`：按 `address|db|user` 缓存空闲中继会话（默认每 key 最多 4）
-- 非事务 passthrough：`take_or_connect` → 查询 → 归还 idle
-- 事务仍用 `tcp_txn` 槽；`SessionReturn::{Drop,Txn,Idle}`
+- `security.state.vault_encrypt_key`：64 hex → AES-256-GCM 信封（`DNVAULT1:`）
+- 有密钥：落盘含 backend secret，多实例可 `backend_identity` 恢复
+- 无密钥：保持明文 metadata-only（密码仍不写盘）
 
 ```bash
-cargo test -p runtime_gateway --lib a08_
-./examples/smoke-dual-listener.sh
+cargo test -p gateway_core --lib h05_
+./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **H05 续** — vault 文件加密（H08 对齐）  
-2. **A10 续** — Statement 缓存 / QueryParams Streaming  
-3. **A08 续** — SSL / idle 健康检查与 TTL
+1. **A10 续** — Statement 缓存 / QueryParams Streaming  
+2. **A08 续** — SSL / idle TTL  
+3. **H05 续** — ticket 文件加密
 
 ---
 

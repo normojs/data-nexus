@@ -70,9 +70,16 @@ pub struct SecurityStateConfig {
     #[serde(default)]
     pub ticket_path: String,
     /// Vault lease JSON path when `backend=file` (required).
-    /// Stores public lease fields + projects only — never backend passwords (H03/H08).
+    /// Stores public lease fields + projects; with `vault_encrypt_key` the file is
+    /// AES-GCM sealed and may include backend secrets for multi-instance recovery
+    /// (H05/H08). Without a key, passwords are never written (H03).
     #[serde(default)]
     pub vault_path: String,
+    /// Optional 32-byte vault file encryption key as **64 hex chars** (H05/H08).
+    /// Empty = plaintext JSON metadata only (no backend passwords on disk).
+    /// Prefer injecting via env at deploy; do not commit real keys.
+    #[serde(default)]
+    pub vault_encrypt_key: String,
     /// Optional Local PDP hot-reloadable snapshot path (H05).
     /// When set (typically with `backend=file`), rules/mask/time/watermark are
     /// shared across processes via JSON + advisory lock. Empty = process-local only.
@@ -90,6 +97,7 @@ impl Default for SecurityStateConfig {
             backend: default_state_backend(),
             ticket_path: String::new(),
             vault_path: String::new(),
+            vault_encrypt_key: String::new(),
             policy_path: String::new(),
             policy_poll_ms: default_policy_poll_ms(),
         }
@@ -330,6 +338,23 @@ impl SecurityPolicyConfig {
                 return Err(GatewayError::Configuration(format!(
                     "security.state.backend must be memory or file, got '{other}'"
                 )));
+            }
+        }
+
+        // H05/H08: optional vault file encrypt key must be 64 hex chars (32 bytes).
+        let vek = self.state.vault_encrypt_key.trim();
+        if !vek.is_empty() {
+            if vek.len() != 64 || !vek.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(GatewayError::Configuration(
+                    "security.state.vault_encrypt_key must be empty or 64 hex characters (AES-256 key)"
+                        .into(),
+                ));
+            }
+            if !self.state.backend.trim().eq_ignore_ascii_case("file")
+                && !self.state.backend.trim().is_empty()
+                && !self.state.backend.trim().eq_ignore_ascii_case("memory")
+            {
+                // key only meaningful with file backend; allow memory+key as no-op
             }
         }
 
@@ -762,4 +787,16 @@ mod tests {
         assert!(err.contains("not implemented") || err.contains("H05"), "{err}");
     }
 
+    #[test]
+    fn h05_vault_encrypt_key_validation() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.state.backend = "file".into();
+        cfg.state.ticket_path = "/tmp/t.json".into();
+        cfg.state.vault_path = "/tmp/v.json".into();
+        cfg.state.vault_encrypt_key = "short".into();
+        assert!(cfg.validate().is_err());
+        cfg.state.vault_encrypt_key =
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into();
+        assert_eq!(cfg.validate(), Ok(()));
+    }
 }

@@ -1174,6 +1174,7 @@ impl CoreGatewayRuntimePlan {
         if let Err(e) = gateway_core::install_vault_store(
             &config.security.state.backend,
             &config.security.state.vault_path,
+            &config.security.state.vault_encrypt_key,
         ) {
             tracing::error!(target: "data_nexus::security", error = %e, "install vault store failed");
         }

@@ -4,8 +4,15 @@
 //! SQL path never returns endpoint secrets; it executes through the PEP.
 //!
 //! H03: revoke / renew / prune. Backend passwords stay process-memory only and
-//! are never serialized on public lease JSON.
+//! are never serialized on **public** lease JSON (Admin API).
+//!
+//! H05/H08: optional AES-256-GCM file envelope (`security.state.vault_encrypt_key`)
+//! stores sealed lease metadata **and** backend secrets for multi-instance
+//! recovery. Without a key, file backend remains plaintext metadata only.
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -19,18 +26,28 @@ use fs2::FileExt;
 
 static GLOBAL: OnceLock<Arc<VaultStore>> = OnceLock::new();
 
+/// Magic prefix for encrypted vault files (H05/H08).
+const VAULT_ENC_MAGIC: &str = "DNVAULT1:";
+
 pub fn global_vault_store() -> Arc<VaultStore> {
     GLOBAL
         .get_or_init(|| Arc::new(VaultStore::new()))
         .clone()
 }
 
-/// H05: install / reconfigure vault store. File backend stores **public** lease
-/// metadata + projects only — never backend passwords (H03/H08).
-pub fn install_vault_store(backend: &str, path: &str) -> Result<Arc<VaultStore>, String> {
+/// H05: install / reconfigure vault store.
+///
+/// `encrypt_key_hex`: empty → plaintext file (no passwords on disk); 64 hex chars
+/// → AES-256-GCM sealed file that may restore backend secrets across processes.
+pub fn install_vault_store(
+    backend: &str,
+    path: &str,
+    encrypt_key_hex: &str,
+) -> Result<Arc<VaultStore>, String> {
+    let key = parse_encrypt_key(encrypt_key_hex)?;
     let store = match backend.trim().to_ascii_lowercase().as_str() {
         "memory" | "" => Arc::new(VaultStore::new()),
-        "file" => Arc::new(VaultStore::with_file(PathBuf::from(path))?),
+        "file" => Arc::new(VaultStore::with_file(PathBuf::from(path), key)?),
         other => {
             return Err(format!(
                 "vault store backend '{other}' not supported (use memory or file)"
@@ -43,6 +60,24 @@ pub fn install_vault_store(backend: &str, path: &str) -> Result<Arc<VaultStore>,
     }
     let _ = GLOBAL.set(store.clone());
     Ok(store)
+}
+
+fn parse_encrypt_key(hex: &str) -> Result<Option<[u8; 32]>, String> {
+    let hex = hex.trim();
+    if hex.is_empty() {
+        return Ok(None);
+    }
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(
+            "vault_encrypt_key must be empty or 64 hex characters (32-byte AES key)".into(),
+        );
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("vault_encrypt_key hex parse: {e}"))?;
+    }
+    Ok(Some(out))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,14 +157,33 @@ pub struct VaultStore {
     leases: Mutex<HashMap<String, LeaseRecord>>,
     projects: Mutex<Vec<ProjectEnv>>,
     seq: AtomicU64,
-    /// H05: optional JSON path (lease metadata only; passwords never written).
+    /// H05: optional JSON path.
     path: Mutex<Option<PathBuf>>,
+    /// H05/H08: AES-256 key for sealed file (None = plaintext metadata only).
+    encrypt_key: Mutex<Option<[u8; 32]>>,
+}
+
+/// On-disk lease row when encryption is enabled (includes backend secret).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SealedLeaseRecord {
+    #[serde(flatten)]
+    lease: VaultLease,
+    #[serde(default)]
+    backend_username: String,
+    #[serde(default)]
+    backend_password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct VaultFile {
     projects: Vec<ProjectEnv>,
+    /// Plaintext mode: public leases only.
+    #[serde(default)]
     leases: Vec<VaultLease>,
+    /// Encrypted mode payload uses `sealed_leases` inside ciphertext; kept here
+    /// only for intermediate serde of the cleartext envelope body.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sealed_leases: Vec<SealedLeaseRecord>,
 }
 
 impl VaultStore {
@@ -139,15 +193,17 @@ impl VaultStore {
             projects: Mutex::new(Vec::new()),
             seq: AtomicU64::new(1),
             path: Mutex::new(None),
+            encrypt_key: Mutex::new(None),
         }
     }
 
-    pub fn with_file(path: PathBuf) -> Result<Self, String> {
+    pub fn with_file(path: PathBuf, encrypt_key: Option<[u8; 32]>) -> Result<Self, String> {
         let store = Self {
             leases: Mutex::new(HashMap::new()),
             projects: Mutex::new(Vec::new()),
             seq: AtomicU64::new(1),
             path: Mutex::new(Some(path)),
+            encrypt_key: Mutex::new(encrypt_key),
         };
         store.load_from_disk()?;
         Ok(store)
@@ -157,19 +213,24 @@ impl VaultStore {
         let leases = other.leases.lock().map_err(|e| e.to_string())?;
         let projects = other.projects.lock().map_err(|e| e.to_string())?.clone();
         let path = other.path.lock().map_err(|e| e.to_string())?.clone();
+        let key = *other.encrypt_key.lock().map_err(|e| e.to_string())?;
         let seq = other.seq.load(Ordering::Relaxed);
-        // File-backed reloads do not carry passwords; memory reconfigure keeps passwords
-        // only when other is also memory with records.
         *self.leases.lock().map_err(|e| e.to_string())? = leases
             .iter()
-            .map(|(k, v)| (k.clone(), LeaseRecord {
-                lease: v.lease.clone(),
-                backend_password: v.backend_password.clone(),
-                backend_username: v.backend_username.clone(),
-            }))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    LeaseRecord {
+                        lease: v.lease.clone(),
+                        backend_password: v.backend_password.clone(),
+                        backend_username: v.backend_username.clone(),
+                    },
+                )
+            })
             .collect();
         *self.projects.lock().map_err(|e| e.to_string())? = projects;
         *self.path.lock().map_err(|e| e.to_string())? = path;
+        *self.encrypt_key.lock().map_err(|e| e.to_string())? = key;
         self.seq.store(seq, Ordering::Relaxed);
         Ok(())
     }
@@ -183,11 +244,7 @@ impl VaultStore {
         if !path.exists() {
             let lock = open_state_lock(&path)?;
             lock.lock_exclusive().map_err(|e| e.to_string())?;
-            self.write_file_locked(
-                &path,
-                &[],
-                &HashMap::new(),
-            )?;
+            self.write_file_locked(&path, &[], &HashMap::new())?;
             let _ = lock.unlock();
             return Ok(());
         }
@@ -200,22 +257,50 @@ impl VaultStore {
         if raw.trim().is_empty() {
             return Ok(());
         }
-        let file: VaultFile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let key = *self.encrypt_key.lock().map_err(|e| e.to_string())?;
+        let file = decode_vault_file(&raw, key.as_ref())?;
         *self.projects.lock().map_err(|e| e.to_string())? = file.projects;
         let mut map = HashMap::new();
         let mut max_seq = 1u64;
-        for lease in file.leases {
-            if let Some(n) = lease.lease_id.rsplit('-').next().and_then(|s| s.parse::<u64>().ok()) {
-                max_seq = max_seq.max(n + 1);
+        if key.is_some() && !file.sealed_leases.is_empty() {
+            for rec in file.sealed_leases {
+                if let Some(n) = rec
+                    .lease
+                    .lease_id
+                    .rsplit('-')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    max_seq = max_seq.max(n + 1);
+                }
+                map.insert(
+                    rec.lease.lease_id.clone(),
+                    LeaseRecord {
+                        lease: rec.lease,
+                        backend_password: rec.backend_password,
+                        backend_username: rec.backend_username,
+                    },
+                );
             }
-            map.insert(
-                lease.lease_id.clone(),
-                LeaseRecord {
-                    lease,
-                    backend_password: String::new(),
-                    backend_username: String::new(),
-                },
-            );
+        } else {
+            for lease in file.leases {
+                if let Some(n) = lease
+                    .lease_id
+                    .rsplit('-')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    max_seq = max_seq.max(n + 1);
+                }
+                map.insert(
+                    lease.lease_id.clone(),
+                    LeaseRecord {
+                        lease,
+                        backend_password: String::new(),
+                        backend_username: String::new(),
+                    },
+                );
+            }
         }
         self.seq.store(max_seq, Ordering::Relaxed);
         *self.leases.lock().map_err(|e| e.to_string())? = map;
@@ -243,14 +328,36 @@ impl VaultStore {
         projects: &[ProjectEnv],
         leases_map: &HashMap<String, LeaseRecord>,
     ) -> Result<(), String> {
-        let mut leases: Vec<VaultLease> = leases_map.values().map(|r| r.lease.clone()).collect();
-        leases.sort_by(|a, b| b.issued_at_unix_ms.cmp(&a.issued_at_unix_ms));
-        let file = VaultFile {
-            projects: projects.to_vec(),
-            leases,
+        let key = *self.encrypt_key.lock().map_err(|e| e.to_string())?;
+        let data = if let Some(key) = key {
+            let mut sealed: Vec<SealedLeaseRecord> = leases_map
+                .values()
+                .map(|r| SealedLeaseRecord {
+                    lease: r.lease.clone(),
+                    backend_username: r.backend_username.clone(),
+                    backend_password: r.backend_password.clone(),
+                })
+                .collect();
+            sealed.sort_by(|a, b| b.lease.issued_at_unix_ms.cmp(&a.lease.issued_at_unix_ms));
+            let body = VaultFile {
+                projects: projects.to_vec(),
+                leases: Vec::new(),
+                sealed_leases: sealed,
+            };
+            let plain = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+            encrypt_vault_blob(&key, &plain)?
+        } else {
+            let mut leases: Vec<VaultLease> =
+                leases_map.values().map(|r| r.lease.clone()).collect();
+            leases.sort_by(|a, b| b.issued_at_unix_ms.cmp(&a.issued_at_unix_ms));
+            let file = VaultFile {
+                projects: projects.to_vec(),
+                leases,
+                sealed_leases: Vec::new(),
+            };
+            serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?
         };
         let tmp = path.with_extension("json.tmp");
-        let data = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
         fs::write(&tmp, data).map_err(|e| e.to_string())?;
         fs::rename(&tmp, path).map_err(|e| e.to_string())?;
         Ok(())
@@ -438,7 +545,7 @@ impl VaultStore {
         if !Self::is_active(&rec.lease, now) {
             return None;
         }
-        // H05 file reload never restores passwords; treat empty as unavailable.
+        // H05 file reload without encrypt key never restores passwords; empty = unavailable.
         if rec.backend_password.is_empty() {
             return None;
         }
@@ -463,7 +570,6 @@ fn simple_nonce(seed: u64) -> u64 {
     seed.wrapping_mul(0x9e3779b97f4a7c15) ^ 0xdeadbeef
 }
 
-
 fn open_state_lock(path: &std::path::Path) -> Result<File, String> {
     let lock_path = path.with_extension("json.lock");
     OpenOptions::new()
@@ -472,6 +578,64 @@ fn open_state_lock(path: &std::path::Path) -> Result<File, String> {
         .write(true)
         .open(lock_path)
         .map_err(|e| e.to_string())
+}
+
+fn decode_vault_file(raw: &str, key: Option<&[u8; 32]>) -> Result<VaultFile, String> {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix(VAULT_ENC_MAGIC) {
+        let key = key.ok_or_else(|| {
+            "vault file is encrypted but security.state.vault_encrypt_key is not set".to_string()
+        })?;
+        let plain = decrypt_vault_blob(key, rest)?;
+        serde_json::from_slice(&plain).map_err(|e| e.to_string())
+    } else {
+        // Plaintext JSON (legacy / no key).
+        serde_json::from_str(raw).map_err(|e| e.to_string())
+    }
+}
+
+fn encrypt_vault_blob(key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
+    // 96-bit nonce from time + simple mix (not CSPRNG; adequate for low-rate vault writes).
+    let mut nonce_bytes = [0u8; 12];
+    let t = now_ms().to_le_bytes();
+    nonce_bytes[..8].copy_from_slice(&t);
+    let mix = simple_nonce(now_ms()).to_le_bytes();
+    nonce_bytes[8..].copy_from_slice(&mix[..4]);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(nonce, plain)
+        .map_err(|e| format!("vault encrypt: {e}"))?;
+    let mut out = Vec::with_capacity(VAULT_ENC_MAGIC.len() + 16 + ct.len());
+    out.extend_from_slice(VAULT_ENC_MAGIC.as_bytes());
+    out.extend_from_slice(B64.encode(nonce_bytes).as_bytes());
+    out.push(b':');
+    out.extend_from_slice(B64.encode(ct).as_bytes());
+    Ok(out)
+}
+
+fn decrypt_vault_blob(key: &[u8; 32], body: &str) -> Result<Vec<u8>, String> {
+    // body = base64(nonce):base64(ciphertext)
+    let (n_b64, c_b64) = body
+        .split_once(':')
+        .ok_or_else(|| "vault ciphertext missing nonce separator".to_string())?;
+    let nonce_bytes = B64
+        .decode(n_b64.trim())
+        .map_err(|e| format!("vault nonce b64: {e}"))?;
+    if nonce_bytes.len() != 12 {
+        return Err(format!(
+            "vault nonce must be 12 bytes, got {}",
+            nonce_bytes.len()
+        ));
+    }
+    let ct = B64
+        .decode(c_b64.trim())
+        .map_err(|e| format!("vault ciphertext b64: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    cipher
+        .decrypt(nonce, ct.as_ref())
+        .map_err(|e| format!("vault decrypt failed (wrong key?): {e}"))
 }
 
 #[cfg(test)]
@@ -552,7 +716,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dn-h05-vault-{}", now_ms()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("vault.json");
-        let store = VaultStore::with_file(path.clone()).unwrap();
+        let store = VaultStore::with_file(path.clone(), None).unwrap();
         store.set_projects(vec![ProjectEnv {
             name: "p".into(),
             environment: "dev".into(),
@@ -576,12 +740,58 @@ mod tests {
         );
         assert!(store.backend_identity(&lease.lease_id).is_some());
         drop(store);
-        let store2 = VaultStore::with_file(path).unwrap();
+        let store2 = VaultStore::with_file(path.clone(), None).unwrap();
         let got = store2.get_lease(&lease.lease_id).expect("lease meta");
         assert_eq!(got.service, "orders");
-        // Password must not survive file reload.
+        // Password must not survive plaintext file reload.
         assert!(store2.backend_identity(&lease.lease_id).is_none());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("s3cret"));
+        assert!(!raw.starts_with(VAULT_ENC_MAGIC));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn h05_vault_encrypted_file_restores_passwords() {
+        let dir = std::env::temp_dir().join(format!("dn-h05-vault-enc-{}", now_ms()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("vault.json");
+        let key_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let key = parse_encrypt_key(key_hex).unwrap();
+        let store = VaultStore::with_file(path.clone(), key).unwrap();
+        let lease = issue(&store);
+        assert!(store.backend_identity(&lease.lease_id).is_some());
+        drop(store);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with(VAULT_ENC_MAGIC), "expected sealed file");
+        assert!(!raw.contains("secret-pass"));
+
+        let store2 = VaultStore::with_file(path.clone(), key).unwrap();
+        let id = store2
+            .backend_identity(&lease.lease_id)
+            .expect("restored secret");
+        assert_eq!(id.0, "root");
+        assert_eq!(id.1, "secret-pass");
+
+        // Wrong / missing key must not silently load secrets.
+        assert!(VaultStore::with_file(path.clone(), None).is_err());
+        let bad = parse_encrypt_key(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .unwrap();
+        assert!(VaultStore::with_file(path, bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn h05_vault_encrypt_key_hex_parse() {
+        assert!(parse_encrypt_key("").unwrap().is_none());
+        assert!(parse_encrypt_key("dead").is_err());
+        assert!(parse_encrypt_key(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        )
+        .unwrap()
+        .is_some());
+    }
 }

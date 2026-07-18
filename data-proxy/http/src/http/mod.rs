@@ -2215,6 +2215,7 @@ impl AxumServer {
             if let Err(e) = gateway_core::install_vault_store(
                 &next_config.gateway.security.state.backend,
                 &next_config.gateway.security.state.vault_path,
+                &next_config.gateway.security.state.vault_encrypt_key,
             ) {
                 tracing::error!(target: "data_nexus::security", error = %e, "reload vault store failed");
             }
