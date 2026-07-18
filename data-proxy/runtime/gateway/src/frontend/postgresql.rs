@@ -25,12 +25,13 @@ pub struct PostgreSqlFrontendProtocol {
     prepared: HashMap<String, String>,
     /// A10: statement name → parameter count (from `$n` in query).
     prepared_params: HashMap<String, u16>,
-    /// A10: portals (Bind) → bound SQL ready for Query rewrite.
+    /// A10: portals (Bind) → SQL with `$n` still present (bound params separate).
     portals: HashMap<String, String>,
+    /// A10: portal → bound parameters (text values as GatewayValue).
+    portal_args: HashMap<String, Vec<GatewayValue>>,
     /// A10: portal → parameter count for Describe('P').
     portal_params: HashMap<String, u16>,
     /// A10: portal → result format codes from Bind (0=text, 1=binary).
-    /// Empty / all-zero → text; single `[1]` or any `1` → prefer binary results.
     portal_result_formats: HashMap<String, Vec<i16>>,
 }
 
@@ -43,6 +44,7 @@ impl PostgreSqlFrontendProtocol {
             prepared: HashMap::new(),
             prepared_params: HashMap::new(),
             portals: HashMap::new(),
+            portal_args: HashMap::new(),
             portal_params: HashMap::new(),
             portal_result_formats: HashMap::new(),
         }
@@ -56,6 +58,7 @@ impl PostgreSqlFrontendProtocol {
             prepared: HashMap::new(),
             prepared_params: HashMap::new(),
             portals: HashMap::new(),
+            portal_args: HashMap::new(),
             portal_params: HashMap::new(),
             portal_result_formats: HashMap::new(),
         }
@@ -157,8 +160,11 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                         Some(s) => GatewayValue::String(s),
                     })
                     .collect();
-                let bound = bind_pg_text_params(&sql, &params)?;
-                self.portals.insert(portal.clone(), bound);
+                // Validate arity against $n placeholders (still fail-closed).
+                let _ = bind_pg_text_params(&sql, &params)?;
+                // Keep SQL with $n; backend binds via prepared protocol (A10).
+                self.portals.insert(portal.clone(), sql);
+                self.portal_args.insert(portal.clone(), params);
                 self.portal_params.insert(portal.clone(), nparams);
                 self.portal_result_formats
                     .insert(portal, result_formats);
@@ -192,6 +198,11 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                         "postgresql Execute: unknown portal '{portal}'"
                     ))
                 })?;
+                let parameters = self
+                    .portal_args
+                    .get(&portal)
+                    .cloned()
+                    .unwrap_or_default();
                 // A10: honor Bind result_formats — any binary (1) requests binary rows.
                 let want_binary = self
                     .portal_result_formats
@@ -199,7 +210,11 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     .map(|fmts| fmts.iter().any(|f| *f == 1))
                     .unwrap_or(false);
                 session.prefer_binary_result = want_binary;
-                Ok(vec![GatewayCommand::Query { sql }])
+                if parameters.is_empty() {
+                    Ok(vec![GatewayCommand::Query { sql }])
+                } else {
+                    Ok(vec![GatewayCommand::QueryParams { sql, parameters }])
+                }
             }
             FrontendMessage::Close { target, name } => {
                 if target == b'S' {
@@ -207,6 +222,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     self.prepared_params.remove(&name);
                 } else {
                     self.portals.remove(&name);
+                    self.portal_args.remove(&name);
                     self.portal_params.remove(&name);
                     self.portal_result_formats.remove(&name);
                 }
@@ -1181,6 +1197,55 @@ mod tests {
         let cmds = protocol.decode(&exec, &mut session).unwrap();
         assert!(matches!(cmds[0], GatewayCommand::Query { .. }));
         assert!(session.prefer_binary_result);
+    }
+
+    #[test]
+    fn a10_bind_params_execute_emits_query_params() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let mut session = SessionState::default();
+
+        // Parse s1 / SELECT $1
+        let mut body = Vec::new();
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(b"SELECT $1\0");
+        body.extend_from_slice(&0i16.to_be_bytes());
+        let mut parse = vec![b'P'];
+        let len = (body.len() + 4) as i32;
+        parse.extend_from_slice(&len.to_be_bytes());
+        parse.extend_from_slice(&body);
+        protocol.decode(&parse, &mut session).unwrap();
+
+        // Bind portal p1 with one text param "42"
+        let mut bbody = Vec::new();
+        bbody.extend_from_slice(b"p1\0");
+        bbody.extend_from_slice(b"s1\0");
+        bbody.extend_from_slice(&0i16.to_be_bytes()); // param formats
+        bbody.extend_from_slice(&1i16.to_be_bytes()); // nparams
+        bbody.extend_from_slice(&2i32.to_be_bytes()); // len
+        bbody.extend_from_slice(b"42");
+        bbody.extend_from_slice(&0i16.to_be_bytes()); // nresult_formats
+        let mut bind = vec![b'B'];
+        let blen = (bbody.len() + 4) as i32;
+        bind.extend_from_slice(&blen.to_be_bytes());
+        bind.extend_from_slice(&bbody);
+        protocol.decode(&bind, &mut session).unwrap();
+
+        let mut ebody = Vec::new();
+        ebody.extend_from_slice(b"p1\0");
+        ebody.extend_from_slice(&0i32.to_be_bytes());
+        let mut exec = vec![b'E'];
+        let elen = (ebody.len() + 4) as i32;
+        exec.extend_from_slice(&elen.to_be_bytes());
+        exec.extend_from_slice(&ebody);
+        let cmds = protocol.decode(&exec, &mut session).unwrap();
+        match &cmds[0] {
+            GatewayCommand::QueryParams { sql, parameters } => {
+                assert_eq!(sql, "SELECT $1");
+                assert_eq!(parameters.len(), 1);
+                assert_eq!(parameters[0], GatewayValue::String("42".into()));
+            }
+            other => panic!("expected QueryParams, got {other:?}"),
+        }
     }
 
     #[test]

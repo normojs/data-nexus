@@ -594,6 +594,12 @@ impl BackendConnector for MySqlBackendConnector {
                 let endpoint = self.select_endpoint(session)?;
                 self.execute_simple_query(endpoint, &sql, session, mode).await
             }
+            // A10: parameterized query — MySQL still rewrites to text (no native bind path yet).
+            GatewayCommand::QueryParams { sql, parameters } => {
+                let sql = bind_mysql_placeholders(&sql, &parameters)?;
+                let endpoint = self.select_endpoint(session)?;
+                self.execute_simple_query(endpoint, &sql, session, mode).await
+            }
             // A10: gateway-owned prepared registry; Execute rewrites to text Query.
             GatewayCommand::Prepare { sql } => {
                 let (statement_id, parameter_count) = self.prepared.prepare(sql);

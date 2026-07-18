@@ -672,7 +672,9 @@ impl LocalPdp {
                     SecurityDecision::allow_empty()
                 }
             }
-            GatewayCommand::Query { sql } | GatewayCommand::Prepare { sql } => {
+            GatewayCommand::Query { sql }
+            | GatewayCommand::QueryParams { sql, .. }
+            | GatewayCommand::Prepare { sql } => {
                 if let Some(set) = objects {
                     if set.parse_failed && set.objects.is_empty() && __p.fail_closed {
                         return SecurityDecision::Deny {
@@ -1899,7 +1901,9 @@ fn select_item_bare_name(item: &str) -> String {
 /// Helper for tests / callers using CommandSummary.
 pub fn sql_from_command(command: &GatewayCommand) -> Option<&str> {
     match command {
-        GatewayCommand::Query { sql } | GatewayCommand::Prepare { sql } => Some(sql.as_str()),
+        GatewayCommand::Query { sql }
+        | GatewayCommand::QueryParams { sql, .. }
+        | GatewayCommand::Prepare { sql } => Some(sql.as_str()),
         _ => None,
     }
 }
@@ -1909,7 +1913,9 @@ pub fn action_from_command(command: &GatewayCommand, dialect: &dyn DialectParser
         GatewayCommand::Begin | GatewayCommand::Commit | GatewayCommand::Rollback => {
             StatementAction::Tcl
         }
-        GatewayCommand::Query { sql } | GatewayCommand::Prepare { sql } => dialect
+        GatewayCommand::Query { sql }
+        | GatewayCommand::QueryParams { sql, .. }
+        | GatewayCommand::Prepare { sql } => dialect
             .leading_keyword(sql)
             .map(|k| StatementAction::from_keyword(&k))
             .unwrap_or(StatementAction::Other),

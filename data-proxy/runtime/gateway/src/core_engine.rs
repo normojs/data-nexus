@@ -417,7 +417,9 @@ impl CoreGatewayConnection {
             let mut command = command;
             // F32: capture SQL (+ tables) for audit payload before rewrite/execute.
             let (audit_sql, audit_tables) = match &command {
-                GatewayCommand::Query { sql } | GatewayCommand::Prepare { sql } => {
+                GatewayCommand::Query { sql }
+                | GatewayCommand::QueryParams { sql, .. }
+                | GatewayCommand::Prepare { sql } => {
                     let set = crate::object_extract::extract_object_set(
                         sql,
                         self.frontend.protocol().as_str(),
@@ -438,7 +440,9 @@ impl CoreGatewayConnection {
                     self.session.database.as_deref(),
                 );
                 let objects = match &command {
-                    GatewayCommand::Query { sql } | GatewayCommand::Prepare { sql } => {
+                    GatewayCommand::Query { sql }
+                    | GatewayCommand::QueryParams { sql, .. }
+                    | GatewayCommand::Prepare { sql } => {
                         let set = crate::object_extract::extract_object_set(
                             sql,
                             self.frontend.protocol().as_str(),
@@ -482,6 +486,7 @@ impl CoreGatewayConnection {
                         pending_obligations = obligations;
                         match &mut command {
                             GatewayCommand::Query { sql: original }
+                            | GatewayCommand::QueryParams { sql: original, .. }
                             | GatewayCommand::Prepare { sql: original } => {
                                 *original = sql;
                             }
@@ -648,6 +653,7 @@ impl CoreGatewayConnection {
                 && !has_result_obl
                 && matches!(command, GatewayCommand::Query { .. })
                 && self.translation_policy.is_none();
+            // QueryParams uses bound prepare path (not TCP wire passthrough).
             // A4: cross-protocol never uses wire passthrough; force Streaming so
             // backend max_rows/window apply and encode path is windowed.
             let exec_mode = if want_passthrough {
@@ -1076,6 +1082,7 @@ fn protocol_metric_name(protocol: &ProtocolKind) -> &'static str {
 fn command_metric_type(command: &GatewayCommand) -> &'static str {
     match command {
         GatewayCommand::Query { .. } => "QUERY",
+        GatewayCommand::QueryParams { .. } => "QUERY_PARAMS",
         GatewayCommand::Prepare { .. } => "PREPARE",
         GatewayCommand::Execute { .. } => "EXECUTE",
         GatewayCommand::CloseStatement { .. } => "CLOSE",
@@ -1731,6 +1738,9 @@ fn command_target_role(
 
     match command {
         GatewayCommand::Query { sql } if dialect.is_read_only(sql) => RouteTargetRole::Read,
+        GatewayCommand::QueryParams { sql, .. } if dialect.is_read_only(sql) => {
+            RouteTargetRole::Read
+        }
         _ => RouteTargetRole::ReadWrite,
     }
 }

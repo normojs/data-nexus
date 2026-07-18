@@ -100,6 +100,18 @@ pub fn prepare_cross_protocol_command(
             )?;
             Ok(GatewayCommand::Query { sql: rewritten })
         }
+        GatewayCommand::QueryParams { sql, parameters } => {
+            check_translation_sql(policy, &sql, dialect)?;
+            let rewritten = rewrite_sql_for_backend(
+                &sql,
+                &policy.frontend_protocol,
+                &policy.backend_protocol,
+            )?;
+            Ok(GatewayCommand::QueryParams {
+                sql: rewritten,
+                parameters,
+            })
+        }
         GatewayCommand::UseDatabase { .. }
         | GatewayCommand::Begin
         | GatewayCommand::Commit

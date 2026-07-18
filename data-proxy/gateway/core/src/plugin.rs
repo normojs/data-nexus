@@ -7,6 +7,7 @@ use crate::{GatewayCommand, ProtocolKind, RoutePlan};
 #[serde(rename_all = "snake_case", tag = "type", content = "payload")]
 pub enum CommandSummary {
     Query { sql: String },
+    QueryParams { sql: String },
     Prepare { sql: String },
     Execute { statement_id: String },
     CloseStatement { statement_id: String },
@@ -23,6 +24,7 @@ impl CommandSummary {
     pub fn from_command(command: &GatewayCommand) -> Self {
         match command {
             GatewayCommand::Query { sql } => Self::Query { sql: sql.clone() },
+            GatewayCommand::QueryParams { sql, .. } => Self::QueryParams { sql: sql.clone() },
             GatewayCommand::Prepare { sql } => Self::Prepare { sql: sql.clone() },
             GatewayCommand::Execute { statement_id, .. } => {
                 Self::Execute { statement_id: statement_id.clone() }
@@ -45,7 +47,7 @@ impl CommandSummary {
     /// Text used by regex-based governance plugins (SQL body when available).
     pub fn match_text(&self) -> &str {
         match self {
-            Self::Query { sql } | Self::Prepare { sql } => sql.as_str(),
+            Self::Query { sql } | Self::QueryParams { sql } | Self::Prepare { sql } => sql.as_str(),
             Self::Execute { statement_id } | Self::CloseStatement { statement_id } => {
                 statement_id.as_str()
             }
@@ -62,6 +64,10 @@ impl CommandSummary {
     pub fn rewritten_sql(&self, sql: String) -> Option<GatewayCommand> {
         match self {
             Self::Query { .. } => Some(GatewayCommand::Query { sql }),
+            Self::QueryParams { .. } => Some(GatewayCommand::QueryParams {
+                sql,
+                parameters: vec![],
+            }),
             Self::Prepare { .. } => Some(GatewayCommand::Prepare { sql }),
             _ => None,
         }

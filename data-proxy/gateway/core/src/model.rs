@@ -144,6 +144,12 @@ pub struct Column {
 #[serde(rename_all = "snake_case", tag = "type", content = "payload")]
 pub enum GatewayCommand {
     Query { sql: String },
+    /// A10: parameterized simple/extended query — SQL keeps `$n` placeholders;
+    /// backend binds via prepared protocol (no string rewrite).
+    QueryParams {
+        sql: String,
+        parameters: Vec<GatewayValue>,
+    },
     Prepare { sql: String },
     Execute { statement_id: String, parameters: Vec<GatewayValue> },
     CloseStatement { statement_id: String },

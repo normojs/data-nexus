@@ -20,7 +20,7 @@ use postgresql_protocol::{
     encode_command_complete, encode_data_row, encode_ready_for_query, encode_row_description,
     FieldDescription, TransactionStatus,
 };
-use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+use tokio_postgres::{types::ToSql, Client, NoTls, Row, SimpleQueryMessage};
 use tracing::error;
 
 use super::pg_tcp_relay::{new_tcp_txn_slot, PgTcpSession, PgTcpTxnSlot};
@@ -327,6 +327,98 @@ impl PostgreSqlBackendConnector {
         Ok(ExecuteOutcome::WireRelay(WireRelay {
             stream: Box::new(stream),
         }))
+    }
+
+    /// A10: execute SQL with `$n` parameters via tokio-postgres prepare/bind
+    /// (no string rewrite). Uses pool lease (including in-transaction).
+    async fn execute_param_query(
+        &self,
+        endpoint: EndpointConfig,
+        sql: &str,
+        parameters: &[GatewayValue],
+        session: &SessionState,
+        mode: ExecuteMode,
+    ) -> GatewayResult<GatewayResponse> {
+        let need = count_pg_placeholders(sql) as usize;
+        if need != parameters.len() {
+            return Err(GatewayError::Protocol(format!(
+                "postgresql prepared Execute expects {need} parameters, got {}",
+                parameters.len()
+            )));
+        }
+        if parameters.is_empty() {
+            if matches!(mode, ExecuteMode::Passthrough) {
+                return self.execute_simple_query_wire(endpoint, sql, session).await;
+            }
+            return self
+                .execute_simple_query(endpoint, sql, session, mode)
+                .await;
+        }
+
+        let in_txn = session.transaction_state == TransactionState::Active
+            || self.txn_lease.lock().is_some();
+        let conn = if in_txn {
+            let need_begin = self.txn_lease.lock().is_none();
+            let conn = self.take_or_acquire_lease(&endpoint, session).await?;
+            if need_begin {
+                let begin =
+                    Self::execute_on_conn(&conn, "BEGIN", ExecuteMode::Materialized).await?;
+                if !matches!(begin, GatewayResponse::Ok { .. }) {
+                    self.store_lease(conn);
+                    return Ok(begin);
+                }
+            }
+            conn
+        } else {
+            self.acquire_conn(&endpoint, session).await?
+        };
+
+        let result = Self::execute_param_on_conn(&conn, sql, parameters, mode).await;
+        if in_txn {
+            self.store_lease(conn);
+        }
+        result
+    }
+
+    async fn execute_param_on_conn(
+        conn: &PoolConn<PostgreSqlBackendConnection>,
+        sql: &str,
+        parameters: &[GatewayValue],
+        mode: ExecuteMode,
+    ) -> GatewayResult<GatewayResponse> {
+        let client = conn.client.as_ref().ok_or_else(|| {
+            GatewayError::Backend("postgresql backend connection is not open".into())
+        })?;
+        let text_params: Vec<Option<String>> = parameters
+            .iter()
+            .map(gateway_value_to_pg_param_text)
+            .collect();
+        let to_sql: Vec<&(dyn ToSql + Sync)> = text_params
+            .iter()
+            .map(|p| p as &(dyn ToSql + Sync))
+            .collect();
+
+        match client.query(sql, to_sql.as_slice()).await {
+            Ok(rows) => rows_to_gateway_response(rows, mode),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("does not return rows")
+                    || msg.contains("no field")
+                    || msg.contains("statement that returns")
+                {
+                    let n = client
+                        .execute(sql, to_sql.as_slice())
+                        .await
+                        .map_err(postgresql_backend_error)?;
+                    Ok(GatewayResponse::Ok {
+                        affected_rows: n,
+                        last_insert_id: None,
+                    })
+                } else {
+                    Err(postgresql_backend_error(e))
+                }
+            }
+        }
     }
 
     /// A08: take or open TCP session for transaction passthrough.
@@ -667,7 +759,13 @@ impl BackendConnector for PostgreSqlBackendConnector {
                     self.execute_simple_query(endpoint, &sql, session, mode).await
                 }
             }
-            // A10: gateway-owned prepared registry; Execute rewrites to text Query.
+            // A10: parameterized query — keep $n, bind via prepare (no string rewrite).
+            GatewayCommand::QueryParams { sql, parameters } => {
+                let endpoint = self.select_endpoint(session)?;
+                self.execute_param_query(endpoint, &sql, &parameters, session, mode)
+                    .await
+            }
+            // A10: gateway-owned prepared registry; Execute uses param bind path.
             GatewayCommand::Prepare { sql } => {
                 let (statement_id, parameter_count) = self.prepared.prepare(sql);
                 Ok(GatewayResponse::Prepared {
@@ -684,14 +782,17 @@ impl BackendConnector for PostgreSqlBackendConnector {
                         "unknown postgresql prepared statement id '{statement_id}'"
                     ))
                 })?;
-                let sql = bind_pg_placeholders(&sql, &parameters)?;
-                let endpoint = self.select_endpoint(session)?;
-                if matches!(mode, ExecuteMode::Passthrough) {
-                    return self
-                        .execute_simple_query_wire(endpoint, &sql, session)
-                        .await;
+                // Validate arity before endpoint selection (unit tests use empty connector).
+                let need = count_pg_placeholders(&sql) as usize;
+                if need != parameters.len() {
+                    return Err(GatewayError::Protocol(format!(
+                        "postgresql prepared Execute expects {need} parameters, got {}",
+                        parameters.len()
+                    )));
                 }
-                self.execute_simple_query(endpoint, &sql, session, mode).await
+                let endpoint = self.select_endpoint(session)?;
+                self.execute_param_query(endpoint, &sql, &parameters, session, mode)
+                    .await
             }
             GatewayCommand::CloseStatement { statement_id } => {
                 let _ = self.prepared.close(&statement_id);
@@ -1016,6 +1117,78 @@ fn simple_query_row_to_gateway_values(row: &tokio_postgres::SimpleQueryRow) -> V
                 .unwrap_or(GatewayValue::Null)
         })
         .collect()
+}
+
+/// A10: bind params as text (frontend Bind is text-format).
+fn gateway_value_to_pg_param_text(v: &GatewayValue) -> Option<String> {
+    match v {
+        GatewayValue::Null => None,
+        GatewayValue::Boolean(b) => Some(if *b { "t".into() } else { "f".into() }),
+        GatewayValue::Integer(i) => Some(i.to_string()),
+        GatewayValue::UnsignedInteger(u) => Some(u.to_string()),
+        GatewayValue::Float(f) => Some(f.to_string()),
+        GatewayValue::Decimal(s) | GatewayValue::String(s) => Some(s.clone()),
+        GatewayValue::Bytes(b) => {
+            // Hex escape for bytea text input.
+            let mut hex = String::with_capacity(2 + b.len() * 2);
+            hex.push_str("\\x");
+            for byte in b {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            Some(hex)
+        }
+    }
+}
+
+fn rows_to_gateway_response(
+    rows: Vec<Row>,
+    mode: ExecuteMode,
+) -> GatewayResult<GatewayResponse> {
+    if rows.is_empty() {
+        // Could be empty SELECT or mis-routed DML; treat as empty ResultSet with no columns.
+        return Ok(GatewayResponse::ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        });
+    }
+    let columns: Vec<GatewayColumn> = rows[0]
+        .columns()
+        .iter()
+        .map(|c| GatewayColumn {
+            name: c.name().to_string(),
+            // Type name for frontend binary encode path.
+            data_type: c.type_().name().to_string(),
+        })
+        .collect();
+    let max_rows = mode.effective_max_rows();
+    let mut out = Vec::new();
+    for row in rows {
+        if let Some(max) = max_rows {
+            if out.len() as u64 >= max {
+                break;
+            }
+        }
+        out.push(typed_row_to_gateway_values(&row)?);
+    }
+    Ok(GatewayResponse::ResultSet {
+        columns,
+        rows: out,
+    })
+}
+
+fn typed_row_to_gateway_values(row: &Row) -> GatewayResult<Vec<GatewayValue>> {
+    let mut values = Vec::with_capacity(row.len());
+    for i in 0..row.len() {
+        // Prefer text representation for all types (stable, works with our binary encode).
+        let v: Option<String> = row.try_get(i).map_err(|e| {
+            GatewayError::Backend(format!("postgresql row get col {i}: {e}"))
+        })?;
+        values.push(match v {
+            None => GatewayValue::Null,
+            Some(s) => GatewayValue::String(s),
+        });
+    }
+    Ok(values)
 }
 
 fn simple_query_messages_to_gateway_response(
@@ -1496,6 +1669,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sql, "SELECT 'x' WHERE id=3");
+    }
+
+    #[test]
+    fn a10_param_text_and_empty_rows_response() {
+        assert_eq!(
+            gateway_value_to_pg_param_text(&GatewayValue::Null),
+            None
+        );
+        assert_eq!(
+            gateway_value_to_pg_param_text(&GatewayValue::Boolean(true)).as_deref(),
+            Some("t")
+        );
+        assert_eq!(
+            gateway_value_to_pg_param_text(&GatewayValue::Integer(7)).as_deref(),
+            Some("7")
+        );
+        let empty = rows_to_gateway_response(vec![], ExecuteMode::Materialized).unwrap();
+        match empty {
+            GatewayResponse::ResultSet { columns, rows } => {
+                assert!(columns.is_empty());
+                assert!(rows.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
