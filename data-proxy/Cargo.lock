@@ -1776,6 +1776,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fuchsia-cprng"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1890,6 +1900,7 @@ dependencies = [
  "async-trait",
  "cedar-policy",
  "chrono",
+ "fs2",
  "opendal",
  "rusqlite",
  "serde",
@@ -4700,6 +4711,7 @@ dependencies = [
  "conn_pool",
  "endpoint",
  "error",
+ "fallible-iterator 0.2.0",
  "futures",
  "gateway_core",
  "indexmap 1.9.3",
@@ -4714,6 +4726,7 @@ dependencies = [
  "opentelemetry",
  "parking_lot 0.12.3",
  "plugin",
+ "postgres-protocol",
  "postgresql_protocol",
  "prometheus",
  "proxy",

@@ -8,11 +8,14 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use fs2::FileExt;
 
 static GLOBAL: OnceLock<Arc<VaultStore>> = OnceLock::new();
 
@@ -174,14 +177,26 @@ impl VaultStore {
     fn load_from_disk(&self) -> Result<(), String> {
         let path = self.path.lock().map_err(|e| e.to_string())?.clone();
         let Some(path) = path else { return Ok(()) };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         if !path.exists() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            self.persist()?;
+            let lock = open_state_lock(&path)?;
+            lock.lock_exclusive().map_err(|e| e.to_string())?;
+            self.write_file_locked(
+                &path,
+                &[],
+                &HashMap::new(),
+            )?;
+            let _ = lock.unlock();
             return Ok(());
         }
-        let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let lock = open_state_lock(&path)?;
+        lock.lock_shared().map_err(|e| e.to_string())?;
+        let mut f = File::open(&path).map_err(|e| e.to_string())?;
+        let mut raw = String::new();
+        f.read_to_string(&mut raw).map_err(|e| e.to_string())?;
+        let _ = lock.unlock();
         if raw.trim().is_empty() {
             return Ok(());
         }
@@ -197,7 +212,6 @@ impl VaultStore {
                 lease.lease_id.clone(),
                 LeaseRecord {
                     lease,
-                    // Passwords never leave the issuing process (H03/H08).
                     backend_password: String::new(),
                     backend_username: String::new(),
                 },
@@ -216,13 +230,29 @@ impl VaultStore {
         }
         let projects = self.projects.lock().map_err(|e| e.to_string())?.clone();
         let leases_guard = self.leases.lock().map_err(|e| e.to_string())?;
-        let mut leases: Vec<VaultLease> = leases_guard.values().map(|r| r.lease.clone()).collect();
+        let lock = open_state_lock(&path)?;
+        lock.lock_exclusive().map_err(|e| e.to_string())?;
+        self.write_file_locked(&path, &projects, &leases_guard)?;
+        let _ = lock.unlock();
+        Ok(())
+    }
+
+    fn write_file_locked(
+        &self,
+        path: &std::path::Path,
+        projects: &[ProjectEnv],
+        leases_map: &HashMap<String, LeaseRecord>,
+    ) -> Result<(), String> {
+        let mut leases: Vec<VaultLease> = leases_map.values().map(|r| r.lease.clone()).collect();
         leases.sort_by(|a, b| b.issued_at_unix_ms.cmp(&a.issued_at_unix_ms));
-        let file = VaultFile { projects, leases };
+        let file = VaultFile {
+            projects: projects.to_vec(),
+            leases,
+        };
         let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
         fs::write(&tmp, data).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, path).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -431,6 +461,17 @@ fn now_ms() -> u64 {
 
 fn simple_nonce(seed: u64) -> u64 {
     seed.wrapping_mul(0x9e3779b97f4a7c15) ^ 0xdeadbeef
+}
+
+
+fn open_state_lock(path: &std::path::Path) -> Result<File, String> {
+    let lock_path = path.with_extension("json.lock");
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

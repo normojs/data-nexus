@@ -23,6 +23,8 @@ tracing = "0.1"
 # B06: SQLite side-index for Admin audit search (bundled = no system libsqlite).
 # Empty security.audit.index_path keeps the connection closed (zero runtime cost).
 rusqlite = { version = "0.32", features = ["bundled"] }
+# H05: advisory file locks for multi-process ticket/vault JSON on shared disk.
+fs2 = "0.4"
 # Pinned major line; 4.4+ works with rustc 1.94 (MSRV of latest transitive deps).
 cedar-policy = { version = "4.4", optional = true }
 # Default features bring rustls TLS + memory + tokio executor (consumers cannot

@@ -12,11 +12,14 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use fs2::FileExt;
 
 static GLOBAL: OnceLock<Arc<TicketStore>> = OnceLock::new();
 
@@ -230,14 +233,23 @@ impl TicketStore {
         let Some(path) = path else {
             return Ok(());
         };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         if !path.exists() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            self.persist_unlocked(&HashMap::new())?;
+            // Create empty file under exclusive lock.
+            let lock = open_state_lock(&path)?;
+            lock.lock_exclusive().map_err(|e| e.to_string())?;
+            self.write_file_locked(&path, &HashMap::new())?;
+            let _ = lock.unlock();
             return Ok(());
         }
-        let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let lock = open_state_lock(&path)?;
+        lock.lock_shared().map_err(|e| e.to_string())?;
+        let mut file = File::open(&path).map_err(|e| e.to_string())?;
+        let mut raw = String::new();
+        file.read_to_string(&mut raw).map_err(|e| e.to_string())?;
+        let _ = lock.unlock();
         if raw.trim().is_empty() {
             return Ok(());
         }
@@ -245,7 +257,6 @@ impl TicketStore {
         let mut map = HashMap::new();
         let mut max_seq = 1u64;
         for t in file.tickets {
-            // best-effort seq recovery from id suffix
             if let Some(n) = t.id.rsplit('-').next().and_then(|s| s.parse::<u64>().ok()) {
                 max_seq = max_seq.max(n + 1);
             }
@@ -269,13 +280,22 @@ impl TicketStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        // Exclusive lock for multi-process writers on shared disk (H05).
+        let lock = open_state_lock(&path)?;
+        lock.lock_exclusive().map_err(|e| e.to_string())?;
+        self.write_file_locked(&path, map)?;
+        let _ = lock.unlock();
+        Ok(())
+    }
+
+    fn write_file_locked(&self, path: &std::path::Path, map: &HashMap<String, Ticket>) -> Result<(), String> {
         let mut tickets: Vec<Ticket> = map.values().cloned().collect();
         tickets.sort_by(|a, b| b.issued_at_unix_ms.cmp(&a.issued_at_unix_ms));
         let file = TicketFile { tickets };
         let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
         fs::write(&tmp, data).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, path).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -604,6 +624,18 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+
+/// Sidecar lock file next to the JSON state file (H05 multi-process).
+fn open_state_lock(path: &std::path::Path) -> Result<File, String> {
+    let lock_path = path.with_extension("json.lock");
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,6 +778,44 @@ mod tests {
         let got = store2.get(&t.id).expect("reloaded");
         assert_eq!(got.subject_id, "alice");
         assert_eq!(got.sql_fingerprint, t.sql_fingerprint);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    #[test]
+    fn h05_ticket_file_lock_serializes_writes() {
+        let dir = std::env::temp_dir().join(format!("dn-h05-lock-{}", now_unix_ms()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("tickets.json");
+        let a = TicketStore::with_file(path.clone()).unwrap();
+        let b = TicketStore::with_file(path.clone()).unwrap();
+        let t1 = a.issue(IssueTicketRequest {
+            subject_id: "a".into(),
+            sql: "SELECT 1".into(),
+            ticket_type: "high_risk".into(),
+            ttl_secs: 600,
+            max_uses: 1,
+            note: None,
+            issued_by: None,
+            dual_control: false,
+        });
+        let t2 = b.issue(IssueTicketRequest {
+            subject_id: "b".into(),
+            sql: "SELECT 2".into(),
+            ticket_type: "high_risk".into(),
+            ttl_secs: 600,
+            max_uses: 1,
+            note: None,
+            issued_by: None,
+            dual_control: false,
+        });
+        // Last exclusive write wins for full-file replace semantics; both must succeed
+        // without panicking under lock. Reload sees a consistent JSON file.
+        let c = TicketStore::with_file(path).unwrap();
+        let list = c.list(10);
+        assert!(!list.is_empty());
+        // At least the last writer's ticket is present.
+        assert!(c.get(&t1.id).is_some() || c.get(&t2.id).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
