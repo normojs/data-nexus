@@ -159,6 +159,7 @@ examples/        smoke + gateway config 样例
 | O01 | Secure 路径 mask/window/audit 指标 | feat(o01) |
 | A06 | 事务内 Streaming max_rows 双协议 smoke（部分） | feat(a06) |
 | A09 | portal json/csv 物化边界 smoke（部分） | feat(a09) |
+| T01 | 列 ACL / 复杂 SQL 矩阵（部分） | feat(t01) |
 
 ---
 
@@ -205,7 +206,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **UI03** | Audit 页增强 | 已接 B06 过滤；可补 stats 卡片、source 角标、导出 | `event_id`/时间窗/`source` 已做（`6ff8cef`） | **可选** |
 | **UI04** | 策略只读页 | data-ui 展示 security rules / mask / high-risk（现多靠 API/配置） | 无专用页 | **可选** |
-| **T01** | 列 ACL / 复杂 SQL 用例矩阵 | 子查询、多表、方言边界；启发式 `parse_failed` 行为 | smoke 覆盖主路径，复杂 SQL 仍靠补测 | **待做** |
+| **T01** | 列 ACL / 复杂 SQL 用例矩阵 | 子查询、多表、方言边界；启发式 `parse_failed` 行为 | extract/PDP 单测矩阵 + column smoke 子查询/join/qualified；WHERE 子查询表提取仍 gap | **部分** |
 | **T02** | Ticket/Vault runbook | 注释注入约定、双人审批、吊销运维说明进 docs | API+UI 有，运维叙事可再收紧 | **可选** |
 | **O01** | Secure 路径观测 | mask 行数、encode 窗口/字节、审计队列深度、worker 处理延迟 | Prometheus always-on；非 OTel feature | **完成** |
 
@@ -229,30 +230,33 @@ examples/        smoke + gateway config 样例
 | 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；非 CRDT |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
+| 复杂 SQL / 列 ACL | T01：JOIN/子查询/CTE 主路径有单测+smoke；**WHERE 子查询表**可能漏抽；列 rewrite 不深改嵌套 SELECT 列表 |
 
 ---
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> T01 复杂 SQL 或 A08 MySQL TLS 或 H05 多实例收口 <<<**
+**>>> H05 多实例收口 或 A08 MySQL TLS 或 UI04 策略只读页 <<<**
 
-本轮（A06/A09 边界 smoke 收口）：
+本轮（T01 复杂 SQL / 列 ACL 矩阵）：
 
-- `smoke-security-stream`：MySQL/PG **事务内** SELECT 仍 `max_rows=1`；MySQL 事务后查询验证 lease 归还
-- `smoke-security-portal`：multi-row **json/csv 物化**（禁止 `backend_window` header）；NDJSON 仍强制 backend_window
-- A06/A09 仍 **部分**（json/csv 真流式未做；事务并发约束仍在）
+- `object_extract`：子查询/CTE/JOIN/方言 schema、parse_failed、UPDATE/DELETE
+- PDP：join 列 rewrite、parse_failed+启发式表仍 deny secret、fail_closed=false 不硬拒
+- `smoke-security-column`：子查询/qualified/join 不泄露 salary
+- 诚实 gap：WHERE 子查询表可能漏抽；嵌套 SELECT 列表 rewrite 不深
 
 ```bash
-./examples/smoke-security-stream.sh
-./examples/smoke-security-portal.sh
+cargo test -p runtime_gateway --lib 'object_extract::tests::t01_'
+cargo test -p gateway_core --lib 'pdp::tests::t01_'
+./examples/smoke-security-column.sh
 ./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **T01** — 复杂 SQL 用例矩阵  
+1. **H05** — 多实例状态外置收口  
 2. **A08** — MySQL backend TLS（若需要）  
-3. **H05** — 多实例状态外置收口  
+3. **UI04** — 策略只读页  
 
 ---
 

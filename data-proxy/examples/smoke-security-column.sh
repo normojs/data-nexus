@@ -161,4 +161,44 @@ set -e
 [[ $sec_rc -ne 0 ]]
 kill -0 "$PROXY_PID"
 
+echo "==> T01: subquery SELECT list still strips salary"
+out="$(mysql_via_gateway 'SELECT id, salary FROM (SELECT id, name, salary FROM employees) t WHERE id=1;')"
+echo "$out"
+echo "$out" | tr '\t' ' ' | grep -q '1'
+if echo "$out" | grep -q '90000'; then
+  echo "T01 subquery: salary leaked" >&2
+  exit 1
+fi
+
+echo "==> T01: qualified column deny (employees.salary) still rewritten"
+out="$(mysql_via_gateway 'SELECT employees.id, employees.salary FROM employees WHERE id=1;')"
+echo "$out"
+if echo "$out" | grep -q '90000'; then
+  echo "T01 qualified: salary leaked" >&2
+  exit 1
+fi
+echo "$out" | tr '\t' ' ' | grep -q '1'
+
+echo "==> T01: multi-table join with denied column does not leak salary"
+# Seed a tiny departments table if missing (orders DB).
+"${COMPOSE[@]}" exec -T mysql-primary mysql -uroot -proot -e "
+USE orders;
+CREATE TABLE IF NOT EXISTS departments (
+  id INT PRIMARY KEY,
+  dept_name VARCHAR(32) NOT NULL
+);
+INSERT INTO departments (id, dept_name) VALUES (1, 'eng')
+  ON DUPLICATE KEY UPDATE dept_name=VALUES(dept_name);
+-- ensure employees has dept_id for join smoke (ignore if already present on recreate path)
+" 2>/dev/null || true
+# employees seed above has no dept_id; use constant join predicate for ACL extract only.
+out="$(mysql_via_gateway "SELECT e.id, e.salary, d.dept_name FROM employees e JOIN departments d ON d.id=1 WHERE e.id=1;")"
+echo "$out"
+if echo "$out" | grep -q '90000'; then
+  echo "T01 join: salary leaked" >&2
+  exit 1
+fi
+# dept_name may remain (not under employees column rule)
+echo "$out" | tr '\t' ' ' | grep -qi 'eng\|1' || true
+
 echo "smoke-security-column: OK"

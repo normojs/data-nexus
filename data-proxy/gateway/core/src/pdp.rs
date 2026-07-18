@@ -2131,6 +2131,153 @@ mod tests {
             .is_deny());
     }
 
+    // --- T01: complex SQL / column ACL matrix (PDP side) ---
+
+    #[test]
+    fn t01_column_deny_on_join_rewrites_only_listed_columns() {
+        let pdp = pdp_with(vec![SecurityRuleConfig {
+            name: "deny-salary".into(),
+            effect: "deny".into(),
+            actions: vec!["select".into()],
+            tables: vec!["employees".into()],
+            columns: vec!["salary".into()],
+            subjects: vec![],
+            row_filter: None,
+        }]);
+        let mut set = ObjectSet::empty();
+        let mut emp = ObjectAccess::new("employees", StatementAction::Select);
+        emp.columns = vec!["id".into(), "salary".into()];
+        set.objects.push(emp);
+        let mut dept = ObjectAccess::new("departments", StatementAction::Select);
+        dept.columns = vec!["dept_name".into()];
+        set.objects.push(dept);
+
+        let sub = subject("app");
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT e.id, e.salary, d.dept_name FROM employees e JOIN departments d ON e.dept_id=d.id"
+                .into(),
+        };
+        match pdp.authorize_command_with_objects(&sub, "hr", &cmd, &dialect, Some(&set)) {
+            SecurityDecision::AllowRewrite { sql, .. } => {
+                let lower = sql.to_ascii_lowercase();
+                assert!(!lower.contains("salary"), "salary should be stripped: {sql}");
+                // departments column is not under employees rule — rewrite may keep or drop
+                // depending on SELECT-list rewriter scope; id should remain.
+                assert!(lower.contains("id"), "id should remain: {sql}");
+            }
+            SecurityDecision::Allow { .. } => {
+                // If rewriter cannot handle join SELECT list, Allow is honest failure mode
+                // only when salary not present in objects path — here we expect rewrite.
+                panic!("expected AllowRewrite for join SELECT with denied column");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t01_parse_failed_with_heuristic_tables_still_denies_secret() {
+        // parse_failed but heuristic recovered table names → still evaluate table ACL.
+        let pdp = pdp_with(vec![SecurityRuleConfig {
+            name: "deny-secret".into(),
+            effect: "deny".into(),
+            actions: vec!["select".into()],
+            tables: vec!["secret_*".into()],
+            columns: vec![],
+            subjects: vec![],
+            row_filter: None,
+        }]);
+        let mut set = ObjectSet::parse_failed();
+        set.objects
+            .push(ObjectAccess::new("secret_tokens", StatementAction::Select));
+        // Non-empty objects with parse_failed: PDP uses set.tables() path.
+        let sub = subject("app");
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT id FROM secret_tokens /* broken */".into(),
+        };
+        assert!(
+            pdp.authorize_command_with_objects(&sub, "orders", &cmd, &dialect, Some(&set))
+                .is_deny(),
+            "secret table must still deny under parse_failed+heuristic tables"
+        );
+    }
+
+    #[test]
+    fn t01_parse_failed_fail_open_when_not_fail_closed() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.enabled = true;
+        cfg.fail_closed = false;
+        cfg.star_policy = "allow".into();
+        cfg.rules = vec![SecurityRuleConfig {
+            name: "deny-secret".into(),
+            effect: "deny".into(),
+            actions: vec!["select".into()],
+            tables: vec!["secret_*".into()],
+            columns: vec![],
+            subjects: vec![],
+            row_filter: None,
+        }];
+        let pdp = LocalPdp::from_config(&cfg).expect("pdp");
+        let set = ObjectSet::parse_failed(); // empty objects
+        let sub = subject("app");
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT !!!".into(),
+        };
+        // fail_closed=false + empty parse_failed → do not hard-deny solely on parse_failed.
+        let decision =
+            pdp.authorize_command_with_objects(&sub, "orders", &cmd, &dialect, Some(&set));
+        match decision {
+            SecurityDecision::Deny { rule, .. } => {
+                assert_ne!(
+                    rule, "fail_closed",
+                    "must not hard fail_closed when fail_closed=false"
+                );
+            }
+            SecurityDecision::Allow { .. }
+            | SecurityDecision::AllowRewrite { .. }
+            | SecurityDecision::RequireTicket { .. } => {}
+        }
+    }
+
+    #[test]
+    fn t01_subquery_objectset_column_deny_rewrites_outer_list() {
+        // ObjectSet as if extract walked subquery and outer SELECT list.
+        // Honest: rewriter may only strip top-level SELECT list; nested salary can remain.
+        let pdp = pdp_with(vec![SecurityRuleConfig {
+            name: "deny-salary".into(),
+            effect: "deny".into(),
+            actions: vec!["select".into()],
+            tables: vec!["employees".into()],
+            columns: vec!["salary".into()],
+            subjects: vec![],
+            row_filter: None,
+        }]);
+        let mut set = ObjectSet::empty();
+        let mut outer = ObjectAccess::new("employees", StatementAction::Select);
+        outer.columns = vec!["id".into(), "salary".into()];
+        set.objects.push(outer);
+        let sub = subject("app");
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT id, salary FROM (SELECT id, salary FROM employees) t".into(),
+        };
+        match pdp.authorize_command_with_objects(&sub, "hr", &cmd, &dialect, Some(&set)) {
+            SecurityDecision::AllowRewrite { sql, .. } => {
+                // Outer list must not project salary; nested FROM may still mention it
+                // (known rewriter depth limit — documented in todo §3.6).
+                let lower = sql.to_ascii_lowercase();
+                let top = lower.split("from").next().unwrap_or(&lower);
+                assert!(
+                    !top.contains("salary"),
+                    "outer SELECT list still projects salary: {sql}"
+                );
+            }
+            other => panic!("expected rewrite, got {other:?}"),
+        }
+    }
+
     #[test]
     fn rewrite_strips_multiple_columns() {
         let denied = vec![
