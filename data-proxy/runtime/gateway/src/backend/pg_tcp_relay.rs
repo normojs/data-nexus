@@ -11,7 +11,9 @@
 //!   connect/auth every passthrough query
 //! - cleartext / MD5 / SCRAM-SHA-256 auth; no SSL to backend
 //! - not shared with the tokio-postgres pool (parallel lease)
-//! - idle TTL only (no active health probe / SSL yet)
+//! - idle TTL + **optional active health probe** (SELECT 1) on take
+//! - cleartext / MD5 / SCRAM-SHA-256 auth; no SSL to backend
+//! - not shared with the tokio-postgres pool (parallel lease)
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -28,11 +30,14 @@ use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 /// Default max idle TCP relay sessions per pool key (A08).
 pub const DEFAULT_TCP_IDLE_MAX_PER_KEY: usize = 4;
 /// Default max age of an idle TCP relay session before it is discarded (A08).
 pub const DEFAULT_TCP_IDLE_TTL: Duration = Duration::from_secs(30);
+/// Default budget for an idle health probe (`SELECT 1`) before discarding (A08).
+pub const DEFAULT_TCP_IDLE_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct IdleEntry {
     session: PgTcpSession,
@@ -88,6 +93,9 @@ pub enum SessionReturn {
 pub struct PgTcpIdlePool {
     max_per_key: usize,
     idle_ttl: Duration,
+    /// When true (default), run `SELECT 1` before reusing an idle session.
+    health_probe: bool,
+    probe_timeout: Duration,
     idle: Mutex<HashMap<String, VecDeque<IdleEntry>>>,
 }
 
@@ -101,12 +109,24 @@ impl PgTcpIdlePool {
             max_per_key: max_per_key.max(1),
             // Zero TTL means "never reuse" (every put is immediately expired).
             idle_ttl,
+            health_probe: true,
+            probe_timeout: DEFAULT_TCP_IDLE_PROBE_TIMEOUT,
             idle: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn with_default_cap() -> Arc<Self> {
         Arc::new(Self::new(DEFAULT_TCP_IDLE_MAX_PER_KEY))
+    }
+
+    /// Disable active health probe (TTL-only). Useful for unit tests without a live PG.
+    pub fn without_health_probe(mut self) -> Self {
+        self.health_probe = false;
+        self
+    }
+
+    pub fn health_probe_enabled(&self) -> bool {
+        self.health_probe
     }
 
     pub fn pool_key(endpoint: &EndpointConfig, database: &str) -> String {
@@ -205,8 +225,26 @@ impl PgTcpIdlePool {
         database: &str,
     ) -> GatewayResult<PgTcpSession> {
         let key = Self::pool_key(endpoint, database);
-        if let Some(s) = self.take(&key) {
-            return Ok(s);
+        // Try a few idle candidates; discard unhealthy / timed-out ones.
+        for _ in 0..self.max_per_key {
+            let Some(sess) = self.take(&key) else {
+                break;
+            };
+            if !self.health_probe {
+                return Ok(sess);
+            }
+            match sess.health_check(self.probe_timeout).await {
+                Ok(sess) => return Ok(sess),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "data_nexus::gateway",
+                        error = %e,
+                        pool_key = %key,
+                        "A08 idle TCP health probe failed; discarding session"
+                    );
+                    // sess dropped
+                }
+            }
         }
         PgTcpSession::connect(endpoint, database).await
     }
@@ -422,6 +460,57 @@ impl PgTcpSession {
             GatewayError::Backend("pg tcp collect_reuse: session not returned".into())
         })?;
         Ok((session, packets))
+    }
+
+    /// A08: lightweight health probe for idle reuse — `SELECT 1` until ReadyForQuery.
+    ///
+    /// Fails on ErrorResponse, timeout, or unexpected close. Always drains to
+    /// Ready on success so the session is reusable for the next real query.
+    pub async fn health_check(mut self, budget: Duration) -> GatewayResult<Self> {
+        match timeout(budget, self.health_check_inner()).await {
+            Ok(Ok(())) => Ok(self),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(GatewayError::Backend(
+                "pg tcp health probe timed out".into(),
+            )),
+        }
+    }
+
+    async fn health_check_inner(&mut self) -> GatewayResult<()> {
+        let mut out = BytesMut::new();
+        frontend::query("SELECT 1", &mut out)
+            .map_err(|e| GatewayError::Backend(format!("pg health query encode: {e}")))?;
+        self.stream
+            .write_all(&out)
+            .await
+            .map_err(|e| GatewayError::Backend(format!("pg health query write: {e}")))?;
+
+        let mut saw_ready = false;
+        while let Some(frame) = self.next_raw_frame().await? {
+            match frame.first().copied() {
+                Some(b'E') => {
+                    return Err(GatewayError::Backend(
+                        "pg tcp health probe: ErrorResponse".into(),
+                    ));
+                }
+                Some(b'Z') => {
+                    saw_ready = true;
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    return Err(GatewayError::Backend(
+                        "pg tcp health probe: empty frame".into(),
+                    ));
+                }
+            }
+        }
+        if !saw_ready {
+            return Err(GatewayError::Backend(
+                "pg tcp health probe: closed before ReadyForQuery".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Read the next complete backend message and return its raw frame bytes.
@@ -655,7 +744,7 @@ mod tests {
 
     #[test]
     fn a08_idle_pool_key_and_cap() {
-        let pool = PgTcpIdlePool::new(2);
+        let pool = PgTcpIdlePool::new(2).without_health_probe();
         let ep = EndpointConfig {
             name: "p".into(),
             protocol: gateway_core::ProtocolKind::PostgreSql,
@@ -672,6 +761,7 @@ mod tests {
         assert!(pool.take(&key).is_none());
         assert_eq!(pool.max_per_key(), 2);
         assert_eq!(pool.idle_ttl(), DEFAULT_TCP_IDLE_TTL);
+        assert!(!pool.health_probe_enabled());
     }
 
     #[test]
@@ -696,7 +786,7 @@ mod tests {
             }
 
             // Zero TTL: put then take must miss (immediately expired).
-            let pool = PgTcpIdlePool::with_ttl(2, Duration::from_secs(0));
+            let pool = PgTcpIdlePool::with_ttl(2, Duration::from_secs(0)).without_health_probe();
             pool.put_for_test("k".into(), dummy_session().await, Instant::now());
             assert!(
                 pool.take("k").is_none(),
@@ -704,7 +794,7 @@ mod tests {
             );
 
             // Non-zero TTL: fresh entry is reusable; aged entry is dropped.
-            let pool2 = PgTcpIdlePool::with_ttl(2, Duration::from_secs(60));
+            let pool2 = PgTcpIdlePool::with_ttl(2, Duration::from_secs(60)).without_health_probe();
             pool2.put_for_test("k".into(), dummy_session().await, Instant::now());
             assert!(pool2.take("k").is_some());
             assert!(pool2.is_empty());
@@ -724,12 +814,45 @@ mod tests {
     }
 
     #[test]
+    fn a08_health_check_fails_on_dead_socket() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let accept = tokio::spawn(async move {
+                let (s, _) = listener.accept().await.unwrap();
+                // Close immediately — probe write/read must fail.
+                drop(s);
+            });
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let _ = accept.await;
+            let sess = PgTcpSession {
+                stream,
+                read_buf: BytesMut::new(),
+            };
+            let err = sess
+                .health_check(Duration::from_millis(200))
+                .await
+                .expect_err("dead peer");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("health") || msg.contains("closed") || msg.contains("tcp"),
+                "err={msg}"
+            );
+        });
+    }
+
+    #[test]
     fn a08_session_return_variants_are_constructible() {
         let slot = new_tcp_txn_slot();
         let _ = SessionReturn::Drop;
         let _ = SessionReturn::Txn(slot);
         let pool = PgTcpIdlePool::with_default_cap();
         assert_eq!(pool.idle_ttl(), DEFAULT_TCP_IDLE_TTL);
+        assert!(pool.health_probe_enabled());
         let _ = SessionReturn::Idle {
             pool,
             key: "k".into(),

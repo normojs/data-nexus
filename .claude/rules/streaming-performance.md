@@ -27,7 +27,7 @@ backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 
 - PostgreSQL **Streaming**（含事务）：`simple_query_raw` + channel；事务内同样还 lease。
 - 并发：同一会话事务内 stream 未 drain 前不要再发下一条（producer 持有 lease）。
 - Portal NDJSON（A09）：backend 返回 `Streaming` 时窗口 yield → HTTP chunk（`stream=backend_window`）；`Complete` 回退 B05b chunked；**json/csv 仍物化**有界 ResultSet。
-- PG Passthrough（A08）：**非事务 idle pool**（cap + **TTL 30s**）+ **事务内 `tcp_txn`** 原帧中继（`WireRelay`）。Streaming 仍用 pool。非 extended；无 backend SSL；无主动健康探测。
+- PG Passthrough（A08）：**非事务 idle pool**（cap + TTL 30s + **SELECT 1 健康探测**）+ **事务内 `tcp_txn`** 原帧中继（`WireRelay`）。Streaming 仍用 pool。非 extended；无 backend SSL。
 - A07：`handle_frame_to_writer` + socket `ResponseWriter` 已接。
 - A10 prepared：MySQL COM_STMT_EXECUTE → binary 行；PG Bind 保留 `$n` → `QueryParams` → prepare/bind + **连接级 Statement 缓存** + **Streaming 窗口**（`query_raw`）；result_format=1 → binary DataRow（含 date/ts/time）；非 TCP passthrough。
 
