@@ -136,6 +136,7 @@ examples/        smoke + gateway config 样例
 | H05 | ticket/vault file state backend（部分） | feat(h05) |
 | A10 | MySQL DATE/TIME/DATETIME binary encode（部分） | feat(a10) |
 | A10 | PG Bind result_format binary portal 结果（部分） | feat(a10) |
+| A10 | PG date/timestamp/time binary encode（部分） | feat(a10) |
 | H05 | ticket/vault file advisory locks（部分） | feat(h05) |
 | H05 | audit SQLite multi-writer + LocalPdp policy_path（部分） | feat(h05) |
 | H05 | LocalPdp policy_path mtime 轮询热更（部分） | feat(h05) |
@@ -157,7 +158,7 @@ examples/        smoke + gateway config 样例
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | 同协议无义务：**非事务 + 事务内** TCP 帧中继（`tcp_txn` 复用）；`WireRelay` 边写 | 专用 TCP 不进池；无 SSL；非 extended；与 Streaming 池 lease 并行 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
-| **A10** | 预处理 / 事务透传矩阵 | 注册表 + 参数绑定；MySQL binary 行；PG ParameterDescription + **Bind result_format→binary DataRow** | PG 参数仍 text Bind；date/timestamp 原生 binary 未做；Execute 仍改写 simple Query | **部分** |
+| **A10** | 预处理 / 事务透传矩阵 | 注册表 + 参数绑定；MySQL binary 行；PG ParameterDescription + Bind result_format→binary（含 **date/timestamp/time**） | PG 参数仍 text Bind；Execute 仍改写 simple Query；numeric 无原生 binary | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
 
@@ -205,7 +206,7 @@ examples/        smoke + gateway config 样例
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：非事务 + **事务内** TCP 帧中继（`tcp_txn` 跨语句复用；COMMIT/ROLLBACK 同 socket）；专用连接不进池 |
-| 预处理语句 | A10：MySQL binary 行（含 DATE/TIME）；PG Bind `result_format=1` → binary DataRow（int/bool/float/text/bytea）；参数仍 text；无 date/ts 原生 binary |
+| 预处理语句 | A10：MySQL binary 行（含 DATE/TIME）；PG Bind `result_format=1` → binary DataRow（int/bool/float/date/ts/time/text/bytea）；参数仍 text；Execute→simple Query |
 | 多副本 | H05：ticket/vault `file`+lock；审计 SQLite WAL+busy；LocalPdp `policy_path` + mtime 轮询（`policy_poll_ms`，0=关）；file vault 无密码；非 CRDT |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
@@ -214,24 +215,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A10 PG date binary / 真 extended Execute 或 A08 池化/SSL 或 H05 vault 加密 <<<**
+**>>> A10 真 extended Execute 或 A08 池化/SSL 或 H05 vault 加密 <<<**
 
-本轮（H05 policy mtime 轮询）：
+本轮（A10 PG date/timestamp/time binary）：
 
-- `security.state.policy_poll_ms`（默认 1000；0=关）
-- `LocalPdpStore::load` 节流 `stat`；mtime 变则合并 policy 文件并 swap epoch
-- install/reload 同步 mtime 基线；peer 写文件后无需 admin reload
+- DATE：days since 2000-01-01 (i32 BE)
+- TIMESTAMP/TIMESTAMPTZ：µs since 2000-01-01（integer_datetimes）；TZ 仅扫 time 段
+- TIME：µs since midnight；非法字符串 fail-closed
 
 ```bash
-cargo test -p gateway_core --lib h05_
+cargo test -p runtime_gateway --lib a10_
 ./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **A10 续** — PG date/timestamp binary 或真 extended Execute  
+1. **A10 续** — 真 extended backend Execute（非 text 改写）  
 2. **A08 续** — SSL / 池化 TCP 会话  
-3. **H05 续** — vault 文件加密 / CRDT
+3. **H05 续** — vault 文件加密
 
 ---
 

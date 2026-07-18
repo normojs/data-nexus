@@ -29,7 +29,7 @@ backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 
 - Portal NDJSON（A09）：backend 返回 `Streaming` 时窗口 yield → HTTP chunk（`stream=backend_window`）；`Complete` 回退 B05b chunked；**json/csv 仍物化**有界 ResultSet。
 - PG Passthrough（A08）：**非事务 + 事务内**专用 TCP 原帧中继（`WireRelay`；事务用 `tcp_txn` 复用）。Streaming 仍用 pool。非 extended；无 backend SSL。
 - A07：`handle_frame_to_writer` + socket `ResponseWriter` 已接。
-- A10 prepared：MySQL COM_STMT_EXECUTE → binary 行（含 DATE/DATETIME/TIME）；PG ParameterDescription + text 参数 Bind→Query；**Bind result_format=1 → binary DataRow**（int/bool/float/text/bytea；date/ts 未原生 binary）。
+- A10 prepared：MySQL COM_STMT_EXECUTE → binary 行（含 DATE/DATETIME/TIME）；PG ParameterDescription + text 参数 Bind→Query；**Bind result_format=1 → binary DataRow**（int/bool/float/date/timestamp/time/text/bytea；numeric 仍 UTF-8）。
 
 ## 实现检查清单
 

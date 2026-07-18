@@ -669,10 +669,8 @@ fn gateway_value_to_text(value: &GatewayValue) -> Option<Vec<u8>> {
 
 /// A10: encode one cell in PostgreSQL binary format.
 ///
-/// Supported native binary layouts: bool, int2/4/8, float4/8, text/varchar,
-/// bytea. Other types fall back to UTF-8 text bytes (still marked binary in
-/// RowDescription — clients that requested binary for text-like OIDs accept
-/// this; true date/timestamp binary is deferred).
+/// Native layouts: bool, int2/4/8, float4/8, date, timestamp/timestamptz
+/// (integer_datetimes=on), text/varchar, bytea. Numeric still UTF-8 fallback.
 fn gateway_value_to_pg_binary(
     value: &GatewayValue,
     data_type: &str,
@@ -684,7 +682,11 @@ fn gateway_value_to_pg_binary(
     match value {
         GatewayValue::Null => Ok(None),
         GatewayValue::Boolean(b) => Ok(Some(vec![if *b { 1 } else { 0 }])),
-        GatewayValue::Integer(i) => Ok(Some(encode_pg_int_binary(*i, &dt))),
+        GatewayValue::Integer(i) => match dt.as_str() {
+            "date" => Ok(Some((*i as i32).to_be_bytes().to_vec())),
+            "timestamp" | "timestamptz" => Ok(Some(i.to_be_bytes().to_vec())),
+            _ => Ok(Some(encode_pg_int_binary(*i, &dt))),
+        },
         GatewayValue::UnsignedInteger(u) => {
             if *u > i64::MAX as u64 {
                 return Err(GatewayError::Protocol(format!(
@@ -701,11 +703,37 @@ fn gateway_value_to_pg_binary(
                 Ok(Some(f.to_bits().to_be_bytes().to_vec()))
             }
         }
-        GatewayValue::Decimal(s) | GatewayValue::String(s) => {
-            // Numeric binary is complex; send UTF-8 bytes (works for text OID;
-            // numeric OID clients may reject — honest partial).
-            Ok(Some(s.as_bytes().to_vec()))
-        }
+        GatewayValue::Decimal(s) | GatewayValue::String(s) => match dt.as_str() {
+            "date" => {
+                let days = parse_pg_date_days(s).ok_or_else(|| {
+                    GatewayError::Protocol(format!("invalid postgresql DATE value '{s}'"))
+                })?;
+                Ok(Some(days.to_be_bytes().to_vec()))
+            }
+            "timestamp" => {
+                let us = parse_pg_timestamp_us(s, false).ok_or_else(|| {
+                    GatewayError::Protocol(format!("invalid postgresql TIMESTAMP value '{s}'"))
+                })?;
+                Ok(Some(us.to_be_bytes().to_vec()))
+            }
+            "timestamptz" => {
+                let us = parse_pg_timestamp_us(s, true).ok_or_else(|| {
+                    GatewayError::Protocol(format!(
+                        "invalid postgresql TIMESTAMPTZ value '{s}'"
+                    ))
+                })?;
+                Ok(Some(us.to_be_bytes().to_vec()))
+            }
+            "time" | "timetz" => {
+                // TIME binary is microseconds since midnight (i64); ignore zone for A10.
+                let us = parse_pg_time_us(s).ok_or_else(|| {
+                    GatewayError::Protocol(format!("invalid postgresql TIME value '{s}'"))
+                })?;
+                Ok(Some(us.to_be_bytes().to_vec()))
+            }
+            // Numeric binary is complex; UTF-8 bytes (text-like clients ok).
+            _ => Ok(Some(s.as_bytes().to_vec())),
+        },
         GatewayValue::Bytes(b) => Ok(Some(b.clone())),
     }
 }
@@ -717,6 +745,191 @@ fn encode_pg_int_binary(i: i64, data_type: &str) -> Vec<u8> {
         // int4 default
         _ => (i as i32).to_be_bytes().to_vec(),
     }
+}
+
+/// PostgreSQL DATE binary: days since 2000-01-01 as i32 BE.
+fn parse_pg_date_days(s: &str) -> Option<i32> {
+    let (y, m, d) = parse_ymd(s.trim())?;
+    Some(days_from_pg_epoch(y, m, d))
+}
+
+/// TIMESTAMP/TIMESTAMPTZ: microseconds since 2000-01-01 00:00:00 UTC (integer_datetimes).
+/// `allow_tz`: if true, optional `+HH`, `+HH:MM`, `Z` offsets are applied; if false, offset rejected.
+fn parse_pg_timestamp_us(s: &str, allow_tz: bool) -> Option<i64> {
+    let s = s.trim().replace('T', " ");
+    let (body, offset_secs) = split_tz_offset(&s, allow_tz)?;
+    let (date, time) = match body.split_once(' ') {
+        Some((d, t)) => (d, t),
+        None => (body.as_str(), "00:00:00"),
+    };
+    let (y, mo, d) = parse_ymd(date)?;
+    let (h, mi, sec, micro) = parse_hms_micro_pg(time)?;
+    let days = days_from_pg_epoch(y, mo, d) as i64;
+    let us = days
+        .checked_mul(86_400_000_000)?
+        .checked_add(h as i64 * 3_600_000_000)?
+        .checked_add(mi as i64 * 60_000_000)?
+        .checked_add(sec as i64 * 1_000_000)?
+        .checked_add(micro as i64)?;
+    // Offset: local = UTC + offset → store UTC = local - offset.
+    us.checked_sub(offset_secs.checked_mul(1_000_000)?)
+}
+
+/// TIME: microseconds since midnight as i64 (optional fractional).
+fn parse_pg_time_us(s: &str) -> Option<i64> {
+    let s = s.trim();
+    // Drop trailing zone if present (timetz text).
+    let body = s
+        .split_once(['+', '-'])
+        .map(|(b, _)| b.trim())
+        .unwrap_or(s);
+    // Avoid stripping leading minus as zone: TIME is non-negative in PG.
+    let (h, mi, sec, micro) = parse_hms_micro_pg(body)?;
+    Some(
+        h as i64 * 3_600_000_000
+            + mi as i64 * 60_000_000
+            + sec as i64 * 1_000_000
+            + micro as i64,
+    )
+}
+
+fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
+    let mut parts = s.split('-');
+    let y: i32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+fn parse_hms_micro_pg(s: &str) -> Option<(u32, u32, u32, u32)> {
+    let s = s.trim();
+    let (hms, frac) = match s.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let mut p = hms.split(':');
+    let h: u32 = p.next()?.parse().ok()?;
+    let mi: u32 = p.next()?.parse().ok()?;
+    let sec: u32 = p.next()?.parse().ok()?;
+    if p.next().is_some() || h > 24 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let micro = match frac {
+        None => 0u32,
+        Some(f) => {
+            let f = f.trim();
+            if f.is_empty() || f.len() > 6 || !f.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let mut v = f.parse::<u32>().ok()?;
+            for _ in f.len()..6 {
+                v *= 10;
+            }
+            v
+        }
+    };
+    Some((h, mi, sec, micro))
+}
+
+/// Returns (body_without_tz, offset_seconds_east_of_utc).
+///
+/// Timezone is only scanned in the **time** portion (after the last space) so
+/// date separators in `YYYY-MM-DD` are never mistaken for offsets.
+fn split_tz_offset(s: &str, allow_tz: bool) -> Option<(String, i64)> {
+    let s = s.trim();
+    if let Some(body) = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')) {
+        if !allow_tz {
+            return None;
+        }
+        return Some((body.trim().to_string(), 0));
+    }
+
+    // Restrict TZ search to the time token so `2000-01-01 00:00:01` is safe.
+    let (prefix, time_part) = match s.rfind(' ') {
+        Some(sp) => (&s[..sp], &s[sp + 1..]),
+        None => {
+            // No space: either DATE-only (`YYYY-MM-DD`) or TIME-only (`HH:MM:SS±zz`).
+            // DATE-only has no colon → no TZ. TIME-only may have ± offset.
+            if !s.contains(':') {
+                return Some((s.to_string(), 0));
+            }
+            ("", s)
+        }
+    };
+
+    let bytes = time_part.as_bytes();
+    let mut idx = None;
+    for i in (1..bytes.len()).rev() {
+        if (bytes[i] == b'+' || bytes[i] == b'-') && bytes[i - 1].is_ascii_digit() {
+            idx = Some(i);
+            break;
+        }
+    }
+    let Some(i) = idx else {
+        return Some((s.to_string(), 0));
+    };
+    if !allow_tz {
+        return None;
+    }
+    let (time_body, off) = time_part.split_at(i);
+    let sign: i64 = if off.starts_with('+') { 1 } else { -1 };
+    let rest = &off[1..];
+    let (hh, mm) = if let Some((h, m)) = rest.split_once(':') {
+        (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?)
+    } else if rest.len() == 4 && rest.chars().all(|c| c.is_ascii_digit()) {
+        (
+            rest[..2].parse::<i64>().ok()?,
+            rest[2..].parse::<i64>().ok()?,
+        )
+    } else if rest.len() <= 2 {
+        (rest.parse::<i64>().ok()?, 0)
+    } else {
+        return None;
+    };
+    if !(0..=14).contains(&hh) || !(0..=59).contains(&mm) {
+        return None;
+    }
+    let body = if prefix.is_empty() {
+        time_body.trim().to_string()
+    } else {
+        format!("{} {}", prefix.trim(), time_body.trim())
+    };
+    Some((body, sign * (hh * 3600 + mm * 60)))
+}
+
+/// Days since 2000-01-01 (PostgreSQL date epoch), civil calendar.
+fn days_from_pg_epoch(year: i32, month: u32, day: u32) -> i32 {
+    // Proleptic Gregorian → Rata Die, then offset so 2000-01-01 = 0.
+    // Algorithm: Howard Hinnant civil_from_days inverse.
+    let y = year as i64 - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp as u64 + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let z = (era * 146_097 + doe as i64) as i32 - 719_468;
+    // Unix epoch days for 2000-01-01 is 10957 (1970-01-01 → 2000-01-01).
+    // Rata Die for 1970-01-01 is 719163; for 2000-01-01 is 730120.
+    // Our z is days since 0000-03-01 style; convert via known epoch.
+    // Simpler: compute days since Unix epoch then subtract 10957.
+    let unix_days = days_since_unix_epoch(year, month, day);
+    unix_days - 10_957
+}
+
+fn days_since_unix_epoch(year: i32, month: u32, day: u32) -> i32 {
+    // Days from civil date to 1970-01-01 using Hinnant algorithm.
+    let y = year as i64 - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m = month as u64;
+    let d = day as u64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let z = era * 146_097 + doe as i64 - 719_468;
+    z as i32
 }
 
 fn transaction_status(session: &SessionState) -> TransactionStatus {
@@ -1058,6 +1271,107 @@ mod tests {
             i32::from_be_bytes([row[19], row[20], row[21], row[22]]),
             -1
         );
+    }
+
+    #[test]
+    fn a10_pg_date_epoch_helpers() {
+        // 2000-01-01 → 0 days from PG epoch
+        assert_eq!(days_from_pg_epoch(2000, 1, 1), 0);
+        // 2000-01-02 → 1
+        assert_eq!(days_from_pg_epoch(2000, 1, 2), 1);
+        // 1970-01-01 → -10957
+        assert_eq!(days_from_pg_epoch(1970, 1, 1), -10_957);
+        // 2024-01-01: known PG date 8766 days after 2000-01-01
+        // 24*365 + 6 leap days (2000,2004,2008,2012,2016,2020) = 8766
+        assert_eq!(days_from_pg_epoch(2024, 1, 1), 8766);
+        assert_eq!(parse_pg_date_days("2024-01-01"), Some(8766));
+    }
+
+    #[test]
+    fn a10_binary_date_timestamp_time() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState {
+            prefer_binary_result: true,
+            ..Default::default()
+        };
+        let packets = protocol
+            .encode(
+                GatewayResponse::ResultSet {
+                    columns: vec![
+                        GatewayColumn {
+                            name: "d".into(),
+                            data_type: "date".into(),
+                        },
+                        GatewayColumn {
+                            name: "ts".into(),
+                            data_type: "timestamp".into(),
+                        },
+                        GatewayColumn {
+                            name: "t".into(),
+                            data_type: "time".into(),
+                        },
+                    ],
+                    rows: vec![vec![
+                        GatewayValue::String("2000-01-01".into()),
+                        GatewayValue::String("2000-01-01 00:00:01".into()),
+                        GatewayValue::String("01:00:00".into()),
+                    ]],
+                },
+                &session,
+            )
+            .unwrap();
+        let row = &packets[1];
+        assert_eq!(row[0], b'D');
+        assert_eq!(i16::from_be_bytes([row[5], row[6]]), 3);
+        // date: 4 bytes, value 0
+        assert_eq!(i32::from_be_bytes([row[7], row[8], row[9], row[10]]), 4);
+        assert_eq!(i32::from_be_bytes([row[11], row[12], row[13], row[14]]), 0);
+        // timestamp: 8 bytes, 1_000_000 us
+        assert_eq!(i32::from_be_bytes([row[15], row[16], row[17], row[18]]), 8);
+        let ts = i64::from_be_bytes([
+            row[19], row[20], row[21], row[22], row[23], row[24], row[25], row[26],
+        ]);
+        assert_eq!(ts, 1_000_000);
+        // time: 8 bytes, 3600e6 us
+        assert_eq!(i32::from_be_bytes([row[27], row[28], row[29], row[30]]), 8);
+        let tm = i64::from_be_bytes([
+            row[31], row[32], row[33], row[34], row[35], row[36], row[37], row[38],
+        ]);
+        assert_eq!(tm, 3_600_000_000);
+    }
+
+    #[test]
+    fn a10_binary_timestamptz_offset() {
+        // 2000-01-01 00:00:00+00 → 0; 2000-01-01 01:00:00+01 → 0 UTC
+        assert_eq!(
+            parse_pg_timestamp_us("2000-01-01 00:00:00+00", true),
+            Some(0)
+        );
+        assert_eq!(
+            parse_pg_timestamp_us("2000-01-01 01:00:00+01", true),
+            Some(0)
+        );
+        assert_eq!(
+            parse_pg_timestamp_us("2000-01-01 00:00:00Z", true),
+            Some(0)
+        );
+        // Without allow_tz, offset rejected
+        assert!(parse_pg_timestamp_us("2000-01-01 00:00:00+00", false).is_none());
+        // Fractional
+        assert_eq!(
+            parse_pg_timestamp_us("2000-01-01 00:00:00.5", false),
+            Some(500_000)
+        );
+    }
+
+    #[test]
+    fn a10_binary_date_invalid_fail_closed() {
+        let err = gateway_value_to_pg_binary(
+            &GatewayValue::String("not-a-date".into()),
+            "date",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GatewayError::Protocol(_)));
     }
 
     #[test]
