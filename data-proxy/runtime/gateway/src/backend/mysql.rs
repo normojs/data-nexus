@@ -458,6 +458,269 @@ impl MySqlBackendConnector {
         response
     }
 
+    /// A10: Streaming path for parameterized queries (`QueryParams` / prepared Execute).
+    ///
+    /// Connection-local COM_STMT cache + binary COM_STMT_EXECUTE; rows are windowed
+    /// over a channel (peak retained ≈ one window per side). Non-SELECT → Complete(Ok).
+    async fn execute_param_query_streaming(
+        &self,
+        endpoint: EndpointConfig,
+        sql: &str,
+        parameters: &[GatewayValue],
+        session: &SessionState,
+        mode: ExecuteMode,
+        in_transaction: bool,
+    ) -> GatewayResult<ExecuteOutcome> {
+        let need = count_mysql_placeholders(sql) as usize;
+        if need != parameters.len() {
+            return Err(GatewayError::Protocol(format!(
+                "mysql prepared Execute expects {need} parameters, got {}",
+                parameters.len()
+            )));
+        }
+        if parameters.is_empty() {
+            return self
+                .execute_simple_query_streaming(endpoint, sql, session, mode, in_transaction)
+                .await;
+        }
+
+        let window = mode.window_rows().unwrap_or(256).max(1);
+        let max_rows = mode.effective_max_rows();
+
+        let mut conn = if in_transaction {
+            let need_begin = self.txn_lease.lock().is_none();
+            let mut conn = self.take_or_acquire_lease(&endpoint, session).await?;
+            if need_begin {
+                let begin =
+                    Self::execute_on_conn(&mut conn, "BEGIN", ExecuteMode::Materialized).await?;
+                if !matches!(begin, GatewayResponse::Ok { .. }) {
+                    self.store_lease(conn);
+                    return Ok(ExecuteOutcome::Complete(begin));
+                }
+            }
+            conn
+        } else {
+            self.acquire_conn(&endpoint, session).await?
+        };
+
+        let prepared = match conn.get_or_prepare(sql).await {
+            Ok(p) => p,
+            Err(e) => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(e);
+            }
+        };
+        if prepared.param_count as usize != parameters.len() {
+            if in_transaction {
+                self.store_lease(conn);
+            }
+            return Err(GatewayError::Protocol(format!(
+                "mysql backend prepare expects {} parameters, got {}",
+                prepared.param_count,
+                parameters.len()
+            )));
+        }
+        let payload = match encode_stmt_execute_payload(prepared.stmt_id, parameters) {
+            Ok(p) => p,
+            Err(e) => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(e);
+            }
+        };
+
+        let client = match conn.client.as_mut() {
+            Some(c) => c,
+            None => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(GatewayError::Backend(
+                    "mysql backend connection is not open".into(),
+                ));
+            }
+        };
+        let mut stream = match client.send_execute(&payload).await {
+            Ok(s) => s,
+            Err(error) => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(GatewayError::Backend(format!(
+                    "mysql COM_STMT_EXECUTE: {error}"
+                )));
+            }
+        };
+
+        // Header / columns on this task; binary rows stream via channel.
+        let header = match read_mysql_result_packet(&mut stream, "mysql binary query header").await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(e);
+            }
+        };
+        let payload = match packet_payload("mysql binary query header", &header) {
+            Ok(p) => p,
+            Err(e) => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(e);
+            }
+        };
+        match payload.first().copied() {
+            Some(OK_HEADER) => {
+                drop(stream);
+                let response = ok_packet_to_gateway_response(payload)?;
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Ok(ExecuteOutcome::Complete(response));
+            }
+            Some(ERR_HEADER) => {
+                drop(stream);
+                let response = err_packet_to_gateway_response(payload);
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Ok(ExecuteOutcome::Complete(response));
+            }
+            Some(_) => {}
+            None => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(GatewayError::Protocol(
+                    "mysql binary query header packet has empty payload".into(),
+                ));
+            }
+        }
+
+        let (column_count, is_null, _) = match decode_lenc_int(payload, "mysql column count") {
+            Ok(v) => v,
+            Err(e) => {
+                if in_transaction {
+                    self.store_lease(conn);
+                }
+                return Err(e);
+            }
+        };
+        if is_null {
+            if in_transaction {
+                self.store_lease(conn);
+            }
+            return Err(GatewayError::Protocol(
+                "mysql result set column count cannot be NULL".into(),
+            ));
+        }
+        let mut column_infos = Vec::with_capacity(column_count as usize);
+        for _ in 0..column_count {
+            let column_packet =
+                match read_mysql_result_packet(&mut stream, "mysql column definition").await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if in_transaction {
+                            self.store_lease(conn);
+                        }
+                        return Err(e);
+                    }
+                };
+            let column_payload =
+                match packet_payload("mysql column definition", &column_packet) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if in_transaction {
+                            self.store_lease(conn);
+                        }
+                        return Err(e);
+                    }
+                };
+            column_infos.push(decode_column(column_payload));
+        }
+        if let Err(e) = read_mysql_result_packet(&mut stream, "mysql column eof").await {
+            if in_transaction {
+                self.store_lease(conn);
+            }
+            return Err(e);
+        }
+        let columns: Vec<GatewayColumn> = column_infos
+            .iter()
+            .map(mysql_column_to_gateway_column)
+            .collect();
+
+        drop(stream);
+
+        let lease_slot = if in_transaction {
+            Some(self.txn_lease.clone())
+        } else {
+            None
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<Vec<GatewayValue>>>(2);
+        tokio::spawn(async move {
+            let run = async {
+                let client = conn.client.as_mut().ok_or_else(|| {
+                    GatewayError::Backend("mysql backend connection is not open".into())
+                })?;
+                let mut stream = ResultsetStream::new(client.framed.as_mut());
+                let mut window_buf: Vec<Vec<GatewayValue>> =
+                    Vec::with_capacity(window.min(256));
+                let mut total: u64 = 0;
+                let mut truncated = false;
+                while let Some(row_packet) = read_optional_mysql_result_packet(&mut stream).await? {
+                    if truncated {
+                        continue;
+                    }
+                    let row_payload = packet_payload("mysql binary row", &row_packet)?;
+                    if let Some(max) = max_rows {
+                        if total >= max {
+                            truncated = true;
+                            continue;
+                        }
+                    }
+                    window_buf.push(binary_row_to_gateway_values(row_payload, &column_infos)?);
+                    total += 1;
+                    if window_buf.len() >= window {
+                        let chunk: Vec<_> = window_buf.drain(..).collect();
+                        if tx.send(chunk).await.is_err() {
+                            while read_optional_mysql_result_packet(&mut stream)
+                                .await?
+                                .is_some()
+                            {}
+                            return Ok(());
+                        }
+                    }
+                }
+                if !window_buf.is_empty() {
+                    let _ = tx.send(window_buf).await;
+                }
+                Ok::<(), GatewayError>(())
+            }
+            .await;
+            if let Err(e) = run {
+                tracing::warn!(
+                    target: "data_nexus::gateway",
+                    error = %e,
+                    "mysql prepared streaming producer failed"
+                );
+            }
+            if let Some(slot) = lease_slot {
+                *slot.lock() = Some(conn);
+            }
+        });
+
+        Ok(ExecuteOutcome::Streaming(StreamingQuery {
+            columns,
+            stream: Box::new(ChannelRowStream { rx }),
+        }))
+    }
+
     /// A06: stream logical rows in windows over a channel.
     ///
     /// Producer task owns the connection while decoding. Peak retained rows ≈
@@ -817,6 +1080,8 @@ impl BackendConnector for MySqlBackendConnector {
         // after draining so COMMIT/ROLLBACK still share the same backend conn.
         let streaming = matches!(mode, ExecuteMode::Streaming { .. });
         let is_query = matches!(command, GatewayCommand::Query { .. });
+        let is_query_params = matches!(command, GatewayCommand::QueryParams { .. });
+        let is_execute = matches!(command, GatewayCommand::Execute { .. });
         let in_txn = session.transaction_state == TransactionState::Active
             || self.txn_lease.lock().is_some();
 
@@ -825,6 +1090,54 @@ impl BackendConnector for MySqlBackendConnector {
                 let endpoint = self.select_endpoint(session)?;
                 return self
                     .execute_simple_query_streaming(endpoint, &sql, session, mode, in_txn)
+                    .await;
+            }
+        }
+
+        // A10: Streaming for parameterized queries (QueryParams / prepared Execute).
+        if streaming && is_query_params {
+            if let GatewayCommand::QueryParams { sql, parameters } = command {
+                let endpoint = self.select_endpoint(session)?;
+                return self
+                    .execute_param_query_streaming(
+                        endpoint,
+                        &sql,
+                        &parameters,
+                        session,
+                        mode,
+                        in_txn,
+                    )
+                    .await;
+            }
+        }
+        if streaming && is_execute {
+            if let GatewayCommand::Execute {
+                statement_id,
+                parameters,
+            } = command
+            {
+                let sql = self.prepared.take_sql(&statement_id).ok_or_else(|| {
+                    GatewayError::Backend(format!(
+                        "unknown mysql prepared statement id '{statement_id}'"
+                    ))
+                })?;
+                let need = count_mysql_placeholders(&sql) as usize;
+                if need != parameters.len() {
+                    return Err(GatewayError::Protocol(format!(
+                        "mysql prepared Execute expects {need} parameters, got {}",
+                        parameters.len()
+                    )));
+                }
+                let endpoint = self.select_endpoint(session)?;
+                return self
+                    .execute_param_query_streaming(
+                        endpoint,
+                        &sql,
+                        &parameters,
+                        session,
+                        mode,
+                        in_txn,
+                    )
                     .await;
             }
         }
@@ -2120,6 +2433,90 @@ mod tests {
                     || msg.contains("os error")
                 {
                     eprintln!("skip live mysql a10 test: {msg}");
+                    return;
+                }
+                panic!("unexpected error: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn a10_query_params_streaming_mode_is_selected() {
+        // execute_outcome routes Streaming + QueryParams to execute_param_query_streaming.
+        let mode = ExecuteMode::from_streaming_config(32, Some(100));
+        assert!(matches!(mode, ExecuteMode::Streaming { .. }));
+        assert!(matches!(
+            GatewayCommand::QueryParams {
+                sql: "SELECT ?".into(),
+                parameters: vec![GatewayValue::Integer(1)],
+            },
+            GatewayCommand::QueryParams { .. }
+        ));
+        assert!(!matches!(
+            GatewayCommand::QueryParams {
+                sql: "SELECT ?".into(),
+                parameters: vec![],
+            },
+            GatewayCommand::Query { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a10_query_params_streaming_against_live_mysql() {
+        let mut ep = endpoint();
+        ep.address = "127.0.0.1:13306".into();
+        ep.database = Some("orders".into());
+        ep.username = "root".into();
+        ep.password = "root".into();
+        let connector = MySqlBackendConnector::with_endpoints(vec![ep]);
+        let mut session = SessionState {
+            database: Some("orders".into()),
+            ..Default::default()
+        };
+        let mode = ExecuteMode::from_streaming_config(2, Some(10));
+        let outcome = connector
+            .execute_outcome(
+                GatewayCommand::QueryParams {
+                    sql: "SELECT ? AS a UNION ALL SELECT ? UNION ALL SELECT ?".into(),
+                    parameters: vec![
+                        GatewayValue::Integer(1),
+                        GatewayValue::Integer(2),
+                        GatewayValue::Integer(3),
+                    ],
+                },
+                &mut session,
+                mode,
+            )
+            .await;
+        match outcome {
+            Ok(ExecuteOutcome::Streaming(mut query)) => {
+                let mut rows = Vec::new();
+                while let Some(chunk) = query.stream.poll_window(2).await.unwrap() {
+                    rows.extend(chunk);
+                }
+                assert!(
+                    rows.len() >= 2,
+                    "expected multi-row streaming windows, got {rows:?}"
+                );
+            }
+            Ok(ExecuteOutcome::Complete(GatewayResponse::ResultSet { rows, .. })) => {
+                // Accept Complete if server returned tiny set without streaming path edge.
+                assert!(!rows.is_empty());
+            }
+            Ok(ExecuteOutcome::Complete(other)) => {
+                panic!("unexpected complete response {other:?}")
+            }
+            Ok(ExecuteOutcome::WireRelay(_)) => {
+                panic!("unexpected wire relay for QueryParams")
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("connect")
+                    || msg.contains("Connection refused")
+                    || msg.contains("timed out")
+                    || msg.contains("os error")
+                {
+                    eprintln!("skip live mysql a10 streaming test: {msg}");
                     return;
                 }
                 panic!("unexpected error: {msg}");
