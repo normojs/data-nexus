@@ -208,6 +208,39 @@ assert ids[:3] == [1, 2, 3] or ids[:2] == [1, 2], ids
 print("ndjson multi-row backend_window ok", "rows", len(rows), "window", meta.get("window_rows"))
 PY
 
+echo "==> portal multi-row JSON is materialized (A09 honest: not backend_window)"
+curl -fsS -D /tmp/dn-portal-json.hdr -o /tmp/dn-portal-multi.json \
+  -X POST "http://127.0.0.1:8082/admin/portal/query" \
+  -H 'content-type: application/json' \
+  -d '{"service":"orders","sql":"SELECT id, name FROM portal_t ORDER BY id","subject_id":"portal-user","format":"json","max_rows":10}'
+python3 - <<'PY'
+import json
+hdr=open("/tmp/dn-portal-json.hdr").read().lower()
+# json path materializes ResultSet; must NOT advertise NDJSON backend_window streaming.
+assert "x-data-nexus-stream: backend_window" not in hdr, hdr
+assert "application/json" in hdr or "json" in hdr, hdr
+body=json.load(open("/tmp/dn-portal-multi.json"))
+assert body.get("decision")=="allow", body
+assert body.get("row_count", 0) >= 2, body
+assert isinstance(body.get("rows"), list) and len(body["rows"]) >= 2, body
+print("json multi-row materialized ok", "rows", body.get("row_count"))
+PY
+
+echo "==> portal multi-row CSV is materialized (A09 honest: not backend_window)"
+curl -fsS -D /tmp/dn-portal-csv2.hdr -o /tmp/dn-portal-multi.csv \
+  -X POST "http://127.0.0.1:8082/admin/portal/query" \
+  -H 'content-type: application/json' \
+  -d '{"service":"orders","sql":"SELECT id, name FROM portal_t ORDER BY id","subject_id":"portal-user","format":"csv","max_rows":10,"download":true}'
+python3 - <<'PY'
+hdr=open("/tmp/dn-portal-csv2.hdr").read().lower()
+body=open("/tmp/dn-portal-multi.csv").read()
+assert "text/csv" in hdr, hdr
+assert "x-data-nexus-stream: backend_window" not in hdr, hdr
+lines=[ln for ln in body.splitlines() if ln.strip()]
+assert len(lines) >= 3, lines  # header + >=2 data rows
+print("csv multi-row materialized ok", "lines", len(lines))
+PY
+
 echo "==> portal invalid format rejected"
 set +e
 curl -sS -o /tmp/dn-portal-badfmt.json -w "%{http_code}" \

@@ -103,6 +103,44 @@ lines_pg="$(echo "$out_pg" | sed '/^$/d' | wc -l | tr -d ' ')"
 [[ "$lines_pg" == "1" ]] || { echo "pg: expected 1 row, got $lines_pg: $out_pg" >&2; exit 1; }
 echo "$out_pg" | grep -qE '1.*a'
 
+echo "==> MySQL in-transaction Streaming still applies max_rows (A06 txn lease)"
+# Producer must return txn_lease after stream drain so COMMIT succeeds.
+out_txn="$(mysql_via_gateway 'BEGIN; SELECT id, name FROM stream_smoke ORDER BY id; COMMIT;')"
+echo "$out_txn"
+# Expect a single data row (max_rows=1); COMMIT may print empty / status lines.
+data_lines="$(echo "$out_txn" | sed '/^$/d' | grep -E $'^[0-9]+[[:space:]]' | wc -l | tr -d ' ')"
+[[ "$data_lines" == "1" ]] || {
+  echo "mysql txn: expected 1 data row under max_rows=1, got $data_lines: $out_txn" >&2
+  exit 1
+}
+echo "$out_txn" | grep -qE $'1[[:space:]]+a'
+
+echo "==> MySQL post-txn query still works (lease returned)"
+out_after="$(mysql_via_gateway 'SELECT id FROM stream_smoke WHERE id=1;')"
+echo "$out_after"
+echo "$out_after" | grep -qE '^1$'
+
+echo "==> PostgreSQL in-transaction Streaming still applies max_rows (A06 txn lease)"
+# Use a multi-line script on one connection so BEGIN..SELECT..COMMIT share the session.
+# -tAc on multi-statement only surfaces the last command (COMMIT); use unaligned text.
+out_pg_txn="$(docker run --rm -i --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+  env PGPASSWORD=postgres \
+  psql -h host.docker.internal -p 9089 -U postgres -d analytics -v ON_ERROR_STOP=1 -A -t <<'SQL'
+BEGIN;
+SELECT id || '|' || name FROM stream_smoke ORDER BY id;
+COMMIT;
+SQL
+)"
+echo "$out_pg_txn"
+# Data rows look like "1|a"; BEGIN/COMMIT may print empty lines or "BEGIN"/"COMMIT" depending on -t.
+pg_txn_data="$(echo "$out_pg_txn" | sed '/^$/d' | grep -E '^[0-9]+\|' || true)"
+pg_txn_lines="$(echo "$pg_txn_data" | sed '/^$/d' | wc -l | tr -d ' ')"
+[[ "$pg_txn_lines" == "1" ]] || {
+  echo "pg txn: expected 1 data row under max_rows=1, got $pg_txn_lines: $out_pg_txn" >&2
+  exit 1
+}
+echo "$pg_txn_data" | grep -qE '1\|a'
+
 echo "==> metrics execute_path present after traffic"
 metrics="$(curl -fsS http://127.0.0.1:8082/metrics || true)"
 if echo "$metrics" | grep -q 'gateway_execute_path_total'; then
