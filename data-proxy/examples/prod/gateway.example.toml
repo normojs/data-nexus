@@ -87,6 +87,22 @@ index_path = "/var/log/data-nexus/audit/index.sqlite"
 #   opendal_prefix = "audit"
 
 # Baseline deny for obvious secrets / DDL (tune per environment).
+# --- H05 multi-instance shared state (optional; default is in-memory) ---
+# When running >1 proxy process against the same policies/tickets/vault:
+# - ticket/vault: JSON + advisory locks (full-file replace, not CRDT)
+# - encrypt keys: 64 hex chars; vault without key never persists backend passwords
+# - policy_path: shared Local PDP snapshot; policy_poll_ms mtime reload (0 = off)
+# - audit index_path above should be on shared durable storage for multi-writer WAL
+[security.state]
+backend = "file"
+ticket_path = "/var/lib/data-nexus/tickets.json"
+vault_path = "/var/lib/data-nexus/vault.json"
+policy_path = "/var/lib/data-nexus/local-pdp.json"
+policy_poll_ms = 1000
+# Prefer env substitution for keys (render-config / private env file):
+ticket_encrypt_key = "__DN_TICKET_ENCRYPT_KEY__"
+vault_encrypt_key = "__DN_VAULT_ENCRYPT_KEY__"
+
 [[security.rules]]
 name = "deny-secret-tables"
 effect = "deny"

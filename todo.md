@@ -160,6 +160,7 @@ examples/        smoke + gateway config 样例
 | A06 | 事务内 Streaming max_rows 双协议 smoke（部分） | feat(a06) |
 | A09 | portal json/csv 物化边界 smoke（部分） | feat(a09) |
 | T01 | 列 ACL / 复杂 SQL 矩阵（部分） | feat(t01) |
+| H05 | multi-instance file bundle + prod state template（部分） | feat(h05) |
 
 ---
 
@@ -195,7 +196,7 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
 | **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
-| **H05** | 多实例状态外置 | ticket/vault JSON+lock+**AES-GCM**；审计 SQLite；`policy_path`+mtime | 全文件替换非 CRDT；轮询默认 1s；密钥 64 hex；vault 无密钥仍不落盘密码 | **部分** |
+| **H05** | 多实例状态外置 | ticket/vault JSON+lock+**AES-GCM**；审计 SQLite；`policy_path`+mtime | 交叉文件 bundle 单测 + prod `security.state` 模板；全文件替换非 CRDT；轮询默认 1s；vault 无密钥仍不落盘密码 | **部分** |
 | **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `223f2c0` → origin/main | **完成** |
 | **H07** | CI 矩阵加深 | PR/push **default**；schedule nightly **extended+cedar**；dispatch 分 job；rustc **1.94.1** | 非 default 不挡 PR；cedar 需 feature 预编译 | **完成** |
 | **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | **H05 已交付 AES-GCM 文件信封**（`vault_encrypt_key`）；进程内存仍明文 | **部分→见 H05** |
@@ -227,7 +228,7 @@ examples/        smoke + gateway config 样例
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；smoke 双协议 max_rows（**含 txn**）+ `execute_path=streaming`；峰值 ≈ 窗口 |
 | PG passthrough | A08：idle pool（TTL+探测）+ 事务 tcp_txn；`ssl_mode` prefer/require；**可配 `ssl_ca_file` + `ssl_accept_invalid_certs=false` 钉 CA**（默认仍 accept_invalid=true）；非 extended |
 | 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；**MySQL QueryParams 走 COM_STMT_PREPARE/EXECUTE 绑定** + binary 行 + **Streaming 窗口** + 连接缓存；date/time binary 结果 hex MVP；非 TCP passthrough |
-| 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；非 CRDT |
+| 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；**prod 模板已含 security.state**；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
 | 复杂 SQL / 列 ACL | T01：JOIN/子查询/CTE 主路径有单测+smoke；**WHERE 子查询表**可能漏抽；列 rewrite 不深改嵌套 SELECT 列表 |
@@ -236,27 +237,25 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> H05 多实例收口 或 A08 MySQL TLS 或 UI04 策略只读页 <<<**
+**>>> A08 MySQL TLS 或 UI04 策略只读页 或 T02 Ticket/Vault runbook <<<**
 
-本轮（T01 复杂 SQL / 列 ACL 矩阵）：
+本轮（H05 多实例收口）：
 
-- `object_extract`：子查询/CTE/JOIN/方言 schema、parse_failed、UPDATE/DELETE
-- PDP：join 列 rewrite、parse_failed+启发式表仍 deny secret、fail_closed=false 不硬拒
-- `smoke-security-column`：子查询/qualified/join 不泄露 salary
-- 诚实 gap：WHERE 子查询表可能漏抽；嵌套 SELECT 列表 rewrite 不深
+- 交叉文件 bundle 单测：encrypted ticket+vault+policy 双句柄共享
+- 配置校验：policy_path 可选；`policy_poll_ms=0` 允许关轮询；redis 仍拒绝
+- prod：`security.state` 模板 + env encrypt keys + render-config 替换 + README 运维说明
+- 仍 **部分**：非 CRDT；进程内存 vault 密码明文；无 redis/remote
 
 ```bash
-cargo test -p runtime_gateway --lib 'object_extract::tests::t01_'
-cargo test -p gateway_core --lib 'pdp::tests::t01_'
-./examples/smoke-security-column.sh
+cargo test -p gateway_core --lib h05_
 ./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **H05** — 多实例状态外置收口  
-2. **A08** — MySQL backend TLS（若需要）  
-3. **UI04** — 策略只读页  
+1. **A08** — MySQL backend TLS（若需要）  
+2. **UI04** — 策略只读页  
+3. **T02** — Ticket/Vault runbook  
 
 ---
 

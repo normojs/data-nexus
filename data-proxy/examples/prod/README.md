@@ -39,6 +39,15 @@ cargo build -p data-proxy --bin proxy
 | OpenDAL archive | optional `audit-opendal` feature: `fs` / `s3` / `oss` after rotate; credentials via `DN_OPENDAL_*` |
 | High risk | DDL + write-without-WHERE require tickets |
 | Streaming | `window_rows=256`, `passthrough=true` |
+| Multi-instance (H05) | `security.state.backend=file` + ticket/vault/policy paths; optional AES-GCM keys |
+
+### H05 multi-instance notes
+
+- **Not CRDT**: concurrent writers use advisory locks + full-file replace (last writer wins for overlapping updates).
+- **Vault passwords**: only persisted when `vault_encrypt_key` is set (64 hex). Without key, lease file is metadata-only.
+- **Local PDP**: `policy_path` + `policy_poll_ms` (default 1000; `0` disables mtime poll).
+- **Audit SQLite**: put `index_path` on shared durable storage; WAL multi-writer OK with busy timeout.
+- Redis/remote state backends are **rejected** at config validate until implemented.
 
 ## Related docs
 
@@ -56,3 +65,4 @@ cargo build -p data-proxy --bin proxy
 3. Audit directory exists and is writable by the proxy user  
 4. TLS: terminate at LB or enable protocol TLS when available  
 5. Run `./examples/run-smoke-matrix.sh l0` against a staging stack  
+6. Multi-instance: shared `security.state.*` paths + encrypt keys; shared audit `index_path`  

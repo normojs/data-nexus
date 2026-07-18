@@ -266,4 +266,110 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.lock"));
     }
+    #[test]
+    fn h05_multi_instance_file_bundle_ticket_vault_policy() {
+        // Two handles share ticket + vault + policy files (full-file replace, not CRDT).
+        use crate::{
+            parse_encrypt_key, IssueTicketRequest, IssueVaultLeaseRequest, SecurityPolicyConfig,
+            SecurityRuleConfig, TicketStore, VaultStore,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("dn-h05-bundle-{ms}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let ticket_path = dir.join("tickets.json");
+        let vault_path = dir.join("vault.json");
+        let policy_path = dir.join("policy.json");
+        let key_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let key = parse_encrypt_key(key_hex).unwrap();
+
+        let mut cfg_a = SecurityPolicyConfig::default();
+        cfg_a.enabled = true;
+        cfg_a.fail_closed = true;
+        cfg_a.star_policy = "deny".into();
+        cfg_a.rules = vec![SecurityRuleConfig {
+            name: "deny-secret".into(),
+            effect: "deny".into(),
+            actions: vec!["select".into()],
+            tables: vec!["secret_*".into()],
+            columns: vec![],
+            subjects: vec![],
+            row_filter: None,
+        }];
+        cfg_a.state.backend = "file".into();
+        cfg_a.state.ticket_path = ticket_path.to_string_lossy().into();
+        cfg_a.state.vault_path = vault_path.to_string_lossy().into();
+        cfg_a.state.policy_path = policy_path.to_string_lossy().into();
+        cfg_a.state.ticket_encrypt_key = key_hex.into();
+        cfg_a.state.vault_encrypt_key = key_hex.into();
+        cfg_a.state.policy_poll_ms = 1;
+        assert_eq!(cfg_a.validate(), Ok(()));
+        crate::persist_local_pdp_to_file(&cfg_a).expect("seed policy");
+        assert!(policy_path.exists());
+
+        let tickets = TicketStore::with_file(ticket_path.clone(), key).unwrap();
+        let t = tickets.issue(IssueTicketRequest {
+            subject_id: "alice".into(),
+            sql: "DROP TABLE t".into(),
+            ticket_type: "ddl".into(),
+            ttl_secs: 600,
+            max_uses: 1,
+            note: None,
+            issued_by: Some("ops".into()),
+            dual_control: false,
+        });
+
+        let vault = VaultStore::with_file(vault_path.clone(), key).unwrap();
+        let lease = vault.issue_lease(
+            IssueVaultLeaseRequest {
+                project: "orders".into(),
+                environment: "dev".into(),
+                ttl_secs: 600,
+                issued_by: None,
+            },
+            "orders",
+            "orders-primary",
+            "mysql",
+            "127.0.0.1:3306",
+            Some("orders".into()),
+            "app",
+            "s3cret",
+        );
+        let lease_json = serde_json::to_string(&lease).unwrap();
+        assert!(!lease_json.contains("s3cret"), "{lease_json}");
+
+        // Second process handles: observe shared durable state.
+        let tickets_b = TicketStore::with_file(ticket_path.clone(), key).unwrap();
+        assert!(tickets_b.get(&t.id).is_some());
+        let vault_b = VaultStore::with_file(vault_path.clone(), key).unwrap();
+        let (user, pass) = vault_b
+            .backend_identity(&lease.lease_id)
+            .expect("password restored with encrypt key");
+        assert_eq!(user, "app");
+        assert_eq!(pass, "s3cret");
+
+        let mut cfg_b = SecurityPolicyConfig::default();
+        cfg_b.enabled = true;
+        cfg_b.state.policy_path = policy_path.to_string_lossy().into();
+        let merged = crate::merge_local_pdp_from_file(&cfg_b).expect("merge");
+        assert!(
+            merged.rules.iter().any(|r| r.name == "deny-secret"),
+            "{:?}",
+            merged.rules
+        );
+
+        let raw_t = std::fs::read_to_string(&ticket_path).unwrap();
+        assert!(raw_t.starts_with("DNTICKET1:"), "{raw_t}");
+        assert!(!raw_t.contains("DROP TABLE"));
+        let raw_v = std::fs::read_to_string(&vault_path).unwrap();
+        assert!(raw_v.starts_with("DNVAULT1:"), "{raw_v}");
+        assert!(!raw_v.contains("s3cret"), "{raw_v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
 }

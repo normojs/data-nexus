@@ -360,6 +360,16 @@ impl SecurityPolicyConfig {
             }
         }
 
+        // H05: policy_poll_ms=0 disables mtime poll (documented); any other value ok.
+        // Reject absurd sub-ms non-zero only if mis-set via overflow — u64 always fine.
+        // When policy_path is set, poll_ms=0 is allowed (manual reload / single writer).
+        if !self.state.policy_path.trim().is_empty()
+            && self.state.backend.trim().eq_ignore_ascii_case("file")
+            && self.state.policy_poll_ms == 0
+        {
+            // Soft allow: operators may disable poll intentionally.
+        }
+
         // enabled=true is a pre-staged shell; PDP stages validate at runtime.
         Ok(())
     }
@@ -804,6 +814,30 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.state.ticket_encrypt_key =
             "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into();
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn h05_policy_path_optional_with_file_backend() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.state.backend = "file".into();
+        cfg.state.ticket_path = "/tmp/t.json".into();
+        cfg.state.vault_path = "/tmp/v.json".into();
+        // policy_path empty is valid (ticket/vault shared; Local PDP stays process-local).
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.state.policy_path = "/var/lib/data-nexus/local-pdp.json".into();
+        cfg.state.policy_poll_ms = 0; // disable mtime poll
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.state.policy_poll_ms = 1000;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn h05_memory_backend_allows_policy_path_only() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.state.backend = "memory".into();
+        cfg.state.policy_path = "/tmp/p.json".into();
+        // ticket/vault stay in-memory; shared policy snapshot still allowed.
         assert_eq!(cfg.validate(), Ok(()));
     }
 }

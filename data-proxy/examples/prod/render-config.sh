@@ -54,6 +54,9 @@ keys = [
 ]
 for k in keys:
     text = text.replace("__" + k + "__", os.environ[k])
+# H05 optional encrypt keys (empty string allowed → leave file unsealed / no password disk)
+for k in ("DN_TICKET_ENCRYPT_KEY", "DN_VAULT_ENCRYPT_KEY"):
+    text = text.replace("__" + k + "__", os.environ.get(k, ""))
 if "__DN_" in text:
     sys.stderr.write("unreplaced placeholders remain in template\n")
     sys.exit(1)
