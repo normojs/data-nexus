@@ -190,6 +190,7 @@ mod tests {
             username: "postgres".into(),
             password: "secret".into(),
             weight: 1,
+        ssl_mode: Default::default(),
         });
         config
     }

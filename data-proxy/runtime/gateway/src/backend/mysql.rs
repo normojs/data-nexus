@@ -706,6 +706,7 @@ impl Default for MySqlBackendConnection {
                 username: String::new(),
                 password: String::new(),
                 weight: 0,
+                ssl_mode: Default::default(),
             },
             pool_key: String::new(),
             database: String::new(),
@@ -1253,6 +1254,7 @@ mod tests {
             username: "root".into(),
             password: "secret".into(),
             weight: 1,
+            ssl_mode: Default::default(),
         }
     }
 

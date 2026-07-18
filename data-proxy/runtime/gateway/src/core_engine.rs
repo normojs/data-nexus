@@ -1980,6 +1980,7 @@ mod tests {
                 username: "root".into(),
                 password: "backend-secret".into(),
                 weight: 1,
+            ssl_mode: Default::default(),
             }],
             ..GatewayConfig::default()
         }
@@ -1998,6 +1999,7 @@ mod tests {
             username: "root".into(),
             password: "backend-secret".into(),
             weight: 1,
+        ssl_mode: Default::default(),
         });
         config.route_policies = vec![gateway_core::RoutePolicyConfig {
             name: "orders-balance".into(),
@@ -2019,6 +2021,7 @@ mod tests {
             username: "root".into(),
             password: "backend-secret".into(),
             weight: 1,
+        ssl_mode: Default::default(),
         });
         config.route_policies = vec![gateway_core::RoutePolicyConfig {
             name: "orders-read-write".into(),

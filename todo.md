@@ -134,6 +134,7 @@ examples/        smoke + gateway config 样例
 | A08 | 非事务 TCP idle pool（按 address\|db\|user） | feat(a08) |
 | A08 | idle pool TTL（默认 30s） | feat(a08) |
 | A08 | idle 主动健康探测 SELECT 1 | feat(a08) |
+| A08 | backend SSL（ssl_mode disable/prefer/require） | feat(a08) |
 | F32 | 审计 L0/L1 SQL 载荷裁剪 | feat(f32) |
 | A10 | MySQL binary resultset after Execute（部分） | feat(a10) |
 | H05 | ticket/vault file state backend（部分） | feat(h05) |
@@ -164,7 +165,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
-| **A08** | PostgreSQL wire 透传 | 非事务 idle pool（cap+TTL+**健康探测**）+ 事务 `tcp_txn`；`WireRelay` | 无 SSL；非 extended；探测超时默认 500ms | **部分** |
+| **A08** | PostgreSQL wire 透传 | idle pool（cap+TTL+健康探测）+ 事务 `tcp_txn`；**ssl_mode** disable/prefer/require | 证书校验 danger_accept_invalid（无自定义 CA）；非 extended | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
 | **A10** | 预处理 / 事务透传矩阵 | MySQL binary；PG binary portal；QueryParams + prepare/bind + **Statement 缓存** + **Streaming 窗口** | 参数仍 text ToSql；缓存 per-conn 上限 64；QueryParams 非 TCP passthrough；MySQL QueryParams 仍 text 改写 | **部分** |
 
@@ -213,7 +214,7 @@ examples/        smoke + gateway config 样例
 |------|------|
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
-| PG passthrough | A08：非事务 idle pool（cap+TTL+SELECT 1 探测）+ 事务 `tcp_txn`；无 SSL |
+| PG passthrough | A08：idle pool（TTL+探测）+ 事务 tcp_txn；`ssl_mode` prefer/require；证书校验未钉 CA |
 | 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；MySQL 仍 text 改写；binary 结果含 date/ts/time；非 TCP passthrough |
 | 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；非 CRDT |
 | L2 样本合规 | **未实现**（B08） |
@@ -223,13 +224,14 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A08 SSL 或 A06/A09 收口 或 H07 CI 加深 <<<**
+**>>> A06/A09 收口 或 H07 CI 加深 或 A08 证书钉扎 <<<**
 
-本轮（A08 idle 健康探测）：
+本轮（A08 backend SSL）：
 
-- 复用前 `SELECT 1` 直到 ReadyForQuery（默认超时 500ms）
-- 失败丢弃连接并尝试下一个 idle / 新建
-- `without_health_probe()` 供单测关闭探测
+- `endpoints[].ssl_mode`：`disable`（默认）/ `prefer` / `require`
+- TCP 中继：SSLRequest → native-tls 握手
+- 池路径：`tokio-postgres` + `postgres-native-tls` 同策略
+- MVP：`danger_accept_invalid_certs`（自定义 CA 后置）
 
 ```bash
 cargo test -p runtime_gateway --lib a08_
@@ -238,9 +240,9 @@ cargo test -p runtime_gateway --lib a08_
 
 建议下一刀：
 
-1. **A08 续** — backend SSL  
-2. **A06/A09** — 边界收口 / smoke 加深  
-3. **H07** — CI extended/cedar 矩阵
+1. **A06/A09** — 边界收口 / smoke 加深  
+2. **H07** — CI extended/cedar  
+3. **A08** — 证书钉扎 / 自定义 CA
 
 ---
 

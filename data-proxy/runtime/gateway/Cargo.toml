@@ -43,6 +43,10 @@ tokio-util = { version = "0.7.0", features = ["full"] }
 tokio-postgres = { version = "0.7" }
 # A08: raw PG TCP frame relay (auth + message framing).
 postgres-protocol = "0.6"
+# A08: TLS for PG pool path (tokio-postgres) and TCP relay.
+postgres-native-tls = "0.5"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 fallible-iterator = "0.2"
 tracing = "0.1.13"
 tracing-futures = { version = "0.2.3" }

@@ -39,7 +39,65 @@ pub struct EndpointConfig {
     pub username: String,
     #[serde(default)]
     pub password: String,
+    #[serde(default = "default_endpoint_weight")]
     pub weight: u32,
+    /// A08: backend TLS mode for PostgreSQL (and future MySQL TLS).
+    ///
+    /// | value | meaning |
+    /// |-------|---------|
+    /// | `disable` (default) | plain TCP |
+    /// | `prefer` | try SSLRequest; fall back to plain if server rejects |
+    /// | `require` | must negotiate TLS; fail if server says no |
+    #[serde(default)]
+    pub ssl_mode: EndpointSslMode,
+}
+
+fn default_endpoint_weight() -> u32 {
+    1
+}
+
+impl Default for EndpointConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            protocol: ProtocolKind::MySql,
+            address: String::new(),
+            database: None,
+            role: EndpointRole::default(),
+            username: String::new(),
+            password: String::new(),
+            weight: 1,
+            ssl_mode: EndpointSslMode::Disable,
+        }
+    }
+}
+
+/// Backend TLS negotiation policy (A08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointSslMode {
+    #[default]
+    Disable,
+    Prefer,
+    Require,
+}
+
+impl EndpointSslMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+        }
+    }
+
+    pub fn wants_tls(self) -> bool {
+        !matches!(self, Self::Disable)
+    }
+
+    pub fn requires_tls(self) -> bool {
+        matches!(self, Self::Require)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +417,7 @@ mod tests {
                 username: "app".into(),
                 password: "secret".into(),
                 weight: 1,
+            ssl_mode: Default::default(),
             }],
             route_policies: vec![RoutePolicyConfig {
                 name: "primary-only".into(),

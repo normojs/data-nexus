@@ -22,15 +22,17 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
-use gateway_core::{EndpointConfig, GatewayError, GatewayResult, WireStream};
+use gateway_core::{EndpointConfig, EndpointSslMode, GatewayError, GatewayResult, WireStream};
 use parking_lot::Mutex;
 use postgres_protocol::authentication::md5_hash;
 use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256, SCRAM_SHA_256};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use postgresql_protocol::encode_ssl_request;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_native_tls::TlsStream;
 
 /// Default max idle TCP relay sessions per pool key (A08).
 pub const DEFAULT_TCP_IDLE_MAX_PER_KEY: usize = 4;
@@ -54,15 +56,42 @@ impl std::fmt::Debug for IdleEntry {
 }
 
 /// Authenticated backend socket ready for simple-query relay (reusable).
+///
+/// A08: may be plain TCP or TLS (`EndpointSslMode`).
 pub struct PgTcpSession {
-    stream: TcpStream,
+    stream: PgBackendStream,
     read_buf: BytesMut,
+}
+
+enum PgBackendStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl PgBackendStream {
+    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.write_all(data).await,
+            Self::Tls(s) => s.write_all(data).await,
+        }
+    }
+
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf).await,
+            Self::Tls(s) => s.read(buf).await,
+        }
+    }
 }
 
 impl std::fmt::Debug for PgTcpSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgTcpSession")
             .field("read_buf_len", &self.read_buf.len())
+            .field(
+                "tls",
+                &matches!(self.stream, PgBackendStream::Tls(_)),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -255,12 +284,13 @@ impl PgTcpSession {
         endpoint: &EndpointConfig,
         database: &str,
     ) -> GatewayResult<Self> {
-        let mut stream = TcpStream::connect(&endpoint.address)
+        let tcp = TcpStream::connect(&endpoint.address)
             .await
             .map_err(|e| GatewayError::Backend(format!("pg tcp connect: {e}")))?;
-        stream
-            .set_nodelay(true)
+        tcp.set_nodelay(true)
             .map_err(|e| GatewayError::Backend(format!("pg tcp nodelay: {e}")))?;
+
+        let stream = maybe_upgrade_tls(tcp, endpoint.ssl_mode).await?;
 
         let mut params: Vec<(&str, &str)> = vec![
             ("user", endpoint.username.as_str()),
@@ -273,16 +303,18 @@ impl PgTcpSession {
         let mut out = BytesMut::new();
         frontend::startup_message(params.into_iter(), &mut out)
             .map_err(|e| GatewayError::Backend(format!("pg startup encode: {e}")))?;
-        stream
-            .write_all(&out)
-            .await
-            .map_err(|e| GatewayError::Backend(format!("pg startup write: {e}")))?;
-
         let mut session = Self {
             stream,
             read_buf: BytesMut::with_capacity(16 * 1024),
         };
-        session.authenticate(&endpoint.username, &endpoint.password).await?;
+        session
+            .stream
+            .write_all(&out)
+            .await
+            .map_err(|e| GatewayError::Backend(format!("pg startup write: {e}")))?;
+        session
+            .authenticate(&endpoint.username, &endpoint.password)
+            .await?;
         Ok(session)
     }
 
@@ -639,6 +671,59 @@ impl WireStream for PgTcpWireStream {
     }
 }
 
+
+/// A08: optional TLS upgrade after TCP connect (PostgreSQL SSLRequest).
+///
+/// `disable` → plain. `prefer` → try SSL, fall back to plain on server "N".
+/// `require` → must get "S" and complete TLS handshake (danger_accept_invalid_certs
+/// for MVP — custom CA pinning deferred).
+async fn maybe_upgrade_tls(
+    mut tcp: TcpStream,
+    mode: EndpointSslMode,
+) -> GatewayResult<PgBackendStream> {
+    if !mode.wants_tls() {
+        return Ok(PgBackendStream::Plain(tcp));
+    }
+    let req = encode_ssl_request();
+    tcp.write_all(&req)
+        .await
+        .map_err(|e| GatewayError::Backend(format!("pg SSLRequest write: {e}")))?;
+    let mut ans = [0u8; 1];
+    tcp.read_exact(&mut ans)
+        .await
+        .map_err(|e| GatewayError::Backend(format!("pg SSLRequest read: {e}")))?;
+    match ans[0] {
+        b'S' => {
+            let connector = native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .map_err(|e| GatewayError::Backend(format!("pg tls connector: {e}")))?;
+            let connector = tokio_native_tls::TlsConnector::from(connector);
+            // SNI host from address (strip port).
+            let host = {
+                // not used for validation when danger_accept_invalid_certs
+                "localhost"
+            };
+            let tls = connector
+                .connect(host, tcp)
+                .await
+                .map_err(|e| GatewayError::Backend(format!("pg tls handshake: {e}")))?;
+            Ok(PgBackendStream::Tls(Box::new(tls)))
+        }
+        b'N' => {
+            if mode.requires_tls() {
+                return Err(GatewayError::Backend(
+                    "postgresql endpoint ssl_mode=require but server refused SSL".into(),
+                ));
+            }
+            Ok(PgBackendStream::Plain(tcp))
+        }
+        other => Err(GatewayError::Backend(format!(
+            "postgresql SSLRequest unexpected response 0x{other:02x}"
+        ))),
+    }
+}
+
 /// Split one complete PG message frame from `buf` without semantic parse.
 fn try_split_frame(buf: &mut BytesMut) -> GatewayResult<Option<Vec<u8>>> {
     if buf.len() < 5 {
@@ -754,6 +839,7 @@ mod tests {
             username: "u".into(),
             password: "x".into(),
             weight: 1,
+        ssl_mode: Default::default(),
         };
         let key = PgTcpIdlePool::pool_key(&ep, "db");
         assert_eq!(key, "127.0.0.1:5432|db|u");
@@ -780,7 +866,7 @@ mod tests {
                 let stream = TcpStream::connect(addr).await.unwrap();
                 let _ = accept.await;
                 PgTcpSession {
-                    stream,
+                    stream: PgBackendStream::Plain(stream),
                     read_buf: BytesMut::new(),
                 }
             }
@@ -830,7 +916,7 @@ mod tests {
             let stream = TcpStream::connect(addr).await.unwrap();
             let _ = accept.await;
             let sess = PgTcpSession {
-                stream,
+                stream: PgBackendStream::Plain(stream),
                 read_buf: BytesMut::new(),
             };
             let err = sess
@@ -858,4 +944,60 @@ mod tests {
             key: "k".into(),
         };
     }
+
+    #[test]
+    fn a08_ssl_mode_helpers() {
+        use gateway_core::EndpointSslMode;
+        assert!(!EndpointSslMode::Disable.wants_tls());
+        assert!(EndpointSslMode::Prefer.wants_tls());
+        assert!(EndpointSslMode::Require.requires_tls());
+        assert_eq!(EndpointSslMode::Disable.as_str(), "disable");
+        assert_eq!(EndpointSslMode::Prefer.as_str(), "prefer");
+        assert_eq!(EndpointSslMode::Require.as_str(), "require");
+    }
+
+    #[tokio::test]
+    async fn a08_ssl_prefer_falls_back_when_server_rejects() {
+        use gateway_core::EndpointSslMode;
+        // Fake server: accept TCP, answer SSLRequest with 'N', then close.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8];
+            use tokio::io::AsyncReadExt;
+            let _ = s.read_exact(&mut buf).await;
+            use tokio::io::AsyncWriteExt;
+            let _ = s.write_all(b"N").await;
+            // leave open briefly for startup attempt or just drop
+            drop(s);
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let stream = maybe_upgrade_tls(tcp, EndpointSslMode::Prefer).await.unwrap();
+        assert!(matches!(stream, PgBackendStream::Plain(_)));
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn a08_ssl_require_fails_when_server_rejects() {
+        use gateway_core::EndpointSslMode;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8];
+            use tokio::io::AsyncReadExt;
+            let _ = s.read_exact(&mut buf).await;
+            use tokio::io::AsyncWriteExt;
+            let _ = s.write_all(b"N").await;
+            drop(s);
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let err = maybe_upgrade_tls(tcp, EndpointSslMode::Require).await;
+        assert!(err.is_err(), "require must fail");
+        let msg = err.err().unwrap().to_string();
+        assert!(msg.contains("require") || msg.contains("refused"), "err={msg}");
+        let _ = server.await;
+    }
+
 }

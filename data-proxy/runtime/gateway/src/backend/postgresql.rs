@@ -20,8 +20,9 @@ use postgresql_protocol::{
     encode_command_complete, encode_data_row, encode_ready_for_query, encode_row_description,
     FieldDescription, TransactionStatus,
 };
-use tokio_postgres::{types::ToSql, Client, NoTls, Row, SimpleQueryMessage, Statement};
+use tokio_postgres::{types::ToSql, Client, Config as PgConfig, NoTls, Row, SimpleQueryMessage, Statement};
 use tracing::error;
+use postgres_native_tls::MakeTlsConnector;
 
 use super::pg_tcp_relay::{
     new_tcp_txn_slot, PgTcpIdlePool, PgTcpSession, PgTcpTxnSlot, SessionReturn,
@@ -1181,6 +1182,7 @@ impl Default for PostgreSqlBackendConnection {
                 username: String::new(),
                 password: String::new(),
                 weight: 0,
+                ssl_mode: Default::default(),
             },
             pool_key: String::new(),
             database: String::new(),
@@ -1346,7 +1348,7 @@ enum PostgreSqlSessionAttr {
 async fn connect_endpoint(endpoint: &EndpointConfig, database: &str) -> GatewayResult<Client> {
     let (host, port) = parse_endpoint_address(&endpoint.address)?;
 
-    let mut config = tokio_postgres::Config::new();
+    let mut config = PgConfig::new();
     config.host(&host);
     config.port(port);
     config.user(&endpoint.username);
@@ -1355,14 +1357,40 @@ async fn connect_endpoint(endpoint: &EndpointConfig, database: &str) -> GatewayR
     }
     config.dbname(database);
 
-    let (client, connection) = config.connect(NoTls).await.map_err(postgresql_backend_error)?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            error!("postgresql backend connection error: {}", error);
-        }
-    });
+    // A08: map EndpointSslMode → tokio-postgres SslMode.
+    use gateway_core::EndpointSslMode;
+    use tokio_postgres::config::SslMode;
+    match endpoint.ssl_mode {
+        EndpointSslMode::Disable => config.ssl_mode(SslMode::Disable),
+        EndpointSslMode::Prefer => config.ssl_mode(SslMode::Prefer),
+        EndpointSslMode::Require => config.ssl_mode(SslMode::Require),
+    };
 
-    Ok(client)
+    if endpoint.ssl_mode.wants_tls() {
+        let connector = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| GatewayError::Backend(format!("pg tls connector: {e}")))?;
+        let connector = MakeTlsConnector::new(connector);
+        let (client, connection) = config
+            .connect(connector)
+            .await
+            .map_err(postgresql_backend_error)?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                error!("postgresql backend connection error: {}", error);
+            }
+        });
+        Ok(client)
+    } else {
+        let (client, connection) = config.connect(NoTls).await.map_err(postgresql_backend_error)?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                error!("postgresql backend connection error: {}", error);
+            }
+        });
+        Ok(client)
+    }
 }
 
 fn register_endpoint_factory(
@@ -1753,6 +1781,7 @@ mod tests {
             username: "postgres".into(),
             password: "secret".into(),
             weight: 1,
+            ssl_mode: Default::default(),
         }
     }
 

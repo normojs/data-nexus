@@ -53,7 +53,7 @@ pub use cedar_pdp::{
     CedarReloadInfo, CedarStatus,
 };
 pub use config::{
-    AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, GatewayConfig, ListenerConfig,
+    AuthPolicyConfig, AuthUserConfig, EndpointConfig, EndpointRole, EndpointSslMode, GatewayConfig, ListenerConfig,
     PluginPolicyConfig, RoutePolicyConfig, ServiceConfig,
 };
 pub use object_set::{ColumnAclOutcome, ObjectAccess, ObjectSet, StarPolicy};
