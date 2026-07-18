@@ -2202,7 +2202,22 @@ impl AxumServer {
         maybe_reload_local_pdp(&next_config.gateway.security, &diff);
         // Audit pipeline reconfigure is idempotent (queue worker stays up).
         if diff.security_changed {
-            let _ = gateway_core::install_audit_pipeline(&next_config.gateway.security.audit, &next_config.gateway.security.default_audit_level);
+            let _ = gateway_core::install_audit_pipeline(
+                &next_config.gateway.security.audit,
+                &next_config.gateway.security.default_audit_level,
+            );
+            if let Err(e) = gateway_core::install_ticket_store(
+                &next_config.gateway.security.state.backend,
+                &next_config.gateway.security.state.ticket_path,
+            ) {
+                tracing::error!(target: "data_nexus::security", error = %e, "reload ticket store failed");
+            }
+            if let Err(e) = gateway_core::install_vault_store(
+                &next_config.gateway.security.state.backend,
+                &next_config.gateway.security.state.vault_path,
+            ) {
+                tracing::error!(target: "data_nexus::security", error = %e, "reload vault store failed");
+            }
         }
 
         // Cedar policy hot-reload (keep-old on failure): when security.pdp is cedar

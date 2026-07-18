@@ -48,6 +48,35 @@ pub struct SecurityPolicyConfig {
     /// Visible result watermark (F14).
     #[serde(default)]
     pub watermark: SecurityWatermarkConfig,
+    /// H05: multi-instance state backend for ticket/vault (process-local by default).
+    #[serde(default)]
+    pub state: SecurityStateConfig,
+}
+
+/// H05: shared state for ticket / vault across gateway processes.
+///
+/// | backend | ticket | vault |
+/// |---------|--------|-------|
+/// | `memory` (default) | process HashMap | process HashMap |
+/// | `file` | JSON file at `ticket_path` | JSON file at `vault_path` (lease metadata only; **no** backend passwords) |
+///
+/// `redis` / remote backends are **rejected** until implemented (no silent no-op).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SecurityStateConfig {
+    /// `memory` | `file`. Default `memory`.
+    #[serde(default = "default_state_backend")]
+    pub backend: String,
+    /// Ticket JSON path when `backend=file` (required).
+    #[serde(default)]
+    pub ticket_path: String,
+    /// Vault lease JSON path when `backend=file` (required).
+    /// Stores public lease fields + projects only — never backend passwords (H03/H08).
+    #[serde(default)]
+    pub vault_path: String,
+}
+
+fn default_state_backend() -> String {
+    "memory".into()
 }
 
 fn default_star_policy() -> String {
@@ -79,6 +108,7 @@ impl Default for SecurityPolicyConfig {
             high_risk_rules: Vec::new(),
             time_rules: Vec::new(),
             watermark: SecurityWatermarkConfig::default(),
+            state: SecurityStateConfig::default(),
         }
     }
 }
@@ -241,6 +271,36 @@ impl SecurityPolicyConfig {
             other => {
                 return Err(GatewayError::Configuration(format!(
                     "security.watermark.mode must be column or suffix, got '{other}'"
+                )));
+            }
+        }
+
+        // H05 state backend
+        match self.state.backend.trim().to_ascii_lowercase().as_str() {
+            "memory" | "" => {}
+            "file" => {
+                if self.state.ticket_path.trim().is_empty() {
+                    return Err(GatewayError::Configuration(
+                        "security.state.backend=file requires non-empty security.state.ticket_path"
+                            .into(),
+                    ));
+                }
+                if self.state.vault_path.trim().is_empty() {
+                    return Err(GatewayError::Configuration(
+                        "security.state.backend=file requires non-empty security.state.vault_path"
+                            .into(),
+                    ));
+                }
+            }
+            "redis" | "remote" => {
+                return Err(GatewayError::Configuration(format!(
+                    "security.state.backend='{}' is not implemented yet (H05); use memory or file",
+                    self.state.backend
+                )));
+            }
+            other => {
+                return Err(GatewayError::Configuration(format!(
+                    "security.state.backend must be memory or file, got '{other}'"
                 )));
             }
         }
@@ -652,6 +712,26 @@ mod tests {
         assert!(err.contains("policy_dir"), "{err}");
         #[cfg(not(feature = "security-cedar"))]
         assert!(err.contains("security-cedar") || err.contains("feature"), "{err}");
+    }
+
+
+    #[test]
+    fn h05_state_file_requires_paths() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.state.backend = "file".into();
+        assert!(cfg.validate().is_err());
+        cfg.state.ticket_path = "/tmp/tickets.json".into();
+        assert!(cfg.validate().is_err());
+        cfg.state.vault_path = "/tmp/vault.json".into();
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn h05_state_redis_rejected() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.state.backend = "redis".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("not implemented") || err.contains("H05"), "{err}");
     }
 
 }

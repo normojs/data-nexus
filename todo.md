@@ -132,6 +132,7 @@ examples/        smoke + gateway config 样例
 | A08 | PG wire 无 ResultSet 物化透传（部分） | feat(a08) |
 | F32 | 审计 L0/L1 SQL 载荷裁剪 | feat(f32) |
 | A10 | MySQL binary resultset after Execute（部分） | feat(a10) |
+| H05 | ticket/vault file state backend（部分） | feat(h05) |
 
 ---
 
@@ -167,7 +168,7 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
 | **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
-| **H05** | 多实例状态外置 | ticket / vault / LocalPdp / SQLite 索引现为**进程内** | 水平扩展需粘性或外置 store | **待做** |
+| **H05** | 多实例状态外置 | `security.state.backend=memory\|file`；ticket/vault JSON 文件后端 | LocalPdp / 审计 SQLite 仍进程内；file vault **不**持久化后端密码 | **部分** |
 | **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `223f2c0` → origin/main | **完成** |
 | **H07** | CI 矩阵加深 | PR 已 default；extended / cedar job 可选或 nightly | workflow_dispatch 可选手动 | **可选** |
 | **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | H03 已声明后置 | **延后** |
@@ -199,7 +200,7 @@ examples/        smoke + gateway config 样例
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：`simple_query_raw` 边解码边编码 Wire（无逻辑 ResultSet）；**非** backend TCP 帧中继；包仍可汇总 |
 | 预处理语句 | A10：MySQL COM_STMT_EXECUTE → binary ProtocolBinary 行；PG 仍 text Bind→Query；日期/时间 binary 简化 |
-| 多副本 | 票据/金库/SQLite 索引/LocalPdp **非**共享状态 |
+| 多副本 | H05：ticket/vault 可选 `file` 共享盘 JSON；LocalPdp 与审计 SQLite 索引仍**进程内**；file vault 重启后无后端密码（需重新 issue） |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
 
@@ -207,23 +208,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> H05 多实例外置 或 A08 TCP 真中继 或 A10 日期 binary <<<**
+**>>> A08 TCP 真中继 或 A10 日期 binary 或 H05 LocalPdp 外置 <<<**
 
-本轮（A10 binary resultset）：
+本轮（H05 部分）：
 
-- `SessionState.prefer_binary_result`：COM_STMT_EXECUTE 置位，编码后清零
-- MySQL `encode_binary_row` / windowed `encode_resultset_rows` 支持 binary
-- 数值/字符串/bytes/null 覆盖；日期/时间仍按字符串 length-encoded（诚实）
+- `security.state.backend = memory | file`（`redis`/`remote` 校验拒绝）
+- `install_ticket_store` / `install_vault_store`：file 后端 JSON 持久化
+- Vault file **永不**写后端密码；reload 后 `backend_identity` 为空（需重新 issue）
 
 ```bash
-cargo test -p runtime_gateway --lib a10_
+cargo test -p gateway_core --lib h05_
+# smoke：security-core（ticket/vault）
 ```
 
 建议下一刀：
 
-1. **H05** — 多实例状态外置  
-2. **A08 续** — 真 TCP 帧中继  
-3. **A10 续** — 日期/时间 binary + PG binary 结果
+1. **A08 续** — 真 TCP 帧中继  
+2. **A10 续** — 日期/时间 binary + PG binary 结果  
+3. **H05 续** — LocalPdp / 审计索引外置
 
 ---
 

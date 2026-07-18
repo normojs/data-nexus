@@ -6,20 +6,45 @@
 //!
 //! **F18 dual control**: when `dual_control=true`, issue creates a **pending** ticket.
 //! A second person (≠ issuer) must `approve` before the data plane can `consume` it.
+//!
+//! **H05**: optional file backend (`security.state.backend=file`) persists tickets as
+//! JSON so multiple gateway processes on shared storage can share ticket state.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static GLOBAL: OnceLock<Arc<TicketStore>> = OnceLock::new();
 
-/// Process-wide ticket store.
+/// Process-wide ticket store (memory or file-backed per install).
 pub fn global_ticket_store() -> Arc<TicketStore> {
     GLOBAL
         .get_or_init(|| Arc::new(TicketStore::new()))
         .clone()
+}
+
+/// H05: install / reconfigure ticket store backend. Safe to call on reload.
+pub fn install_ticket_store(backend: &str, path: &str) -> Result<Arc<TicketStore>, String> {
+    let store = match backend.trim().to_ascii_lowercase().as_str() {
+        "memory" | "" => Arc::new(TicketStore::new()),
+        "file" => Arc::new(TicketStore::with_file(PathBuf::from(path))?),
+        other => {
+            return Err(format!(
+                "ticket store backend '{other}' not supported (use memory or file)"
+            ))
+        }
+    };
+    // OnceLock cannot replace; if already set, reconfigure in place.
+    if let Some(existing) = GLOBAL.get() {
+        existing.reconfigure_from(&store)?;
+        return Ok(existing.clone());
+    }
+    let _ = GLOBAL.set(store.clone());
+    Ok(store)
 }
 
 /// Lifecycle status for dual-control tickets.
@@ -157,10 +182,17 @@ fn default_max_uses() -> u32 {
     1
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TicketFile {
+    tickets: Vec<Ticket>,
+}
+
 #[derive(Debug)]
 pub struct TicketStore {
     inner: Mutex<HashMap<String, Ticket>>,
     seq: AtomicU64,
+    /// H05: optional JSON file path for durable shared state.
+    path: Mutex<Option<PathBuf>>,
 }
 
 impl TicketStore {
@@ -168,7 +200,83 @@ impl TicketStore {
         Self {
             inner: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
+            path: Mutex::new(None),
         }
+    }
+
+    pub fn with_file(path: PathBuf) -> Result<Self, String> {
+        let store = Self {
+            inner: Mutex::new(HashMap::new()),
+            seq: AtomicU64::new(1),
+            path: Mutex::new(Some(path.clone())),
+        };
+        store.load_from_disk()?;
+        Ok(store)
+    }
+
+    /// Replace in-memory map from another store (used when GLOBAL already installed).
+    fn reconfigure_from(&self, other: &TicketStore) -> Result<(), String> {
+        let map = other.inner.lock().map_err(|e| e.to_string())?.clone();
+        let path = other.path.lock().map_err(|e| e.to_string())?.clone();
+        let seq = other.seq.load(Ordering::Relaxed);
+        *self.inner.lock().map_err(|e| e.to_string())? = map;
+        *self.path.lock().map_err(|e| e.to_string())? = path;
+        self.seq.store(seq, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn load_from_disk(&self) -> Result<(), String> {
+        let path = self.path.lock().map_err(|e| e.to_string())?.clone();
+        let Some(path) = path else {
+            return Ok(());
+        };
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            self.persist_unlocked(&HashMap::new())?;
+            return Ok(());
+        }
+        let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        if raw.trim().is_empty() {
+            return Ok(());
+        }
+        let file: TicketFile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let mut map = HashMap::new();
+        let mut max_seq = 1u64;
+        for t in file.tickets {
+            // best-effort seq recovery from id suffix
+            if let Some(n) = t.id.rsplit('-').next().and_then(|s| s.parse::<u64>().ok()) {
+                max_seq = max_seq.max(n + 1);
+            }
+            map.insert(t.id.clone(), t);
+        }
+        self.seq.store(max_seq, Ordering::Relaxed);
+        *self.inner.lock().map_err(|e| e.to_string())? = map;
+        Ok(())
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        let guard = self.inner.lock().map_err(|e| e.to_string())?;
+        self.persist_unlocked(&guard)
+    }
+
+    fn persist_unlocked(&self, map: &HashMap<String, Ticket>) -> Result<(), String> {
+        let path = self.path.lock().map_err(|e| e.to_string())?.clone();
+        let Some(path) = path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut tickets: Vec<Ticket> = map.values().cloned().collect();
+        tickets.sort_by(|a, b| b.issued_at_unix_ms.cmp(&a.issued_at_unix_ms));
+        let file = TicketFile { tickets };
+        let tmp = path.with_extension("json.tmp");
+        let data = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+        fs::write(&tmp, data).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn issue(&self, req: IssueTicketRequest) -> Ticket {
@@ -207,10 +315,11 @@ impl TicketStore {
             rejected_by: None,
             reject_reason: None,
         };
-        self.inner
-            .lock()
-            .expect("ticket lock")
-            .insert(id, ticket.clone());
+        {
+            let mut guard = self.inner.lock().expect("ticket lock");
+            guard.insert(id, ticket.clone());
+        }
+        let _ = self.persist();
         ticket
     }
 
@@ -269,7 +378,10 @@ impl TicketStore {
         ticket.status = TicketStatus::Active;
         ticket.approved_by = Some(approver.to_owned());
         ticket.approved_at_unix_ms = Some(now);
-        Ok(ticket.clone())
+        let out = ticket.clone();
+        drop(guard);
+        let _ = self.persist();
+        Ok(out)
     }
 
     /// Reject a pending dual-control ticket (or any unused ticket).
@@ -301,7 +413,10 @@ impl TicketStore {
         ticket.status = TicketStatus::Rejected;
         ticket.rejected_by = Some(rejector.to_owned());
         ticket.reject_reason = reason;
-        Ok(ticket.clone())
+        let out = ticket.clone();
+        drop(guard);
+        let _ = self.persist();
+        Ok(out)
     }
 
     /// H03: alias of reject for active/pending unused tickets (explicit revoke wording).
@@ -320,7 +435,12 @@ impl TicketStore {
         let mut guard = self.inner.lock().expect("ticket lock");
         let before = guard.len();
         guard.retain(|_, t| !t.is_expired(now));
-        before.saturating_sub(guard.len())
+        let removed = before.saturating_sub(guard.len());
+        drop(guard);
+        if removed > 0 {
+            let _ = self.persist();
+        }
+        removed
     }
 
     /// Validate and consume one use. Returns Ok(ticket) or Err(reason).
@@ -359,7 +479,10 @@ impl TicketStore {
             ));
         }
         ticket.uses += 1;
-        Ok(ticket.clone())
+        let out = ticket.clone();
+        drop(guard);
+        let _ = self.persist();
+        Ok(out)
     }
 }
 
@@ -601,4 +724,29 @@ mod tests {
             .expect_err("rejected");
         assert!(err.to_ascii_lowercase().contains("reject"), "err={err}");
     }
+
+    #[test]
+    fn h05_ticket_file_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("dn-h05-tkt-{}", now_unix_ms()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("tickets.json");
+        let store = TicketStore::with_file(path.clone()).unwrap();
+        let t = store.issue(IssueTicketRequest {
+            subject_id: "alice".into(),
+            sql: "DELETE FROM t".into(),
+            ticket_type: "high_risk".into(),
+            ttl_secs: 600,
+            max_uses: 1,
+            note: None,
+            issued_by: Some("admin".into()),
+            dual_control: false,
+        });
+        drop(store);
+        let store2 = TicketStore::with_file(path).unwrap();
+        let got = store2.get(&t.id).expect("reloaded");
+        assert_eq!(got.subject_id, "alice");
+        assert_eq!(got.sql_fingerprint, t.sql_fingerprint);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

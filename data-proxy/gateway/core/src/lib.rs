@@ -75,12 +75,14 @@ pub use time_rules::{
     is_inside_window, parse_hhmm, security_now_unix_secs, SecurityTimeRuleConfig,
 };
 pub use ticket::{
-    extract_ticket_id, global_ticket_store, is_write_without_where, sql_fingerprint,
+    extract_ticket_id, global_ticket_store, install_ticket_store, is_write_without_where,
+    sql_fingerprint,
     strip_ticket_comment, ApproveTicketRequest, IssueTicketRequest, RejectTicketRequest, Ticket,
     TicketStatus, TicketStore,
 };
 pub use vault::{
-    global_vault_store, IssueVaultLeaseRequest, ProjectEnv, RenewVaultLeaseRequest,
+    global_vault_store, install_vault_store, IssueVaultLeaseRequest, ProjectEnv,
+    RenewVaultLeaseRequest,
     RevokeVaultLeaseRequest, VaultLease, VaultStore,
 };
 pub use dialect::{default_dialect_parser, DialectParser, HeuristicDialectParser};

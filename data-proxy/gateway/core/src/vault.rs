@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +20,26 @@ pub fn global_vault_store() -> Arc<VaultStore> {
     GLOBAL
         .get_or_init(|| Arc::new(VaultStore::new()))
         .clone()
+}
+
+/// H05: install / reconfigure vault store. File backend stores **public** lease
+/// metadata + projects only — never backend passwords (H03/H08).
+pub fn install_vault_store(backend: &str, path: &str) -> Result<Arc<VaultStore>, String> {
+    let store = match backend.trim().to_ascii_lowercase().as_str() {
+        "memory" | "" => Arc::new(VaultStore::new()),
+        "file" => Arc::new(VaultStore::with_file(PathBuf::from(path))?),
+        other => {
+            return Err(format!(
+                "vault store backend '{other}' not supported (use memory or file)"
+            ))
+        }
+    };
+    if let Some(existing) = GLOBAL.get() {
+        existing.reconfigure_from(&store)?;
+        return Ok(existing.clone());
+    }
+    let _ = GLOBAL.set(store.clone());
+    Ok(store)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +119,14 @@ pub struct VaultStore {
     leases: Mutex<HashMap<String, LeaseRecord>>,
     projects: Mutex<Vec<ProjectEnv>>,
     seq: AtomicU64,
+    /// H05: optional JSON path (lease metadata only; passwords never written).
+    path: Mutex<Option<PathBuf>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct VaultFile {
+    projects: Vec<ProjectEnv>,
+    leases: Vec<VaultLease>,
 }
 
 impl VaultStore {
@@ -105,11 +135,100 @@ impl VaultStore {
             leases: Mutex::new(HashMap::new()),
             projects: Mutex::new(Vec::new()),
             seq: AtomicU64::new(1),
+            path: Mutex::new(None),
         }
+    }
+
+    pub fn with_file(path: PathBuf) -> Result<Self, String> {
+        let store = Self {
+            leases: Mutex::new(HashMap::new()),
+            projects: Mutex::new(Vec::new()),
+            seq: AtomicU64::new(1),
+            path: Mutex::new(Some(path)),
+        };
+        store.load_from_disk()?;
+        Ok(store)
+    }
+
+    fn reconfigure_from(&self, other: &VaultStore) -> Result<(), String> {
+        let leases = other.leases.lock().map_err(|e| e.to_string())?;
+        let projects = other.projects.lock().map_err(|e| e.to_string())?.clone();
+        let path = other.path.lock().map_err(|e| e.to_string())?.clone();
+        let seq = other.seq.load(Ordering::Relaxed);
+        // File-backed reloads do not carry passwords; memory reconfigure keeps passwords
+        // only when other is also memory with records.
+        *self.leases.lock().map_err(|e| e.to_string())? = leases
+            .iter()
+            .map(|(k, v)| (k.clone(), LeaseRecord {
+                lease: v.lease.clone(),
+                backend_password: v.backend_password.clone(),
+                backend_username: v.backend_username.clone(),
+            }))
+            .collect();
+        *self.projects.lock().map_err(|e| e.to_string())? = projects;
+        *self.path.lock().map_err(|e| e.to_string())? = path;
+        self.seq.store(seq, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn load_from_disk(&self) -> Result<(), String> {
+        let path = self.path.lock().map_err(|e| e.to_string())?.clone();
+        let Some(path) = path else { return Ok(()) };
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            self.persist()?;
+            return Ok(());
+        }
+        let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        if raw.trim().is_empty() {
+            return Ok(());
+        }
+        let file: VaultFile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        *self.projects.lock().map_err(|e| e.to_string())? = file.projects;
+        let mut map = HashMap::new();
+        let mut max_seq = 1u64;
+        for lease in file.leases {
+            if let Some(n) = lease.lease_id.rsplit('-').next().and_then(|s| s.parse::<u64>().ok()) {
+                max_seq = max_seq.max(n + 1);
+            }
+            map.insert(
+                lease.lease_id.clone(),
+                LeaseRecord {
+                    lease,
+                    // Passwords never leave the issuing process (H03/H08).
+                    backend_password: String::new(),
+                    backend_username: String::new(),
+                },
+            );
+        }
+        self.seq.store(max_seq, Ordering::Relaxed);
+        *self.leases.lock().map_err(|e| e.to_string())? = map;
+        Ok(())
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        let path = self.path.lock().map_err(|e| e.to_string())?.clone();
+        let Some(path) = path else { return Ok(()) };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let projects = self.projects.lock().map_err(|e| e.to_string())?.clone();
+        let leases_guard = self.leases.lock().map_err(|e| e.to_string())?;
+        let mut leases: Vec<VaultLease> = leases_guard.values().map(|r| r.lease.clone()).collect();
+        leases.sort_by(|a, b| b.issued_at_unix_ms.cmp(&a.issued_at_unix_ms));
+        let file = VaultFile { projects, leases };
+        let tmp = path.with_extension("json.tmp");
+        let data = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+        fs::write(&tmp, data).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn set_projects(&self, projects: Vec<ProjectEnv>) {
         *self.projects.lock().expect("projects") = projects;
+        let _ = self.persist();
     }
 
     pub fn list_projects(&self) -> Vec<ProjectEnv> {
@@ -178,6 +297,7 @@ impl VaultStore {
                 backend_username: username.to_owned(),
             },
         );
+        let _ = self.persist();
         lease
     }
 
@@ -244,7 +364,10 @@ impl VaultStore {
         rec.lease.access_token = format!("revoked-{}", rec.lease.lease_id);
         rec.lease.expires_at_unix_ms = now;
         rec.backend_password.clear();
-        Ok(rec.lease.clone())
+        let out = rec.lease.clone();
+        drop(guard);
+        let _ = self.persist();
+        Ok(out)
     }
 
     pub fn renew(&self, lease_id: &str, ttl_secs: u64) -> Result<VaultLease, String> {
@@ -259,7 +382,10 @@ impl VaultStore {
         let ttl = ttl_secs.max(1);
         rec.lease.expires_at_unix_ms = now.saturating_add(ttl.saturating_mul(1000));
         rec.lease.access_token = format!("pvt-{}", simple_nonce(now ^ ttl));
-        Ok(rec.lease.clone())
+        let out = rec.lease.clone();
+        drop(guard);
+        let _ = self.persist();
+        Ok(out)
     }
 
     pub fn prune_expired(&self) -> usize {
@@ -267,7 +393,12 @@ impl VaultStore {
         let mut guard = self.leases.lock().expect("leases");
         let before = guard.len();
         guard.retain(|_, r| Self::is_active(&r.lease, now));
-        before.saturating_sub(guard.len())
+        let removed = before.saturating_sub(guard.len());
+        drop(guard);
+        if removed > 0 {
+            let _ = self.persist();
+        }
+        removed
     }
 
     pub fn backend_identity(&self, lease_id: &str) -> Option<(String, String)> {
@@ -275,6 +406,10 @@ impl VaultStore {
         let guard = self.leases.lock().ok()?;
         let rec = guard.get(lease_id)?;
         if !Self::is_active(&rec.lease, now) {
+            return None;
+        }
+        // H05 file reload never restores passwords; treat empty as unavailable.
+        if rec.backend_password.is_empty() {
             return None;
         }
         Some((rec.backend_username.clone(), rec.backend_password.clone()))
@@ -370,4 +505,42 @@ mod tests {
         assert!(store.get_lease(&a.lease_id).is_none());
         assert!(store.get_valid_lease(&b.lease_id).is_some());
     }
+
+    #[test]
+    fn h05_vault_file_roundtrip_no_passwords() {
+        let dir = std::env::temp_dir().join(format!("dn-h05-vault-{}", now_ms()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("vault.json");
+        let store = VaultStore::with_file(path.clone()).unwrap();
+        store.set_projects(vec![ProjectEnv {
+            name: "p".into(),
+            environment: "dev".into(),
+            service: "orders".into(),
+            description: String::new(),
+        }]);
+        let lease = store.issue_lease(
+            IssueVaultLeaseRequest {
+                project: "p".into(),
+                environment: "dev".into(),
+                ttl_secs: 600,
+                issued_by: None,
+            },
+            "orders",
+            "ep1",
+            "mysql",
+            "127.0.0.1:3306",
+            Some("db".into()),
+            "root",
+            "s3cret",
+        );
+        assert!(store.backend_identity(&lease.lease_id).is_some());
+        drop(store);
+        let store2 = VaultStore::with_file(path).unwrap();
+        let got = store2.get_lease(&lease.lease_id).expect("lease meta");
+        assert_eq!(got.service, "orders");
+        // Password must not survive file reload.
+        assert!(store2.backend_identity(&lease.lease_id).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

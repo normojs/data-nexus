@@ -1077,7 +1077,23 @@ impl CoreGatewayRuntimePlan {
     pub fn from_config(config: &GatewayConfig) -> GatewayResult<Self> {
         config.validate()?;
         // S4: install process-wide audit pipeline from security.audit (idempotent).
-        let _ = gateway_core::install_audit_pipeline(&config.security.audit, &config.security.default_audit_level);
+        let _ = gateway_core::install_audit_pipeline(
+            &config.security.audit,
+            &config.security.default_audit_level,
+        );
+        // H05: ticket/vault state backend (memory default; file for shared disk).
+        if let Err(e) = gateway_core::install_ticket_store(
+            &config.security.state.backend,
+            &config.security.state.ticket_path,
+        ) {
+            tracing::error!(target: "data_nexus::security", error = %e, "install ticket store failed");
+        }
+        if let Err(e) = gateway_core::install_vault_store(
+            &config.security.state.backend,
+            &config.security.state.vault_path,
+        ) {
+            tracing::error!(target: "data_nexus::security", error = %e, "install vault store failed");
+        }
 
         let listeners = config
             .listeners
