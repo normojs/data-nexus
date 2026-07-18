@@ -1,7 +1,11 @@
-# Local smoke matrix for Data Nexus (H02)
+# Smoke matrix for Data Nexus (H02 + H07)
 #
-# Runs on macOS/Linux agents with Docker. Cargo target defaults to the
-# external volume documented in data-proxy/docs/build-cache.md.
+# - PR / push (data-proxy paths): **default** = l0 + security-core
+# - workflow_dispatch: choose group (default | security-extended | all | cedar | …)
+# - schedule (nightly): **security-extended** + **cedar** (optional depth; default not re-run)
+#
+# Cedar job builds/runs with `--features security-cedar` (scripts rebuild if needed).
+# Rustc pinned to 1.94.1 (data-proxy/rust-toolchain.toml / time+Cedar MSRV).
 #
 # Optional secrets: none (smokes use docker-compose.dev.yml local passwords).
 
@@ -14,6 +18,9 @@ on:
         description: "Smoke group: l0 | security-core | default | security-extended | all | cedar"
         required: false
         default: "default"
+  schedule:
+    # ~03:17 UTC daily — off the :00/:30 fleet stampede
+    - cron: "17 3 * * *"
   push:
     branches: [main, master]
     paths:
@@ -24,8 +31,21 @@ on:
       - "data-proxy/**"
       - ".github/workflows/smoke-matrix.yml"
 
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: "1.94.1"
+
 jobs:
-  smoke:
+  # -------------------------------------------------------------------------
+  # Gate: PR / push always; dispatch when group is default/l0/security-core/all
+  # -------------------------------------------------------------------------
+  smoke-default:
+    name: smoke (default)
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' &&
+        contains(fromJSON('["default","l0","security-core","all"]'), github.event.inputs.group))
     runs-on: ubuntu-latest
     timeout-minutes: 120
     defaults:
@@ -35,19 +55,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        # Prefer 1.94+ when available for cedar optional jobs; stable is enough for L0.
+      - name: Install Rust 1.94.1
+        uses: dtolnay/rust-toolchain@1.94.1
 
-      - name: Cache cargo target
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ${{ github.workspace }}/.ci-cargo-target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('data-proxy/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-1.94.1-${{ hashFiles('data-proxy/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-1.94.1-
             ${{ runner.os }}-cargo-
 
       - name: Install system deps
@@ -58,12 +78,131 @@ jobs:
       - name: Docker availability
         run: docker info
 
-      - name: Run smoke matrix
+      - name: rustc version
+        run: rustc --version && cargo --version
+
+      - name: Run smoke matrix (default / dispatch group)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-cargo-target
           DN_SMOKE_KEEP_GOING: "0"
           DN_SMOKE_TIMEOUT_SECS: "1200"
         run: |
           chmod +x examples/run-smoke-matrix.sh examples/smoke-*.sh
-          # PR/push: l0 + security-core. Dispatch may override (extended/cedar/all).
-          ./examples/run-smoke-matrix.sh "${{ github.event.inputs.group || 'default' }}"
+          GROUP="${{ github.event.inputs.group || 'default' }}"
+          # "all" on dispatch still runs default job as l0+core; extended is separate.
+          if [[ "$GROUP" == "all" ]]; then
+            GROUP="default"
+          fi
+          ./examples/run-smoke-matrix.sh "$GROUP"
+
+  # -------------------------------------------------------------------------
+  # Extended: stream / passthrough / watermark / dual-control / time / xproto
+  # -------------------------------------------------------------------------
+  smoke-extended:
+    name: smoke (security-extended)
+    if: |
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+        contains(fromJSON('["security-extended","all"]'), github.event.inputs.group))
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: data-proxy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.1
+        uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ github.workspace }}/.ci-cargo-target
+          key: ${{ runner.os }}-cargo-1.94.1-${{ hashFiles('data-proxy/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-1.94.1-
+            ${{ runner.os }}-cargo-
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Docker availability
+        run: docker info
+
+      - name: rustc version
+        run: rustc --version && cargo --version
+
+      - name: Run security-extended smoke
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-cargo-target
+          DN_SMOKE_KEEP_GOING: "0"
+          DN_SMOKE_TIMEOUT_SECS: "1200"
+        run: |
+          chmod +x examples/run-smoke-matrix.sh examples/smoke-*.sh
+          ./examples/run-smoke-matrix.sh security-extended
+
+  # -------------------------------------------------------------------------
+  # Cedar: optional feature binary (not in default gate)
+  # -------------------------------------------------------------------------
+  smoke-cedar:
+    name: smoke (cedar)
+    if: |
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.group == 'cedar')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: data-proxy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.1
+        uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Cache cargo (cedar feature)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ github.workspace }}/.ci-cargo-target
+          key: ${{ runner.os }}-cargo-1.94.1-cedar-${{ hashFiles('data-proxy/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-1.94.1-cedar-
+            ${{ runner.os }}-cargo-1.94.1-
+            ${{ runner.os }}-cargo-
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Docker availability
+        run: docker info
+
+      - name: rustc version
+        run: rustc --version && cargo --version
+
+      - name: Prebuild proxy with security-cedar
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-cargo-target
+        run: |
+          cargo build -p data-proxy --bin proxy --features security-cedar
+
+      - name: Run cedar smoke matrix
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-cargo-target
+          DN_SMOKE_KEEP_GOING: "0"
+          DN_SMOKE_TIMEOUT_SECS: "1200"
+        run: |
+          chmod +x examples/run-smoke-matrix.sh examples/smoke-*.sh
+          ./examples/run-smoke-matrix.sh cedar

@@ -152,6 +152,7 @@ examples/        smoke + gateway config 样例
 | A08 | backend SSL `ssl_mode` disable/prefer/require | feat(a08) |
 | A06 | smoke 双协议 max_rows + streaming metrics（部分） | feat(a06) |
 | A09 | portal multi-row NDJSON 强制 backend_window（部分） | feat(a09) |
+| H07 | CI extended/cedar jobs + nightly schedule + rustc 1.94.1 | feat(h07) |
 
 ---
 
@@ -189,7 +190,7 @@ examples/        smoke + gateway config 样例
 | **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
 | **H05** | 多实例状态外置 | ticket/vault JSON+lock+**AES-GCM**；审计 SQLite；`policy_path`+mtime | 全文件替换非 CRDT；轮询默认 1s；密钥 64 hex；vault 无密钥仍不落盘密码 | **部分** |
 | **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `223f2c0` → origin/main | **完成** |
-| **H07** | CI 矩阵加深 | PR 已 default；extended / cedar job 可选或 nightly | workflow_dispatch 可选手动 | **可选** |
+| **H07** | CI 矩阵加深 | PR/push **default**；schedule nightly **extended+cedar**；dispatch 分 job；rustc **1.94.1** | 非 default 不挡 PR；cedar 需 feature 预编译 | **完成** |
 | **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | **H05 已交付 AES-GCM 文件信封**（`vault_encrypt_key`）；进程内存仍明文 | **部分→见 H05** |
 
 ### 3.4 P2 — 体验与正确性打磨
@@ -227,28 +228,30 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> H07 CI 加深 或 A08 证书钉扎 或 A10 MySQL QueryParams <<<**
+**>>> A08 证书钉扎 或 A10 MySQL QueryParams 或 O01 观测 <<<**
 
-本轮（A06/A09 smoke 收口）：
+本轮（H07 CI 加深）：
 
-- `smoke-security-stream`：MySQL + PG 双协议 `max_rows=1`；metrics `execute_path=streaming`
-- `smoke-security-portal`：multi-row NDJSON **强制** `x-data-nexus-stream: backend_window`
-- 单测：`a06_*`（transport/mysql/pg）、`a09_*`（portal NDJSON encode / Streaming mode）
+- `.github/workflows/smoke-matrix.yml`：三 job 拆分
+  - `smoke-default`：PR/push 门禁（l0 + security-core）
+  - `smoke-extended`：schedule + dispatch（stream/passthrough/…）
+  - `smoke-cedar`：schedule + dispatch `cedar`（预编译 `security-cedar`）
+- rustc 钉 **1.94.1**；cache key 带版本 / cedar 后缀
+- 规则 `testing-smoke.md` 同步
 
 ```bash
-cargo test -p gateway_core --lib a06_
-cargo test -p runtime_gateway --lib a06_
-cargo test -p http@0.1.0 --lib a09_
-./examples/smoke-security-stream.sh
-./examples/smoke-security-portal.sh
+# 本地对齐 CI
 ./examples/run-smoke-matrix.sh default
+./examples/run-smoke-matrix.sh security-extended
+cargo build -p data-proxy --bin proxy --features security-cedar
+./examples/run-smoke-matrix.sh cedar
 ```
 
 建议下一刀：
 
-1. **H07** — CI extended/cedar  
-2. **A08** — 证书钉扎 / 自定义 CA  
-3. **A10** — MySQL QueryParams 去 text 改写  
+1. **A08** — 证书钉扎 / 自定义 CA  
+2. **A10** — MySQL QueryParams 去 text 改写  
+3. **O01** — Secure 路径观测  
 
 ---
 

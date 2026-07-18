@@ -45,9 +45,16 @@ cargo build -p data-proxy --bin proxy
 4. Feature 任务在对应 feature 下测。
 5. 单测优先 `gateway_core` / `runtime_gateway` 相关 lib filter，再 smoke。
 
-## CI
+## CI（H07）
 
-- `.github/workflows/smoke-matrix.yml`：PR 路径变更跑矩阵（默认组以 workflow 为准，目标 **default**）。
-- extended/cedar 可 `workflow_dispatch`。
+- Workflow：`.github/workflows/smoke-matrix.yml`
+- **rustc 钉 1.94.1**（`dtolnay/rust-toolchain@1.94.1`，与 `rust-toolchain.toml` 一致）
+- **PR / push**（`data-proxy/**`）：job `smoke-default` → `./examples/run-smoke-matrix.sh default`
+- **schedule**（每日 UTC 03:17）：`smoke-extended` + `smoke-cedar`（不重复 default）
+- **workflow_dispatch** `group`：
+  - `default` / `l0` / `security-core` → default job
+  - `security-extended` / `all` → extended job（`all` 时 default 与 extended 都跑）
+  - `cedar` → cedar job（预编译 `--features security-cedar`）
+- Cedar **不进** PR 门禁（可选 feature；发版前本地或 dispatch `cedar`）
 
 实现或修测时用 skill **dn-smoke** 或 `/dn-smoke`；提交前用 **dn-dod** / `/dn-dod`。
