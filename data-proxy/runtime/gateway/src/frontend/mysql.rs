@@ -671,9 +671,19 @@ fn encode_binary_value(
             Ok(())
         }
         GatewayValue::Decimal(s) | GatewayValue::String(s) => {
-            packet.put_lenc_int(s.len() as u64, true);
-            packet.extend_from_slice(s.as_bytes());
-            Ok(())
+            let dt = data_type.to_ascii_lowercase();
+            match dt.as_str() {
+                "date" => encode_mysql_binary_date(packet, s),
+                "datetime" | "timestamp" | "timestamptz" => {
+                    encode_mysql_binary_datetime(packet, s)
+                }
+                "time" => encode_mysql_binary_time(packet, s),
+                _ => {
+                    packet.put_lenc_int(s.len() as u64, true);
+                    packet.extend_from_slice(s.as_bytes());
+                    Ok(())
+                }
+            }
         }
         GatewayValue::Bytes(b) => {
             packet.put_lenc_int(b.len() as u64, true);
@@ -681,6 +691,129 @@ fn encode_binary_value(
             Ok(())
         }
     }
+}
+
+/// MySQL ProtocolBinary DATE: len(1)=4, year(2 LE), month(1), day(1).
+fn encode_mysql_binary_date(packet: &mut Vec<u8>, s: &str) -> GatewayResult<()> {
+    let (y, m, d) = parse_mysql_date(s).ok_or_else(|| {
+        GatewayError::Protocol(format!("invalid mysql DATE value '{s}'"))
+    })?;
+    packet.push(4);
+    packet.extend_from_slice(&y.to_le_bytes());
+    packet.push(m);
+    packet.push(d);
+    Ok(())
+}
+
+/// DATETIME/TIMESTAMP: len=7 (no micros) or 11 (with micros).
+fn encode_mysql_binary_datetime(packet: &mut Vec<u8>, s: &str) -> GatewayResult<()> {
+    let (y, mo, d, h, mi, sec, micro) = parse_mysql_datetime(s).ok_or_else(|| {
+        GatewayError::Protocol(format!("invalid mysql DATETIME value '{s}'"))
+    })?;
+    if micro == 0 {
+        packet.push(7);
+        packet.extend_from_slice(&y.to_le_bytes());
+        packet.push(mo);
+        packet.push(d);
+        packet.push(h);
+        packet.push(mi);
+        packet.push(sec);
+    } else {
+        packet.push(11);
+        packet.extend_from_slice(&y.to_le_bytes());
+        packet.push(mo);
+        packet.push(d);
+        packet.push(h);
+        packet.push(mi);
+        packet.push(sec);
+        packet.extend_from_slice(&micro.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// TIME: len=8 (no micros) or 12; is_negative, days, h, m, s [, micro].
+fn encode_mysql_binary_time(packet: &mut Vec<u8>, s: &str) -> GatewayResult<()> {
+    let (neg, days, h, m, sec, micro) = parse_mysql_time(s).ok_or_else(|| {
+        GatewayError::Protocol(format!("invalid mysql TIME value '{s}'"))
+    })?;
+    if micro == 0 {
+        packet.push(8);
+        packet.push(if neg { 1 } else { 0 });
+        packet.extend_from_slice(&days.to_le_bytes());
+        packet.push(h);
+        packet.push(m);
+        packet.push(sec);
+    } else {
+        packet.push(12);
+        packet.push(if neg { 1 } else { 0 });
+        packet.extend_from_slice(&days.to_le_bytes());
+        packet.push(h);
+        packet.push(m);
+        packet.push(sec);
+        packet.extend_from_slice(&micro.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn parse_mysql_date(s: &str) -> Option<(u16, u8, u8)> {
+    // YYYY-MM-DD
+    let s = s.trim();
+    let mut parts = s.split('-');
+    let y: u16 = parts.next()?.parse().ok()?;
+    let m: u8 = parts.next()?.parse().ok()?;
+    let d: u8 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+fn parse_mysql_datetime(s: &str) -> Option<(u16, u8, u8, u8, u8, u8, u32)> {
+    // YYYY-MM-DD HH:MM:SS[.ffffff] or YYYY-MM-DDTHH:MM:SS
+    let s = s.trim().replace('T', " ");
+    let (date, time) = s.split_once(' ')?;
+    let (y, mo, d) = parse_mysql_date(date)?;
+    let (h, mi, sec, micro) = parse_hms_micro(time)?;
+    Some((y, mo, d, h, mi, sec, micro))
+}
+
+fn parse_mysql_time(s: &str) -> Option<(bool, u32, u8, u8, u8, u32)> {
+    // [-]HH:MM:SS[.ffffff] or [-]D HH:MM:SS
+    let s = s.trim();
+    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r.trim())
+    } else {
+        (false, s)
+    };
+    let (days, hms) = if let Some((d, t)) = rest.split_once(' ') {
+        (d.parse::<u32>().ok()?, t)
+    } else {
+        (0u32, rest)
+    };
+    let (h, m, sec, micro) = parse_hms_micro(hms)?;
+    // MySQL stores days separately; hours may be > 23 for long TIME — keep as-is.
+    Some((neg, days, h, m, sec, micro))
+}
+
+fn parse_hms_micro(s: &str) -> Option<(u8, u8, u8, u32)> {
+    let (main, micro) = if let Some((a, b)) = s.split_once('.') {
+        let mut frac = b.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+        while frac.len() < 6 {
+            frac.push('0');
+        }
+        frac.truncate(6);
+        (a, frac.parse::<u32>().ok()?)
+    } else {
+        (s, 0u32)
+    };
+    let mut parts = main.split(':');
+    let h: u8 = parts.next()?.parse().ok()?;
+    let m: u8 = parts.next()?.parse().ok()?;
+    let sec: u8 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((h, m, sec, micro))
 }
 
 fn gateway_column_to_mysql_column(column: &GatewayColumn) -> ColumnInfo {
@@ -1222,6 +1355,59 @@ mod tests {
             .unwrap();
         });
         assert_eq!(writer.into_packets(), full);
+    }
+
+
+    #[test]
+    fn a10_encodes_binary_date_datetime_time() {
+        let mut packet = Vec::new();
+        encode_mysql_binary_date(&mut packet, "2024-08-31").unwrap();
+        assert_eq!(packet, vec![4, 0xe8, 0x07, 8, 31]); // 2024 LE = 0x07e8
+
+        packet.clear();
+        encode_mysql_binary_datetime(&mut packet, "2022-08-31 07:16:16").unwrap();
+        assert_eq!(packet, vec![7, 0xe6, 0x07, 8, 31, 7, 16, 16]);
+
+        packet.clear();
+        encode_mysql_binary_datetime(&mut packet, "2023-12-31 01:02:03.123123").unwrap();
+        assert_eq!(packet[0], 11);
+        assert_eq!(&packet[1..3], &2023u16.to_le_bytes());
+        assert_eq!(packet[3], 12);
+        assert_eq!(packet[4], 31);
+        assert_eq!(packet[5], 1);
+        assert_eq!(packet[6], 2);
+        assert_eq!(packet[7], 3);
+        assert_eq!(&packet[8..12], &123123u32.to_le_bytes());
+
+        packet.clear();
+        encode_mysql_binary_time(&mut packet, "-1 10:08:21").unwrap();
+        assert_eq!(packet, vec![8, 1, 1, 0, 0, 0, 10, 8, 21]);
+    }
+
+    #[test]
+    fn a10_binary_resultset_uses_native_datetime() {
+        let mut adapter = adapter();
+        let session = SessionState {
+            prefer_binary_result: true,
+            ..SessionState::default()
+        };
+        let packets = adapter
+            .encode(
+                GatewayResponse::ResultSet {
+                    columns: vec![GatewayColumn {
+                        name: "ts".into(),
+                        data_type: "datetime".into(),
+                    }],
+                    rows: vec![vec![GatewayValue::String("2022-08-31 07:16:16".into())]],
+                },
+                &session,
+            )
+            .unwrap();
+        // col_count + coldef + eof + binary row + eof
+        let row = &packets[3];
+        assert_eq!(row[0], 0x00); // binary header
+        // null bitmap 1 byte, then datetime payload
+        assert_eq!(&row[2..], &[7, 0xe6, 0x07, 8, 31, 7, 16, 16]);
     }
 
 }

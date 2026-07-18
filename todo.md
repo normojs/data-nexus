@@ -133,6 +133,7 @@ examples/        smoke + gateway config 样例
 | F32 | 审计 L0/L1 SQL 载荷裁剪 | feat(f32) |
 | A10 | MySQL binary resultset after Execute（部分） | feat(a10) |
 | H05 | ticket/vault file state backend（部分） | feat(h05) |
+| A10 | MySQL DATE/TIME/DATETIME binary encode（部分） | feat(a10) |
 
 ---
 
@@ -151,7 +152,7 @@ examples/        smoke + gateway config 样例
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 | 同协议无义务时 `simple_query_raw`→Wire（无 ResultSet 物化） | 仍非 backend TCP 帧中继；Wire 包仍汇总后写出 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | json/csv 仍物化；Complete 回退 B05b | **部分** |
-| **A10** | 预处理 / 事务透传矩阵 | 注册表 + 参数绑定 + MySQL **binary 结果行** + PG ParameterDescription | 日期/时间 binary 仍简化；PG 无 binary portal 结果 | **部分** |
+| **A10** | 预处理 / 事务透传矩阵 | 注册表 + 参数绑定 + MySQL binary 行（含 DATE/TIME/DATETIME） + PG ParameterDescription | PG 仍 text Bind→Query；无 binary portal 结果 | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
 
@@ -199,7 +200,7 @@ examples/        smoke + gateway config 样例
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP；json/csv 与 Complete 回退仍物化 |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；峰值 ≈ 窗口；prepared 仍 text 改写 |
 | PG passthrough | A08：`simple_query_raw` 边解码边编码 Wire（无逻辑 ResultSet）；**非** backend TCP 帧中继；包仍可汇总 |
-| 预处理语句 | A10：MySQL COM_STMT_EXECUTE → binary ProtocolBinary 行；PG 仍 text Bind→Query；日期/时间 binary 简化 |
+| 预处理语句 | A10：MySQL COM_STMT_EXECUTE → ProtocolBinary（含 DATE/DATETIME/TIME）；PG 仍 text Bind→Query |
 | 多副本 | H05：ticket/vault 可选 `file` 共享盘 JSON；LocalPdp 与审计 SQLite 索引仍**进程内**；file vault 重启后无后端密码（需重新 issue） |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
@@ -208,24 +209,22 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A08 TCP 真中继 或 A10 日期 binary 或 H05 LocalPdp 外置 <<<**
+**>>> A08 TCP 真中继 或 H05 LocalPdp 外置 或 A10 PG binary 结果 <<<**
 
-本轮（H05 部分）：
+本轮（A10 日期 binary）：
 
-- `security.state.backend = memory | file`（`redis`/`remote` 校验拒绝）
-- `install_ticket_store` / `install_vault_store`：file 后端 JSON 持久化
-- Vault file **永不**写后端密码；reload 后 `backend_identity` 为空（需重新 issue）
+- MySQL binary 结果：`date` / `datetime` / `timestamp` / `time` 从字符串解析为原生 ProtocolBinary 布局
+- 支持微秒 DATETIME 与负 TIME（`days + hms`）
 
 ```bash
-cargo test -p gateway_core --lib h05_
-# smoke：security-core（ticket/vault）
+cargo test -p runtime_gateway --lib a10_
 ```
 
 建议下一刀：
 
 1. **A08 续** — 真 TCP 帧中继  
-2. **A10 续** — 日期/时间 binary + PG binary 结果  
-3. **H05 续** — LocalPdp / 审计索引外置
+2. **H05 续** — LocalPdp / 审计索引外置  
+3. **A10 续** — PG binary portal 结果
 
 ---
 
