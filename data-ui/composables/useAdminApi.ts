@@ -82,13 +82,39 @@ export type AdminAuditEvent = {
   rule?: string
   listener?: string
   command_type?: string
+  action?: string
+  db_user?: string
+  sql_fingerprint?: string
+  tables?: string[]
+  audit_level?: string
+}
+
+export type AdminAuditStats = {
+  accepted?: number
+  written?: number
+  dropped?: number
+  queue_capacity?: number
+  priority_queue_capacity?: number
+  priority_accepted?: number
+  priority_dropped?: number
+  queue_len?: number
+  priority_queue_len?: number
+  recent_len?: number
+  rotated?: number
+  pruned?: number
+  index_enabled?: boolean
+  index_rows?: number
+  index_inserted?: number
+  index_errors?: number
+  index_pruned?: number
+  installed?: boolean
 }
 
 export type AdminAuditEventsResponse = {
   events: AdminAuditEvent[]
   source?: string
   note?: string
-  stats?: Record<string, unknown>
+  stats?: AdminAuditStats
 }
 
 export type AdminProject = {
@@ -389,6 +415,8 @@ export function useAdminApi() {
       const qs = q.toString()
       return getJson<AdminAuditEventsResponse>(`/admin/audit/events${qs ? `?${qs}` : ''}`, base)
     },
+    /** UI03: pipeline counters (B06/B07); also embedded on events response. */
+    auditStats: (base?: string) => getJson<AdminAuditStats>('/admin/audit/stats', base),
     projects: (base?: string) => getJson<AdminProject[]>('/admin/projects', base),
     vaultLeases: (base?: string) => getJson<AdminVaultLease[]>('/admin/vault/leases', base),
     issueVaultLease: (body: { project: string, environment: string, ttl_secs?: number }, base?: string) =>

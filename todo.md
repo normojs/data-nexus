@@ -165,6 +165,7 @@ examples/        smoke + gateway config 样例
 | A08 | MySQL backend TLS via ssl_mode/ssl_ca_file（部分） | feat(a08) |
 | UI04 | 策略只读页 + security-policies 扩展字段 | feat(ui04) |
 | T02 | Ticket/Vault 运维 runbook | feat(t02) |
+| UI03 | Audit stats 卡片 + source 角标 + 导出 | feat(ui03) |
 
 ---
 
@@ -209,7 +210,7 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
-| **UI03** | Audit 页增强 | 已接 B06 过滤；可补 stats 卡片、source 角标、导出 | `event_id`/时间窗/`source` 已做（`6ff8cef`） | **可选** |
+| **UI03** | Audit 页增强 | stats 卡片、source 角标、当前结果导出 | `event_id`/时间窗/`source` + stats 卡片 + JSON/CSV 客户端导出（`e723a45` 后 UI03） | **完成** |
 | **UI04** | 策略只读页 | data-ui 展示 security rules / mask / high-risk | `/policies` + 扩展 `GET /admin/security-policies`（mask/tags/high-risk/time/watermark/streaming；水印 token 不回传） | **完成** |
 | **T01** | 列 ACL / 复杂 SQL 用例矩阵 | 子查询、多表、方言边界；启发式 `parse_failed` 行为 | extract/PDP 单测矩阵 + column smoke 子查询/join/qualified；WHERE 子查询表提取仍 gap | **部分** |
 | **T02** | Ticket/Vault runbook | 注释注入约定、双人审批、吊销运维说明进 docs | [`docs/ticket-vault-runbook.md`](docs/ticket-vault-runbook.md)；prod README 链接；非 BPM | **完成** |
@@ -241,25 +242,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> UI03 Audit 增强 或 A08 prefer 明文回落 或 T01 WHERE 子查询表提取 <<<**
+**>>> A08 prefer 明文回落 或 T01 WHERE 子查询表提取 或 F29 Cedar 实体属性（延后） <<<**
 
-本轮（T02 Ticket/Vault runbook）：
+本轮（UI03 Audit 页增强）：
 
-- 新增 [`docs/ticket-vault-runbook.md`](docs/ticket-vault-runbook.md)：注释注入、指纹、双人审批、吊销、Vault/Portal、多实例、排错
-- prod README 链接；诚实边界（非 BPM / 非 CRDT）
-- 行为以 smoke-ticket / dual-control / portal / vault 为准
+- stats 卡片：accepted/written/dropped/priority/queue/index（吃 events.stats 或 `/admin/audit/stats`）
+- `source=index|recent` 角标；decision 色标；event_id 一键复制
+- 当前过滤结果 **客户端** JSON/CSV 导出（非服务端 dump API）
 
 ```bash
-# 文档任务：核对 smoke 与 API 路径即可
-./examples/smoke-security-ticket.sh          # 可选
-./examples/run-smoke-matrix.sh default       # 不因纯文档强制
+# UI-only；API 已有 stats/source
+# 可选：./examples/smoke-security-audit.sh
 ```
 
 建议下一刀：
 
-1. **UI03** — Audit 页增强（可选）  
-2. **A08** — MySQL prefer 明文回落（可选）  
-3. **T01** — WHERE 子查询表提取 gap  
+1. **A08** — MySQL prefer 明文回落（可选）  
+2. **T01** — WHERE 子查询表提取 gap  
+3. **F29** — Cedar 实体属性（延后）  
 
 ---
 
