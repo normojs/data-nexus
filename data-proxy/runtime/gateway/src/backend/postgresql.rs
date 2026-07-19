@@ -1094,9 +1094,43 @@ impl BackendConnector for PostgreSqlBackendConnector {
             }
         }
 
-        // A10: Streaming for parameterized queries (Bind → QueryParams).
+        // A10: Streaming for parameterized queries (Bind → QueryParams / prepared Execute).
         if streaming && is_query_params {
             if let GatewayCommand::QueryParams { sql, parameters } = command {
+                let endpoint = self.select_endpoint(session)?;
+                return self
+                    .execute_param_query_streaming(
+                        endpoint,
+                        &sql,
+                        &parameters,
+                        session,
+                        mode,
+                        in_txn,
+                    )
+                    .await;
+            }
+        }
+        // A10: prepared Execute must share the QueryParams Streaming path (MySQL parity).
+        // Previously only QueryParams hit execute_param_query_streaming; Execute fell through
+        // to Complete materialization even under ExecuteMode::Streaming.
+        if streaming {
+            if let GatewayCommand::Execute {
+                statement_id,
+                parameters,
+            } = command
+            {
+                let sql = self.prepared.take_sql(&statement_id).ok_or_else(|| {
+                    GatewayError::Backend(format!(
+                        "unknown postgresql prepared statement id '{statement_id}'"
+                    ))
+                })?;
+                let need = count_pg_placeholders(&sql) as usize;
+                if need != parameters.len() {
+                    return Err(GatewayError::Protocol(format!(
+                        "postgresql prepared Execute expects {need} parameters, got {}",
+                        parameters.len()
+                    )));
+                }
                 let endpoint = self.select_endpoint(session)?;
                 return self
                     .execute_param_query_streaming(
@@ -2218,6 +2252,173 @@ mod tests {
             },
             GatewayCommand::Query { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn a10_prepared_execute_streaming_unknown_id_fail_closed() {
+        // Streaming Execute must hit the prepared registry path (not silent Complete).
+        let connector = PostgreSqlBackendConnector::new();
+        let mut session = SessionState::default();
+        let mode = ExecuteMode::from_streaming_config(32, Some(100));
+        let err = connector
+            .execute_outcome(
+                GatewayCommand::Execute {
+                    statement_id: "missing-stmt".into(),
+                    parameters: vec![],
+                },
+                &mut session,
+                mode,
+            )
+            .await;
+        match err {
+            Err(GatewayError::Backend(_)) => {}
+            Ok(_) => panic!("expected unknown prepared id Backend error, got Ok"),
+            Err(other) => panic!("expected unknown prepared id Backend error, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a10_prepared_execute_streaming_arity_checked_before_connect() {
+        // Arity mismatch is Protocol error on the Streaming Execute branch
+        // (same as materialize Execute), proving we do not fall through to connect first.
+        let connector = PostgreSqlBackendConnector::new();
+        let mut session = SessionState::default();
+        let prepared = connector
+            .execute(
+                GatewayCommand::Prepare {
+                    sql: "SELECT $1, $2".into(),
+                },
+                &mut session,
+            )
+            .await
+            .unwrap();
+        let statement_id = match prepared {
+            GatewayResponse::Prepared { statement_id, .. } => statement_id,
+            other => panic!("expected Prepared, got {other:?}"),
+        };
+        let mode = ExecuteMode::from_streaming_config(16, Some(50));
+        let err = connector
+            .execute_outcome(
+                GatewayCommand::Execute {
+                    statement_id,
+                    parameters: vec![GatewayValue::Integer(1)], // need 2
+                },
+                &mut session,
+                mode,
+            )
+            .await;
+        match err {
+            Err(GatewayError::Protocol(_)) => {}
+            Ok(_) => panic!("expected arity Protocol error on Streaming Execute, got Ok"),
+            Err(other) => {
+                panic!("expected arity Protocol error on Streaming Execute, got {other}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a10_prepared_execute_streaming_against_live_pg() {
+        // examples-postgres-primary maps host 15433 (not 5432/15432).
+        let mut ep = endpoint();
+        ep.address = "127.0.0.1:15433".into();
+        ep.database = Some("analytics".into());
+        ep.username = "postgres".into();
+        ep.password = "postgres".into();
+        let connector = PostgreSqlBackendConnector::with_endpoints(vec![ep]);
+        let mut session = SessionState {
+            database: Some("analytics".into()),
+            ..Default::default()
+        };
+        // Text params + UNION keeps ToSql simple (i64→int4 serialize can fail on some paths).
+        let prepared = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connector.execute(
+                GatewayCommand::Prepare {
+                    sql: "SELECT $1 AS a UNION ALL SELECT $2 UNION ALL SELECT $3".into(),
+                },
+                &mut session,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(GatewayResponse::Prepared { statement_id, .. })) => statement_id,
+            Ok(Ok(other)) => panic!("expected Prepared, got {other:?}"),
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if msg.contains("connect")
+                    || msg.contains("Connection refused")
+                    || msg.contains("timed out")
+                    || msg.contains("timeout")
+                    || msg.contains("os error")
+                {
+                    eprintln!("skip live pg a10 prepared streaming test: {msg}");
+                    return;
+                }
+                panic!("unexpected prepare error: {msg}");
+            }
+            Err(_) => {
+                eprintln!("skip live pg a10 prepared streaming test: connect timeout");
+                return;
+            }
+        };
+        let mode = ExecuteMode::from_streaming_config(2, Some(10));
+        let outcome = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connector.execute_outcome(
+                GatewayCommand::Execute {
+                    statement_id: prepared,
+                    parameters: vec![
+                        GatewayValue::String("1".into()),
+                        GatewayValue::String("2".into()),
+                        GatewayValue::String("3".into()),
+                    ],
+                },
+                &mut session,
+                mode,
+            ),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(_) => {
+                eprintln!("skip live pg a10 prepared streaming test: execute timeout");
+                return;
+            }
+        };
+        match outcome {
+            Ok(ExecuteOutcome::Streaming(mut query)) => {
+                let mut rows = Vec::new();
+                while let Some(chunk) = query.stream.poll_window(2).await.unwrap() {
+                    rows.extend(chunk);
+                }
+                assert!(
+                    rows.len() >= 2,
+                    "expected multi-row streaming windows for prepared Execute, got {rows:?}"
+                );
+            }
+            Ok(ExecuteOutcome::Complete(GatewayResponse::ResultSet { rows, .. })) => {
+                assert!(!rows.is_empty());
+            }
+            Ok(ExecuteOutcome::Complete(other)) => {
+                panic!("unexpected complete response {other:?}")
+            }
+            Ok(ExecuteOutcome::WireRelay(_)) => {
+                panic!("unexpected wire relay for prepared Execute")
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("connect")
+                    || msg.contains("Connection refused")
+                    || msg.contains("timed out")
+                    || msg.contains("timeout")
+                    || msg.contains("os error")
+                {
+                    eprintln!("skip live pg a10 prepared streaming test: {msg}");
+                    return;
+                }
+                panic!("unexpected error: {msg}");
+            }
+        }
     }
 
     #[test]

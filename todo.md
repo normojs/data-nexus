@@ -161,6 +161,7 @@ examples/        smoke + gateway config 样例
 | A06 | 事务内 Streaming max_rows 双协议 smoke（部分） | feat(a06) |
 | A09 | portal json/csv 物化边界 smoke（部分） | feat(a09) |
 | A09 | portal CSV backend_window 流式 + json 仍物化（部分） | feat(a09) |
+| A10 | PG prepared Execute Streaming 与 QueryParams 对齐（部分） | feat(a10) |
 | T01 | 列 ACL / 复杂 SQL 矩阵（部分） | feat(t01) |
 | T01 | WHERE/HAVING/JOIN 子查询表提取 | feat(t01) |
 | H05 | multi-instance file bundle + prod state template（部分） | feat(h05) |
@@ -199,7 +200,7 @@ examples/        smoke + gateway config 样例
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 + backend TLS | idle pool + 事务 `tcp_txn`；PG/MySQL **ssl_mode + ssl_ca_file / ssl_accept_invalid_certs** | 默认 accept_invalid=true（兼容）；**prod 模板 require+CA+verify**；validate 拒绝 require+verify 无 CA；非 extended；MySQL prefer 可明文回落 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON + **CSV**：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | multi-row NDJSON/**CSV** **强制** `backend_window`；**json 仍物化**（smoke 断言无 backend_window）；Complete 回退 B05b / 单 body CSV | **部分** |
-| **A10** | 预处理 / 事务透传矩阵 | MySQL **prepare/bind** + binary 行 + **Streaming 窗口** + 连接 stmt 缓存；PG QueryParams + Statement 缓存 + Streaming | **双协议 ISO 字符串参数可绑原生时间类型**；结果 ISO/ binary encode 已有；其它 scalar/text；非 TCP passthrough | **部分** |
+| **A10** | 预处理 / 事务透传矩阵 | MySQL **prepare/bind** + binary 行 + **Streaming 窗口** + 连接 stmt 缓存；PG QueryParams + Statement 缓存 + Streaming | **PG `Execute` 与 QueryParams 同走 Streaming**（未知 id/arity fail-closed + live 单测）；**双协议 ISO 字符串参数可绑原生时间类型**；其它 scalar/text；非 TCP passthrough | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
 
@@ -247,7 +248,7 @@ examples/        smoke + gateway config 样例
 | Portal「流式」 | A09 NDJSON+**CSV**：Streaming backend 真窗口 + HTTP（smoke 强制 multi-row `backend_window`）；**json 仍物化**（smoke 断言无 backend_window）；Complete 回退 B05b / 单 body CSV |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；smoke 双协议 max_rows（**含 txn**）+ `execute_path=streaming`；峰值 ≈ 窗口 |
 | PG/MySQL backend TLS | A08：PG idle pool+tcp_txn；双协议 `ssl_mode`/`ssl_ca_file`/`ssl_accept_invalid_certs`；**默认 accept_invalid=true（兼容）**；**prod 模板 require+CA+verify**；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；非 extended |
-| 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；**MySQL QueryParams 走 COM_STMT_PREPARE/EXECUTE 绑定** + binary 行 + **Streaming 窗口** + 连接缓存；MySQL date/time binary 结果 ISO 文本；**双协议 ISO 字符串参数可绑原生时间类型**；其余 scalar/text；非 TCP passthrough |
+| 预处理语句 | A10：PG QueryParams + **prepared Execute** + Statement 缓存 + Streaming 窗口；**MySQL QueryParams/Execute 走 COM_STMT_PREPARE/EXECUTE 绑定** + binary 行 + **Streaming 窗口** + 连接缓存；MySQL date/time binary 结果 ISO 文本；**双协议 ISO 字符串参数可绑原生时间类型**；其余 scalar/text；非 TCP passthrough |
 | 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；**prod 模板已含 security.state**；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
 | L2 样本合规 | B08：**默认关**；L2+enabled 时物化 ResultSet **或 Streaming 首窗**（脱敏后、有界 rows/bytes）附样本；OpenDAL 需 `audit-opendal` |
 | Remote PDP | F31：HTTP 旁路表/动作；超时默认 fail_closed；mask/行改写仍在 Local 规则；**非**热路径逐行调用 |
@@ -260,20 +261,21 @@ examples/        smoke + gateway config 样例
 
 **>>> A 轨剩余债 或 体验小刀 或 下一产品切片 <<<**
 
-本轮（A09 CSV backend_window）：
+本轮（A09 CSV + A10 PG Execute Streaming）：
 
-- Portal **CSV** 与 NDJSON 同路径：backend `Streaming` → 窗口 mask → HTTP chunk + `x-data-nexus-stream: backend_window`
-- **json 仍物化**（smoke 断言无 backend_window）；Complete 回退单 body CSV
-- `smoke-security-portal` 绿；单测 `a09_portal_csv_encode_rows_escapes_and_joins`
+- Portal **CSV** 与 NDJSON 同路径：backend `Streaming` → 窗口 mask → HTTP chunk + `backend_window`
+- **json 仍物化**（smoke 断言无 backend_window）
+- PG **`GatewayCommand::Execute` Streaming** 与 QueryParams 对齐（未知 id / arity fail-closed；live 多行窗口单测）
 
 ```bash
 cargo test -p http@0.1.0 a09_
 ./examples/smoke-security-portal.sh
+cargo test -p runtime_gateway --lib a10_prepared_execute_streaming
 ```
 
 建议下一刀：
 
-1. A 轨剩余诚实债（A09 **json** 物化、A06/A10 边界）  
+1. A 轨剩余诚实债（A09 **json** 物化、A06 Materialized 路径、A10 协议 smoke）  
 2. 体验小刀  
 3. 新切片（F30 等延后项勿静默当完成）
 

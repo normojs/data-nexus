@@ -2557,7 +2557,7 @@ async fn portal_execute_logical(
     max_rows: Option<u64>,
 ) -> Result<AdminPortalQueryResponse, (String, String)> {
     // A09: uses execute_outcome. Streaming backends are drained into a bounded
-    // ResultSet for json/csv response shape; prefer portal_execute_ndjson_streaming
+    // ResultSet for json response shape; prefer portal_execute_ndjson/csv_streaming
     // for true windowed HTTP export.
     let prepared = portal_prepare(config, service_name, sql, subject_id, max_rows)?;
     let response = prepared
