@@ -208,7 +208,7 @@ assert ids[:3] == [1, 2, 3] or ids[:2] == [1, 2], ids
 print("ndjson multi-row backend_window ok", "rows", len(rows), "window", meta.get("window_rows"))
 PY
 
-echo "==> portal multi-row JSON is materialized (A09 honest: not backend_window)"
+echo "==> portal multi-row JSON streams backend_window (A09)"
 curl -fsS -D /tmp/dn-portal-json.hdr -o /tmp/dn-portal-multi.json \
   -X POST "http://127.0.0.1:8082/admin/portal/query" \
   -H 'content-type: application/json' \
@@ -216,14 +216,19 @@ curl -fsS -D /tmp/dn-portal-json.hdr -o /tmp/dn-portal-multi.json \
 python3 - <<'PY'
 import json
 hdr=open("/tmp/dn-portal-json.hdr").read().lower()
-# json path materializes ResultSet; must NOT advertise NDJSON backend_window streaming.
-assert "x-data-nexus-stream: backend_window" not in hdr, hdr
 assert "application/json" in hdr or "json" in hdr, hdr
+# A09: multi-row MySQL SELECT via portal JSON must use backend Streaming → HTTP chunk.
+assert "x-data-nexus-stream: backend_window" in hdr, hdr
 body=json.load(open("/tmp/dn-portal-multi.json"))
 assert body.get("decision")=="allow", body
+assert body.get("stream")=="backend_window", body
 assert body.get("row_count", 0) >= 2, body
 assert isinstance(body.get("rows"), list) and len(body["rows"]) >= 2, body
-print("json multi-row materialized ok", "rows", body.get("row_count"))
+# rows remain array-of-arrays (AdminPortalQueryResponse shape for data-ui).
+assert isinstance(body["rows"][0], list), body["rows"][0]
+ids=sorted(int(r[0]) for r in body["rows"] if r)
+assert ids[:3] == [1, 2, 3] or ids[:2] == [1, 2], ids
+print("json multi-row backend_window ok", "rows", body.get("row_count"), "window", body.get("window_rows"))
 PY
 
 echo "==> portal multi-row CSV streams backend_window (A09)"

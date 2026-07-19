@@ -23,7 +23,7 @@ description: >
 2. **有 mask/水印/max_rows** → `Streaming` + `execute_outcome` / `write_streaming_query_with_obligations`；禁止仅 `apply_obligations_to_response` 全量
 3. **事务内 Streaming** → producer 结束后必须写回 `txn_lease`（见 MySQL/PG backend）
 4. **跨协议** → Streaming 窗口 encode + 类型映射
-5. **Portal NDJSON** → A09：`Streaming` 时 backend 窗口 → HTTP；json/csv 仍物化
+5. **Portal NDJSON/CSV/JSON** → A09：`Streaming` 时 backend 窗口 → HTTP；`Complete` 仍物化单 body
 
 ## Code map
 

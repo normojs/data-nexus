@@ -63,9 +63,9 @@ cd data-proxy
   - 路径：`backend/postgresql`、endpoint 配置与 validate
 
 - [ ] **A09** Portal 端到端流式  
-  - 已有：NDJSON + **CSV** 在 backend Streaming 时窗口 → HTTP chunk（`x-data-nexus-stream: backend_window`）；multi-row smoke 强制；Complete 回退 B05b / 单 body CSV  
-  - 仍欠：**json 仍物化** ResultSet（smoke 断言无 backend_window）  
-  - 路径：`http` portal_execute_*；`smoke-security-portal.sh`
+  - 已有：NDJSON + CSV + **JSON** 在 backend Streaming 时窗口 → HTTP chunk（`x-data-nexus-stream: backend_window`）；multi-row smoke **三格式强制** backend_window；JSON 分片拼装完整 `AdminPortalQueryResponse`（UI 可 parse）  
+  - 仍欠：`Complete` 回退仍物化单 body；跨协议 portal 边界未加深；无峰值内存 CI  
+  - 路径：`http` portal_execute_{ndjson,csv,json}_streaming；`smoke-security-portal.sh`
 
 - [ ] **A10** 预处理 / 事务透传矩阵  
   - 已有：MySQL COM_STMT prepare/bind + binary 行 + Streaming + stmt 缓存 + COM_STMT_RESET + handshake `8.0.36`；PG Parse/Bind/Execute → QueryParams + Statement 缓存 + Streaming；Bind binary i32/i64→text；INT4 绑 i32；协议 smoke `max_rows=1`  
@@ -116,7 +116,7 @@ cd data-proxy
 
 | 主题 | 限制 |
 |------|------|
-| Portal「流式」 | A09 NDJSON+CSV：Streaming 真窗口 + HTTP；**json 仍物化**；Complete 回退物化 |
+| Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming 真窗口 + HTTP（smoke 强制 multi-row backend_window）；**Complete 仍物化**单 body（无 backend_window） |
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；**Materialized 仍全量**；峰值 ≈ 窗口仅 Streaming |
 | PG/MySQL backend TLS | A08：默认 accept_invalid=true；prod 模板 require+CA+verify；非 extended |
 | 预处理语句 | A10：协议 smoke 已覆盖 max_rows；**Describe 仍 NoData**；非 TCP passthrough |
@@ -134,9 +134,9 @@ cd data-proxy
 
 建议优先级：
 
-1. **A09** portal **json** 真窗口流（或继续诚实物化并锁文档）  
-2. **A10** PG **Describe → RowDescription**（解锁 psycopg 全链路）  
-3. **A06** Materialized 路径减物化 / 峰值诚实  
+1. **A10** PG **Describe → RowDescription**（解锁 psycopg 全链路）  
+2. **A06** Materialized 路径减物化 / 峰值诚实  
+3. **A09** Complete 回退减物化 / 峰值 CI（json/csv/ndjson 已 backend_window）  
 4. **H05** 多副本语义 / 进程内 vault 明文边界  
 5. 体验小刀；**F30/P0x 延后项未点名勿做**
 
