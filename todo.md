@@ -160,6 +160,7 @@ examples/        smoke + gateway config 样例
 | O01 | Secure 路径 mask/window/audit 指标 | feat(o01) |
 | A06 | 事务内 Streaming max_rows 双协议 smoke（部分） | feat(a06) |
 | A09 | portal json/csv 物化边界 smoke（部分） | feat(a09) |
+| A09 | portal CSV backend_window 流式 + json 仍物化（部分） | feat(a09) |
 | T01 | 列 ACL / 复杂 SQL 矩阵（部分） | feat(t01) |
 | T01 | WHERE/HAVING/JOIN 子查询表提取 | feat(t01) |
 | H05 | multi-instance file bundle + prod state template（部分） | feat(h05) |
@@ -197,7 +198,7 @@ examples/        smoke + gateway config 样例
 | **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease；**smoke max_rows 双协议（含 txn）+ metrics streaming** | **部分** |
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 + backend TLS | idle pool + 事务 `tcp_txn`；PG/MySQL **ssl_mode + ssl_ca_file / ssl_accept_invalid_certs** | 默认 accept_invalid=true（兼容）；**prod 模板 require+CA+verify**；validate 拒绝 require+verify 无 CA；非 extended；MySQL prefer 可明文回落 | **部分** |
-| **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | multi-row NDJSON **强制** `backend_window`；**smoke 断言 json/csv 无 backend_window（仍物化）**；Complete 回退 B05b | **部分** |
+| **A09** | Portal 端到端流式 | NDJSON + **CSV**：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | multi-row NDJSON/**CSV** **强制** `backend_window`；**json 仍物化**（smoke 断言无 backend_window）；Complete 回退 B05b / 单 body CSV | **部分** |
 | **A10** | 预处理 / 事务透传矩阵 | MySQL **prepare/bind** + binary 行 + **Streaming 窗口** + 连接 stmt 缓存；PG QueryParams + Statement 缓存 + Streaming | **双协议 ISO 字符串参数可绑原生时间类型**；结果 ISO/ binary encode 已有；其它 scalar/text；非 TCP passthrough | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
@@ -243,7 +244,7 @@ examples/        smoke + gateway config 样例
 
 | 主题 | 限制 |
 |------|------|
-| Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP（smoke 强制 multi-row `backend_window`）；**json/csv smoke 断言无 backend_window（物化）**；Complete 回退 B05b |
+| Portal「流式」 | A09 NDJSON+**CSV**：Streaming backend 真窗口 + HTTP（smoke 强制 multi-row `backend_window`）；**json 仍物化**（smoke 断言无 backend_window）；Complete 回退 B05b / 单 body CSV |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；smoke 双协议 max_rows（**含 txn**）+ `execute_path=streaming`；峰值 ≈ 窗口 |
 | PG/MySQL backend TLS | A08：PG idle pool+tcp_txn；双协议 `ssl_mode`/`ssl_ca_file`/`ssl_accept_invalid_certs`；**默认 accept_invalid=true（兼容）**；**prod 模板 require+CA+verify**；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；非 extended |
 | 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；**MySQL QueryParams 走 COM_STMT_PREPARE/EXECUTE 绑定** + binary 行 + **Streaming 窗口** + 连接缓存；MySQL date/time binary 结果 ISO 文本；**双协议 ISO 字符串参数可绑原生时间类型**；其余 scalar/text；非 TCP passthrough |
@@ -259,22 +260,20 @@ examples/        smoke + gateway config 样例
 
 **>>> A 轨剩余债 或 体验小刀 或 下一产品切片 <<<**
 
-本轮（post-F31 full smoke）：
+本轮（A09 CSV backend_window）：
 
-- `run-smoke-matrix.sh all`：**17/17**
-- `run-smoke-matrix.sh cedar`：**2/2**（预编译 security-cedar 后已恢复默认二进制）
-- 与 origin/main 对齐；F31 文档+代码已闭环
+- Portal **CSV** 与 NDJSON 同路径：backend `Streaming` → 窗口 mask → HTTP chunk + `x-data-nexus-stream: backend_window`
+- **json 仍物化**（smoke 断言无 backend_window）；Complete 回退单 body CSV
+- `smoke-security-portal` 绿；单测 `a09_portal_csv_encode_rows_escapes_and_joins`
 
 ```bash
-./examples/run-smoke-matrix.sh all
-cargo build -p data-proxy --bin proxy --features security-cedar
-./examples/run-smoke-matrix.sh cedar
-cargo build -p data-proxy --bin proxy
+cargo test -p http@0.1.0 a09_
+./examples/smoke-security-portal.sh
 ```
 
 建议下一刀：
 
-1. A 轨剩余诚实债（A09 json/csv 物化、A06/A10 边界）  
+1. A 轨剩余诚实债（A09 **json** 物化、A06/A10 边界）  
 2. 体验小刀  
 3. 新切片（F30 等延后项勿静默当完成）
 

@@ -1895,7 +1895,8 @@ impl AxumServer {
         let stream_window = config.security.streaming.window_rows.max(1) as usize;
 
         // A09: NDJSON uses backend StreamingQuery when available (true windowed
-        // path). json/csv still materialize a bounded ResultSet for response shape.
+        // path). CSV also streams when backend yields Streaming; json still
+        // materializes a bounded ResultSet for response shape.
         if format == "ndjson" {
             match portal_execute_ndjson_streaming(
                 &config,
@@ -1917,6 +1918,50 @@ impl AxumServer {
                         outcome: Some("portal_export".into()),
                         message: Some(format!(
                             "format=ndjson stream=backend_window window={stream_window} max_rows={max_rows}"
+                        )),
+                        audit_level: Some("L0".into()),
+                        ..gateway_core::AuditEvent::default()
+                    });
+                    return response;
+                }
+                Err((code, msg)) => {
+                    gateway_core::try_audit(gateway_core::AuditEvent {
+                        action: Some(AuditAction::Query.as_str().into()),
+                        decision: Some(AuditDecision::Deny.as_str().into()),
+                        subject_id: Some(subject_id),
+                        service: Some(body.service.clone()),
+                        outcome: Some("portal_deny".into()),
+                        message: Some(msg.clone()),
+                        code: Some(code.clone()),
+                        audit_level: Some("L0".into()),
+                        ..gateway_core::AuditEvent::default()
+                    });
+                    return admin_json_error(StatusCode::FORBIDDEN, "portal_denied", msg);
+                }
+            }
+        }
+
+        if format == "csv" {
+            match portal_execute_csv_streaming(
+                &config,
+                &body.service,
+                &body.sql,
+                &subject_id,
+                Some(max_rows),
+                stream_window,
+                download,
+            )
+            .await
+            {
+                Ok(response) => {
+                    gateway_core::try_audit(gateway_core::AuditEvent {
+                        action: Some(AuditAction::Query.as_str().into()),
+                        decision: Some(AuditDecision::Execute.as_str().into()),
+                        subject_id: Some(subject_id),
+                        service: Some(body.service.clone()),
+                        outcome: Some("portal_export".into()),
+                        message: Some(format!(
+                            "format=csv stream=backend_window_or_materialized window={stream_window} max_rows={max_rows}"
                         )),
                         audit_level: Some("L0".into()),
                         ..gateway_core::AuditEvent::default()
@@ -3031,6 +3076,229 @@ async fn portal_execute_ndjson_streaming(
     }
 }
 
+/// A09: CSV export with backend window yield → HTTP chunk (when Streaming).
+/// Materialized backends fall back to a single-body CSV (same as before).
+async fn portal_execute_csv_streaming(
+    config: &gateway_core::GatewayConfig,
+    service_name: &str,
+    sql: &str,
+    subject_id: &str,
+    max_rows: Option<u64>,
+    window_rows: usize,
+    download: bool,
+) -> Result<Response<Body>, (String, String)> {
+    use gateway_core::{
+        apply_masks_to_rows, apply_watermark_to_resultset, build_mask_index, map_response_types,
+        ExecuteOutcome, GatewayResponse, GatewayValue,
+    };
+
+    let prepared = portal_prepare(config, service_name, sql, subject_id, max_rows)?;
+    let mut session = prepared.session.clone();
+    let outcome = prepared
+        .backend
+        .execute_outcome(prepared.command, &mut session, prepared.mode)
+        .await
+        .map_err(|e| ("backend".into(), e.to_string()))?;
+
+    let window = window_rows.max(1);
+    let (mut tx, body) = Body::channel();
+
+    match outcome {
+        ExecuteOutcome::WireRelay(mut relay) => {
+            while relay
+                .stream
+                .poll_packets(64)
+                .await
+                .map_err(|e| ("backend".into(), e.to_string()))?
+                .is_some()
+            {}
+            Err((
+                "unsupported".into(),
+                "portal CSV path does not support wire passthrough relay".into(),
+            ))
+        }
+        ExecuteOutcome::Streaming(mut query) => {
+            if prepared.backend_protocol != prepared.frontend_protocol {
+                for col in &mut query.columns {
+                    col.data_type = gateway_core::map_column_type(
+                        &col.data_type,
+                        &prepared.backend_protocol,
+                        &prepared.frontend_protocol,
+                    );
+                }
+            }
+            let mut columns = query.columns;
+            let mask_specs = prepared.obligations.column_masks.clone();
+            let mask_idx: Vec<(usize, gateway_core::MaskSpec)> = {
+                let tmp = build_mask_index(&columns, &mask_specs);
+                tmp.into_iter().map(|(i, s)| (i, s.clone())).collect()
+            };
+            if let Some(wm) = prepared.obligations.watermark.as_ref() {
+                let mut empty = Vec::new();
+                apply_watermark_to_resultset(&mut columns, &mut empty, wm);
+            }
+            let header_width = columns.len();
+            let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let max_total = max_rows.or(prepared.obligations.max_rows);
+            let watermark = prepared.obligations.watermark.clone();
+
+            tokio::spawn(async move {
+                // Header line first (CSV schema).
+                let mut header = col_names
+                    .iter()
+                    .map(|c| csv_escape(c))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                header.push('\n');
+                if tx.send_data(Bytes::from(header)).await.is_err() {
+                    while query.stream.poll_window(window).await.ok().flatten().is_some() {}
+                    return;
+                }
+                let mut total: u64 = 0;
+                let mut truncated = false;
+                loop {
+                    if let Some(max) = max_total {
+                        if total >= max {
+                            truncated = true;
+                            while query.stream.poll_window(window).await.ok().flatten().is_some() {}
+                            break;
+                        }
+                    }
+                    let want = match max_total {
+                        Some(max) => ((max - total) as usize).min(window).max(1),
+                        None => window,
+                    };
+                    let chunk = match query.stream.poll_window(want).await {
+                        Ok(Some(c)) => c,
+                        Ok(None) => break,
+                        Err(_) => break,
+                    };
+                    let mut chunk = chunk;
+                    if !mask_idx.is_empty() {
+                        let refs: Vec<(usize, &gateway_core::MaskSpec)> =
+                            mask_idx.iter().map(|(i, s)| (*i, s)).collect();
+                        apply_masks_to_rows(&mut chunk, &refs);
+                    }
+                    if let Some(wm) = watermark.as_ref() {
+                        for row in chunk.iter_mut() {
+                            while row.len() < header_width {
+                                if row.len() + 1 == header_width {
+                                    row.push(GatewayValue::String(wm.token.clone()));
+                                } else {
+                                    row.push(GatewayValue::Null);
+                                }
+                            }
+                        }
+                    }
+                    total += chunk.len() as u64;
+                    let bytes = portal_csv_encode_rows(&col_names, &chunk);
+                    if tx.send_data(Bytes::from(bytes)).await.is_err() {
+                        while query.stream.poll_window(window).await.ok().flatten().is_some() {}
+                        return;
+                    }
+                }
+                if truncated {
+                    let _ = tx
+                        .send_data(Bytes::from_static(b"# truncated=true\n"))
+                        .await;
+                }
+            });
+
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+                .header("x-data-nexus-stream", "backend_window");
+            if download {
+                builder = builder.header(
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"portal-export.csv\"",
+                );
+            }
+            Ok(builder.body(body).unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("response build failed"))
+                    .expect("static")
+            }))
+        }
+        ExecuteOutcome::Complete(response) => {
+            // Fallback: materialize then single-body CSV (no backend_window header).
+            let response = map_response_types(
+                response,
+                &prepared.backend_protocol,
+                &prepared.frontend_protocol,
+            );
+            let response = if prepared.obligations.has_result_obligations() {
+                gateway_core::apply_obligations_to_response(response, &prepared.obligations)
+            } else {
+                response
+            };
+            match response {
+                GatewayResponse::ResultSet { columns, rows } => {
+                    let limit = max_rows.or(prepared.obligations.max_rows);
+                    let truncated = limit.map(|m| rows.len() as u64 >= m).unwrap_or(false);
+                    let col_names: Vec<String> = columns.into_iter().map(|c| c.name).collect();
+                    let json_rows = rows
+                        .into_iter()
+                        .map(|row| row.into_iter().map(gateway_value_to_json).collect())
+                        .collect::<Vec<_>>();
+                    let row_count = json_rows.len();
+                    let resp = AdminPortalQueryResponse {
+                        columns: col_names,
+                        rows: json_rows,
+                        row_count,
+                        truncated,
+                        service: service_name.to_owned(),
+                        decision: "allow".into(),
+                        message: None,
+                    };
+                    let body = portal_to_csv(&resp);
+                    let mut builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8");
+                    // Honest: Complete path is materialized (no backend_window).
+                    if download {
+                        builder = builder.header(
+                            header::CONTENT_DISPOSITION,
+                            "attachment; filename=\"portal-export.csv\"",
+                        );
+                    }
+                    Ok(builder.body(Body::from(body)).unwrap_or_else(|_| {
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Body::from("response build failed"))
+                            .expect("static")
+                    }))
+                }
+                GatewayResponse::Error { code, message } => Err((code, message)),
+                GatewayResponse::Ok { affected_rows, .. } => {
+                    let resp = AdminPortalQueryResponse {
+                        columns: vec!["affected_rows".into()],
+                        rows: vec![vec![serde_json::json!(affected_rows)]],
+                        row_count: 1,
+                        truncated: false,
+                        service: service_name.to_owned(),
+                        decision: "allow".into(),
+                        message: Some("ok".into()),
+                    };
+                    let body = portal_to_csv(&resp);
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+                        .body(Body::from(body))
+                        .unwrap_or_else(|_| {
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Body::from("response build failed"))
+                                .expect("static")
+                        }))
+                }
+                other => Err(("unsupported".into(), format!("{other:?}"))),
+            }
+        }
+    }
+}
+
 fn json_response<T: Serialize>(value: &T) -> Response<Body> {
     match serde_json::to_vec(value) {
         Ok(body) => Response::builder()
@@ -3258,6 +3526,47 @@ fn portal_to_csv(resp: &AdminPortalQueryResponse) -> Vec<u8> {
         out.push_str("# truncated=true\n");
     }
     out.into_bytes()
+}
+
+/// A09: encode one window of gateway rows as CSV lines (no header).
+fn portal_csv_encode_rows(
+    columns: &[String],
+    rows: &[Vec<gateway_core::GatewayValue>],
+) -> Vec<u8> {
+    let mut out = String::new();
+    for row in rows {
+        let line = columns
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let cell = row.get(i).cloned().unwrap_or(gateway_core::GatewayValue::Null);
+                csv_escape(&gateway_value_to_csv_cell(&cell))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+fn gateway_value_to_csv_cell(v: &gateway_core::GatewayValue) -> String {
+    match v {
+        gateway_core::GatewayValue::Null => String::new(),
+        gateway_core::GatewayValue::Boolean(b) => b.to_string(),
+        gateway_core::GatewayValue::Integer(i) => i.to_string(),
+        gateway_core::GatewayValue::UnsignedInteger(u) => u.to_string(),
+        gateway_core::GatewayValue::Float(f) => f.to_string(),
+        gateway_core::GatewayValue::Decimal(s) | gateway_core::GatewayValue::String(s) => s.clone(),
+        gateway_core::GatewayValue::Bytes(b) => {
+            let mut hex = String::with_capacity(2 + b.len() * 2);
+            hex.push_str("0x");
+            for byte in b {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex
+        }
+    }
 }
 
 fn portal_to_ndjson(resp: &AdminPortalQueryResponse) -> Vec<u8> {
@@ -4136,6 +4445,22 @@ service = "missing-service"
         assert_eq!(r0["name"], "portal");
         let r2: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(r2["id"], 3);
+    }
+
+    #[test]
+    fn a09_portal_csv_encode_rows_escapes_and_joins() {
+        use gateway_core::GatewayValue;
+        let cols = vec!["id".into(), "name".into()];
+        let rows = vec![
+            vec![GatewayValue::Integer(1), GatewayValue::String("a,b".into())],
+            vec![GatewayValue::Integer(2), GatewayValue::String("x\"y".into())],
+        ];
+        let text = String::from_utf8(portal_csv_encode_rows(&cols, &rows)).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "1,\"a,b\"");
+        assert!(lines[1].starts_with("2,"));
+        assert!(lines[1].contains("\"\"")); // escaped quote
     }
 
     #[test]

@@ -26,7 +26,7 @@ backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 
 - MySQL **Streaming**（含事务）：channel `RowStream`；事务内 producer 结束后写回 `txn_lease`；smoke `max_rows`（**含 BEGIN..SELECT..COMMIT**）+ metrics `streaming`。
 - PostgreSQL **Streaming**（含事务）：`simple_query_raw` + channel；事务内同样还 lease；smoke 事务内 max_rows 同路径。
 - 并发：同一会话事务内 stream 未 drain 前不要再发下一条（producer 持有 lease）。
-- Portal NDJSON（A09）：backend 返回 `Streaming` 时窗口 yield → HTTP chunk（`stream=backend_window`）；multi-row smoke **强制** backend_window；smoke 断言 **json/csv 无 backend_window（物化）**；`Complete` 回退 B05b chunked。
+- Portal（A09）：**NDJSON + CSV** 在 backend `Streaming` 时窗口 yield → HTTP chunk（`x-data-nexus-stream: backend_window`）；multi-row smoke **强制** NDJSON/CSV backend_window；**json 仍物化** ResultSet（smoke 断言无 backend_window）；`Complete` 回退 B05b chunked / 单 body CSV。
 - MySQL backend TLS（A08）：`ssl_mode` prefer/require + `ssl_ca_file`/`ssl_accept_invalid_certs`；**prefer：服务端无 CLIENT_SSL 时回落明文**；require 仍失败；**prod 模板 require+CA+verify**（validate 拒绝 require+verify 无 CA）。
 - PG Passthrough（A08）：idle pool（cap + TTL + SELECT 1 探测）+ 事务 `tcp_txn` 原帧中继；`endpoints[].ssl_mode` disable/prefer/require；**`ssl_ca_file` + `ssl_accept_invalid_certs`**（默认 true 兼容 MVP；**prod 模板 false + CA PEM**；validate 拒绝 require+verify 无 CA）。Streaming 仍用 pool。非 extended。MySQL prefer 与 PG prefer 同语义（可明文回落）。
 - A07：`handle_frame_to_writer` + socket `ResponseWriter` 已接。

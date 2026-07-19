@@ -226,7 +226,7 @@ assert isinstance(body.get("rows"), list) and len(body["rows"]) >= 2, body
 print("json multi-row materialized ok", "rows", body.get("row_count"))
 PY
 
-echo "==> portal multi-row CSV is materialized (A09 honest: not backend_window)"
+echo "==> portal multi-row CSV streams backend_window (A09)"
 curl -fsS -D /tmp/dn-portal-csv2.hdr -o /tmp/dn-portal-multi.csv \
   -X POST "http://127.0.0.1:8082/admin/portal/query" \
   -H 'content-type: application/json' \
@@ -235,10 +235,12 @@ python3 - <<'PY'
 hdr=open("/tmp/dn-portal-csv2.hdr").read().lower()
 body=open("/tmp/dn-portal-multi.csv").read()
 assert "text/csv" in hdr, hdr
-assert "x-data-nexus-stream: backend_window" not in hdr, hdr
-lines=[ln for ln in body.splitlines() if ln.strip()]
+# MySQL non-txn Streaming should yield true backend_window for CSV now.
+assert "x-data-nexus-stream: backend_window" in hdr, hdr
+lines=[ln for ln in body.splitlines() if ln.strip() and not ln.startswith("#")]
 assert len(lines) >= 3, lines  # header + >=2 data rows
-print("csv multi-row materialized ok", "lines", len(lines))
+assert lines[0].lower().startswith("id"), lines[0]
+print("csv multi-row backend_window ok", "lines", len(lines))
 PY
 
 echo "==> portal invalid format rejected"
