@@ -175,12 +175,13 @@ database = "__DN_MYSQL_DATABASE__"
 username = "__DN_MYSQL_USER__"
 password = "__DN_MYSQL_PASSWORD__"
 weight = 1
-# A08 backend TLS: disable | prefer | require
+# A08 production pin: require TLS + verify CA (no accept-invalid).
+# Local/dev may use ssl_mode=disable or accept_invalid=true without CA.
+ssl_mode = "require"
+ssl_ca_file = "__DN_MYSQL_SSL_CA_FILE__"
+ssl_accept_invalid_certs = false
 # MySQL prefer falls back to plaintext if the server lacks CLIENT_SSL;
-# require fails hard (same semantics as PostgreSQL ssl_mode).
-ssl_mode = "disable"
-# ssl_ca_file = "/etc/ssl/certs/mysql-ca.pem"
-# ssl_accept_invalid_certs = false
+# require fails hard (same semantics as PostgreSQL).
 
 [[endpoints]]
 name = "analytics-primary"
@@ -190,9 +191,9 @@ database = "__DN_PG_DATABASE__"
 username = "__DN_PG_USER__"
 password = "__DN_PG_PASSWORD__"
 weight = 1
-ssl_mode = "disable"
-# ssl_ca_file = "/etc/ssl/certs/pg-ca.pem"
-# ssl_accept_invalid_certs = false
+ssl_mode = "require"
+ssl_ca_file = "__DN_PG_SSL_CA_FILE__"
+ssl_accept_invalid_certs = false
 
 [[route_policies]]
 name = "orders-balance"

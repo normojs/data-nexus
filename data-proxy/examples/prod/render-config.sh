@@ -19,11 +19,13 @@ required=(
   DN_MYSQL_DATABASE
   DN_MYSQL_USER
   DN_MYSQL_PASSWORD
+  DN_MYSQL_SSL_CA_FILE
   DN_PG_HOST
   DN_PG_PORT
   DN_PG_DATABASE
   DN_PG_USER
   DN_PG_PASSWORD
+  DN_PG_SSL_CA_FILE
 )
 
 missing=0
@@ -50,7 +52,9 @@ text = open(path, encoding="utf-8").read()
 keys = [
   "DN_JWT_SECRET", "DN_BREAK_GLASS_PASSWORD",
   "DN_MYSQL_HOST", "DN_MYSQL_PORT", "DN_MYSQL_DATABASE", "DN_MYSQL_USER", "DN_MYSQL_PASSWORD",
+  "DN_MYSQL_SSL_CA_FILE",
   "DN_PG_HOST", "DN_PG_PORT", "DN_PG_DATABASE", "DN_PG_USER", "DN_PG_PASSWORD",
+  "DN_PG_SSL_CA_FILE",
 ]
 for k in keys:
     text = text.replace("__" + k + "__", os.environ[k])

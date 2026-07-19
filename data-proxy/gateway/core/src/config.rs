@@ -265,6 +265,24 @@ impl GatewayConfig {
                     )));
                 }
             }
+            // A08 production pin: require + verify must name a CA (or rely on system
+            // roots only when accept_invalid is true — still discourage silent pin-less
+            // require+verify without any CA path by requiring ssl_ca_file when
+            // accept_invalid_certs=false).
+            if endpoint.ssl_mode == EndpointSslMode::Require
+                && !endpoint.ssl_accept_invalid_certs
+                && endpoint
+                    .ssl_ca_file
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_none()
+            {
+                return Err(GatewayError::Configuration(format!(
+                    "endpoint '{}' ssl_mode=require with ssl_accept_invalid_certs=false requires ssl_ca_file (production pin)",
+                    endpoint.name
+                )));
+            }
         }
 
         let services: HashSet<&str> = self.services.iter().map(|item| item.name.as_str()).collect();
@@ -663,6 +681,30 @@ mod tests {
         config.endpoints[0].ssl_mode = EndpointSslMode::Require;
         config.endpoints[0].ssl_ca_file = Some("/tmp/ca.pem".into());
         config.endpoints[0].ssl_accept_invalid_certs = false;
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a08_require_verify_without_ca_file_rejected() {
+        let mut config = config();
+        config.endpoints[0].ssl_mode = EndpointSslMode::Require;
+        config.endpoints[0].ssl_ca_file = None;
+        config.endpoints[0].ssl_accept_invalid_certs = false;
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ssl_ca_file") && msg.contains("require"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a08_require_accept_invalid_without_ca_still_ok() {
+        // Dev/MVP path: require TLS but skip verification (no CA needed).
+        let mut config = config();
+        config.endpoints[0].ssl_mode = EndpointSslMode::Require;
+        config.endpoints[0].ssl_ca_file = None;
+        config.endpoints[0].ssl_accept_invalid_certs = true;
         assert_eq!(config.validate(), Ok(()));
     }
 }
