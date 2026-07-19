@@ -161,6 +161,7 @@ examples/        smoke + gateway config 样例
 | A06 | 事务内 Streaming max_rows 双协议 smoke（部分） | feat(a06) |
 | A09 | portal json/csv 物化边界 smoke（部分） | feat(a09) |
 | T01 | 列 ACL / 复杂 SQL 矩阵（部分） | feat(t01) |
+| T01 | WHERE/HAVING/JOIN 子查询表提取 | feat(t01) |
 | H05 | multi-instance file bundle + prod state template（部分） | feat(h05) |
 | A08 | MySQL backend TLS via ssl_mode/ssl_ca_file（部分） | feat(a08) |
 | A08 | MySQL prefer 明文回落（服务端无 CLIENT_SSL） | feat(a08) |
@@ -213,7 +214,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **UI03** | Audit 页增强 | stats 卡片、source 角标、当前结果导出 | `event_id`/时间窗/`source` + stats 卡片 + JSON/CSV 客户端导出（`e723a45` 后 UI03） | **完成** |
 | **UI04** | 策略只读页 | data-ui 展示 security rules / mask / high-risk | `/policies` + 扩展 `GET /admin/security-policies`（mask/tags/high-risk/time/watermark/streaming；水印 token 不回传） | **完成** |
-| **T01** | 列 ACL / 复杂 SQL 用例矩阵 | 子查询、多表、方言边界；启发式 `parse_failed` 行为 | extract/PDP 单测矩阵 + column smoke 子查询/join/qualified；WHERE 子查询表提取仍 gap | **部分** |
+| **T01** | 列 ACL / 复杂 SQL 用例矩阵 | 子查询、多表、方言边界；启发式 `parse_failed` 行为 | extract/PDP 单测 + WHERE/HAVING/EXISTS/IN/标量子查询表提取；column smoke WHERE IN deny；**列 rewrite 仍不深改嵌套 SELECT 列表** | **部分** |
 | **T02** | Ticket/Vault runbook | 注释注入约定、双人审批、吊销运维说明进 docs | [`docs/ticket-vault-runbook.md`](docs/ticket-vault-runbook.md)；prod README 链接；非 BPM | **完成** |
 | **O01** | Secure 路径观测 | mask 行数、encode 窗口/字节、审计队列深度、worker 处理延迟 | Prometheus always-on；非 OTel feature | **完成** |
 
@@ -237,32 +238,32 @@ examples/        smoke + gateway config 样例
 | 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；**prod 模板已含 security.state**；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
 | L2 样本合规 | **未实现**（B08） |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
-| 复杂 SQL / 列 ACL | T01：JOIN/子查询/CTE 主路径有单测+smoke；**WHERE 子查询表**可能漏抽；列 rewrite 不深改嵌套 SELECT 列表 |
+| 复杂 SQL / 列 ACL | T01：JOIN/CTE/WHERE·HAVING·EXISTS·IN 子查询表可抽；**列 rewrite 不深改嵌套 SELECT 列表**；极端方言/解析失败仍走 heuristic |
 
 ---
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> T01 WHERE 子查询表提取 或 F29 Cedar 实体属性（延后） 或 B08 L2 样本（延后） <<<**
+**>>> F29 Cedar 实体属性（延后） 或 B08 L2 样本（延后） 或 F31 Remote PDP（延后） <<<**
 
-本轮（A08 MySQL prefer 明文回落）：
+本轮（T01 WHERE 子查询表提取）：
 
-- `ClientTlsOpts.require_tls`：prefer=false / require=true
-- 握手：服务端无 `CLIENT_SSL` 时 prefer 清掉 tls 继续明文；require → `ProtocolError::Tls`
-- 单测：auth prefer/require + backend `require_tls` 标志
-- 与 PG prefer 同语义；默认 accept_invalid 仍 true
+- PG/sqlparser：WHERE / HAVING / JOIN ON / SELECT 列表 / EXISTS / IN (SELECT) 子查询表
+- MySQL：WHERE/HAVING + `InExpr` 内 `SubQueryExpr` / EXISTS / CompSubQuery
+- 单测硬断言双表；smoke-column WHERE IN secret_tokens deny
+- 仍 **部分**：嵌套 SELECT 列表列 rewrite 深度有限
 
 ```bash
-cargo test -p mysql_protocol --lib 'a08_'
-cargo test -p runtime_gateway --lib 'backend::mysql::tests::a08_'
+cargo test -p runtime_gateway --lib 'object_extract::tests::t01_'
 ./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **T01** — WHERE 子查询表提取 gap  
-2. **F29** — Cedar 实体属性（延后）  
-3. **B08** — L2 样本（延后）  
+1. **F29** — Cedar 实体属性（延后）  
+2. **B08** — L2 样本（延后）  
+3. **F31** — Remote PDP（延后）  
+   或体验向小刀 / 发版准备  
 
 ---
 

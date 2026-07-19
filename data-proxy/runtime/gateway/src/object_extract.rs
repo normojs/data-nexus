@@ -100,6 +100,7 @@ fn walk_sqlparser_statement(stmt: &Statement, set: &mut ObjectSet) {
             table,
             assignments,
             from,
+            selection,
             ..
         } => {
             collect_table_with_joins(table, StatementAction::Update, set);
@@ -126,8 +127,15 @@ fn walk_sqlparser_statement(stmt: &Statement, set: &mut ObjectSet) {
                     }
                 }
             }
+            // assignment values may embed subqueries (after releasing objects borrow)
+            for assignment in assignments {
+                walk_expr_subqueries(&assignment.value, set);
+            }
             if let Some(from) = from {
                 collect_table_with_joins(from, StatementAction::Select, set);
+            }
+            if let Some(sel) = selection {
+                walk_expr_subqueries(sel, set);
             }
         }
         Statement::Delete(Delete {
@@ -225,6 +233,8 @@ fn walk_set_expr(expr: &SetExpr, action: StatementAction, set: &mut ObjectSet) {
                     }
                     SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
                         collect_expr_columns(e, &mut columns);
+                        // T01: scalar subqueries in SELECT list.
+                        walk_expr_subqueries(e, set);
                     }
                 }
             }
@@ -239,6 +249,13 @@ fn walk_set_expr(expr: &SetExpr, action: StatementAction, set: &mut ObjectSet) {
                         push_col(&mut obj.columns, c.clone());
                     }
                 }
+            }
+            // T01: WHERE / HAVING / JOIN ON subqueries contribute tables for ACL.
+            if let Some(sel) = &select.selection {
+                walk_expr_subqueries(sel, set);
+            }
+            if let Some(hav) = &select.having {
+                walk_expr_subqueries(hav, set);
             }
         }
         SetExpr::Query(q) => walk_query(q, action, set),
@@ -259,6 +276,31 @@ fn collect_table_with_joins(
     collect_table_factor(&twj.relation, action, set);
     for join in &twj.joins {
         collect_table_factor(&join.relation, action, set);
+        // T01: JOIN ON (SELECT …) / EXISTS in join condition.
+        match &join.join_operator {
+            sqlparser::ast::JoinOperator::Inner(c)
+            | sqlparser::ast::JoinOperator::LeftOuter(c)
+            | sqlparser::ast::JoinOperator::RightOuter(c)
+            | sqlparser::ast::JoinOperator::FullOuter(c)
+            | sqlparser::ast::JoinOperator::LeftSemi(c)
+            | sqlparser::ast::JoinOperator::RightSemi(c)
+            | sqlparser::ast::JoinOperator::LeftAnti(c)
+            | sqlparser::ast::JoinOperator::RightAnti(c) => {
+                if let sqlparser::ast::JoinConstraint::On(expr) = c {
+                    walk_expr_subqueries(expr, set);
+                }
+            }
+            sqlparser::ast::JoinOperator::AsOf {
+                match_condition,
+                constraint,
+            } => {
+                walk_expr_subqueries(match_condition, set);
+                if let sqlparser::ast::JoinConstraint::On(expr) = constraint {
+                    walk_expr_subqueries(expr, set);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -336,6 +378,88 @@ fn collect_expr_columns(expr: &Expr, columns: &mut Vec<String>) {
             }
             if let Some(e) = else_result {
                 collect_expr_columns(e, columns);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// T01: walk expression tree and extract tables from nested SELECT / EXISTS / IN (SELECT).
+fn walk_expr_subqueries(expr: &Expr, set: &mut ObjectSet) {
+    match expr {
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
+            walk_query(q, StatementAction::Select, set);
+        }
+        Expr::InSubquery { expr: outer, subquery, .. } => {
+            walk_expr_subqueries(outer, set);
+            walk_query(subquery, StatementAction::Select, set);
+        }
+        Expr::InList { expr: outer, list, .. } => {
+            walk_expr_subqueries(outer, set);
+            for e in list {
+                walk_expr_subqueries(e, set);
+            }
+        }
+        Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } | Expr::Cast { expr: e, .. } => {
+            walk_expr_subqueries(e, set);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            walk_expr_subqueries(left, set);
+            walk_expr_subqueries(right, set);
+        }
+        Expr::IsNull(e)
+        | Expr::IsNotNull(e)
+        | Expr::IsTrue(e)
+        | Expr::IsNotTrue(e)
+        | Expr::IsFalse(e)
+        | Expr::IsNotFalse(e)
+        | Expr::IsUnknown(e)
+        | Expr::IsNotUnknown(e) => walk_expr_subqueries(e, set),
+        Expr::Between { expr, low, high, .. } => {
+            walk_expr_subqueries(expr, set);
+            walk_expr_subqueries(low, set);
+            walk_expr_subqueries(high, set);
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            walk_expr_subqueries(expr, set);
+            walk_expr_subqueries(pattern, set);
+        }
+        Expr::Function(func) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
+                for arg in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) = arg
+                    {
+                        walk_expr_subqueries(e, set);
+                    }
+                }
+            } else if let sqlparser::ast::FunctionArguments::Subquery(q) = &func.args {
+                walk_query(q, StatementAction::Select, set);
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                walk_expr_subqueries(op, set);
+            }
+            for cond in conditions {
+                walk_expr_subqueries(cond, set);
+            }
+            for result in results {
+                walk_expr_subqueries(result, set);
+            }
+            if let Some(e) = else_result {
+                walk_expr_subqueries(e, set);
+            }
+        }
+        Expr::Tuple(items) => {
+            for e in items {
+                walk_expr_subqueries(e, set);
             }
         }
         _ => {}
@@ -432,7 +556,11 @@ fn walk_mysql_select(select: &SelectStmt, action: StatementAction, set: &mut Obj
             for item in &q.items.items {
                 match item {
                     Item::Wild(_) | Item::TableWild(_) => wildcard = true,
-                    Item::ItemExpr(ie) => collect_mysql_expr_columns(&ie.expr, &mut columns),
+                    Item::ItemExpr(ie) => {
+                        collect_mysql_expr_columns(&ie.expr, &mut columns);
+                        // T01: scalar subqueries in SELECT list.
+                        walk_mysql_expr_subqueries(&ie.expr, set);
+                    }
                 }
             }
             let before = set.objects.len();
@@ -448,6 +576,13 @@ fn walk_mysql_select(select: &SelectStmt, action: StatementAction, set: &mut Obj
                         push_col(&mut obj.columns, c.clone());
                     }
                 }
+            }
+            // T01: WHERE / HAVING subqueries contribute tables for ACL.
+            if let Some(where_clause) = &q.where_clause {
+                walk_mysql_expr_subqueries(&where_clause.expr, set);
+            }
+            if let Some(having_clause) = &q.having_clause {
+                walk_mysql_expr_subqueries(&having_clause.expr, set);
             }
             if let Some(union) = &q.union_query {
                 walk_mysql_select(union, action, set);
@@ -510,6 +645,8 @@ fn walk_mysql_update(update: &UpdateStmt, set: &mut ObjectSet) {
         if let Some(name) = mysql_value_ident(&u.var_name) {
             push_col(&mut columns, name);
         }
+        // assignment RHS may embed subqueries
+        walk_mysql_expr_subqueries(&u.expr, set);
     }
     for obj in set.objects[before..].iter_mut() {
         if obj.op == StatementAction::Update {
@@ -517,6 +654,9 @@ fn walk_mysql_update(update: &UpdateStmt, set: &mut ObjectSet) {
                 push_col(&mut obj.columns, c.clone());
             }
         }
+    }
+    if let Some(where_clause) = &update.where_clause {
+        walk_mysql_expr_subqueries(&where_clause.expr, set);
     }
 }
 
@@ -527,6 +667,9 @@ fn walk_mysql_delete(delete: &DeleteStmt, set: &mut ObjectSet) {
     }
     for r in &delete.table_refs {
         walk_mysql_table_ref(r, StatementAction::Delete, set);
+    }
+    if let Some(where_clause) = &delete.where_clause {
+        walk_mysql_expr_subqueries(&where_clause.expr, set);
     }
 }
 
@@ -586,7 +729,98 @@ fn collect_mysql_expr_columns(expr: &mysql_parser::ast::Expr, columns: &mut Vec<
                 collect_mysql_expr_columns(p, columns);
             }
         }
-        E::SubQueryExpr(_) | E::ExistsSubQuery(_) => {}
+        // Column collection ignores subquery bodies; tables are walked separately.
+        E::SubQueryExpr(_) | E::ExistsSubQuery(_) | E::CompSubQueryExpr(_) => {}
+        _ => {}
+    }
+}
+
+/// T01: walk MySQL expression tree and extract tables from nested SELECT / EXISTS / IN.
+fn walk_mysql_expr_subqueries(expr: &mysql_parser::ast::Expr, set: &mut ObjectSet) {
+    use mysql_parser::ast::Expr as E;
+    match expr {
+        E::SubQueryExpr(sub) | E::ExistsSubQuery(sub) => {
+            walk_mysql_select(sub, StatementAction::Select, set);
+        }
+        E::CompSubQueryExpr(comp) => {
+            walk_mysql_expr_subqueries(&comp.expr, set);
+            walk_mysql_select(&comp.subquery, StatementAction::Select, set);
+        }
+        E::InExpr { expr, exprs, .. } => {
+            walk_mysql_expr_subqueries(expr, set);
+            // IN (SELECT …) is represented as InExpr with SubQueryExpr children.
+            for e in exprs {
+                walk_mysql_expr_subqueries(e, set);
+            }
+        }
+        E::BinaryOperationExpr { left, right, .. } => {
+            walk_mysql_expr_subqueries(left, set);
+            walk_mysql_expr_subqueries(right, set);
+        }
+        E::UnaryOperationExpr { expr, .. }
+        | E::IsTruthExpr { expr, .. }
+        | E::IsUnknownExpr { expr, .. }
+        | E::IsNullExpr { expr, .. }
+        | E::BinaryExpr(expr)
+        | E::CastExpr { expr, .. }
+        | E::InSumExpr { expr, .. }
+        | E::SetFuncSpecExpr(expr) => walk_mysql_expr_subqueries(expr, set),
+        E::BetweenExpr {
+            expr, left, right, ..
+        } => {
+            walk_mysql_expr_subqueries(expr, set);
+            walk_mysql_expr_subqueries(left, set);
+            walk_mysql_expr_subqueries(right, set);
+        }
+        E::LikeExpr {
+            expr,
+            pattern_expr,
+            escape_expr,
+            ..
+        } => {
+            walk_mysql_expr_subqueries(expr, set);
+            walk_mysql_expr_subqueries(pattern_expr, set);
+            if let Some(esc) = escape_expr {
+                walk_mysql_expr_subqueries(esc, set);
+            }
+        }
+        E::MemberOfExpr { expr, of_expr, .. } => {
+            walk_mysql_expr_subqueries(expr, set);
+            walk_mysql_expr_subqueries(of_expr, set);
+        }
+        E::SoundsExpr { left, right, .. } | E::RegexpExpr { left, right, .. } => {
+            walk_mysql_expr_subqueries(left, set);
+            walk_mysql_expr_subqueries(right, set);
+        }
+        E::FuncCallExpr { args, .. } | E::RowExpr(args) => {
+            for p in args {
+                walk_mysql_expr_subqueries(p, set);
+            }
+        }
+        E::CaseExpr {
+            expr,
+            when_exprs,
+            else_expr,
+            ..
+        } => {
+            if let Some(e) = expr.as_ref() {
+                walk_mysql_expr_subqueries(e, set);
+            }
+            for w in when_exprs {
+                walk_mysql_expr_subqueries(&w.when, set);
+                walk_mysql_expr_subqueries(&w.then, set);
+            }
+            if let Some(e) = else_expr.as_ref() {
+                walk_mysql_expr_subqueries(e, set);
+            }
+        }
+        E::MatchAgainstExpr { expr, .. } => walk_mysql_expr_subqueries(expr, set),
+        E::CollateExpr { expr, .. } => walk_mysql_expr_subqueries(expr, set),
+        E::AggExpr(agg) => {
+            for e in &agg.exprs {
+                walk_mysql_expr_subqueries(e, set);
+            }
+        }
         _ => {}
     }
 }
@@ -836,31 +1070,78 @@ mod tests {
 
     #[test]
     fn t01_pg_in_subquery_where_extracts_both_tables() {
-        // WHERE (SELECT ...) subquery should still surface secret_tokens if walked.
         let set = extract_object_set(
             "SELECT id FROM employees WHERE id IN (SELECT emp_id FROM secret_tokens)",
             "postgresql",
         );
-        // Parser may or may not walk WHERE subqueries depending on visitor depth;
-        // T01 records honest behaviour: outer table always present; inner best-effort.
         assert!(!set.parse_failed, "{set:?}");
-        assert!(
-            set.objects
-                .iter()
-                .any(|o| o.table.eq_ignore_ascii_case("employees")),
-            "{set:?}"
-        );
         let tables = set.tables();
-        // Prefer seeing both; if only outer is seen, flag as known limitation via assert soft note.
-        if !tables
-            .iter()
-            .any(|t| t.to_ascii_lowercase().contains("secret_tokens"))
-        {
-            // Documented gap: WHERE-subquery tables may be missed by current walker.
-            eprintln!(
-                "t01 note: WHERE subquery table not extracted (honest gap): tables={tables:?}"
-            );
-        }
+        assert!(
+            tables
+                .iter()
+                .any(|t| t.to_ascii_lowercase().contains("employees")),
+            "outer table missing: {tables:?}"
+        );
+        assert!(
+            tables
+                .iter()
+                .any(|t| t.to_ascii_lowercase().contains("secret_tokens")),
+            "WHERE IN subquery table must be extracted: {tables:?}"
+        );
+    }
+
+    #[test]
+    fn t01_mysql_in_subquery_where_extracts_both_tables() {
+        let set = extract_object_set(
+            "SELECT id FROM employees WHERE id IN (SELECT emp_id FROM secret_tokens)",
+            "mysql",
+        );
+        assert!(!set.parse_failed, "{set:?}");
+        let tables = set.tables();
+        assert!(
+            tables
+                .iter()
+                .any(|t| t.to_ascii_lowercase().contains("employees")),
+            "outer table missing: {tables:?}"
+        );
+        assert!(
+            tables
+                .iter()
+                .any(|t| t.to_ascii_lowercase().contains("secret_tokens")),
+            "MySQL WHERE IN subquery table must be extracted: {tables:?}"
+        );
+    }
+
+    #[test]
+    fn t01_pg_exists_subquery_where_extracts_inner_table() {
+        let set = extract_object_set(
+            "SELECT id FROM employees WHERE EXISTS (SELECT 1 FROM secret_tokens st WHERE st.emp_id = employees.id)",
+            "postgresql",
+        );
+        assert!(!set.parse_failed, "{set:?}");
+        let tables = set.tables();
+        assert!(
+            tables
+                .iter()
+                .any(|t| t.to_ascii_lowercase().contains("secret_tokens")),
+            "EXISTS subquery table must be extracted: {tables:?}"
+        );
+    }
+
+    #[test]
+    fn t01_pg_scalar_subquery_in_select_list() {
+        let set = extract_object_set(
+            "SELECT id, (SELECT COUNT(*) FROM secret_tokens) AS n FROM employees",
+            "postgresql",
+        );
+        assert!(!set.parse_failed, "{set:?}");
+        let tables = set.tables();
+        assert!(
+            tables
+                .iter()
+                .any(|t| t.to_ascii_lowercase().contains("secret_tokens")),
+            "scalar subquery table must be extracted: {tables:?}"
+        );
     }
 
     #[test]

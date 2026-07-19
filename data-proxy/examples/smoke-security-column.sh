@@ -201,4 +201,26 @@ fi
 # dept_name may remain (not under employees column rule)
 echo "$out" | tr '\t' ' ' | grep -qi 'eng\|1' || true
 
+echo "==> T01: WHERE IN subquery table is extracted (deny secret_tokens)"
+# secret_tokens is denied by table ACL in security-column config; previously
+# WHERE-subquery tables could be missed so this might incorrectly allow.
+set +e
+mysql_via_gateway 'SELECT id FROM employees WHERE id IN (SELECT id FROM secret_tokens);' \
+  >/tmp/data-nexus-column-where-subq.txt 2>&1
+where_rc=$?
+set -e
+if [[ $where_rc -eq 0 ]]; then
+  if grep -qiE 'secret|token|denied|security|ERROR|1105' /tmp/data-nexus-column-where-subq.txt; then
+    : # some clients print error on stdout with 0? still ok if denied text present
+  else
+    echo "T01 WHERE subquery: expected deny on secret_tokens, got success" >&2
+    cat /tmp/data-nexus-column-where-subq.txt >&2
+    exit 1
+  fi
+fi
+grep -qiE 'secret|token|denied|security|ERROR|1105|policy' /tmp/data-nexus-column-where-subq.txt \
+  || { echo "T01 WHERE subquery: deny message missing"; cat /tmp/data-nexus-column-where-subq.txt; exit 1; }
+kill -0 "$PROXY_PID"
+echo "T01 WHERE subquery deny ok"
+
 echo "smoke-security-column: OK"
