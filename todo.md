@@ -8,6 +8,7 @@
 | `docs/data-security-roadmap.md` | 产品对标（防水坝 / 树安 SQLDEV）+ S0–S6 定义 |
 | `docs/data-nexus-tech-architecture-2026.md` | **v2 技术主文档**（术语、选型、双路径、实现切片） |
 | `docs/data-audit-architecture.md` | 审计/流式专项 |
+| `docs/ticket-vault-runbook.md` | **T02** Ticket/Vault 运维（注释注入、双人、吊销、Portal） |
 | `data-proxy/docs/build-cache.md` | Cargo target 外置缓存 |
 | `.claude/rules/data-nexus-development.md` | **开发强制规则**（DoD / 铁律 / 双路径） |
 | `.claude/README.md` | Claude Skills / Commands / Superpowers 能力地图 |
@@ -163,6 +164,7 @@ examples/        smoke + gateway config 样例
 | H05 | multi-instance file bundle + prod state template（部分） | feat(h05) |
 | A08 | MySQL backend TLS via ssl_mode/ssl_ca_file（部分） | feat(a08) |
 | UI04 | 策略只读页 + security-policies 扩展字段 | feat(ui04) |
+| T02 | Ticket/Vault 运维 runbook | feat(t02) |
 
 ---
 
@@ -210,7 +212,7 @@ examples/        smoke + gateway config 样例
 | **UI03** | Audit 页增强 | 已接 B06 过滤；可补 stats 卡片、source 角标、导出 | `event_id`/时间窗/`source` 已做（`6ff8cef`） | **可选** |
 | **UI04** | 策略只读页 | data-ui 展示 security rules / mask / high-risk | `/policies` + 扩展 `GET /admin/security-policies`（mask/tags/high-risk/time/watermark/streaming；水印 token 不回传） | **完成** |
 | **T01** | 列 ACL / 复杂 SQL 用例矩阵 | 子查询、多表、方言边界；启发式 `parse_failed` 行为 | extract/PDP 单测矩阵 + column smoke 子查询/join/qualified；WHERE 子查询表提取仍 gap | **部分** |
-| **T02** | Ticket/Vault runbook | 注释注入约定、双人审批、吊销运维说明进 docs | API+UI 有，运维叙事可再收紧 | **可选** |
+| **T02** | Ticket/Vault runbook | 注释注入约定、双人审批、吊销运维说明进 docs | [`docs/ticket-vault-runbook.md`](docs/ticket-vault-runbook.md)；prod README 链接；非 BPM | **完成** |
 | **O01** | Secure 路径观测 | mask 行数、encode 窗口/字节、审计队列深度、worker 处理延迟 | Prometheus always-on；非 OTel feature | **完成** |
 
 ### 3.5 P3 — 边界扩展（明确后置）
@@ -239,26 +241,25 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> T02 Ticket/Vault runbook 或 UI03 Audit 增强 或 A08 prefer 明文回落 <<<**
+**>>> UI03 Audit 增强 或 A08 prefer 明文回落 或 T01 WHERE 子查询表提取 <<<**
 
-本轮（UI04 策略只读页）：
+本轮（T02 Ticket/Vault runbook）：
 
-- 扩展 `GET /admin/security-policies`：mask / column_tags / high_risk / time / watermark / streaming
-- 水印 **不**回传静态 token 原文（仅 `has_static_token`）
-- data-ui `/policies` 只读页 + nav；`useAdminApi.securityPolicies`
-- smoke deny/mask 断言扩展字段
+- 新增 [`docs/ticket-vault-runbook.md`](docs/ticket-vault-runbook.md)：注释注入、指纹、双人审批、吊销、Vault/Portal、多实例、排错
+- prod README 链接；诚实边界（非 BPM / 非 CRDT）
+- 行为以 smoke-ticket / dual-control / portal / vault 为准
 
 ```bash
-cargo check -p http
-./examples/run-smoke-matrix.sh default
-# data-ui: open /policies against admin API
+# 文档任务：核对 smoke 与 API 路径即可
+./examples/smoke-security-ticket.sh          # 可选
+./examples/run-smoke-matrix.sh default       # 不因纯文档强制
 ```
 
 建议下一刀：
 
-1. **T02** — Ticket/Vault runbook  
-2. **UI03** — Audit 页增强（可选）  
-3. **A08** — MySQL prefer 明文回落（可选）  
+1. **UI03** — Audit 页增强（可选）  
+2. **A08** — MySQL prefer 明文回落（可选）  
+3. **T01** — WHERE 子查询表提取 gap  
 
 ---
 

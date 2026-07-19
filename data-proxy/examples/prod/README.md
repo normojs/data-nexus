@@ -53,6 +53,7 @@ cargo build -p data-proxy --bin proxy
 
 - [`docs/admin-auth-password.md`](../../../docs/admin-auth-password.md) — break-glass vs OIDC  
 - [`data-ui/docs/oidc-production.md`](../../../data-ui/docs/oidc-production.md) — production SSO runbook (H04)  
+- [`docs/ticket-vault-runbook.md`](../../../docs/ticket-vault-runbook.md) — Ticket / Vault ops (T02): comment injection, dual-control, revoke, portal  
 - [`gateway-jwks.example.toml`](gateway-jwks.example.toml) — JWKS admin_auth fragment  
 - [`docs/build-cache.md`](../build-cache.md) — Cargo target on external volume  
 - [`examples/admin-auth.snippet.toml`](../admin-auth.snippet.toml) — JWKS snippet  
