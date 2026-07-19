@@ -151,6 +151,7 @@ examples/        smoke + gateway config 样例
 | A10 | SELECT * catalog DescribeSql + RowDescription | feat(a10) |
 | A09 | Complete 回退 CSV/JSON/NDJSON 窗口 chunked | feat(a09) |
 | A10 | same-conn re-Bind/Execute RowDescription fix | feat(a10) |
+| A06 | peak_window_rows metric + smoke ≤ window_rows | feat(a06) |
 
 ---
 

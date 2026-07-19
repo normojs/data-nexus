@@ -66,6 +66,8 @@ PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
     || [[ "$ROOT/runtime/gateway/src/backend/postgresql.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/frontend/postgresql.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/frontend/mysql.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/runtime/gateway/src/server/metrics.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/gateway/core/src/transport.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/gateway/core/src/model.rs" -nt "$PROXY_BIN" ]]; then
     cargo build -p data-proxy --bin proxy
   fi
@@ -437,7 +439,7 @@ echo "$pg_psycopg_out"
 echo "$pg_psycopg_out" | grep -q 'psycopg_prepared_ok'
 echo "$pg_psycopg_out" | grep -q 'psycopg_rebind_rows'
 
-echo "==> metrics execute_path present after traffic"
+echo "==> metrics execute_path + A06 encode peak after traffic"
 metrics="$(curl -fsS http://127.0.0.1:8082/metrics || true)"
 if echo "$metrics" | grep -q 'gateway_execute_path_total'; then
   echo "$metrics" | grep 'gateway_execute_path_total' | head -8 || true
@@ -452,6 +454,40 @@ if echo "$metrics" | grep -q 'gateway_execute_path_total'; then
   fi
 else
   echo "note: gateway_execute_path_total metric missing; continuing"
+fi
+
+# A06 honesty: encode windows written and logical peak window rows ≤ configured window_rows=2.
+if echo "$metrics" | grep -q 'gateway_encode_windows_total'; then
+  echo "$metrics" | grep 'gateway_encode_windows_total' | head -6 || true
+  # At least one window should have been encoded on Streaming queries.
+  if ! echo "$metrics" | grep 'gateway_encode_windows_total' | grep -qvE ' 0$'; then
+    echo "FAIL: expected gateway_encode_windows_total > 0 after Streaming traffic" >&2
+    exit 1
+  fi
+  echo "encode windows counter observed"
+else
+  echo "note: gateway_encode_windows_total missing; continuing"
+fi
+
+if echo "$metrics" | grep -q 'gateway_encode_peak_window_rows'; then
+  echo "$metrics" | grep 'gateway_encode_peak_window_rows' | head -8 || true
+  # Config window_rows=2; peak must not exceed that (logical peak, not RSS).
+  # Gauge lines look like: metric{labels} <value>
+  bad_peak="$(echo "$metrics" | awk '/gateway_encode_peak_window_rows\{/ {
+    v=$NF+0; if (v > 2) print v
+  }' | head -1)"
+  if [[ -n "$bad_peak" ]]; then
+    echo "FAIL: gateway_encode_peak_window_rows=$bad_peak exceeds window_rows=2" >&2
+    exit 1
+  fi
+  # And at least one sample should be positive (traffic ran).
+  if ! echo "$metrics" | awk '/gateway_encode_peak_window_rows\{/ { if ($NF+0 > 0) found=1 } END { exit !found }'; then
+    echo "FAIL: expected gateway_encode_peak_window_rows > 0 after Streaming traffic" >&2
+    exit 1
+  fi
+  echo "encode peak_window_rows ≤ window_rows observed"
+else
+  echo "note: gateway_encode_peak_window_rows missing; continuing"
 fi
 
 echo "smoke-security-stream: OK"

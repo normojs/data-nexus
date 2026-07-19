@@ -237,6 +237,9 @@ pub struct StreamingEncodeStats {
     pub encoded_bytes: u64,
     /// Rows that passed through a non-empty mask index.
     pub masked_rows: u64,
+    /// A06 honesty: max rows held in one encode window (should be ≤ configured window).
+    /// Not process RSS — logical peak retained for encode, not full ResultSet.
+    pub peak_window_rows: u64,
     /// B08: optional first-window sample body (already masked), when requested.
     pub sample_body: Option<String>,
     pub sample_row_count: Option<u32>,
@@ -371,8 +374,12 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
             let take = need.min(chunk.len());
             sample_rows.extend(chunk.iter().take(take).cloned());
         }
-        stats.total_rows += chunk.len() as u64;
+        let chunk_len = chunk.len() as u64;
+        stats.total_rows += chunk_len;
         stats.windows = stats.windows.saturating_add(1);
+        if chunk_len > stats.peak_window_rows {
+            stats.peak_window_rows = chunk_len;
+        }
         let packets = frontend.encode_resultset_rows(&columns, &chunk, session)?;
         for p in &packets {
             stats.encoded_bytes = stats.encoded_bytes.saturating_add(p.len() as u64);
@@ -482,11 +489,15 @@ pub async fn write_resultset_windowed_with_obligations<W: ResponseWriter + ?Size
     while !rows.is_empty() {
         let take = window.min(rows.len());
         let mut chunk: Vec<Vec<GatewayValue>> = rows.drain(..take).collect();
+        let chunk_len = chunk.len() as u64;
         if has_masks {
             apply_masks_to_rows(&mut chunk, &mask_idx);
-            stats.masked_rows += chunk.len() as u64;
+            stats.masked_rows += chunk_len;
         }
         stats.windows = stats.windows.saturating_add(1);
+        if chunk_len > stats.peak_window_rows {
+            stats.peak_window_rows = chunk_len;
+        }
         let packets = frontend.encode_resultset_rows(&columns, &chunk, session)?;
         for p in &packets {
             stats.encoded_bytes = stats.encoded_bytes.saturating_add(p.len() as u64);
@@ -802,6 +813,14 @@ mod tests {
         // Encode path called once per window (header once).
         assert_eq!(fe.header_calls, 1);
         assert!(fe.row_calls >= 14);
+        // StreamingEncodeStats.peak_window_rows mirrors max retained encode window.
+        assert!(
+            stats.peak_window_rows <= window as u64,
+            "stats.peak_window_rows={} window={}",
+            stats.peak_window_rows,
+            window
+        );
+        assert!(stats.peak_window_rows >= 1);
     }
 
     #[tokio::test]

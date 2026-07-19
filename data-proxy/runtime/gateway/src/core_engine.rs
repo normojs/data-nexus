@@ -248,11 +248,12 @@ impl CoreGatewayConnection {
                         "QUERY",
                         ep,
                     ];
-                    self.metrics.record_secure_encode(
+                    self.metrics.record_secure_encode_peak(
                         &labels,
                         stats.masked_rows,
                         stats.windows,
                         stats.encoded_bytes,
+                        stats.peak_window_rows,
                     );
                     Ok(())
                 } else {
@@ -912,12 +913,13 @@ impl CoreGatewayConnection {
                     .await?;
                     // A10: binary flag is one-shot per Execute response.
                     self.session.prefer_binary_result = false;
-                    // O01: mask / window / encode-byte counters on Secure streaming path.
-                    self.metrics.record_secure_encode(
+                    // O01/A06: mask / window / encode-byte / peak-window counters on Secure streaming path.
+                    self.metrics.record_secure_encode_peak(
                         &labels,
                         encode_stats.masked_rows,
                         encode_stats.windows,
                         encode_stats.encoded_bytes,
+                        encode_stats.peak_window_rows,
                     );
                     let execute_path = if self.translation_policy.is_some() {
                         "xproto_stream"

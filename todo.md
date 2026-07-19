@@ -53,9 +53,9 @@ cd data-proxy
 > A1–A4 / A07 骨架与 socket writer 已交付（见归档）。
 
 - [ ] **A06** Backend→PEP 真行流  
-  - 已有：MySQL/PG `RowStream` + channel（含事务 producer 还 lease）；smoke 双协议 max_rows（含 txn）；**Materialized 的 Query/QueryParams/Execute 升为 Streaming**（`promote_row_stream`，默认 window=256）；encode 峰值单测 `a06_streaming_encode_peak_rows_bounded_by_window`；smoke **强制** `execute_path=streaming`  
-  - 仍欠：`execute_with_mode` / Complete 回退（非 SELECT 控制语句、空结果）仍可物化小 ResultSet；无进程级峰值内存 CI；portal Complete 回退见 A09  
-  - 路径：`backend/mysql` + `postgresql`、`transport`、`core_engine`、`model::ExecuteMode`
+  - 已有：MySQL/PG `RowStream` + channel（含事务 producer 还 lease）；smoke 双协议 max_rows（含 txn）；**Materialized Query* 升 Streaming**；encode 峰值单测；**`StreamingEncodeStats.peak_window_rows` + Prometheus `gateway_encode_peak_window_rows`**（逻辑峰值高水位，非 RSS）；smoke **强制** `execute_path=streaming` + `encode_windows>0` + **peak≤window_rows**  
+  - 仍欠：控制语句/空结果 Complete 仍可小物化；**无进程 RSS 峰值 CI**（仅逻辑窗口峰值）；portal Complete 见 A09  
+  - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
   - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落  
@@ -117,7 +117,7 @@ cd data-proxy
 | 主题 | 限制 |
 |------|------|
 | Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`；**Complete → `chunked` 窗口 HTTP**（非 backend_window）；backend 无 RowStream 时 ResultSet 仍可能先物化 |
-| 脱敏大数据 | A06 Streaming 真窗口（含 txn）；**Query* 的 Materialized 已升 Streaming**；控制语句/Complete 小结果仍可物化；峰值 ≈ 窗口仅 Streaming encode |
+| 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；控制语句/Complete 小结果仍可物化；**非进程 RSS CI** |
 | PG/MySQL backend TLS | A08：默认 accept_invalid=true；prod 模板 require+CA+verify；非 extended |
 | 预处理语句 | A10：协议 smoke + **psycopg3 rebind**；**Describe 显式 SELECT + `SELECT *` catalog**；MySQL COM_STMT Describe 未接；非 TCP passthrough |
 | 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
@@ -134,9 +134,9 @@ cd data-proxy
 
 建议优先级：
 
-1. **A06** 进程级峰值内存 CI / Complete 小结果边界  
-2. **A10** MySQL COM_STMT Describe catalog  
-3. **A09** 跨协议 portal / 进程峰值 CI  
+1. **A10** MySQL COM_STMT Describe catalog  
+2. **A09** 跨协议 portal / 进程峰值 CI  
+3. **A06** 进程 RSS 峰值 CI（若需要）/ Complete 控制语句边界  
 4. **H05** 多副本语义 / 进程内 vault 明文边界  
 5. 体验小刀；**F30/P0x 延后项未点名勿做**
 
