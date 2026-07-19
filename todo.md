@@ -172,6 +172,7 @@ examples/        smoke + gateway config 样例
 | B08 | Streaming 首窗样本（脱敏后） | feat(b08) |
 | F31 | Remote PDP HTTP 旁路（表/动作） | feat(f31) |
 | F31 | 架构文档 Remote PDP 收口 | docs(f31) |
+| H06 | post-F31 full smoke all+cedar（已 push 前验证） | chore(h06) |
 | UI04 | 策略只读页 + security-policies 扩展字段 | feat(ui04) |
 | T02 | Ticket/Vault 运维 runbook | feat(t02) |
 | UI03 | Audit stats 卡片 + source 角标 + 导出 | feat(ui03) |
@@ -256,24 +257,26 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> A 轨剩余债 或 发版前 full smoke 或体验/文档小刀 <<<**
+**>>> A 轨剩余债 或 体验小刀 或 下一产品切片 <<<**
 
-本轮（F31 文档收口）：
+本轮（post-F31 full smoke）：
 
-- 架构文：F31 契约表、配置样例、Track B6b、PDP 图标注
-- 开发规则已允许 `backend=remote`（前轮）
-- 建议 Docker 可用时再跑 default/all smoke 回归
+- `run-smoke-matrix.sh all`：**17/17**
+- `run-smoke-matrix.sh cedar`：**2/2**（预编译 security-cedar 后已恢复默认二进制）
+- 与 origin/main 对齐；F31 文档+代码已闭环
 
 ```bash
-cargo test -p gateway_core --lib f31_
-./examples/run-smoke-matrix.sh default
+./examples/run-smoke-matrix.sh all
+cargo build -p data-proxy --bin proxy --features security-cedar
+./examples/run-smoke-matrix.sh cedar
+cargo build -p data-proxy --bin proxy
 ```
 
 建议下一刀：
 
-1. **default/all smoke**（Docker 可用）  
-2. A 轨剩余债（A09 物化边界诚实账已在）  
-3. 体验小刀（若有）
+1. A 轨剩余诚实债（A09 json/csv 物化、A06/A10 边界）  
+2. 体验小刀  
+3. 新切片（F30 等延后项勿静默当完成）
 
 
 ---
