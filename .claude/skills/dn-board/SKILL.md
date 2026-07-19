@@ -14,12 +14,12 @@ description: >
 
 ## Steps
 
-1. 读 [`todo.md`](../../../todo.md)：
+1. 读 [`todo.md`](../../../todo.md)（**仅未完成**；已交付见 [`todo-impl.md`](../../../todo-impl.md)）：
    - §0 版本状态
-   - §3 未完成 backlog（P0→P3）
-   - §3.6 已知限制（诚实账）
-   - **§4 当前下一动作（唯一焦点）**
-2. 用户已点名 ID（如 A09、F29）→ 以用户为准；否则采用 §4。
+   - §1–§3 未完成 backlog（P0→P3，条目为 `- [ ]`）
+   - §4 已知限制（诚实账）
+   - **§5 当前下一动作（唯一焦点）**
+2. 用户已点名 ID（如 A09、F29）→ 以用户为准；否则采用 §5。
 3. 对照 [`.claude/rules/data-nexus-development.md`](../../rules/data-nexus-development.md) 确认非目标。
 4. 输出切片：
 
@@ -42,7 +42,7 @@ description: >
 ## DoD
 - [ ] 实现
 - [ ] 测试
-- [ ] todo 勾选 + 下一动作
+- [ ] todo 更新（部分：改「已有/仍欠」；整项完成：迁 todo-impl.md）+ 下一动作
 - [ ] commit（feat(id): …）
 ```
 
@@ -51,5 +51,5 @@ description: >
 
 ## Forbidden
 
-- 忽略 §3.6，把「部分」写成「已交付」。
+- 忽略 §4 诚实账，把「部分」写成「已交付」。
 - 私自开 P01/Agent/Arrow 等非目标主线。

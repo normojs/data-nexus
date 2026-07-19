@@ -58,7 +58,7 @@ cd data-proxy && ./examples/run-smoke-matrix.sh security-core
 
 ### 5. 收尾
 
-- 更新 `todo.md` 状态与「下一动作」
+- 更新 `todo.md`（`- [ ]` + 已有/仍欠 + §5 下一动作）；整项完成迁 `todo-impl.md`
 - Commit：`feat(b06):` / `fix(f28):` 等
 - 走 **dn-dod**
 

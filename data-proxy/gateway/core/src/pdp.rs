@@ -2342,7 +2342,7 @@ mod tests {
         match pdp.authorize_command_with_objects(&sub, "hr", &cmd, &dialect, Some(&set)) {
             SecurityDecision::AllowRewrite { sql, .. } => {
                 // Outer list must not project salary; nested FROM may still mention it
-                // (known rewriter depth limit — documented in todo §3.6).
+                // (known rewriter depth limit — documented in todo.md §4 honesty).
                 let lower = sql.to_ascii_lowercase();
                 let top = lower.split("from").next().unwrap_or(&lower);
                 assert!(

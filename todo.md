@@ -1,310 +1,183 @@
-# Data Nexus 开发看板
+# Data Nexus 开发看板（未完成）
 
-**架构文档**（细节以文档为准，本文件只排期与勾选）：
+**已交付归档** → [`todo-impl.md`](todo-impl.md)  
+**架构与规则**（细节以文档为准，本文件只排未完成债）：
 
 | 文档 | 用途 |
 |------|------|
 | `docs/data-nexus-protocol-gateway-plan.md` | L0 / v1 协议网关底座 |
-| `docs/data-security-roadmap.md` | 产品对标（防水坝 / 树安 SQLDEV）+ S0–S6 定义 |
-| `docs/data-nexus-tech-architecture-2026.md` | **v2 技术主文档**（术语、选型、双路径、实现切片） |
-| `docs/data-audit-architecture.md` | 审计/流式专项 |
-| `docs/ticket-vault-runbook.md` | **T02** Ticket/Vault 运维（注释注入、双人、吊销、Portal） |
+| `docs/data-security-roadmap.md` | 产品对标 + S0–S6 |
+| `docs/data-nexus-tech-architecture-2026.md` | **v2 技术主文档** |
+| `docs/data-audit-architecture.md` | 审计 / 流式专项 |
+| `docs/ticket-vault-runbook.md` | Ticket/Vault 运维 |
 | `data-proxy/docs/build-cache.md` | Cargo target 外置缓存 |
-| `.claude/rules/data-nexus-development.md` | **开发强制规则**（DoD / 铁律 / 双路径） |
-| `.claude/README.md` | Claude Skills / Commands / Superpowers 能力地图 |
+| `.claude/rules/data-nexus-development.md` | 开发强制规则 |
 | `CLAUDE.md` | 规则与技能入口 |
 
 ---
 
-## 0. 版本划分
+## 0. 版本与原则
 
 ```text
-v1 = L0   数据库协议中转站 + 管理面鉴权 + 运维 UI + 观测     ✅ 已完成（M0–M10）
-v2 = L1   数据访问安全（对标 SQLDEV：访问+脱敏+权限+审计）   ✅ MVP + P1/P2 增强已完成
-v2.1      生产化 / 运维硬化 / 审计与策略深化                 ✅ P3 主线完成
-v2.2      真流式封顶 + 企业策略/合规深化                     ⏳ 下一阶段（见 §3 未完成）
+v1 / L0     协议中转 + 管理面 + 观测          ✅ 见 todo-impl.md
+v2 MVP      访问 + 脱敏 + 权限 + 审计         ✅ 见 todo-impl.md
+v2.1        生产化 / 运维硬化                 ✅ 见 todo-impl.md
+v2.2        真流式封顶 + 企业策略/合规         ⏳ 本文件唯一焦点
 ```
 
-| 版本 | 一句话 | 状态 |
-|------|--------|:----:|
-| **v1** | 客户端 ↔ 网关 ↔ MySQL/PG；路由/池/跨协议/Admin | **完成** |
-| **v2 MVP** | 谁在何种条件下对何对象做什么；结果如何可见；可证明审计 | **完成** |
-| **v2.1** | 可上线：CI、密钥、冷归档、审计检索、策略运维、UI | **主线完成** |
-| **v2.2** | 大数据热路径封顶 + ABAC/样本/Remote PDP | **进行中**（A 轨部分 + F29/B08/F31） |
+| 原则 | 说明 |
+|------|------|
+| 默认关安全 | `security.enabled=false` 不破坏 v1 |
+| 身份分离 | 管理面鉴权 ≠ 数据面 Subject |
+| 门户经 PEP | 禁止 UI/API 直连生产库 |
+| 审计不堵查询 | 有界队列；worker 落盘/索引 |
+| 配置勿静默 no-op | 未实现能力必须校验失败 |
+| 诚实边界 | 部分完成标「部分」，见 §3 |
 
-**原则（不变）**
+**工具链**：`CARGO_TARGET_DIR` 外置；rustc **1.94.1**。
 
-- v2 默认 `security.enabled=false`，不破坏 v1 行为
-- 管理面鉴权 ≠ 数据面 Subject
-- 门户 SQL 必须经 PEP，禁止直连生产库
-- 非目标：主机堡垒、操作录屏、一次 30+ 库、热路径 Arrow、Admin JWT 当数据身份
-
-**工具链**
-
-- 日常构建：`/Volumes/fushilu/.caches/data-nexus/cargo-target`（见 `data-proxy/docs/build-cache.md`）
-- **rustc 钉 1.94.1**（`data-proxy/rust-toolchain.toml`；`time`/Cedar 要求 ≥1.88）
-
----
-
-## 1. 现状快照（已交付）
-
-### 1.1 主线
-
-- [x] **v1 / L0**：双协议、跨协议、Admin JWT/OIDC 雏形、data-ui、观测、smoke
-- [x] **S0–S6**：配置壳、表/语句/列 ACL、脱敏与行级、审计管道、票据、门户+Vault
-- [x] **A1–A4**：窗口读、窗口 encode、同协议透传（MySQL wire）、跨协议流式 encode
-- [x] **P1**：水印 F14、L0 回归 B01、403 页 B02
-- [x] **P2**：双人金库 F18、时间窗 F27、Cedar F26/F26b、OTel B03、审计轮转+OpenDAL B04、portal 导出 B05
-- [x] **P3 主线**：H01–H04、B04c/B05b/B06/B07、F28、A05、UI01/UI02、smoke 硬化
-
-### 1.2 关键 smoke（本机 19/19 绿）
-
-| 组 | 脚本数 | 内容 |
-|----|:------:|------|
-| `l0` | 4 | admin-auth / dual-listener / cross-protocol ×2 |
-| `security-core` | 7 | deny / column / mask / audit / ticket / portal / vault |
-| `security-extended` | 6 | stream / passthrough / watermark / dual-control / time / xproto-stream |
-| `cedar` | 2 | cedar + cedar-reload（需 `--features security-cedar`） |
+**Smoke（本机门禁）**
 
 ```bash
 cd data-proxy
-./examples/run-smoke-matrix.sh default   # l0 + security-core（CI 默认）
+./examples/run-smoke-matrix.sh default   # CI 默认
 ./examples/run-smoke-matrix.sh all       # + extended
-./examples/run-smoke-matrix.sh cedar     # 需预编译 feature
-```
-
-### 1.3 可选 Cargo features
-
-| Feature | 用途 |
-|---------|------|
-| `otel` | OTLP 导出 + 业务 metrics |
-| `security-cedar` | Cedar 表/动作 PDP + 热更新 |
-| `audit-opendal` | 轮转 JSONL 的 OpenDAL 归档（`fs` / `memory` / `s3` / `oss`） |
-
-### 1.4 代码落点
-
-```text
-gateway/core     security / pdp / cedar_pdp / obligations / audit_* / ticket / vault / transport
-runtime/gateway  core_engine PEP、流式/透传、object_extract
-http             Admin API（策略/审计/票据/门户/Cedar reload）
-data-ui          运维台 + SQL Portal + Audit + Tickets + Vault + Cedar
-examples/        smoke + gateway config 样例
-.claude/         rules + skills + commands（Superpowers 工作流）
+./examples/run-smoke-matrix.sh cedar     # 需 --features security-cedar
 ```
 
 ---
 
-## 2. 已完成归档（不重复开发）
+## 1. P0 — 真流式 / 热路径封顶
 
-| ID | 项 | 提交（近端） |
-|----|----|--------------|
-| S0–S6 | 安全主线 MVP | … → portal 等 |
-| A1–A4 | 性能双路径骨架 | `332573e`…`4a3094f` |
-| F14 | 结果水印 | `4a9d995` |
-| B01 | L0 smoke 回归 | `ae04aa0` |
-| B02 | data-ui 403 | `66a9761` |
-| F18 | 双人金库 | `cbc196e` |
-| F27 | 时间维策略 | `bd6588e` |
-| B05 | portal CSV/NDJSON | `507890e` |
-| F26 | Cedar PDP | `bd15913` |
-| F26b | Cedar 热更新 | `82974f9` |
-| B03 | OTel 安全属性 | `b6fe519` |
-| B04 | JSONL 轮转/保留 | `120252f` |
-| B04b | OpenDAL fs/memory | `0dda947` |
-| B04c | OpenDAL S3/OSS | `4118e80` |
-| B05b | portal HTTP 真流式 NDJSON | `b0343be` |
-| B07 | Deny 高优审计队列 | `26ce55c` |
-| B06 | 审计 SQLite 检索索引 | `bc88b36` |
-| F28 | Local 规则热更新 | `b642c29` |
-| A05 | 透传路径观测补齐 | `25bc948` |
-| UI01 | 票据/金库管理页 | `e3d16ed` |
-| UI02 | Cedar 状态页 | `e3d16ed` |
-| H01–H04 | 生产配置 / CI 矩阵 / Vault 硬化 / OIDC 文档 | `16abb2b`…`9325215` |
-| chore | rustc 1.94.1 + smoke 硬化 | `ff88c73` |
-| chore | 开发规则 + 审计债小修 | `6ff8cef` |
-| chore | Claude skills/rules/commands | `91abab3` |
-| A09 | portal NDJSON backend 窗口流（部分） | feat(a09) |
-| A06 | PG 非事务 Streaming yield（部分） | feat(a06) |
-| A10 | prepared 注册表 + encode（部分） | feat(a10) |
-| A10 | 参数绑定 + PG 扩展协议解码（部分） | feat(a10) |
-| A06 | 事务内 Streaming 还 lease（部分） | feat(a06) |
-| H06 | origin 同步完成 | 223f2c0 |
-| A10 | prepare param defs + PG ParameterDescription（部分） | feat(a10) |
-| A08 | PG 非事务 TCP 帧中继 + WireRelay | feat(a08) |
-| A08 | PG 事务内 TCP 帧中继（tcp_txn 复用） | feat(a08) |
-| A08 | 非事务 TCP idle pool（按 address\|db\|user） | feat(a08) |
-| A08 | idle pool TTL（默认 30s） | feat(a08) |
-| A08 | idle 主动健康探测 SELECT 1 | feat(a08) |
-| A08 | backend SSL（ssl_mode disable/prefer/require） | feat(a08) |
-| F32 | 审计 L0/L1 SQL 载荷裁剪 | feat(f32) |
-| A10 | MySQL binary resultset after Execute（部分） | feat(a10) |
-| H05 | ticket/vault file state backend（部分） | feat(h05) |
-| A10 | MySQL DATE/TIME/DATETIME binary encode（部分） | feat(a10) |
-| A10 | PG Bind result_format binary portal 结果（部分） | feat(a10) |
-| A10 | PG date/timestamp/time binary encode（部分） | feat(a10) |
-| A10 | QueryParams + prepare/bind Execute（部分） | feat(a10) |
-| A10 | 连接级 Statement 缓存（QueryParams） | feat(a10) |
-| A10 | QueryParams Streaming 窗口 yield | feat(a10) |
-| H05 | ticket/vault file advisory locks（部分） | feat(h05) |
-| H05 | audit SQLite multi-writer + LocalPdp policy_path（部分） | feat(h05) |
-| H05 | LocalPdp policy_path mtime 轮询热更（部分） | feat(h05) |
-| H05 | vault 文件 AES-GCM 加密 + 密钥恢复 secret（部分 / H08） | feat(h05) |
-| H05 | ticket 文件 AES-GCM 加密（`ticket_encrypt_key`） | feat(h05) |
-| A08 | backend SSL `ssl_mode` disable/prefer/require | feat(a08) |
-| A06 | smoke 双协议 max_rows + streaming metrics（部分） | feat(a06) |
-| A09 | portal multi-row NDJSON 强制 backend_window（部分） | feat(a09) |
-| H07 | CI extended/cedar jobs + nightly schedule + rustc 1.94.1 | feat(h07) |
-| A08 | backend TLS `ssl_ca_file` + `ssl_accept_invalid_certs`（部分） | feat(a08) |
-| A10 | MySQL QueryParams COM_STMT prepare/bind（部分） | feat(a10) |
-| A10 | MySQL QueryParams Streaming 窗口 yield（部分） | feat(a10) |
-| O01 | Secure 路径 mask/window/audit 指标 | feat(o01) |
-| A06 | 事务内 Streaming max_rows 双协议 smoke（部分） | feat(a06) |
-| A09 | portal json/csv 物化边界 smoke（部分） | feat(a09) |
-| A09 | portal CSV backend_window 流式 + json 仍物化（部分） | feat(a09) |
-| A10 | PG prepared Execute Streaming 与 QueryParams 对齐（部分） | feat(a10) |
-| A10 | 协议路径 prepared max_rows smoke + Bind/row 兼容（部分） | feat(a10) |
-| T01 | 列 ACL / 复杂 SQL 矩阵（部分） | feat(t01) |
-| T01 | WHERE/HAVING/JOIN 子查询表提取 | feat(t01) |
-| H05 | multi-instance file bundle + prod state template（部分） | feat(h05) |
-| A08 | MySQL backend TLS via ssl_mode/ssl_ca_file（部分） | feat(a08) |
-| A08 | MySQL prefer 明文回落（服务端无 CLIENT_SSL） | feat(a08) |
-| A10 | MySQL binary DATE/TIME/DATETIME ISO 解码 | feat(a10) |
-| A08 | 生产 TLS pin require+CA（validate） | feat(a08) |
-| A10 | MySQL ISO string 参数绑 DATE/TIME/DATETIME | feat(a10) |
-| A10 | PG ISO string 参数绑 DATE/TIME/TIMESTAMP | feat(a10) |
-| B08 | Streaming 首窗样本（脱敏后） | feat(b08) |
-| F31 | Remote PDP HTTP 旁路（表/动作） | feat(f31) |
-| F31 | 架构文档 Remote PDP 收口 | docs(f31) |
-| H06 | post-F31 full smoke all+cedar（已 push 前验证） | chore(h06) |
-| UI04 | 策略只读页 + security-policies 扩展字段 | feat(ui04) |
-| T02 | Ticket/Vault 运维 runbook | feat(t02) |
-| UI03 | Audit stats 卡片 + source 角标 + 导出 | feat(ui03) |
-| B08 | L2 结果样本 attach + 可选 OpenDAL | feat(b08) |
-| F29 | Cedar 实体属性 tenant/clearance | feat(f29) |
-| H06 | 本地 full smoke all+cedar 发版验证（未 push） | chore(h06) |
-| H06 | push origin/main 至 47faec5 | chore(h06) |
+> 目标：backend 行流 → 义务 → 编码 → 客户端；峰值内存 ≈ 1～2 个窗口。  
+> A1–A4 / A07 骨架与 socket writer 已交付（见归档）。
+
+- [ ] **A06** Backend→PEP 真行流  
+  - 已有：MySQL/PG `RowStream` + channel（含事务 producer 还 lease）；smoke 双协议 max_rows（含 txn）+ metrics `streaming`  
+  - 仍欠：**Materialized/Complete 仍拼全量 `Vec`**；峰值内存无 CI；metrics 断言偏软  
+  - 路径：`backend/mysql` + `postgresql`、`transport`、`core_engine`
+
+- [ ] **A08** PostgreSQL wire 透传 + backend TLS  
+  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落  
+  - 仍欠：默认 `accept_invalid=true`（兼容）；**非 extended 透传**；Streaming 仍用 pool  
+  - 路径：`backend/postgresql`、endpoint 配置与 validate
+
+- [ ] **A09** Portal 端到端流式  
+  - 已有：NDJSON + **CSV** 在 backend Streaming 时窗口 → HTTP chunk（`x-data-nexus-stream: backend_window`）；multi-row smoke 强制；Complete 回退 B05b / 单 body CSV  
+  - 仍欠：**json 仍物化** ResultSet（smoke 断言无 backend_window）  
+  - 路径：`http` portal_execute_*；`smoke-security-portal.sh`
+
+- [ ] **A10** 预处理 / 事务透传矩阵  
+  - 已有：MySQL COM_STMT prepare/bind + binary 行 + Streaming + stmt 缓存 + COM_STMT_RESET + handshake `8.0.36`；PG Parse/Bind/Execute → QueryParams + Statement 缓存 + Streaming；Bind binary i32/i64→text；INT4 绑 i32；协议 smoke `max_rows=1`  
+  - 仍欠：**Describe 仍 NoData**（psycopg 全链路未封）；类型/extended 矩阵不完整；**非 TCP passthrough**  
+  - 路径：frontend/backend mysql+pg、`protocol/postgresql`、`smoke-security-stream.sh`
 
 ---
 
-## 3. 未完成 backlog（v2.2）
+## 2. P1 — 策略 / 合规 / 运维
 
-按 **性能封顶 → 合规/策略 → 体验 → 边界** 排序。  
-每项仍遵守：规划 → 实现 → smoke/单测 → 勾选本文件 → `git commit`（见开发规则 DoD）。
+- [ ] **B08** L2 样本 / 大 payload  
+  - 已有：物化 ResultSet + Streaming 首窗（脱敏后）；`sample_enabled` 默认关；OpenDAL 可选  
+  - 仍欠：默认关与有界语义文档化到位；勿宣传「全量 L2 合规样本」  
+  - 路径：audit sample attach、`audit-opendal` feature
 
-### 3.1 P0 — 真流式 / 热路径封顶（大数据场景必做）
+- [ ] **H05** 多实例状态外置（含 H08 vault 文件加密）  
+  - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板  
+  - 仍欠：**全文件替换非 CRDT**；**进程内存 vault 密码仍明文**；轮询默认 1s  
+  - 路径：ticket/vault file backend、prod 模板
 
-> 架构目标：backend 行流 → 义务 → 编码 → 客户端。当前 A1–A4 是骨架，**端到端「只持有一个窗口」未封顶**。
+- [ ] **H04b** 真 IdP OIDC 联调  
+  - 已有：文档 + 模板  
+  - 仍欠：部署侧真实回调与角色映射验收（**本仓不强制**）  
+  - 路径：部署 runbook / 运维侧
 
-| ID | 项 | 说明 | 现状 / 债务 | 状态 |
-|----|----|------|-------------|:----:|
-| **A06** | Backend→PEP 真行流 | `RowStream` + MySQL/PG channel yield；encode 边 mask 边写 | 非事务 + **事务内** Streaming 真窗口；producer 结束后还 lease；**smoke max_rows 双协议（含 txn）+ metrics streaming** | **部分** |
-| **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
-| **A08** | PostgreSQL wire 透传 + backend TLS | idle pool + 事务 `tcp_txn`；PG/MySQL **ssl_mode + ssl_ca_file / ssl_accept_invalid_certs** | 默认 accept_invalid=true（兼容）；**prod 模板 require+CA+verify**；validate 拒绝 require+verify 无 CA；非 extended；MySQL prefer 可明文回落 | **部分** |
-| **A09** | Portal 端到端流式 | NDJSON + **CSV**：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | multi-row NDJSON/**CSV** **强制** `backend_window`；**json 仍物化**（smoke 断言无 backend_window）；Complete 回退 B05b / 单 body CSV | **部分** |
-| **A10** | 预处理 / 事务透传矩阵 | MySQL **prepare/bind** + binary 行 + **Streaming 窗口** + 连接 stmt 缓存；PG QueryParams + Statement 缓存 + Streaming | **协议 smoke**：MySQL COM_STMT + PG raw Parse/Bind/Execute 在 `max_rows=1` 下截断；**PG `Execute` 与 QueryParams 同走 Streaming**；Bind binary i32→text；INT4 绑 i32；typed row 解码；COM_STMT_RESET no-op；handshake `8.0.36`；Describe 仍 NoData（诚实边界） | **部分** |
+- [ ] **T01** 列 ACL / 复杂 SQL 用例矩阵  
+  - 已有：extract/PDP 单测；WHERE/HAVING/EXISTS/IN/标量子查询表提取；column smoke WHERE IN deny  
+  - 仍欠：**列 rewrite 不深改嵌套 SELECT 列表**；极端方言/解析失败仍 heuristic  
+  - 路径：`object_extract`、PDP column rewrite、smoke
 
-### 3.2 P1 — 策略 / 合规深化
+- [ ] **F30** 敏感识别增强 — **延后**  
+  - 现状：仅 `column_tags` + mask 规则  
+  - 非目标：全量 DLP  
+  - 未点名勿静默当完成
 
-| ID | 项 | 说明 | 现状 / 债务 | 状态 |
-|----|----|------|-------------|:----:|
-| **F29** | Cedar 实体属性 | Subject/Table 属性（tenant/clearance）进 Entities；与 Local 对照用例 | `subject_attrs`/`table_attrs` → Entities；uid-only 兼容；对照单测 + attrs-example.cedar | **完成** |
-| **B08** | L2 样本 / 大 payload | 可选结果样本上传 OpenDAL；体积/采样可配 | 物化 ResultSet + **Streaming 首窗**（脱敏后）；`sample_enabled` 默认关；OpenDAL 可选 | **部分** |
-| **F31** | Remote PDP 适配器 | HTTP 旁路 OPA/外部 PDP；超时 fail_closed | `backend=remote` + `remote_url`/`timeout`/`token`/`fail_closed`；表/动作 gate；默认 fail_closed；**不做** per-row mask | **完成** |
-| **F30** | 敏感识别增强 | 静态列标签之外的规则/词典 MVP（仍不做全量 DLP） | 仅 `column_tags` + mask 规则 | **延后** |
-| **F32** | 审计 L0/L1 载荷裁剪 | 按 `default_audit_level` 裁剪 `sql_text`；L0 剥离、L1/L2 截断 | L2 样本上传仍未做（B08） | **完成** |
+---
 
-### 3.3 P1 — 运维 / 多实例 / 发布
+## 3. P3 — 边界扩展（明确后置）
 
-| ID | 项 | 说明 | 现状 / 债务 | 状态 |
-|----|----|------|-------------|:----:|
-| **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
-| **H05** | 多实例状态外置 | ticket/vault JSON+lock+**AES-GCM**；审计 SQLite；`policy_path`+mtime | 交叉文件 bundle 单测 + prod `security.state` 模板；全文件替换非 CRDT；轮询默认 1s；vault 无密钥仍不落盘密码 | **部分** |
-| **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `47faec5` → origin/main | **完成** |
-| **H07** | CI 矩阵加深 | PR/push **default**；schedule nightly **extended+cedar**；dispatch 分 job；rustc **1.94.1** | 非 default 不挡 PR；cedar 需 feature 预编译 | **完成** |
-| **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | **H05 已交付 AES-GCM 文件信封**（`vault_encrypt_key`）；进程内存仍明文 | **部分→见 H05** |
+- [ ] **P01** 新协议（Redis/…）— **延后**
+- [ ] **P02** 深终端 Agent — **不做/后置**
+- [ ] **P03** 审计 Parquet/分析（DataFusion 可选）— **延后**
+- [ ] **P04** Sharding rewrite（`gateway_core` stub）— **延后**
 
-### 3.4 P2 — 体验与正确性打磨
+---
 
-| ID | 项 | 说明 | 现状 / 债务 | 状态 |
-|----|----|------|-------------|:----:|
-| **UI03** | Audit 页增强 | stats 卡片、source 角标、当前结果导出 | `event_id`/时间窗/`source` + stats 卡片 + JSON/CSV 客户端导出（`e723a45` 后 UI03） | **完成** |
-| **UI04** | 策略只读页 | data-ui 展示 security rules / mask / high-risk | `/policies` + 扩展 `GET /admin/security-policies`（mask/tags/high-risk/time/watermark/streaming；水印 token 不回传） | **完成** |
-| **T01** | 列 ACL / 复杂 SQL 用例矩阵 | 子查询、多表、方言边界；启发式 `parse_failed` 行为 | extract/PDP 单测 + WHERE/HAVING/EXISTS/IN/标量子查询表提取；column smoke WHERE IN deny；**列 rewrite 仍不深改嵌套 SELECT 列表** | **部分** |
-| **T02** | Ticket/Vault runbook | 注释注入约定、双人审批、吊销运维说明进 docs | [`docs/ticket-vault-runbook.md`](docs/ticket-vault-runbook.md)；prod README 链接；非 BPM | **完成** |
-| **O01** | Secure 路径观测 | mask 行数、encode 窗口/字节、审计队列深度、worker 处理延迟 | Prometheus always-on；非 OTel feature | **完成** |
-
-### 3.5 P3 — 边界扩展（明确后置）
-
-| ID | 项 | 说明 | 状态 |
-|----|----|------|:----:|
-| **P01** | 新协议（Redis/…） | 路线图「扩库型后置」 | **延后** |
-| **P02** | 深终端 Agent | 非协议 PEP 主线 | **不做/后置** |
-| **P03** | 审计 Parquet/分析 | DataFusion 可选 feature | **延后** |
-| **P04** | Sharding rewrite | `gateway_core` 仍为 stub | **延后**（非主线） |
-
-### 3.6 已知限制（诚实账，勿当已交付宣传）
+## 4. 已知限制（诚实账，勿当已交付宣传）
 
 | 主题 | 限制 |
 |------|------|
-| Portal「流式」 | A09 NDJSON+**CSV**：Streaming backend 真窗口 + HTTP（smoke 强制 multi-row `backend_window`）；**json 仍物化**（smoke 断言无 backend_window）；Complete 回退 B05b / 单 body CSV |
-| 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；smoke 双协议 max_rows（**含 txn**）+ `execute_path=streaming`；峰值 ≈ 窗口 |
-| PG/MySQL backend TLS | A08：PG idle pool+tcp_txn；双协议 `ssl_mode`/`ssl_ca_file`/`ssl_accept_invalid_certs`；**默认 accept_invalid=true（兼容）**；**prod 模板 require+CA+verify**；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；非 extended |
-| 预处理语句 | A10：**协议 smoke 已覆盖** MySQL COM_STMT + PG Parse/Bind/Execute（`max_rows=1`）；PG Bind binary int→text + i32 绑 INT4；query_raw 行 typed 解码；COM_STMT_RESET→OK；MySQL handshake `8.0.36`；**Describe 仍 NoData**（psycopg 全链路需再补）；非 TCP passthrough |
-| 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；**prod 模板已含 security.state**；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
-| L2 样本合规 | B08：**默认关**；L2+enabled 时物化 ResultSet **或 Streaming 首窗**（脱敏后、有界 rows/bytes）附样本；OpenDAL 需 `audit-opendal` |
-| Remote PDP | F31：HTTP 旁路表/动作；超时默认 fail_closed；mask/行改写仍在 Local 规则；**非**热路径逐行调用 |
-| Cedar ABAC | F29：`subject_attrs`/`table_attrs` 静态目录进 Entities；无目录 = F26 uid-only；非动态 IdP 属性同步 |
-| 复杂 SQL / 列 ACL | T01：JOIN/CTE/WHERE·HAVING·EXISTS·IN 子查询表可抽；**列 rewrite 不深改嵌套 SELECT 列表**；极端方言/解析失败仍走 heuristic |
+| Portal「流式」 | A09 NDJSON+CSV：Streaming 真窗口 + HTTP；**json 仍物化**；Complete 回退物化 |
+| 脱敏大数据 | A06 Streaming 真窗口（含 txn）；**Materialized 仍全量**；峰值 ≈ 窗口仅 Streaming |
+| PG/MySQL backend TLS | A08：默认 accept_invalid=true；prod 模板 require+CA+verify；非 extended |
+| 预处理语句 | A10：协议 smoke 已覆盖 max_rows；**Describe 仍 NoData**；非 TCP passthrough |
+| 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
+| L2 样本 | B08：默认关；有界 rows/bytes；OpenDAL 需 feature |
+| Remote PDP | F31 已交付：表/动作 gate；超时 fail_closed；**非**热路径逐行 mask |
+| Cedar ABAC | F29 已交付：静态 `subject_attrs`/`table_attrs`；非动态 IdP 同步 |
+| 复杂 SQL / 列 ACL | T01：表可抽；**列 rewrite 不深改嵌套 SELECT** |
 
 ---
 
-## 4. 当前下一动作（唯一焦点）
+## 5. 当前下一动作（唯一焦点）
 
-**>>> A 轨剩余债 或 体验小刀 或 下一产品切片 <<<**
+**>>> A 轨剩余诚实债 或 体验小刀 或 下一产品切片 <<<**
 
-本轮（A10 协议 prepared Streaming smoke）：
+建议优先级：
 
-- `smoke-security-stream`：**MySQL COM_STMT** + **PG raw Parse/Bind/Execute** 在 `max_rows=1` 下各 1 行
-- 兼容：MySQL `8.0.36` handshake、`COM_STMT_RESET`；PG Bind binary i32→text、INT4 绑 i32、query_raw typed 行解码
-- 诚实：PG **Describe 仍 NoData**（psycopg 全链路未封）；json 仍物化
+1. **A09** portal **json** 真窗口流（或继续诚实物化并锁文档）  
+2. **A10** PG **Describe → RowDescription**（解锁 psycopg 全链路）  
+3. **A06** Materialized 路径减物化 / 峰值诚实  
+4. **H05** 多副本语义 / 进程内 vault 明文边界  
+5. 体验小刀；**F30/P0x 延后项未点名勿做**
 
 ```bash
+# A 轨相关回归入口
 ./examples/smoke-security-stream.sh
+./examples/smoke-security-portal.sh
 cargo test -p postgresql_protocol a10_decodes_bind
 cargo test -p runtime_gateway --lib a10_prepared_execute_streaming
 ```
 
-建议下一刀：
-
-1. A 轨剩余诚实债（A09 **json** 物化、A06 Materialized、PG Describe/RowDescription）  
-2. 体验小刀  
-3. 新切片（F30 等延后项勿静默当完成）
-
-
 ---
 
-## 5. 完成定义（DoD）
+## 6. 完成定义（DoD）
 
 每个任务合并前：
 
-- [ ] 有 smoke 或单测
-- [ ] 相关 `cargo test` / `cargo check` 通过（feature 任务在对应 feature 下测）
-- [ ] `security.enabled=false` 不破坏 v1 行为
-- [ ] 更新本文件勾选与「下一动作」
-- [ ] 行为变更同步规则/必要架构文
-- [ ] `git commit`（scope 清晰，带看板 ID）
+- [ ] 有 smoke 或单测  
+- [ ] 相关 `cargo test` / `cargo check` 通过（feature 任务在对应 feature 下测）  
+- [ ] `security.enabled=false` 不破坏 v1 行为  
+- [ ] 更新本文件勾选；**整项完成后**迁入 [`todo-impl.md`](todo-impl.md) 并删本文件对应条  
+- [ ] 行为变更同步规则 / 必要架构文 / §4 诚实账  
+- [ ] `git commit`（scope 清晰，带看板 ID）  
+
+部分完成：保持 `- [ ]`，更新「已有 / 仍欠」，**不要**假装勾完。
 
 ---
 
-## 6. 纪律
+## 7. 纪律
 
 | 纪律 | 说明 |
 |------|------|
 | 门户不直连 | S6 铁律 |
-| 审计不堵查询 | 有界队列；归档/索引在 worker 侧 |
-| 流式先于大数据脱敏 | A 轨目标；禁止把 HTTP chunk 说成端到端流式 |
+| 审计不堵查询 | 有界队列；归档/索引在 worker |
+| 流式先于大数据脱敏 | 禁止把 HTTP chunk 说成端到端流式 |
 | 默认二进制精简 | Cedar/OpenDAL/OTel 继续 optional feature |
-| 配置勿静默 no-op | 未实现能力必须校验失败（如 remote PDP） |
-| 文档同步 | 行为变更同 PR 改看板/必要架构文 |
-| 构建缓存外置 | 禁止再在仓库写多 GB `.cargo-target*` |
-| 规则优先 | 冲突时：铁律 > `.claude/rules` > 架构文 > 本看板排期 |
+| 配置勿静默 no-op | 未实现能力必须校验失败 |
+| 文档同步 | 行为变更同 PR 改看板 / 规则 |
+| 构建缓存外置 | 禁止仓库内多 GB `.cargo-target*` |
+| 规则优先 | 铁律 > `.claude/rules` > 架构文 > 本看板 |
+
+---
+
+修订：未完成债在本文件；已交付历史见 [`todo-impl.md`](todo-impl.md)。

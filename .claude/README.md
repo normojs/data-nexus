@@ -12,7 +12,7 @@
 | **Skills（流程）** | [`.claude/skills/`](skills/) | description 匹配 / 用户点名 | 可重复工作流 |
 | **Commands（快捷）** | [`.claude/commands/`](commands/) | `/dn-*` | 包装 skill 的 slash 入口 |
 | **Agents（可选）** | [`.claude/agents/`](agents/) | 显式 spawn | `dn-reviewer` 评审 |
-| 看板 | [`todo.md`](../todo.md) | 排期 | 唯一焦点 + 未完成债 |
+| 看板 | [`todo.md`](../todo.md) / [`todo-impl.md`](../todo-impl.md) | 排期 | 未完成债 + 已交付归档 |
 | 架构 | `docs/*` | 细节争议时 | 术语与目标态 |
 
 冲突优先级：**安全铁律 > rules > 架构文档 > todo 排期**。
@@ -96,7 +96,7 @@
 
 - 不在 rules 里写长篇架构复述（指向 `docs/`）。
 - 不默认打开 Cedar/OpenDAL/OTel（精简二进制）。
-- 不把「HTTP chunk」说成端到端流式（诚实账在 todo §3.6）。
+- 不把「HTTP chunk」说成端到端流式（诚实账在 todo §4）。
 - 不把 Agents 当日常默认路径（评审场景再用）。
 
 ## 维护

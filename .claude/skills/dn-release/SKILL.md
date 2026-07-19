@@ -36,8 +36,8 @@ cargo build -p data-proxy --bin proxy   # 恢复默认二进制
 
 ### 2. 文档与看板
 
-- [ ] `todo.md` 版本表与「下一动作」与代码一致
-- [ ] 已知限制 §3.6 无夸大
+- [ ] `todo.md` 版本表与 §5「下一动作」与代码一致
+- [ ] 已知限制 §4 无夸大；已交付与 `todo-impl.md` 不矛盾
 - [ ] 生产模板无真实密钥（`__DN_*__`）
 - [ ] OBSERVABILITY / runbook 若行为变已更新
 

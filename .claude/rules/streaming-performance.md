@@ -40,7 +40,7 @@ backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 
 2. 有义务时是否仍 `apply_obligations_to_response` 整包？→ 优先 `write_streaming_query_with_obligations` / encode 窗口 mask。
 3. 是否接到 socket writer，而不是只 `CollectingWriter`？
 4. 失败/提前结束是否 drain 流并归还连接？
-5. todo §3.6 与 OBSERVABILITY 是否需要更新诚实账？
+5. todo §4 诚实账与 OBSERVABILITY 是否需要更新？
 
 ## 落点
 

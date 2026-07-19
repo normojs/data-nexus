@@ -11,6 +11,7 @@
 | [测试/Smoke 规则](.claude/rules/testing-smoke.md) | 回归与工具链（paths 自动挂载） |
 | [**Claude 能力地图**](.claude/README.md) | Skills / Commands / Superpowers |
 | [看板 `todo.md`](todo.md) | 唯一焦点与未完成债 |
+| [已交付 `todo-impl.md`](todo-impl.md) | 完成切片归档（勿与未完成混排） |
 
 ## 架构
 

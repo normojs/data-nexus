@@ -42,9 +42,9 @@ paths: **/*
 2. **实现**：落在既有分层（见 §3），不发明平行体系。
 3. **测试**：单测和/或 smoke；feature 任务在对应 feature 下测。
 4. **回归**：至少不破坏 `security.enabled=false`；相关 `cargo test` / smoke 通过。
-5. **文档**：更新 `todo.md` 勾选与「下一动作」；行为变更同步架构/runbook/OBSERVABILITY。
+5. **文档**：更新 `todo.md`（未完成 `- [ ]` +「已有/仍欠」+ §5 下一动作）；整项完成迁入 `todo-impl.md`；行为变更同步架构/runbook/OBSERVABILITY。
 6. **提交**：scope 清晰（`feat(b06):` / `fix:` / `chore:`）；中英文均可，但 ID 与意图清楚。
-7. **诚实**：部分完成标 **部分**，更新 `todo.md` §3.6 已知限制。
+7. **诚实**：部分完成保持 `- [ ]`，更新 `todo.md` §4 已知限制；禁止把部分当交付。
 
 **禁止**
 

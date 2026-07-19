@@ -15,7 +15,7 @@ description: >
 ## Force-read
 
 - [`.claude/rules/streaming-performance.md`](../../rules/streaming-performance.md)
-- `todo.md` A06–A10 与 §3.6 诚实账
+- `todo.md` A06–A10（§1）与 §4 诚实账；已交付子切片见 `todo-impl.md`
 
 ## Decision tree
 
@@ -58,4 +58,4 @@ cd data-proxy && ./examples/run-smoke-matrix.sh security-extended
 
 ## Honesty
 
-部分完成必须在 `todo.md` 标 **部分**，commit body 写边界（例：仅非事务 MySQL；PG Streaming 仍物化）。收尾 **dn-dod**。
+部分完成必须在 `todo.md` 保持 `- [ ]` 并更新「已有/仍欠」，commit body 写边界（例：仅非事务 MySQL；PG Streaming 仍物化）。整项封顶后再迁 `todo-impl.md`。收尾 **dn-dod**。
