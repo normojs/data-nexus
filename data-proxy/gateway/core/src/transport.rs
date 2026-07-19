@@ -227,7 +227,7 @@ pub async fn write_wire_relay<W: ResponseWriter + ?Sized>(
 }
 
 /// O01: stats from windowed encode (Secure path observability).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamingEncodeStats {
     /// Rows encoded after max_rows truncation.
     pub total_rows: u64,
@@ -237,6 +237,19 @@ pub struct StreamingEncodeStats {
     pub encoded_bytes: u64,
     /// Rows that passed through a non-empty mask index.
     pub masked_rows: u64,
+    /// B08: optional first-window sample body (already masked), when requested.
+    pub sample_body: Option<String>,
+    pub sample_row_count: Option<u32>,
+    pub sample_bytes: Option<u32>,
+    pub sample_truncated: bool,
+}
+
+/// Optional B08 sample capture during streaming encode (first window only).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamingSampleOpts {
+    pub enabled: bool,
+    pub max_rows: usize,
+    pub max_bytes: usize,
 }
 
 /// Encode a progressive [`StreamingQuery`] through `writer` (A06+A07).
@@ -248,10 +261,33 @@ pub struct StreamingEncodeStats {
 pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
     frontend: &mut dyn FrontendProtocolAdapter,
     session: &SessionState,
+    query: StreamingQuery,
+    window_rows: usize,
+    obligations: Option<&Obligations>,
+    writer: &mut W,
+) -> GatewayResult<StreamingEncodeStats> {
+    write_streaming_query_with_obligations_sample(
+        frontend,
+        session,
+        query,
+        window_rows,
+        obligations,
+        writer,
+        StreamingSampleOpts::default(),
+    )
+    .await
+}
+
+/// Like [`write_streaming_query_with_obligations`], optionally capturing a B08
+/// first-window sample **after** mask/watermark and **before** drop(chunk).
+pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?Sized>(
+    frontend: &mut dyn FrontendProtocolAdapter,
+    session: &SessionState,
     mut query: StreamingQuery,
     window_rows: usize,
     obligations: Option<&Obligations>,
     writer: &mut W,
+    sample_opts: StreamingSampleOpts,
 ) -> GatewayResult<StreamingEncodeStats> {
     let window = window_rows.max(1);
     let mut columns = query.columns;
@@ -275,6 +311,16 @@ pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
         .await?;
 
     let mut stats = StreamingEncodeStats::default();
+    let sample_budget = if sample_opts.enabled {
+        sample_opts.max_rows.max(1)
+    } else {
+        0
+    };
+    let mut sample_rows: Vec<Vec<GatewayValue>> = if sample_budget > 0 {
+        Vec::with_capacity(sample_budget.min(64))
+    } else {
+        Vec::new()
+    };
 
     loop {
         if let Some(max) = max_total {
@@ -319,6 +365,12 @@ pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
                 }
             }
         }
+        // B08: capture from first window(s) until sample_budget rows (already masked).
+        if sample_budget > 0 && sample_rows.len() < sample_budget {
+            let need = sample_budget - sample_rows.len();
+            let take = need.min(chunk.len());
+            sample_rows.extend(chunk.iter().take(take).cloned());
+        }
         stats.total_rows += chunk.len() as u64;
         stats.windows = stats.windows.saturating_add(1);
         let packets = frontend.encode_resultset_rows(&columns, &chunk, session)?;
@@ -327,6 +379,23 @@ pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
         }
         drop(chunk);
         writer.write_packets(packets).await?;
+    }
+
+    if sample_budget > 0 && !sample_rows.is_empty() {
+        let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        // truncated if stream had more rows than sampled, or sample builder truncated.
+        let stream_truncated = stats.total_rows as usize > sample_rows.len();
+        if let Some((body, n, bytes, builder_trunc)) = crate::build_result_sample(
+            &col_names,
+            &sample_rows,
+            sample_opts.max_rows.max(1),
+            sample_opts.max_bytes.max(1),
+        ) {
+            stats.sample_body = Some(body);
+            stats.sample_row_count = Some(n);
+            stats.sample_bytes = Some(bytes);
+            stats.sample_truncated = stream_truncated || builder_trunc;
+        }
     }
 
     writer
@@ -655,6 +724,66 @@ mod tests {
         assert_eq!(fe.row_calls, 2);
         assert_eq!(fe.footer_calls, 1);
         assert_eq!(writer.packets.last().unwrap(), &vec![3u8]);
+    }
+
+    #[tokio::test]
+    async fn b08_streaming_first_window_sample_after_mask() {
+        use crate::{MaskAlgorithm, MaskSpec, Obligations};
+        let columns = vec![
+            Column {
+                name: "id".into(),
+                data_type: "int".into(),
+            },
+            Column {
+                name: "secret".into(),
+                data_type: "text".into(),
+            },
+        ];
+        let rows = (0..5)
+            .map(|i| {
+                vec![
+                    GatewayValue::Integer(i),
+                    GatewayValue::String(format!("s{i}")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut obl = Obligations::default();
+        obl.column_masks
+            .push(MaskSpec::new("secret", MaskAlgorithm::Nullify, "m"));
+        let query = StreamingQuery {
+            columns,
+            stream: Box::new(VecRowStream::new(rows)),
+        };
+        let mut fe = FakeFrontend {
+            header_calls: 0,
+            row_calls: 0,
+            footer_calls: 0,
+        };
+        let session = SessionState::default();
+        let mut writer = CollectingWriter::new();
+        let stats = write_streaming_query_with_obligations_sample(
+            &mut fe,
+            &session,
+            query,
+            2,
+            Some(&obl),
+            &mut writer,
+            StreamingSampleOpts {
+                enabled: true,
+                max_rows: 3,
+                max_bytes: 4096,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.total_rows, 5);
+        let body = stats.sample_body.expect("sample");
+        assert!(body.contains("\"rows\""));
+        // masked: secret cells nullified → JSON null, not s0
+        assert!(!body.contains("s0"));
+        assert!(!body.contains("s1"));
+        assert_eq!(stats.sample_row_count, Some(3));
+        assert!(stats.sample_truncated); // 5 total > 3 sampled
     }
 
     #[tokio::test]

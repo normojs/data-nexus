@@ -17,12 +17,12 @@ use std::{sync::Arc, time::Instant};
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
         write_resultset_windowed, write_resultset_windowed_with_obligations,
-        write_streaming_query_with_obligations, write_wire_relay, CollectingWriter, map_response_types,
+        write_streaming_query_with_obligations_sample, write_wire_relay, CollectingWriter, map_response_types,
         prepare_cross_protocol_command, BackendConnector, CommandSummary, DialectParser,
         EndpointConfig, EndpointRef, EndpointRole, ExecuteMode, ExecuteOutcome,
         FrontendProtocolAdapter, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse,
         GatewayResult, ListenerConfig, Obligations, PluginContext, PluginDecision, ProtocolKind,
-        ResponseWriter, RoutePlan, ServiceConfig, SessionState, TransactionState,
+        ResponseWriter, RoutePlan, ServiceConfig, SessionState, StreamingSampleOpts, TransactionState,
         TranslationPolicyConfig,
     };
 use loadbalance::balance::{AlgorithmName, Balance, BalanceType, LoadBalance};
@@ -873,13 +873,25 @@ impl CoreGatewayConnection {
                     } else {
                         None
                     };
-                    let encode_stats = write_streaming_query_with_obligations(
+                    let sample_opts = if self.audit_sample_enabled
+                        && self.default_audit_level.eq_ignore_ascii_case("L2")
+                    {
+                        StreamingSampleOpts {
+                            enabled: true,
+                            max_rows: self.audit_sample_max_rows.max(1) as usize,
+                            max_bytes: self.audit_sample_max_bytes.max(1) as usize,
+                        }
+                    } else {
+                        StreamingSampleOpts::default()
+                    };
+                    let encode_stats = write_streaming_query_with_obligations_sample(
                         self.frontend.as_mut(),
                         &self.session,
                         query,
                         window,
                         obl,
                         writer,
+                        sample_opts,
                     )
                     .await?;
                     // A10: binary flag is one-shot per Execute response.
@@ -943,6 +955,10 @@ impl CoreGatewayConnection {
                         sql_fingerprint: audit_sql.as_deref().map(gateway_core::sql_fingerprint),
                         sql_text: audit_sql.clone(),
                         tables: audit_tables.clone(),
+                        sample_body: encode_stats.sample_body.clone(),
+                        sample_row_count: encode_stats.sample_row_count,
+                        sample_bytes: encode_stats.sample_bytes,
+                        sample_truncated: encode_stats.sample_truncated,
                         ..gateway_core::AuditEvent::default()
                     });
                     if let (Some(plugins), Some(idx)) =

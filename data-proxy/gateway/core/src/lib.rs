@@ -111,9 +111,10 @@ pub use translation::{
     TranslationStatementKind,
 };
 pub use transport::{
-    write_resultset_windowed, write_resultset_windowed_with_obligations, write_streaming_query_with_obligations,
-    StreamingEncodeStats,
+    write_resultset_windowed, write_resultset_windowed_with_obligations,
+    write_streaming_query_with_obligations, write_streaming_query_with_obligations_sample,
     write_wire_relay, BackendConnector, CollectingWriter, ExecuteOutcome, FrontendProtocolAdapter,
-    ResponseWriter, RowStream, StreamingQuery, VecRowStream, WireRelay, WireStream,
+    ResponseWriter, RowStream, StreamingEncodeStats, StreamingQuery, StreamingSampleOpts,
+    VecRowStream, WireRelay, WireStream,
 };
 pub use types::{map_column_type, parse_backend_type, CanonicalDataType};

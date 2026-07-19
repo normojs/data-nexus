@@ -169,6 +169,7 @@ examples/        smoke + gateway config 样例
 | A08 | 生产 TLS pin require+CA（validate） | feat(a08) |
 | A10 | MySQL ISO string 参数绑 DATE/TIME/DATETIME | feat(a10) |
 | A10 | PG ISO string 参数绑 DATE/TIME/TIMESTAMP | feat(a10) |
+| B08 | Streaming 首窗样本（脱敏后） | feat(b08) |
 | UI04 | 策略只读页 + security-policies 扩展字段 | feat(ui04) |
 | T02 | Ticket/Vault 运维 runbook | feat(t02) |
 | UI03 | Audit stats 卡片 + source 角标 + 导出 | feat(ui03) |
@@ -200,7 +201,7 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
 | **F29** | Cedar 实体属性 | Subject/Table 属性（tenant/clearance）进 Entities；与 Local 对照用例 | `subject_attrs`/`table_attrs` → Entities；uid-only 兼容；对照单测 + attrs-example.cedar | **完成** |
-| **B08** | L2 样本 / 大 payload | 可选结果样本上传 OpenDAL；体积/采样可配 | `sample_enabled` + max_rows/bytes；物化 ResultSet 附样本；worker 可选 OpenDAL；默认关；Streaming 不采样 | **部分** |
+| **B08** | L2 样本 / 大 payload | 可选结果样本上传 OpenDAL；体积/采样可配 | 物化 ResultSet + **Streaming 首窗**（脱敏后）；`sample_enabled` 默认关；OpenDAL 可选 | **部分** |
 | **F31** | Remote PDP 适配器 | HTTP 旁路 OPA/外部 PDP；超时 fail_closed | 配置已 **拒绝** `backend=remote`（防静默 no-op）；实现后放开 | **延后** |
 | **F30** | 敏感识别增强 | 静态列标签之外的规则/词典 MVP（仍不做全量 DLP） | 仅 `column_tags` + mask 规则 | **延后** |
 | **F32** | 审计 L0/L1 载荷裁剪 | 按 `default_audit_level` 裁剪 `sql_text`；L0 剥离、L1/L2 截断 | L2 样本上传仍未做（B08） | **完成** |
@@ -243,7 +244,7 @@ examples/        smoke + gateway config 样例
 | PG/MySQL backend TLS | A08：PG idle pool+tcp_txn；双协议 `ssl_mode`/`ssl_ca_file`/`ssl_accept_invalid_certs`；**默认 accept_invalid=true（兼容）**；**prod 模板 require+CA+verify**；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；非 extended |
 | 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；**MySQL QueryParams 走 COM_STMT_PREPARE/EXECUTE 绑定** + binary 行 + **Streaming 窗口** + 连接缓存；MySQL date/time binary 结果 ISO 文本；**双协议 ISO 字符串参数可绑原生时间类型**；其余 scalar/text；非 TCP passthrough |
 | 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；**prod 模板已含 security.state**；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
-| L2 样本合规 | B08：**默认关**；L2+enabled 时物化 ResultSet 附截断样本；OpenDAL 需 `audit-opendal`；Streaming 路径不采样 |
+| L2 样本合规 | B08：**默认关**；L2+enabled 时物化 ResultSet **或 Streaming 首窗**（脱敏后、有界 rows/bytes）附样本；OpenDAL 需 `audit-opendal` |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
 | Cedar ABAC | F29：`subject_attrs`/`table_attrs` 静态目录进 Entities；无目录 = F26 uid-only；非动态 IdP 属性同步 |
 | 复杂 SQL / 列 ACL | T01：JOIN/CTE/WHERE·HAVING·EXISTS·IN 子查询表可抽；**列 rewrite 不深改嵌套 SELECT 列表**；极端方言/解析失败仍走 heuristic |
@@ -254,22 +255,22 @@ examples/        smoke + gateway config 样例
 
 **>>> push origin（需确认） 或 F31 Remote PDP（延后） <<<**
 
-本轮（A10 PG 参数类型细化）：
+本轮（B08 Streaming 首窗样本）：
 
-- QueryParams：ISO date/datetime/time 字符串 → chrono `NaiveDate`/`NaiveDateTime`/`NaiveTime` 绑定
-- 物化 + Streaming 路径统一 `PgParamBind`
-- 非法/普通字符串仍 text；单测分类
+- `write_streaming_query_with_obligations_sample`：首窗(s) 脱敏后采样，不物化全量
+- core_engine Streaming 审计事件带 `sample_*`（L2 + sample_enabled）
+- 单测：mask 后样本不含明文敏感列
 
 ```bash
-cargo test -p runtime_gateway --lib a10_pg_param_bind
-cargo test -p runtime_gateway --lib 'backend::postgresql::tests::a10_'
+cargo test -p gateway_core --lib b08_streaming_first_window
+cargo check -p runtime_gateway
 ```
 
 建议下一刀：
 
-1. **push origin**（需明确同意；领先 origin）  
+1. **push origin**（需明确同意）  
 2. **F31** — Remote PDP（延后）  
-3. 体验债 / 文档收口
+3. 文档收口 / 体验债
 
 
 ---
