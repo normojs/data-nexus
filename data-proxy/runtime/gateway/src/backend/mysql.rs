@@ -2079,10 +2079,10 @@ fn mysql_client_tls_opts(
     match endpoint.ssl_mode {
         EndpointSslMode::Disable => Ok(None),
         EndpointSslMode::Prefer | EndpointSslMode::Require => {
-            // MySQL protocol path: CLIENT_SSL is requested when tls_config is Some.
-            // Prefer: if server lacks CLIENT_SSL, auth returns ProtocolError::Tls — map to
-            // a clear backend error (honest: no silent plain fallback on prefer yet;
-            // require and prefer both need server TLS for this MVP slice).
+            // MySQL: CLIENT_SSL is negotiated when tls_config is Some.
+            // Prefer: if server lacks CLIENT_SSL, client clears tls_config and
+            // continues plain (aligned with PG ssl_mode=prefer).
+            // Require: handshake fails with ProtocolError::Tls.
             let server_name = {
                 let addr = endpoint.address.as_str();
                 match addr.rsplit_once(':') {
@@ -2098,6 +2098,7 @@ fn mysql_client_tls_opts(
                 server_name,
                 accept_invalid_certs: endpoint.ssl_accept_invalid_certs,
                 ca_file: endpoint.ssl_ca_file.clone(),
+                require_tls: endpoint.ssl_mode.requires_tls(),
             }))
         }
     }
@@ -2590,16 +2591,29 @@ mod tests {
         assert_eq!(opts.server_name, "db.example.com");
         assert!(!opts.accept_invalid_certs);
         assert_eq!(opts.ca_file.as_deref(), Some("/etc/ssl/certs/mysql-ca.pem"));
+        assert!(opts.require_tls);
     }
 
     #[test]
     fn a08_mysql_tls_prefer_and_require_both_request_client_ssl() {
-        // Prefer currently also requires server CLIENT_SSL (no silent plain fallback).
+        // Both modes set tls_config so CLIENT_SSL is attempted when server supports it.
         for mode in [EndpointSslMode::Prefer, EndpointSslMode::Require] {
             let mut ep = endpoint();
             ep.ssl_mode = mode;
             assert!(mysql_client_tls_opts(&ep).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn a08_mysql_tls_prefer_allows_plain_fallback_flag() {
+        let mut ep = endpoint();
+        ep.ssl_mode = EndpointSslMode::Prefer;
+        let prefer = mysql_client_tls_opts(&ep).unwrap().expect("tls");
+        assert!(!prefer.require_tls, "prefer must allow plain fallback");
+
+        ep.ssl_mode = EndpointSslMode::Require;
+        let require = mysql_client_tls_opts(&ep).unwrap().expect("tls");
+        assert!(require.require_tls, "require must fail without server SSL");
     }
 
     #[test]

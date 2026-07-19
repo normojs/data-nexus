@@ -158,7 +158,8 @@ username = "__DN_MYSQL_USER__"
 password = "__DN_MYSQL_PASSWORD__"
 weight = 1
 # A08 backend TLS: disable | prefer | require
-# MySQL prefer does NOT fall back to plaintext if the server lacks SSL.
+# MySQL prefer falls back to plaintext if the server lacks CLIENT_SSL;
+# require fails hard (same semantics as PostgreSQL ssl_mode).
 ssl_mode = "disable"
 # ssl_ca_file = "/etc/ssl/certs/mysql-ca.pem"
 # ssl_accept_invalid_certs = false

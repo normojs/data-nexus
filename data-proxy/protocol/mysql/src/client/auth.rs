@@ -151,7 +151,16 @@ impl ClientAuth {
         }
 
         if self.capability & CLIENT_SSL == 0 && self.tls_config.is_some() {
-            return Err(ProtocolError::Tls);
+            // A08: prefer → plain fallback; require → hard fail (like PG ssl_mode).
+            let require = self
+                .tls_config
+                .as_ref()
+                .map(|t| t.require_tls)
+                .unwrap_or(true);
+            if require {
+                return Err(ProtocolError::Tls);
+            }
+            self.tls_config = None;
         }
 
         if data.is_empty() {
@@ -667,6 +676,8 @@ mod test {
 
     use super::{handshake, ClientAuth};
     use crate::client::{codec::ClientCodec, stream::LocalStream};
+    use crate::err::ProtocolError;
+    use crate::mysql_const::CLIENT_PROTOCOL_41;
 
     #[test]
     fn test_initial_handshake() {
@@ -710,6 +721,7 @@ mod test {
             server_name: "localhost".into(),
             accept_invalid_certs: true,
             ca_file: None,
+            require_tls: true,
         });
         assert_eq!(test_handshake_resp(auth_codec).await, true);
     }
@@ -732,6 +744,7 @@ mod test {
             server_name: "localhost".into(),
             accept_invalid_certs: true,
             ca_file: None,
+            require_tls: true,
         });
         assert_eq!(test_handshake_resp(auth_codec).await, false);
     }
@@ -752,6 +765,54 @@ mod test {
         auth_codec.user = "root".to_string();
         auth_codec.password = "1234567".to_string();
         assert_eq!(test_handshake_resp(auth_codec).await, false);
+    }
+
+    fn minimal_handshake_no_ssl() -> BytesMut {
+        let mut data = BytesMut::new();
+        data.extend_from_slice(&[10]); // protocol version
+        data.extend_from_slice(b"8.0.36\0");
+        data.extend_from_slice(&7u32.to_le_bytes()); // connection id
+        data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // auth-plugin-data-part-1
+        data.extend_from_slice(&[0]); // filler
+        // lower capability: PROTOCOL_41 only (no CLIENT_SSL)
+        data.extend_from_slice(&(CLIENT_PROTOCOL_41 as u16).to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn a08_prefer_falls_back_when_server_lacks_ssl() {
+        let mut auth = ClientAuth::new();
+        auth.tls_config = Some(crate::client::tls_opts::ClientTlsOpts {
+            server_name: "localhost".into(),
+            accept_invalid_certs: true,
+            ca_file: None,
+            require_tls: false,
+        });
+        let mut data = minimal_handshake_no_ssl();
+        let out = auth.read_initial_handshake(&mut data).expect("prefer ok");
+        assert!(
+            out.tls_config.is_none(),
+            "prefer must clear tls_config and continue plain"
+        );
+    }
+
+    #[test]
+    fn a08_require_fails_when_server_lacks_ssl() {
+        let mut auth = ClientAuth::new();
+        auth.tls_config = Some(crate::client::tls_opts::ClientTlsOpts {
+            server_name: "localhost".into(),
+            accept_invalid_certs: true,
+            ca_file: None,
+            require_tls: true,
+        });
+        let mut data = minimal_handshake_no_ssl();
+        let err = auth
+            .read_initial_handshake(&mut data)
+            .expect_err("require must fail");
+        assert!(
+            matches!(err, ProtocolError::Tls),
+            "expected ProtocolError::Tls, got {err:?}"
+        );
     }
 
     async fn test_handshake_resp(codec: ClientAuth) -> bool {

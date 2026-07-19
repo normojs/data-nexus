@@ -16,6 +16,9 @@ pub struct ClientTlsOpts {
     pub accept_invalid_certs: bool,
     /// Optional PEM CA file (single cert or bundle).
     pub ca_file: Option<String>,
+    /// A08: `true` = ssl_mode=require (fail if server has no CLIENT_SSL);
+    /// `false` = ssl_mode=prefer (plain fallback when server lacks SSL).
+    pub require_tls: bool,
 }
 
 impl ClientTlsOpts {
@@ -105,6 +108,7 @@ mod tests {
             server_name: "localhost".into(),
             accept_invalid_certs: true,
             ca_file: None,
+            require_tls: false,
         };
         opts.build_connector().unwrap();
     }
@@ -115,6 +119,7 @@ mod tests {
             server_name: "db.example.com".into(),
             accept_invalid_certs: false,
             ca_file: Some("/no/such/data-nexus-mysql-a08-ca.pem".into()),
+            require_tls: true,
         };
         let err = opts.build_connector().unwrap_err();
         let msg = err.to_string();
@@ -138,6 +143,7 @@ mod tests {
             server_name: "localhost".into(),
             accept_invalid_certs: false,
             ca_file: Some(ca_path.to_string_lossy().into()),
+            require_tls: true,
         };
         let err = opts.build_connector().unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
