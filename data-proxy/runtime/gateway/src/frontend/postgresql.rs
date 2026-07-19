@@ -164,9 +164,10 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             FrontendMessage::Terminate => Ok(vec![GatewayCommand::Quit]),
             FrontendMessage::Sync => {
                 // Sync ends the extended-query unit; clear one-shot header suppress /
-                // unfinished catalog Describe.
+                // unfinished catalog Describe / stale portal describe flags.
                 self.suppress_next_row_description = false;
                 self.pending_describe = None;
+                self.portal_row_described.clear();
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_ready_for_query(transaction_status(session))],
                 }])
@@ -222,18 +223,10 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 } else {
                     self.portal_columns.remove(&portal);
                 }
-                // Inherit statement-level RowDescription so Execute does not re-send T
-                // after Parse/Describe(S)/Bind/Execute (common psycopg path).
-                if self
-                    .prepared_row_described
-                    .get(&statement)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    self.portal_row_described.insert(portal.clone(), true);
-                } else {
-                    self.portal_row_described.remove(&portal);
-                }
+                // Fresh portal: only Describe('P') (or catalog DescribeSql for 'P') may
+                // suppress the next Execute RowDescription. Do NOT inherit statement
+                // Describe('S') — re-Bind after Sync must send T again (psycopg re-execute).
+                self.portal_row_described.remove(&portal);
                 self.portals.insert(portal.clone(), sql);
                 self.portal_args.insert(portal.clone(), params);
                 self.portal_params.insert(portal.clone(), nparams);
@@ -363,13 +356,11 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     .map(|fmts| fmts.iter().any(|f| *f == 1))
                     .unwrap_or(false);
                 session.prefer_binary_result = want_binary;
-                // If Describe('P') already sent RowDescription, suppress the header on
-                // the upcoming Streaming/Complete encode so clients do not see T twice.
-                self.suppress_next_row_description = self
-                    .portal_row_described
-                    .get(&portal)
-                    .copied()
-                    .unwrap_or(false);
+                // If Describe('P') already sent RowDescription in this unit, suppress the
+                // header once on the upcoming encode. Consume the flag so a later Execute
+                // of a re-bound portal (without re-Describe) still emits RowDescription.
+                self.suppress_next_row_description =
+                    self.portal_row_described.remove(&portal).unwrap_or(false);
                 if parameters.is_empty() {
                     Ok(vec![GatewayCommand::Query { sql }])
                 } else {
@@ -1604,7 +1595,9 @@ mod tests {
             protocol.decode(&encode_terminate_message(), &mut session),
             Ok(vec![GatewayCommand::Quit])
         );
-        assert_eq!(protocol.decode(&encode_sync_message(), &mut session), Ok(vec![]));
+        let sync_cmds = protocol.decode(&encode_sync_message(), &mut session).unwrap();
+        assert_eq!(sync_cmds.len(), 1);
+        assert!(matches!(sync_cmds[0], GatewayCommand::ClientWire { .. }));
     }
 
     #[test]
@@ -1740,6 +1733,75 @@ mod tests {
             Some(2)
         );
         assert!(protocol.pending_describe.is_none());
+    }
+
+    #[test]
+    fn a10_rebind_without_describe_p_sends_rowdescription_again() {
+        // Parse → Describe(S) → Bind → Execute (no Describe P) → Sync → Bind → Execute.
+        // Second Execute must emit RowDescription (not suppress forever after Describe S).
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let mut session = SessionState::default();
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(b"SELECT id, name FROM t WHERE id > $1\0");
+        body.extend_from_slice(&0i16.to_be_bytes());
+        let mut parse = vec![b'P'];
+        let len = (body.len() + 4) as i32;
+        parse.extend_from_slice(&len.to_be_bytes());
+        parse.extend_from_slice(&body);
+        protocol.decode(&parse, &mut session).unwrap();
+
+        // Describe statement
+        let mut dbody = vec![b'S'];
+        dbody.extend_from_slice(b"s1\0");
+        let mut describe = vec![b'D'];
+        let dlen = (dbody.len() + 4) as i32;
+        describe.extend_from_slice(&dlen.to_be_bytes());
+        describe.extend_from_slice(&dbody);
+        protocol.decode(&describe, &mut session).unwrap();
+        assert!(protocol.prepared_row_described.get("s1").copied().unwrap_or(false));
+
+        // Bind portal p1
+        let mut bbody = Vec::new();
+        bbody.extend_from_slice(b"p1\0");
+        bbody.extend_from_slice(b"s1\0");
+        bbody.extend_from_slice(&0i16.to_be_bytes());
+        bbody.extend_from_slice(&1i16.to_be_bytes());
+        bbody.extend_from_slice(&1i32.to_be_bytes());
+        bbody.extend_from_slice(b"0");
+        bbody.extend_from_slice(&0i16.to_be_bytes());
+        let mut bind = vec![b'B'];
+        let blen = (bbody.len() + 4) as i32;
+        bind.extend_from_slice(&blen.to_be_bytes());
+        bind.extend_from_slice(&bbody);
+        protocol.decode(&bind, &mut session).unwrap();
+        // Bind does not inherit statement describe → portal not described.
+        assert!(!protocol.portal_row_described.get("p1").copied().unwrap_or(false));
+
+        // Execute 1: no suppress
+        let mut ebody = Vec::new();
+        ebody.extend_from_slice(b"p1\0");
+        ebody.extend_from_slice(&0i32.to_be_bytes());
+        let mut exec = vec![b'E'];
+        let elen = (ebody.len() + 4) as i32;
+        exec.extend_from_slice(&elen.to_be_bytes());
+        exec.extend_from_slice(&ebody);
+        protocol.decode(&exec, &mut session).unwrap();
+        assert!(!protocol.suppress_next_row_description);
+
+        // Sync clears portal flags
+        protocol
+            .decode(&encode_sync_message(), &mut session)
+            .unwrap();
+
+        // Re-bind same portal
+        protocol.decode(&bind, &mut session).unwrap();
+        protocol.decode(&exec, &mut session).unwrap();
+        assert!(
+            !protocol.suppress_next_row_description,
+            "second Execute without Describe(P) must still send RowDescription"
+        );
     }
 
     #[test]

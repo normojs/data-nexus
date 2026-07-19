@@ -380,8 +380,7 @@ echo "$pg_star_out" | grep -q 'pg_star_describe_ok'
 echo "==> A10 PostgreSQL psycopg3 prepared max_rows=1 (Describe + RowDescription)"
 # Full client path: requires Describe → RowDescription (not NoData).
 # Integer binds may arrive as binary INT2 even under text format codes.
-# One prepared execute per connection is the covered path; re-using the same
-# server-side prepare for a second Bind can still flake (honest A10 boundary).
+# Same-connection re-execute (psycopg prepare reuse) must work after Sync.
 pg_psycopg_out="$(docker run --rm --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
   bash -lc 'pip install -q --disable-pip-version-check "psycopg[binary]>=3.1" >/tmp/pip.log 2>&1 || { cat /tmp/pip.log; exit 1; }
 python - <<"PY"
@@ -400,7 +399,16 @@ with psycopg.connect(
         print("psycopg_rows", len(rows), rows)
         assert len(rows) == 1, rows
         assert int(rows[0][0]) == 1, rows
-# separate connection for text param (avoids re-bind of same prepared portal)
+        # same connection, same prepared SQL — second Bind/Execute after Sync
+        cur.execute(
+            "SELECT id, name FROM stream_smoke WHERE id > %s ORDER BY id",
+            (0,),
+        )
+        rows_re = cur.fetchall()
+        print("psycopg_rebind_rows", len(rows_re), rows_re)
+        assert len(rows_re) == 1, rows_re
+        assert int(rows_re[0][0]) == 1, rows_re
+# separate connection for text param
 with psycopg.connect(
     "host=host.docker.internal port=9089 user=postgres password=postgres dbname=analytics",
     autocommit=True,
@@ -427,6 +435,7 @@ PY
 ')"
 echo "$pg_psycopg_out"
 echo "$pg_psycopg_out" | grep -q 'psycopg_prepared_ok'
+echo "$pg_psycopg_out" | grep -q 'psycopg_rebind_rows'
 
 echo "==> metrics execute_path present after traffic"
 metrics="$(curl -fsS http://127.0.0.1:8082/metrics || true)"
