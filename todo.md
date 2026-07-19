@@ -176,6 +176,7 @@ examples/        smoke + gateway config 样例
 | B08 | L2 结果样本 attach + 可选 OpenDAL | feat(b08) |
 | F29 | Cedar 实体属性 tenant/clearance | feat(f29) |
 | H06 | 本地 full smoke all+cedar 发版验证（未 push） | chore(h06) |
+| H06 | push origin/main 至 47faec5 | chore(h06) |
 
 ---
 
@@ -212,7 +213,7 @@ examples/        smoke + gateway config 样例
 |----|----|------|-------------|:----:|
 | **H04b** | 真 IdP OIDC 联调 | 部署侧真实回调、角色映射验收 | 文档+模板完成；真 IdP 未在本仓库验收 | **部署侧** |
 | **H05** | 多实例状态外置 | ticket/vault JSON+lock+**AES-GCM**；审计 SQLite；`policy_path`+mtime | 交叉文件 bundle 单测 + prod `security.state` 模板；全文件替换非 CRDT；轮询默认 1s；vault 无密钥仍不落盘密码 | **部分** |
-| **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `223f2c0` → origin/main | **完成** |
+| **H06** | 发布与 origin 同步 | `main` 与 origin 同步；发布 checklist + 默认 smoke | 本机 all+cedar 绿；**已 push** `47faec5` → origin/main | **完成** |
 | **H07** | CI 矩阵加深 | PR/push **default**；schedule nightly **extended+cedar**；dispatch 分 job；rustc **1.94.1** | 非 default 不挡 PR；cedar 需 feature 预编译 | **完成** |
 | **H08** | Vault 文件加密后端 | 进程内存明文密码后置方案 | **H05 已交付 AES-GCM 文件信封**（`vault_encrypt_key`）；进程内存仍明文 | **部分→见 H05** |
 
@@ -253,24 +254,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> push origin（需确认） 或 F31 Remote PDP（延后） <<<**
+**>>> F31 Remote PDP（延后） 或 体验/文档收口 或 A 轨继续 <<<**
 
-本轮（B08 Streaming 首窗样本）：
+本轮（H06 push origin）：
 
-- `write_streaming_query_with_obligations_sample`：首窗(s) 脱敏后采样，不物化全量
-- core_engine Streaming 审计事件带 `sample_*`（L2 + sample_enabled）
-- 单测：mask 后样本不含明文敏感列
+- `git push origin HEAD` → `277e2a9..47faec5` on `main`
+- 本地与 `origin/main` 对齐（45 commits 已同步）
+- 此前本地 full smoke all+cedar 已绿；默认二进制已恢复
 
 ```bash
-cargo test -p gateway_core --lib b08_streaming_first_window
-cargo check -p runtime_gateway
+git status -sb   # 应显示与 origin/main 同步
+git log -1 --oneline
 ```
 
 建议下一刀：
 
-1. **push origin**（需明确同意）  
-2. **F31** — Remote PDP（延后）  
-3. 文档收口 / 体验债
+1. **F31** — Remote PDP（延后）  
+2. 文档/体验收口  
+3. A 轨剩余债（A09 json/csv 物化、A08 extended 非目标等）
 
 
 ---
