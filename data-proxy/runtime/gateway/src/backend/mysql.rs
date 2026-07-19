@@ -1925,12 +1925,14 @@ fn decode_binary_result_value(
                     "mysql binary date/time length exceeds packet".into(),
                 ));
             }
-            // Honest MVP: surface as hex length-prefixed payload string.
-            let hex: String = data[1..1 + len]
-                .iter()
-                .map(|b| format!("{b:02X}"))
-                .collect();
-            Ok((GatewayValue::String(hex), 1 + len))
+            let payload = &data[1..1 + len];
+            let text = match &column.column_type {
+                MYSQL_TYPE_TIME => decode_mysql_binary_time_text(payload)?,
+                MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => decode_mysql_binary_date_text(payload)?,
+                // DATETIME / TIMESTAMP (and ambiguous NEWDATE already handled)
+                _ => decode_mysql_binary_datetime_text(payload)?,
+            };
+            Ok((GatewayValue::String(text), 1 + len))
         }
         MYSQL_TYPE_STRING
         | MYSQL_TYPE_VAR_STRING
@@ -1960,6 +1962,113 @@ fn decode_binary_result_value(
             Ok((value, n))
         }
     }
+}
+
+/// A10: MySQL ProtocolBinary DATE payload → `YYYY-MM-DD`.
+/// len is already stripped; payload is year(2 LE) month day (0 or 4 bytes).
+fn decode_mysql_binary_date_text(payload: &[u8]) -> GatewayResult<String> {
+    if payload.is_empty() {
+        return Ok("0000-00-00".into());
+    }
+    if payload.len() < 4 {
+        return Err(GatewayError::Protocol(format!(
+            "mysql binary DATE payload len {} (need 0 or ≥4)",
+            payload.len()
+        )));
+    }
+    let y = u16::from_le_bytes([payload[0], payload[1]]);
+    let m = payload[2];
+    let d = payload[3];
+    Ok(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+/// A10: DATETIME/TIMESTAMP payload → `YYYY-MM-DD HH:MM:SS[.ffffff]`.
+/// Wire lengths: 0 | 4 (date only) | 7 | 11 (+micros).
+fn decode_mysql_binary_datetime_text(payload: &[u8]) -> GatewayResult<String> {
+    if payload.is_empty() {
+        return Ok("0000-00-00 00:00:00".into());
+    }
+    if payload.len() < 4 {
+        return Err(GatewayError::Protocol(format!(
+            "mysql binary DATETIME payload len {} (need 0/4/7/11)",
+            payload.len()
+        )));
+    }
+    let y = u16::from_le_bytes([payload[0], payload[1]]);
+    let mo = payload[2];
+    let d = payload[3];
+    if payload.len() == 4 {
+        return Ok(format!("{y:04}-{mo:02}-{d:02} 00:00:00"));
+    }
+    if payload.len() < 7 {
+        return Err(GatewayError::Protocol(format!(
+            "mysql binary DATETIME payload len {} (need 0/4/7/11)",
+            payload.len()
+        )));
+    }
+    let h = payload[4];
+    let mi = payload[5];
+    let sec = payload[6];
+    if payload.len() == 7 {
+        return Ok(format!(
+            "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{sec:02}"
+        ));
+    }
+    if payload.len() < 11 {
+        return Err(GatewayError::Protocol(format!(
+            "mysql binary DATETIME micros truncated (len {})",
+            payload.len()
+        )));
+    }
+    let micro = u32::from_le_bytes([payload[7], payload[8], payload[9], payload[10]]);
+    Ok(format!(
+        "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{sec:02}.{micro:06}"
+    ))
+}
+
+/// A10: TIME payload → `[-][D ]HH:MM:SS[.ffffff]` (D days only when non-zero).
+/// Wire: is_negative(1) days(4 LE) h m s [micro 4 LE]; total 0 | 8 | 12.
+fn decode_mysql_binary_time_text(payload: &[u8]) -> GatewayResult<String> {
+    if payload.is_empty() {
+        return Ok("00:00:00".into());
+    }
+    if payload.len() < 8 {
+        return Err(GatewayError::Protocol(format!(
+            "mysql binary TIME payload len {} (need 0/8/12)",
+            payload.len()
+        )));
+    }
+    let neg = payload[0] != 0;
+    let days = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    let h = payload[5];
+    let m = payload[6];
+    let sec = payload[7];
+    let micro = if payload.len() >= 12 {
+        Some(u32::from_le_bytes([
+            payload[8], payload[9], payload[10], payload[11],
+        ]))
+    } else if payload.len() == 8 {
+        None
+    } else {
+        return Err(GatewayError::Protocol(format!(
+            "mysql binary TIME unexpected len {}",
+            payload.len()
+        )));
+    };
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    if days > 0 {
+        out.push_str(&format!("{days} "));
+    }
+    out.push_str(&format!("{h:02}:{m:02}:{sec:02}"));
+    if let Some(us) = micro {
+        if us != 0 {
+            out.push_str(&format!(".{us:06}"));
+        }
+    }
+    Ok(out)
 }
 
 fn decode_lenc_bytes(data: &[u8]) -> GatewayResult<(Vec<u8>, usize)> {
@@ -2422,6 +2531,64 @@ mod tests {
         assert_eq!(
             values,
             vec![GatewayValue::Null, GatewayValue::Integer(99)]
+        );
+    }
+
+    #[test]
+    fn a10_binary_date_datetime_time_to_iso_text() {
+        // DATE 2024-08-31: len=4, year LE 0x07E8=2024, mon=8, day=31
+        let date_payload = [0xE8u8, 0x07, 8, 31];
+        assert_eq!(
+            decode_mysql_binary_date_text(&date_payload).unwrap(),
+            "2024-08-31"
+        );
+        // empty date
+        assert_eq!(decode_mysql_binary_date_text(&[]).unwrap(), "0000-00-00");
+
+        // DATETIME 2022-08-31 07:16:16 (fixture from protocol tests)
+        let dt = [0xE6u8, 0x07, 0x08, 0x1f, 0x07, 0x10, 0x10];
+        assert_eq!(
+            decode_mysql_binary_datetime_text(&dt).unwrap(),
+            "2022-08-31 07:16:16"
+        );
+        // DATETIME with micros 2003-12-31 01:02:03.123123
+        // year 2003=0x07D3, micro 123123=0x0001E0F3 LE
+        let dt_us = [
+            0xD3u8, 0x07, 12, 31, 1, 2, 3, 0xF3, 0xE0, 0x01, 0x00,
+        ];
+        assert_eq!(
+            decode_mysql_binary_datetime_text(&dt_us).unwrap(),
+            "2003-12-31 01:02:03.123123"
+        );
+        // DATE-only datetime payload (len 4 body)
+        assert_eq!(
+            decode_mysql_binary_datetime_text(&date_payload).unwrap(),
+            "2024-08-31 00:00:00"
+        );
+
+        // TIME -1 day 10:08:21 → "-1 10:08:21" (protocol fixture)
+        // is_neg=1 days=1 h=10 m=8 s=21
+        let tm = [0x01u8, 0x01, 0x00, 0x00, 0x00, 10, 8, 21];
+        assert_eq!(
+            decode_mysql_binary_time_text(&tm).unwrap(),
+            "-1 10:08:21"
+        );
+        // plain 00:00:00 empty
+        assert_eq!(decode_mysql_binary_time_text(&[]).unwrap(), "00:00:00");
+    }
+
+    #[test]
+    fn a10_binary_row_decodes_datetime_column() {
+        // row: header, null_bitmap (1 col → 1 byte), datetime payload
+        // 1 column → null map size ((1+7+2)/8)=1
+        let mut row = vec![0x00, 0x00]; // no nulls
+        row.push(7); // len
+        row.extend_from_slice(&[0xE6, 0x07, 0x08, 0x1f, 0x07, 0x10, 0x10]);
+        let columns = vec![column_info("ts", ColumnType::MYSQL_TYPE_DATETIME)];
+        let values = binary_row_to_gateway_values(&row, &columns).unwrap();
+        assert_eq!(
+            values,
+            vec![GatewayValue::String("2022-08-31 07:16:16".into())]
         );
     }
 

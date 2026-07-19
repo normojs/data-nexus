@@ -398,12 +398,8 @@ fn decode_binary_param_value(data: &[u8], type_byte: u8) -> Option<(GatewayValue
             Some((GatewayValue::Float(f64::from_bits(bits)), 8))
         }
         MYSQL_TYPE_NULL => Some((GatewayValue::Null, 0)),
-        // Date/time binary forms: length-prefixed.
-        MYSQL_TYPE_DATE
-        | MYSQL_TYPE_DATETIME
-        | MYSQL_TYPE_TIMESTAMP
-        | MYSQL_TYPE_TIME
-        | MYSQL_TYPE_NEWDATE => {
+        // Date/time binary forms: length-prefixed → ISO text (A10).
+        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => {
             if data.is_empty() {
                 return None;
             }
@@ -411,11 +407,30 @@ fn decode_binary_param_value(data: &[u8], type_byte: u8) -> Option<(GatewayValue
             if data.len() < 1 + len {
                 return None;
             }
-            let hex: String = data[1..1 + len]
-                .iter()
-                .map(|b| format!("{b:02X}"))
-                .collect();
-            Some((GatewayValue::String(hex), 1 + len))
+            let text = decode_mysql_binary_date_text(&data[1..1 + len])?;
+            Some((GatewayValue::String(text), 1 + len))
+        }
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP => {
+            if data.is_empty() {
+                return None;
+            }
+            let len = data[0] as usize;
+            if data.len() < 1 + len {
+                return None;
+            }
+            let text = decode_mysql_binary_datetime_text(&data[1..1 + len])?;
+            Some((GatewayValue::String(text), 1 + len))
+        }
+        MYSQL_TYPE_TIME => {
+            if data.is_empty() {
+                return None;
+            }
+            let len = data[0] as usize;
+            if data.len() < 1 + len {
+                return None;
+            }
+            let text = decode_mysql_binary_time_text(&data[1..1 + len])?;
+            Some((GatewayValue::String(text), 1 + len))
         }
         // String-like / decimal / binary blobs as length-encoded strings.
         MYSQL_TYPE_STRING
@@ -691,6 +706,92 @@ fn encode_binary_value(
             Ok(())
         }
     }
+}
+
+/// A10: MySQL ProtocolBinary DATE payload (len stripped) → `YYYY-MM-DD`.
+fn decode_mysql_binary_date_text(payload: &[u8]) -> Option<String> {
+    if payload.is_empty() {
+        return Some("0000-00-00".into());
+    }
+    if payload.len() < 4 {
+        return None;
+    }
+    let y = u16::from_le_bytes([payload[0], payload[1]]);
+    let m = payload[2];
+    let d = payload[3];
+    Some(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+/// A10: DATETIME/TIMESTAMP payload → `YYYY-MM-DD HH:MM:SS[.ffffff]`.
+fn decode_mysql_binary_datetime_text(payload: &[u8]) -> Option<String> {
+    if payload.is_empty() {
+        return Some("0000-00-00 00:00:00".into());
+    }
+    if payload.len() < 4 {
+        return None;
+    }
+    let y = u16::from_le_bytes([payload[0], payload[1]]);
+    let mo = payload[2];
+    let d = payload[3];
+    if payload.len() == 4 {
+        return Some(format!("{y:04}-{mo:02}-{d:02} 00:00:00"));
+    }
+    if payload.len() < 7 {
+        return None;
+    }
+    let h = payload[4];
+    let mi = payload[5];
+    let sec = payload[6];
+    if payload.len() == 7 {
+        return Some(format!(
+            "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{sec:02}"
+        ));
+    }
+    if payload.len() < 11 {
+        return None;
+    }
+    let micro = u32::from_le_bytes([payload[7], payload[8], payload[9], payload[10]]);
+    Some(format!(
+        "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{sec:02}.{micro:06}"
+    ))
+}
+
+/// A10: TIME payload → `[-][D ]HH:MM:SS[.ffffff]`.
+fn decode_mysql_binary_time_text(payload: &[u8]) -> Option<String> {
+    if payload.is_empty() {
+        return Some("00:00:00".into());
+    }
+    if payload.len() < 8 {
+        return None;
+    }
+    let neg = payload[0] != 0;
+    let days = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    let h = payload[5];
+    let m = payload[6];
+    let sec = payload[7];
+    let micro = if payload.len() >= 12 {
+        Some(u32::from_le_bytes([
+            payload[8], payload[9], payload[10], payload[11],
+        ]))
+    } else if payload.len() == 8 {
+        None
+    } else {
+        return None;
+    };
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    if days > 0 {
+        out.push_str(&format!("{days} "));
+    }
+    out.push_str(&format!("{h:02}:{m:02}:{sec:02}"));
+    if let Some(us) = micro {
+        if us != 0 {
+            out.push_str(&format!(".{us:06}"));
+        }
+    }
+    Some(out)
 }
 
 /// MySQL ProtocolBinary DATE: len(1)=4, year(2 LE), month(1), day(1).
@@ -1382,6 +1483,31 @@ mod tests {
         packet.clear();
         encode_mysql_binary_time(&mut packet, "-1 10:08:21").unwrap();
         assert_eq!(packet, vec![8, 1, 1, 0, 0, 0, 10, 8, 21]);
+    }
+
+    #[test]
+    fn a10_decodes_binary_date_datetime_time_params() {
+        // DATE
+        let (v, n) = decode_binary_param_value(&[4, 0xe8, 0x07, 8, 31], ColumnType::MYSQL_TYPE_DATE as u8)
+            .unwrap();
+        assert_eq!(v, GatewayValue::String("2024-08-31".into()));
+        assert_eq!(n, 5);
+        // DATETIME
+        let (v, n) = decode_binary_param_value(
+            &[7, 0xe6, 0x07, 8, 31, 7, 16, 16],
+            ColumnType::MYSQL_TYPE_DATETIME as u8,
+        )
+        .unwrap();
+        assert_eq!(v, GatewayValue::String("2022-08-31 07:16:16".into()));
+        assert_eq!(n, 8);
+        // TIME negative
+        let (v, n) = decode_binary_param_value(
+            &[8, 1, 1, 0, 0, 0, 10, 8, 21],
+            ColumnType::MYSQL_TYPE_TIME as u8,
+        )
+        .unwrap();
+        assert_eq!(v, GatewayValue::String("-1 10:08:21".into()));
+        assert_eq!(n, 9);
     }
 
     #[test]

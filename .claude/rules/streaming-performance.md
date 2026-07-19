@@ -30,7 +30,7 @@ backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 
 - MySQL backend TLS（A08）：`ssl_mode` prefer/require + `ssl_ca_file`/`ssl_accept_invalid_certs`；**prefer：服务端无 CLIENT_SSL 时回落明文**；require 仍失败。
 - PG Passthrough（A08）：idle pool（cap + TTL + SELECT 1 探测）+ 事务 `tcp_txn` 原帧中继；`endpoints[].ssl_mode` disable/prefer/require；**`ssl_ca_file` + `ssl_accept_invalid_certs`**（默认 true 兼容 MVP；生产可 `false` + CA PEM）。Streaming 仍用 pool。非 extended。MySQL prefer 与 PG prefer 同语义（可明文回落）。
 - A07：`handle_frame_to_writer` + socket `ResponseWriter` 已接。
-- A10 prepared：MySQL COM_STMT_EXECUTE → backend **COM_STMT_PREPARE/EXECUTE 绑定**（连接级 stmt 缓存）+ binary 行解码 + **Streaming 窗口**（`QueryParams`/`Execute`）；PG Bind 保留 `$n` → `QueryParams` → prepare/bind + **连接级 Statement 缓存** + **Streaming 窗口**（`query_raw`）；result_format=1 → binary DataRow（含 date/ts/time）；非 TCP passthrough。
+- A10 prepared：MySQL COM_STMT_EXECUTE → backend **COM_STMT_PREPARE/EXECUTE 绑定**（连接级 stmt 缓存）+ binary 行解码（**DATE/TIME/DATETIME → ISO 文本**）+ **Streaming 窗口**（`QueryParams`/`Execute`）；PG Bind 保留 `$n` → `QueryParams` → prepare/bind + **连接级 Statement 缓存** + **Streaming 窗口**（`query_raw`）；result_format=1 → binary DataRow（含 date/ts/time）；非 TCP passthrough。
 
 ## 实现检查清单
 
