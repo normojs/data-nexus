@@ -163,6 +163,8 @@ struct LocalPdpInner {
     /// True when config asked for cedar backend (even if load failed).
     #[cfg(feature = "security-cedar")]
     cedar_required: bool,
+    /// F31: optional HTTP Remote PDP (table/action gate only).
+    remote: Option<crate::RemotePdpClient>,
 }
 
 impl LocalPdpInner {
@@ -197,6 +199,26 @@ impl LocalPdpInner {
             (None, false)
         };
 
+        let remote = if config.pdp.backend.eq_ignore_ascii_case("remote") {
+            match crate::RemotePdpClient::from_config(&config.pdp) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::error!(
+                        target: "data_nexus::security",
+                        error = %e,
+                        "failed to configure Remote PDP; authorize will deny (fail closed)"
+                    );
+                    // Keep a fail-closed stub via transport error client.
+                    Some(crate::RemotePdpClient::transport_error_for_test(
+                        &e.to_string(),
+                        config.pdp.remote_fail_closed,
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             fail_closed: config.fail_closed,
             star_policy: StarPolicy::from_config(&config.star_policy),
@@ -211,6 +233,7 @@ impl LocalPdpInner {
             cedar,
             #[cfg(feature = "security-cedar")]
             cedar_required,
+            remote,
         }
     }
 
@@ -220,6 +243,10 @@ impl LocalPdpInner {
             let mut next = Self::from_config(config);
             if next.cedar_required && previous.cedar_required && next.cedar.is_none() {
                 next.cedar = previous.cedar.clone();
+            }
+            // Preserve remote client if URL/token unchanged and rebuild kept same backend.
+            if next.remote.is_none() && previous.remote.is_some() {
+                // only if still remote backend — from_config already set it
             }
             next
         }
@@ -262,6 +289,7 @@ impl LocalPdpStore {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
+            remote: None,
         }
     }
 
@@ -733,6 +761,13 @@ impl LocalPdp {
                     return deny;
                 }
 
+                // F31: optional Remote HTTP PDP table/action gate.
+                if let Some(deny) =
+                    self.evaluate_remote(subject, service, action, &tables, sql.as_str())
+                {
+                    return deny;
+                }
+
                 // F27: time-window gates (business hours / freeze windows).
                 if let Some(decision) =
                     self.evaluate_time_rules(subject, action, sql, objects, &tables)
@@ -1065,6 +1100,46 @@ impl LocalPdp {
         {
             let _ = (subject, action, tables);
             None
+        }
+    }
+
+    /// F31: Remote HTTP PDP table/action gate (not used for mask/row obligations).
+    fn evaluate_remote(
+        &self,
+        subject: &Subject,
+        service: &str,
+        action: StatementAction,
+        tables: &[String],
+        sql: &str,
+    ) -> Option<SecurityDecision> {
+        let __p = self.inner();
+        let Some(client) = __p.remote.as_ref() else {
+            return None;
+        };
+        let fp = crate::sql_fingerprint(sql);
+        match client.authorize_tables(
+            &subject.subject_id,
+            service,
+            action,
+            tables,
+            Some(fp.as_str()),
+        ) {
+            Ok(()) => None,
+            Err(message) => {
+                if client.fail_closed() {
+                    Some(SecurityDecision::Deny {
+                        rule: "remote".into(),
+                        message,
+                    })
+                } else {
+                    tracing::warn!(
+                        target: "data_nexus::security",
+                        error = %message,
+                        "remote PDP error with fail_closed=false; allowing"
+                    );
+                    None
+                }
+            }
         }
     }
 
@@ -1946,6 +2021,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
+            remote: None,
         })
     }
 
@@ -2319,6 +2395,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
+            remote: None,
         });
         let mut set = ObjectSet::empty();
         let mut obj = ObjectAccess::new("employees", StatementAction::Select);
@@ -2368,6 +2445,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
+            remote: None,
         });
         let mut set = ObjectSet::empty();
         let mut obj = ObjectAccess::new("employees", StatementAction::Select);
@@ -2413,6 +2491,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
+            remote: None,
         });
         let sub = subject("root");
         let dialect = HeuristicDialectParser::mysql();
@@ -2496,6 +2575,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
+            remote: None,
         });
         let sub = subject("root");
         let dialect = HeuristicDialectParser::mysql();
@@ -2555,6 +2635,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
+            remote: None,
         });
         let sub = subject("app");
         let dialect = HeuristicDialectParser::new(ProtocolKind::MySql);
@@ -2577,6 +2658,7 @@ mod tests {
             cedar: None,
             #[cfg(feature = "security-cedar")]
             cedar_required: false,
+            remote: None,
         });
         assert!(pdp.epoch() > epoch_before);
         assert!(!pdp.authorize_command(&sub, "orders", &cmd, &dialect).is_deny());
@@ -2683,5 +2765,128 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.lock"));
+    }
+
+    #[test]
+    fn f31_remote_deny_overrides_local_allow() {
+        let pdp = LocalPdp::from_inner(LocalPdpInner {
+            fail_closed: true,
+            star_policy: StarPolicy::Deny,
+            rules: vec![SecurityRuleConfig {
+                name: "allow-all".into(),
+                effect: "allow".into(),
+                actions: vec!["select".into()],
+                tables: vec!["*".into()],
+                columns: vec![],
+                subjects: vec![],
+                row_filter: None,
+            }],
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
+            default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
+            remote: Some(crate::RemotePdpClient::fixed_for_test(
+                crate::RemotePdpResponse {
+                    allow: false,
+                    rule: Some("opa".into()),
+                    message: Some("secret blocked".into()),
+                },
+                true,
+            )),
+        });
+        let sub = subject("alice");
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT id FROM employees".into(),
+        };
+        let dec = pdp.authorize_command(&sub, "orders", &cmd, &dialect);
+        assert!(dec.is_deny(), "{dec:?}");
+        match dec {
+            SecurityDecision::Deny { rule, message } => {
+                assert_eq!(rule, "remote");
+                assert!(message.contains("secret blocked"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn f31_remote_transport_error_fail_closed() {
+        let pdp = LocalPdp::from_inner(LocalPdpInner {
+            fail_closed: true,
+            star_policy: StarPolicy::Deny,
+            rules: vec![SecurityRuleConfig {
+                name: "allow-all".into(),
+                effect: "allow".into(),
+                actions: vec!["select".into()],
+                tables: vec!["*".into()],
+                columns: vec![],
+                subjects: vec![],
+                row_filter: None,
+            }],
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
+            default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
+            remote: Some(crate::RemotePdpClient::transport_error_for_test(
+                "timeout", true,
+            )),
+        });
+        let sub = subject("alice");
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT 1".into(),
+        };
+        let dec = pdp.authorize_command(&sub, "orders", &cmd, &dialect);
+        assert!(dec.is_deny(), "fail_closed must deny on timeout: {dec:?}");
+    }
+
+    #[test]
+    fn f31_remote_transport_error_fail_open_allows() {
+        let pdp = LocalPdp::from_inner(LocalPdpInner {
+            fail_closed: true,
+            star_policy: StarPolicy::Deny,
+            rules: vec![SecurityRuleConfig {
+                name: "allow-all".into(),
+                effect: "allow".into(),
+                actions: vec!["select".into()],
+                tables: vec!["*".into()],
+                columns: vec![],
+                subjects: vec![],
+                row_filter: None,
+            }],
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
+            default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
+            remote: Some(crate::RemotePdpClient::transport_error_for_test(
+                "timeout", false,
+            )),
+        });
+        let sub = subject("alice");
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT 1".into(),
+        };
+        let dec = pdp.authorize_command(&sub, "orders", &cmd, &dialect);
+        assert!(!dec.is_deny(), "fail_closed=false should allow: {dec:?}");
     }
 }

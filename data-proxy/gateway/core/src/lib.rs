@@ -21,6 +21,7 @@ mod obligations;
 mod pdp;
 mod plugin;
 mod policy_file;
+mod remote_pdp;
 mod route;
 mod security;
 mod sharding;
@@ -69,6 +70,7 @@ pub use pdp::{
     security_requires_listener_rebuild, sql_from_command, AccessRequest, LocalPdp,
     LocalPdpReloadInfo, LocalPdpStore, SecurityDecision, StatementAction, Subject,
 };
+pub use remote_pdp::{RemotePdpClient, RemotePdpRequest, RemotePdpResponse};
 pub use policy_file::{
     load_local_pdp_policy_file, merge_local_pdp_from_file, persist_local_pdp_to_file,
     save_local_pdp_policy_file, LocalPdpPolicyFile,

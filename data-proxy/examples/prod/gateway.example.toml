@@ -49,8 +49,14 @@ sources = ["protocol_user"]
 [security.pdp]
 backend = "local"
 # For Cedar: backend = "cedar", policy_dir = "/etc/data-nexus/cedar", cache_epoch_reload = true
+# For Remote PDP (F31): backend = "remote", remote_url = "https://pdp.example/v1/data_nexus"
+#   remote_timeout_ms = 50, remote_fail_closed = true, optional remote_token
 policy_dir = ""
 cache_epoch_reload = true
+# remote_url = ""
+# remote_timeout_ms = 50
+# remote_token = ""
+# remote_fail_closed = true
 # F29: static Cedar entity attributes (only used when backend=cedar).
 # [[security.pdp.subject_attrs]]
 # subject_id = "app_ro"

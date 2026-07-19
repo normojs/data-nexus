@@ -191,16 +191,29 @@ impl SecurityPolicyConfig {
                     }
                 }
             }
-            // F31 not implemented: reject early so configs cannot "pass validate and no-op".
+            // F31: HTTP Remote PDP (table/action gate; not for per-row mask loops).
             "remote" => {
-                return Err(GatewayError::Configuration(
-                    "security.pdp.backend=remote is not implemented yet (F31 Remote PDP); use local or cedar"
-                        .into(),
-                ));
+                if self.pdp.remote_url.trim().is_empty() {
+                    return Err(GatewayError::Configuration(
+                        "security.pdp.backend=remote requires non-empty security.pdp.remote_url"
+                            .into(),
+                    ));
+                }
+                let url = self.pdp.remote_url.trim();
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(GatewayError::Configuration(format!(
+                        "security.pdp.remote_url must be http(s) URL, got '{url}'"
+                    )));
+                }
+                if self.pdp.remote_timeout_ms == 0 || self.pdp.remote_timeout_ms > 30_000 {
+                    return Err(GatewayError::Configuration(
+                        "security.pdp.remote_timeout_ms must be 1..=30000".into(),
+                    ));
+                }
             }
             other => {
                 return Err(GatewayError::Configuration(format!(
-                    "security.pdp.backend must be local or cedar (remote reserved for F31), got '{other}'"
+                    "security.pdp.backend must be local, cedar, or remote, got '{other}'"
                 )));
             }
         }
@@ -434,6 +447,18 @@ pub struct SecurityPdpConfig {
     /// Looked up by bare table name (case-insensitive). Empty = no resource attrs.
     #[serde(default)]
     pub table_attrs: Vec<SecurityTableAttrConfig>,
+    /// F31: Remote PDP HTTP endpoint (POST JSON). Required when `backend=remote`.
+    #[serde(default)]
+    pub remote_url: String,
+    /// F31: request timeout in milliseconds (default 50; hard cap 30000).
+    #[serde(default = "default_remote_timeout_ms")]
+    pub remote_timeout_ms: u64,
+    /// F31: optional Bearer token for remote PDP (never log).
+    #[serde(default)]
+    pub remote_token: String,
+    /// F31: on transport/timeout/parse errors, deny when true (default).
+    #[serde(default = "default_true")]
+    pub remote_fail_closed: bool,
 }
 
 /// F29: attributes attached to Cedar `User::"<subject_id>"`.
@@ -471,6 +496,10 @@ fn default_pdp_backend() -> String {
     "local".into()
 }
 
+fn default_remote_timeout_ms() -> u64 {
+    50
+}
+
 impl Default for SecurityPdpConfig {
     fn default() -> Self {
         Self {
@@ -479,6 +508,10 @@ impl Default for SecurityPdpConfig {
             cache_epoch_reload: true,
             subject_attrs: Vec::new(),
             table_attrs: Vec::new(),
+            remote_url: String::new(),
+            remote_timeout_ms: default_remote_timeout_ms(),
+            remote_token: String::new(),
+            remote_fail_closed: true,
         }
     }
 }
@@ -852,15 +885,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_remote_pdp_until_f31() {
+    fn rejects_remote_pdp_without_url() {
         let mut cfg = SecurityPolicyConfig::default();
         cfg.pdp.backend = "remote".into();
-        let err = cfg.validate().expect_err("remote must fail closed until F31");
+        let err = cfg.validate().expect_err("remote requires url");
         let msg = err.to_string();
-        assert!(
-            msg.contains("remote") && msg.contains("F31"),
-            "unexpected message: {msg}"
-        );
+        assert!(msg.contains("remote_url"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn accepts_remote_pdp_with_url() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.pdp.backend = "remote".into();
+        cfg.pdp.remote_url = "http://127.0.0.1:8181/v1/data/data_nexus/allow".into();
+        cfg.pdp.remote_timeout_ms = 100;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_remote_pdp_bad_timeout() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.pdp.backend = "remote".into();
+        cfg.pdp.remote_url = "http://127.0.0.1:8181/pdp".into();
+        cfg.pdp.remote_timeout_ms = 0;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

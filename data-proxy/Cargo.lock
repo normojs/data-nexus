@@ -1959,6 +1959,7 @@ dependencies = [
  "chrono",
  "fs2",
  "opendal",
+ "reqwest 0.11.27",
  "rusqlite",
  "serde",
  "serde_json",
