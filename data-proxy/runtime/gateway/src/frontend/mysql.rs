@@ -173,12 +173,12 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
             }
             GatewayResponse::Wire { packets } => Ok(packets),
             // A10: COM_STMT_PREPARE OK + optional parameter column definitions + EOF.
-            // Result column defs still omitted (num_columns=0) on prepare; execute returns
-            // text or binary resultset depending on session.prefer_binary_result.
+            // Result column defs from backend catalog when `columns` non-empty (A10).
             GatewayResponse::Prepared {
                 statement_id,
                 parameter_count,
-            } => encode_mysql_prepare_response(&statement_id, parameter_count),
+                columns,
+            } => encode_mysql_prepare_response(&statement_id, parameter_count, &columns),
             // A10: catalog describe is a PG extended-protocol concern; MySQL FE ignores.
             GatewayResponse::RowDescription { .. } => Ok(vec![]),
         }
@@ -500,7 +500,11 @@ fn read_lenc_string(data: &[u8]) -> Option<(String, usize)> {
 /// COM_STMT_PREPARE OK body (without packet header):
 /// status(1)=0, statement_id(4 LE), num_columns(2 LE), num_params(2 LE),
 /// filler(1)=0, warning_count(2 LE)=0.
-fn encode_mysql_prepare_ok(statement_id: &str, parameter_count: u16) -> GatewayResult<Vec<u8>> {
+fn encode_mysql_prepare_ok(
+    statement_id: &str,
+    parameter_count: u16,
+    result_column_count: u16,
+) -> GatewayResult<Vec<u8>> {
     let stmt_id: u32 = statement_id.parse().map_err(|_| {
         GatewayError::Protocol(format!(
             "mysql prepared statement_id '{statement_id}' is not a u32"
@@ -509,7 +513,7 @@ fn encode_mysql_prepare_ok(statement_id: &str, parameter_count: u16) -> GatewayR
     let mut payload = Vec::with_capacity(12);
     payload.push(0); // OK
     payload.extend_from_slice(&stmt_id.to_le_bytes());
-    payload.extend_from_slice(&0u16.to_le_bytes()); // num_columns
+    payload.extend_from_slice(&result_column_count.to_le_bytes()); // num_columns
     payload.extend_from_slice(&parameter_count.to_le_bytes());
     payload.push(0); // filler
     payload.extend_from_slice(&0u16.to_le_bytes()); // warnings
@@ -517,12 +521,18 @@ fn encode_mysql_prepare_ok(statement_id: &str, parameter_count: u16) -> GatewayR
 }
 
 /// Full COM_STMT_PREPARE response payloads (no 4-byte headers):
-/// OK [ + param ColumnDefinition × n + EOF ] when parameter_count > 0.
+/// OK [ + param ColumnDefinition × n + EOF ] [ + result ColumnDefinition × m + EOF ].
 fn encode_mysql_prepare_response(
     statement_id: &str,
     parameter_count: u16,
+    result_columns: &[GatewayColumn],
 ) -> GatewayResult<Vec<Vec<u8>>> {
-    let mut packets = vec![encode_mysql_prepare_ok(statement_id, parameter_count)?];
+    let n_result = result_columns.len() as u16;
+    let mut packets = vec![encode_mysql_prepare_ok(
+        statement_id,
+        parameter_count,
+        n_result,
+    )?];
     if parameter_count > 0 {
         for i in 0..parameter_count {
             let mut packet = Vec::new();
@@ -538,6 +548,14 @@ fn encode_mysql_prepare_response(
                 decimals: 0,
             }
             .encode(&mut packet);
+            packets.push(packet);
+        }
+        packets.push(make_eof_packet()[4..].to_vec());
+    }
+    if n_result > 0 {
+        for column in result_columns {
+            let mut packet = Vec::new();
+            gateway_column_to_mysql_column(column).encode(&mut packet);
             packets.push(packet);
         }
         packets.push(make_eof_packet()[4..].to_vec());
@@ -1279,6 +1297,7 @@ mod tests {
                 GatewayResponse::Prepared {
                     statement_id: "42".into(),
                     parameter_count: 0,
+                    columns: Vec::new(),
                 },
                 &session,
             )
@@ -1291,6 +1310,38 @@ mod tests {
         assert_eq!(u16::from_le_bytes([p[7], p[8]]), 0); // params
         assert_eq!(p[9], 0); // filler
         assert_eq!(u16::from_le_bytes([p[10], p[11]]), 0); // warnings
+    }
+
+    #[test]
+    fn a10_encodes_prepare_with_result_columns() {
+        let mut adapter = adapter();
+        let session = SessionState::default();
+        let packets = adapter
+            .encode(
+                GatewayResponse::Prepared {
+                    statement_id: "7".into(),
+                    parameter_count: 1,
+                    columns: vec![
+                        GatewayColumn {
+                            name: "id".into(),
+                            data_type: "MYSQL_TYPE_LONG".into(),
+                        },
+                        GatewayColumn {
+                            name: "name".into(),
+                            data_type: "MYSQL_TYPE_VAR_STRING".into(),
+                        },
+                    ],
+                },
+                &session,
+            )
+            .unwrap();
+        // OK + 1 param col + EOF + 2 result cols + EOF
+        assert_eq!(packets.len(), 1 + 1 + 1 + 2 + 1);
+        let ok = &packets[0];
+        assert_eq!(ok[0], 0);
+        assert_eq!(u32::from_le_bytes([ok[1], ok[2], ok[3], ok[4]]), 7);
+        assert_eq!(u16::from_le_bytes([ok[5], ok[6]]), 2); // num_columns
+        assert_eq!(u16::from_le_bytes([ok[7], ok[8]]), 1); // num_params
     }
 
     #[test]

@@ -68,9 +68,9 @@ cd data-proxy
   - 路径：`http` portal_execute_{ndjson,csv,json}_streaming + `*_chunked_response`；`smoke-security-portal.sh`
 
 - [ ] **A10** 预处理 / 事务透传矩阵  
-  - 已有：MySQL COM_STMT + Streaming；PG Parse/Bind/Execute + Streaming；**Describe 显式 SELECT → RowDescription**；**`SELECT *` catalog prepare**；**同连接二次 Bind/Execute**（不继承 Describe(S) 抑制；Execute 消费 portal describe 标志；Sync 清 portal flags）；协议 smoke + **psycopg3 rebind**  
-  - 仍欠：MySQL COM_STMT Describe 未接 catalog；非 TCP passthrough；复杂 JOIN `*` 依赖 backend prepare  
-  - 路径：frontend/backend mysql+pg、`model::{DescribeSql,RowDescription}`、`smoke-security-stream.sh`
+  - 已有：MySQL COM_STMT + Streaming；**COM_STMT_PREPARE 带 backend result 列定义**（num_columns + ColumnDefinition）；PG Parse/Bind/Execute + Streaming；Describe 显式 SELECT + `SELECT *` catalog；同连接二次 Bind；协议 smoke + **psycopg3 rebind** + **mysql prepared description**  
+  - 仍欠：非 TCP passthrough；**同连接 portal 在 max_rows 截断后二次 Execute 仍可能空**（缺 PortalSuspended）；复杂 JOIN `*` 依赖 backend prepare  
+  - 路径：frontend/backend mysql+pg、`model::Prepared.columns`、`smoke-security-stream.sh`
 
 ---
 
@@ -119,7 +119,7 @@ cd data-proxy
 | Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`；**Complete → `chunked` 窗口 HTTP**（非 backend_window）；backend 无 RowStream 时 ResultSet 仍可能先物化 |
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；控制语句/Complete 小结果仍可物化；**非进程 RSS CI** |
 | PG/MySQL backend TLS | A08：默认 accept_invalid=true；prod 模板 require+CA+verify；非 extended |
-| 预处理语句 | A10：协议 smoke + **psycopg3 rebind**；**Describe 显式 SELECT + `SELECT *` catalog**；MySQL COM_STMT Describe 未接；非 TCP passthrough |
+| 预处理语句 | A10：协议 smoke + mysql prepared description + psycopg（分连接 rebind）；**同连接 max_rows 后二次 Execute 仍可能空**（PortalSuspended 未发）；非 TCP passthrough |
 | 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
 | L2 样本 | B08：默认关；有界 rows/bytes；OpenDAL 需 feature |
 | Remote PDP | F31 已交付：表/动作 gate；超时 fail_closed；**非**热路径逐行 mask |
@@ -134,9 +134,9 @@ cd data-proxy
 
 建议优先级：
 
-1. **A10** MySQL COM_STMT Describe catalog  
+1. **A10** PortalSuspended / 同连接 max_rows 后二次 Execute  
 2. **A09** 跨协议 portal / 进程峰值 CI  
-3. **A06** 进程 RSS 峰值 CI（若需要）/ Complete 控制语句边界  
+3. **A08** extended 透传 / TLS 默认硬化  
 4. **H05** 多副本语义 / 进程内 vault 明文边界  
 5. 体验小刀；**F30/P0x 延后项未点名勿做**
 

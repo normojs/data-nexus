@@ -178,7 +178,14 @@ pub enum GatewayResponse {
     /// MySQL: packet payloads **without** the 4-byte frame header (as
     /// `PacketSend::Encode` expects). PostgreSQL: full backend messages.
     Wire { packets: Vec<Vec<u8>> },
-    Prepared { statement_id: String, parameter_count: u16 },
+    /// A10: gateway-owned prepared id. Optional `columns` from backend catalog
+    /// prepare (MySQL COM_STMT_PREPARE result column defs; PG may leave empty).
+    Prepared {
+        statement_id: String,
+        parameter_count: u16,
+        #[serde(default)]
+        columns: Vec<Column>,
+    },
     /// A10: column metadata only (extended-protocol Describe / catalog prepare).
     /// Frontend encodes as RowDescription (or NoData if empty); no CommandComplete.
     RowDescription { columns: Vec<Column> },

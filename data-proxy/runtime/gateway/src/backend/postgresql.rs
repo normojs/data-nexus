@@ -1019,6 +1019,7 @@ impl BackendConnector for PostgreSqlBackendConnector {
                 Ok(GatewayResponse::Prepared {
                     statement_id,
                     parameter_count,
+                    columns: Vec::new(),
                 })
             }
             GatewayCommand::Execute {
@@ -2244,6 +2245,7 @@ mod tests {
             GatewayResponse::Prepared {
                 statement_id,
                 parameter_count,
+                columns: _,
             } => {
                 assert_eq!(parameter_count, 0);
                 statement_id

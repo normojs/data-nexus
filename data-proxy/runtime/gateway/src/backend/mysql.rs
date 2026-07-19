@@ -47,6 +47,8 @@ struct BackendPrepared {
     /// MySQL statement id (little-endian 4 bytes as used on the wire).
     stmt_id: u32,
     param_count: u16,
+    /// Result column metadata from COM_STMT_PREPARE (may be empty for non-SELECT).
+    columns: Vec<GatewayColumn>,
 }
 
 const MAX_MYSQL_STMT_CACHE_PER_CONN: usize = 64;
@@ -569,6 +571,30 @@ impl MySqlBackendConnector {
 
     fn store_lease(&self, conn: PoolConn<MySqlBackendConnection>) {
         *self.txn_lease.lock() = Some(conn);
+    }
+
+    /// A10: COM_STMT_PREPARE on a backend connection to learn result column defs
+    /// without executing the statement. Uses the connection-local prepare cache.
+    async fn describe_sql_columns(
+        &self,
+        endpoint: EndpointConfig,
+        sql: &str,
+        session: &SessionState,
+    ) -> GatewayResult<Vec<GatewayColumn>> {
+        let in_txn = session.transaction_state == TransactionState::Active
+            || self.txn_lease.lock().is_some();
+        let mut conn = if in_txn {
+            self.take_or_acquire_lease(&endpoint, session).await?
+        } else {
+            self.acquire_conn(&endpoint, session).await?
+        };
+        let result = conn.prepare_result_columns(sql).await;
+        if in_txn {
+            self.store_lease(conn);
+        } else {
+            drop(conn);
+        }
+        result
     }
 
     async fn execute_simple_query(
@@ -1223,11 +1249,32 @@ impl BackendConnector for MySqlBackendConnector {
                     .await
             }
             // A10: gateway-owned prepared registry; Execute binds via backend prepare.
+            // When an endpoint is available, also COM_STMT_PREPARE on a backend
+            // connection to learn result column definitions (num_columns + defs).
             GatewayCommand::Prepare { sql } => {
-                let (statement_id, parameter_count) = self.prepared.prepare(sql);
+                let (statement_id, parameter_count) = self.prepared.prepare(sql.clone());
+                let columns = match self.select_endpoint(session) {
+                    Ok(endpoint) => match self
+                        .describe_sql_columns(endpoint, &sql, session)
+                        .await
+                    {
+                        Ok(cols) => cols,
+                        Err(e) => {
+                            // Fail soft for unit tests / empty connectors: keep empty columns.
+                            tracing::debug!(
+                                target: "data_nexus::a10",
+                                error = %e,
+                                "mysql COM_STMT_PREPARE catalog describe skipped"
+                            );
+                            Vec::new()
+                        }
+                    },
+                    Err(_) => Vec::new(),
+                };
                 Ok(GatewayResponse::Prepared {
                     statement_id,
                     parameter_count,
+                    columns,
                 })
             }
             GatewayCommand::Execute {
@@ -1258,11 +1305,12 @@ impl BackendConnector for MySqlBackendConnector {
                     last_insert_id: None,
                 })
             }
-            // A10: MySQL COM_STMT catalog describe is not wired for frontend Describe yet
-            // (PG extended protocol is the consumer). Return empty → NoData honestly.
-            GatewayCommand::DescribeSql { .. } => Ok(GatewayResponse::RowDescription {
-                columns: Vec::new(),
-            }),
+            // A10: catalog describe via COM_STMT_PREPARE result column defs (no execute).
+            GatewayCommand::DescribeSql { sql } => {
+                let endpoint = self.select_endpoint(session)?;
+                let columns = self.describe_sql_columns(endpoint, &sql, session).await?;
+                Ok(GatewayResponse::RowDescription { columns })
+            }
             GatewayCommand::ClientWire { packets } => Ok(GatewayResponse::Wire { packets }),
         }
     }
@@ -1440,9 +1488,22 @@ impl MySqlBackendConnection {
             .send_prepare(sql.as_bytes())
             .await
             .map_err(|error| GatewayError::Backend(format!("mysql COM_STMT_PREPARE: {error}")))?;
+        let columns: Vec<GatewayColumn> = stmt
+            .cols_data
+            .iter()
+            .filter_map(|pkt| {
+                // Column definition packets include the 4-byte MySQL packet header.
+                if pkt.len() <= 4 {
+                    return None;
+                }
+                let info = decode_column(&pkt[4..]);
+                Some(mysql_column_to_gateway_column(&info))
+            })
+            .collect();
         let prepared = BackendPrepared {
             stmt_id: stmt.stmt_id,
             param_count: stmt.params_count,
+            columns,
         };
         let mut cache = self.stmt_cache.lock();
         if cache.len() >= MAX_MYSQL_STMT_CACHE_PER_CONN {
@@ -1450,6 +1511,12 @@ impl MySqlBackendConnection {
         }
         cache.insert(sql.to_owned(), prepared.clone());
         Ok(prepared)
+    }
+
+    /// A10: result columns from COM_STMT_PREPARE catalog (no execute).
+    async fn prepare_result_columns(&mut self, sql: &str) -> GatewayResult<Vec<GatewayColumn>> {
+        let prepared = self.get_or_prepare(sql).await?;
+        Ok(prepared.columns)
     }
 
     async fn simple_query(
@@ -2611,6 +2678,7 @@ mod tests {
             GatewayResponse::Prepared {
                 statement_id,
                 parameter_count,
+                columns: _,
             } => {
                 assert_eq!(parameter_count, 0);
                 statement_id

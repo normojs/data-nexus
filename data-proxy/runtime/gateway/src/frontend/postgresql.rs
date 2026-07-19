@@ -164,10 +164,11 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             FrontendMessage::Terminate => Ok(vec![GatewayCommand::Quit]),
             FrontendMessage::Sync => {
                 // Sync ends the extended-query unit; clear one-shot header suppress /
-                // unfinished catalog Describe / stale portal describe flags.
+                // unfinished catalog Describe / stale portal describe flags / binary flag.
                 self.suppress_next_row_description = false;
                 self.pending_describe = None;
                 self.portal_row_described.clear();
+                session.prefer_binary_result = false;
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_ready_for_query(transaction_status(session))],
                 }])
@@ -223,10 +224,11 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 } else {
                     self.portal_columns.remove(&portal);
                 }
-                // Fresh portal: only Describe('P') (or catalog DescribeSql for 'P') may
-                // suppress the next Execute RowDescription. Do NOT inherit statement
-                // Describe('S') — re-Bind after Sync must send T again (psycopg re-execute).
+                // Fresh portal: only Describe('P') may suppress the next Execute header.
+                // Do NOT inherit statement Describe('S'). Re-Bind after Sync must send T.
                 self.portal_row_described.remove(&portal);
+                // Clear any leftover one-shot suppress from a previous unit.
+                self.suppress_next_row_description = false;
                 self.portals.insert(portal.clone(), sql);
                 self.portal_args.insert(portal.clone(), params);
                 self.portal_params.insert(portal.clone(), nparams);
@@ -423,6 +425,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             GatewayResponse::Prepared {
                 statement_id,
                 parameter_count,
+                columns: _,
             } => Ok(vec![
                 encode_command_complete(&format!(
                     "PREPARE {statement_id} params={parameter_count}"
@@ -1609,6 +1612,7 @@ mod tests {
                 GatewayResponse::Prepared {
                     statement_id: "1".into(),
                     parameter_count: 0,
+                    columns: Vec::new(),
                 },
                 &session,
             )
