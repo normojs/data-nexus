@@ -63,9 +63,9 @@ cd data-proxy
   - 路径：`backend/postgresql`、endpoint 配置与 validate
 
 - [ ] **A09** Portal 端到端流式  
-  - 已有：NDJSON + CSV + **JSON** 在 backend Streaming 时窗口 → HTTP chunk（`x-data-nexus-stream: backend_window`）；multi-row smoke **三格式强制** backend_window；JSON 分片拼装完整 `AdminPortalQueryResponse`（UI 可 parse）  
-  - 仍欠：`Complete` 回退仍物化单 body；跨协议 portal 边界未加深；无峰值内存 CI  
-  - 路径：`http` portal_execute_{ndjson,csv,json}_streaming；`smoke-security-portal.sh`
+  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** NDJSON/CSV/JSON 均按窗口 HTTP chunk（`x-data-nexus-stream: chunked`，非 backend_window）；JSON 分片文档 UI 可 parse  
+  - 仍欠：Complete 路径 ResultSet 在 backend 侧仍可能先物化（无 RowStream 时不可避免）；跨协议 portal 边界；无进程峰值 CI  
+  - 路径：`http` portal_execute_{ndjson,csv,json}_streaming + `*_chunked_response`；`smoke-security-portal.sh`
 
 - [ ] **A10** 预处理 / 事务透传矩阵  
   - 已有：MySQL COM_STMT + Streaming；PG Parse/Bind/Execute + Streaming；**Describe 显式 SELECT → RowDescription**；**`SELECT *` 经 backend prepare（`DescribeSql`）拿 catalog 列**；portal/statement Describe 后 Execute 抑制二次 T；协议 smoke + **psycopg3**（分连接 int/text/`SELECT *`）  
@@ -116,7 +116,7 @@ cd data-proxy
 
 | 主题 | 限制 |
 |------|------|
-| Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming 真窗口 + HTTP（smoke 强制 multi-row backend_window）；**Complete 仍物化**单 body（无 backend_window） |
+| Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`；**Complete → `chunked` 窗口 HTTP**（非 backend_window）；backend 无 RowStream 时 ResultSet 仍可能先物化 |
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；**Query* 的 Materialized 已升 Streaming**；控制语句/Complete 小结果仍可物化；峰值 ≈ 窗口仅 Streaming encode |
 | PG/MySQL backend TLS | A08：默认 accept_invalid=true；prod 模板 require+CA+verify；非 extended |
 | 预处理语句 | A10：协议 smoke + **psycopg3**；**Describe 显式 SELECT + `SELECT *` catalog prepare**；同连接二次 Bind 仍可能 flake；非 TCP passthrough |
@@ -134,9 +134,9 @@ cd data-proxy
 
 建议优先级：
 
-1. **A09** Complete 回退减物化 / 峰值 CI  
-2. **A10** 同连接二次 Bind / MySQL COM_STMT Describe  
-3. **A06** 进程级峰值内存 CI / Complete 小结果边界  
+1. **A10** 同连接二次 Bind / MySQL COM_STMT Describe  
+2. **A06** 进程级峰值内存 CI / Complete 小结果边界  
+3. **A09** 跨协议 portal / 进程峰值 CI  
 4. **H05** 多副本语义 / 进程内 vault 明文边界  
 5. 体验小刀；**F30/P0x 延后项未点名勿做**
 

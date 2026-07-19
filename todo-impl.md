@@ -149,6 +149,7 @@ examples/        smoke + gateway config 样例
 | A10 | PG Describe 显式 SELECT → RowDescription + psycopg smoke | feat(a10) |
 | A06 | Materialized Query* 升 Streaming + peak-window 单测 | feat(a06) |
 | A10 | SELECT * catalog DescribeSql + RowDescription | feat(a10) |
+| A09 | Complete 回退 CSV/JSON/NDJSON 窗口 chunked | feat(a09) |
 
 ---
 
