@@ -153,6 +153,7 @@ examples/        smoke + gateway config 样例
 | A10 | same-conn re-Bind/Execute RowDescription fix | feat(a10) |
 | A06 | peak_window_rows metric + smoke ≤ window_rows | feat(a06) |
 | A10 | MySQL COM_STMT_PREPARE result column defs | feat(a10) |
+| A10 | extended Execute omits ReadyForQuery (same-conn rebind) | fix(a10) |
 
 ---
 

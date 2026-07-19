@@ -32,7 +32,7 @@ backend 行窗口 → 义务(mask/水印/max_rows) → encode 窗口 → socket 
 - MySQL backend TLS（A08）：`ssl_mode` prefer/require + `ssl_ca_file`/`ssl_accept_invalid_certs`；**prefer：服务端无 CLIENT_SSL 时回落明文**；require 仍失败；**prod 模板 require+CA+verify**（validate 拒绝 require+verify 无 CA）。
 - PG Passthrough（A08）：idle pool（cap + TTL + SELECT 1 探测）+ 事务 `tcp_txn` 原帧中继；`endpoints[].ssl_mode` disable/prefer/require；**`ssl_ca_file` + `ssl_accept_invalid_certs`**（默认 true 兼容 MVP；**prod 模板 false + CA PEM**；validate 拒绝 require+verify 无 CA）。Streaming 仍用 pool。非 extended。MySQL prefer 与 PG prefer 同语义（可明文回落）。
 - A07：`handle_frame_to_writer` + socket `ResponseWriter` 已接。
-- A10 prepared：MySQL COM_STMT_EXECUTE → backend **COM_STMT_PREPARE/EXECUTE 绑定**（连接级 stmt 缓存）+ binary 行解码 + **PREPARE 回传 result 列定义（num_columns + ColumnDefinition）**；PG Bind → QueryParams + Statement 缓存 + Streaming；**Describe 显式 SELECT / `SELECT *` catalog**；同连接二次 Bind 不永久抑制 T；**smoke**：双协议 prepared max_rows + **psycopg3 rebind** + **mysql prepared description**；非 TCP passthrough。
+- A10 prepared：MySQL COM_STMT_EXECUTE → backend **COM_STMT_PREPARE/EXECUTE 绑定**（连接级 stmt 缓存）+ binary 行解码 + **PREPARE 回传 result 列定义（num_columns + ColumnDefinition）**；PG Bind → QueryParams + Statement 缓存 + Streaming；**Describe 显式 SELECT / `SELECT *` catalog**；**扩展协议 Execute 不发 ReadyForQuery**（仅 Sync 发 Z）→ 同连接 rebind；**smoke**：双协议 prepared max_rows + **psycopg 同连接 rebind** + mysql description；**PortalSuspended 仍未做**；非 TCP passthrough。
 
 ## 实现检查清单
 

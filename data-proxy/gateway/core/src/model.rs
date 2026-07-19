@@ -119,6 +119,10 @@ pub struct SessionState {
     /// Frontend clears this after encoding one resultset (or non-result response).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prefer_binary_result: bool,
+    /// A10: PostgreSQL extended-query unit is open (after Parse/Bind/Execute,
+    /// before Sync). Result footers must not emit ReadyForQuery — only Sync does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pg_extended_query: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -159,6 +159,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
         match decode_frontend_message(frame).map_err(postgresql_protocol_error)? {
             FrontendMessage::Query(sql) => {
                 self.suppress_next_row_description = false;
+                session.pg_extended_query = false;
                 Ok(vec![decode_query_command(sql, session)])
             }
             FrontendMessage::Terminate => Ok(vec![GatewayCommand::Quit]),
@@ -169,6 +170,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 self.pending_describe = None;
                 self.portal_row_described.clear();
                 session.prefer_binary_result = false;
+                session.pg_extended_query = false;
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_ready_for_query(transaction_status(session))],
                 }])
@@ -179,6 +181,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 query,
                 param_types: _,
             } => {
+                session.pg_extended_query = true;
                 let nparams = count_pg_placeholders_frontend(&query);
                 self.prepared_params.insert(statement.clone(), nparams);
                 // Infer explicit SELECT-list columns for Describe RowDescription.
@@ -199,6 +202,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 parameters,
                 result_formats,
             } => {
+                session.pg_extended_query = true;
                 let sql = self.prepared.get(&statement).cloned().ok_or_else(|| {
                     GatewayError::Protocol(format!(
                         "postgresql Bind: unknown statement '{statement}'"
@@ -341,6 +345,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 }
             }
             FrontendMessage::Execute { portal, max_rows: _ } => {
+                session.pg_extended_query = true;
                 let sql = self.portals.get(&portal).cloned().ok_or_else(|| {
                     GatewayError::Protocol(format!(
                         "postgresql Execute: unknown portal '{portal}'"
@@ -395,43 +400,66 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
         response: GatewayResponse,
         session: &SessionState,
     ) -> GatewayResult<Vec<Vec<u8>>> {
-        let ready = encode_ready_for_query(transaction_status(session));
+        // Simple-query / non-extended responses append ReadyForQuery.
+        // Extended-query Execute must not — Sync alone emits Z.
+        let ready = if session.pg_extended_query {
+            None
+        } else {
+            Some(encode_ready_for_query(transaction_status(session)))
+        };
         match response {
             GatewayResponse::Ok { affected_rows, .. } => {
-                Ok(vec![encode_command_complete(&format!("OK {}", affected_rows)), ready])
+                let mut out = vec![encode_command_complete(&format!("OK {}", affected_rows))];
+                if let Some(r) = ready {
+                    out.push(r);
+                }
+                Ok(out)
             }
-            GatewayResponse::Pong => Ok(vec![encode_command_complete("SELECT 1"), ready]),
+            GatewayResponse::Pong => {
+                let mut out = vec![encode_command_complete("SELECT 1")];
+                if let Some(r) = ready {
+                    out.push(r);
+                }
+                Ok(out)
+            }
             GatewayResponse::Bye => Ok(vec![]),
-            GatewayResponse::Error { code, message } => Ok(vec![
-                encode_error_response("ERROR", postgresql_sqlstate(&code), &message),
-                ready,
-            ]),
+            GatewayResponse::Error { code, message } => {
+                let mut out = vec![encode_error_response(
+                    "ERROR",
+                    postgresql_sqlstate(&code),
+                    &message,
+                )];
+                if let Some(r) = ready {
+                    out.push(r);
+                }
+                Ok(out)
+            }
             GatewayResponse::ResultSet { columns, rows } => {
                 let skip_header = self.suppress_next_row_description;
                 if skip_header {
                     self.suppress_next_row_description = false;
                 }
+                let ready_pkt = ready.unwrap_or_default();
                 if session.prefer_binary_result {
-                    encode_resultset_binary_opts(columns, rows, ready, skip_header)
+                    encode_resultset_binary_opts(columns, rows, ready_pkt, skip_header)
                 } else {
-                    encode_resultset_opts(columns, rows, ready, skip_header)
+                    encode_resultset_opts(columns, rows, ready_pkt, skip_header)
                 }
             }
             GatewayResponse::Wire { packets } => Ok(packets),
-            // A10: gateway-owned prepared registry is not the PG extended protocol.
-            // Clients using Parse/Bind still need extended-query decode (not in this
-            // slice). When a Prepared response is produced (e.g. via IR), answer with
-            // CommandComplete + Ready so the session does not hang on Unsupported.
             GatewayResponse::Prepared {
                 statement_id,
                 parameter_count,
                 columns: _,
-            } => Ok(vec![
-                encode_command_complete(&format!(
+            } => {
+                let mut out = vec![encode_command_complete(&format!(
                     "PREPARE {statement_id} params={parameter_count}"
-                )),
-                ready,
-            ]),
+                ))];
+                if let Some(r) = ready {
+                    out.push(r);
+                }
+                Ok(out)
+            }
             // A10: catalog DescribeSql result — encode ParameterDescription (if any) +
             // RowDescription / NoData. No ReadyForQuery (extended protocol unit ends at Sync).
             GatewayResponse::RowDescription { columns } => {
@@ -513,11 +541,16 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
         total_rows: usize,
         session: &SessionState,
     ) -> GatewayResult<Vec<Vec<u8>>> {
-        let ready = encode_ready_for_query(transaction_status(session));
-        Ok(vec![
-            encode_command_complete(&format!("SELECT {total_rows}")),
-            ready,
-        ])
+        // Extended-query Execute must NOT send ReadyForQuery — the client expects
+        // more messages until Sync (which alone emits Z). Emitting Z early makes
+        // clients drop subsequent Bind/Execute responses (same-conn re-execute).
+        let complete = encode_command_complete(&format!("SELECT {total_rows}"));
+        if session.pg_extended_query {
+            Ok(vec![complete])
+        } else {
+            let ready = encode_ready_for_query(transaction_status(session));
+            Ok(vec![complete, ready])
+        }
     }
 }
 
@@ -1117,7 +1150,9 @@ fn encode_resultset_opts(
     };
     messages.extend(encode_pg_resultset_rows(&columns, &rows)?);
     messages.push(encode_command_complete(&format!("SELECT {}", rows.len())));
-    messages.push(ready);
+    if !ready.is_empty() {
+        messages.push(ready);
+    }
     Ok(messages)
 }
 
@@ -1142,7 +1177,9 @@ fn encode_resultset_binary_opts(
     };
     messages.extend(encode_pg_resultset_rows_binary(&columns, &rows)?);
     messages.push(encode_command_complete(&format!("SELECT {}", rows.len())));
-    messages.push(ready);
+    if !ready.is_empty() {
+        messages.push(ready);
+    }
     Ok(messages)
 }
 
@@ -1737,6 +1774,33 @@ mod tests {
             Some(2)
         );
         assert!(protocol.pending_describe.is_none());
+    }
+
+    #[test]
+    fn a10_extended_execute_footer_omits_ready_for_query() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState {
+            pg_extended_query: true,
+            ..SessionState::default()
+        };
+        let footer = protocol
+            .encode_resultset_footer(&[], 1, &session)
+            .unwrap();
+        assert_eq!(footer.len(), 1);
+        assert_eq!(footer[0][0], b'C'); // CommandComplete only
+        assert!(!footer.iter().any(|p| p.first() == Some(&b'Z')));
+    }
+
+    #[test]
+    fn a10_simple_query_footer_includes_ready_for_query() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState::default();
+        let footer = protocol
+            .encode_resultset_footer(&[], 2, &session)
+            .unwrap();
+        assert_eq!(footer.len(), 2);
+        assert_eq!(footer[0][0], b'C');
+        assert_eq!(footer[1][0], b'Z');
     }
 
     #[test]
