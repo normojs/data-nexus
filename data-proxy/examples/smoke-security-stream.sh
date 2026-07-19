@@ -64,6 +64,8 @@ PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
   if [[ ! -x "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/backend/mysql.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/backend/postgresql.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/runtime/gateway/src/frontend/postgresql.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/runtime/gateway/src/frontend/mysql.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/gateway/core/src/model.rs" -nt "$PROXY_BIN" ]]; then
     cargo build -p data-proxy --bin proxy
   fi
@@ -178,9 +180,8 @@ echo "$mysql_prep_out"
 echo "$mysql_prep_out" | grep -q 'mysql_prepared_ok'
 
 echo "==> A10 PostgreSQL Bind/Execute (QueryParams) max_rows=1"
-# Speak extended protocol without Describe: our Describe still returns NoData
-# (no backend column describe yet), which makes psycopg reject later DataRows.
-# Raw Parse/Bind/Execute/Sync hits frontend QueryParams → Streaming + max_rows.
+# Extended protocol with Describe: explicit SELECT list → RowDescription (not NoData).
+# After Describe('P'), Execute must not re-send RowDescription.
 pg_prep_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
   python - <<'PY'
 import socket, struct
@@ -231,24 +232,36 @@ while True:
 sql = "SELECT id, name FROM stream_smoke WHERE id > $1 ORDER BY id"
 # Parse unnamed statement
 sock.sendall(msg(b"P", cstr("") + cstr(sql) + i16(0)))
+# Describe statement (expect ParameterDescription + RowDescription)
+sock.sendall(msg(b"D", b"S" + cstr("")))
 # Bind: portal "", stmt "", 0 param formats, 1 text param "0", 0 result formats
 bind = cstr("") + cstr("") + i16(0) + i16(1) + i32(1) + b"0" + i16(0)
 sock.sendall(msg(b"B", bind))
+# Describe portal (expect RowDescription only)
+sock.sendall(msg(b"D", b"P" + cstr("")))
 # Execute portal "", max_rows=0 (all)
 sock.sendall(msg(b"E", cstr("") + i32(0)))
 # Sync
 sock.sendall(msg(b"S", b""))
 
 rows = 0
-saw_t = False
+rowdesc_count = 0
+paramdesc = 0
+nodata = 0
 while True:
     tag, body = read_msg(sock)
     if tag == b"1":  # ParseComplete
         continue
     if tag == b"2":  # BindComplete
         continue
+    if tag == b"t":  # ParameterDescription
+        paramdesc += 1
+        continue
+    if tag == b"n":  # NoData
+        nodata += 1
+        continue
     if tag == b"T":
-        saw_t = True
+        rowdesc_count += 1
         continue
     if tag == b"D":
         rows += 1
@@ -258,11 +271,18 @@ while True:
     if tag == b"Z":
         break
     if tag == b"E":
-        # error fields are null-separated
         raise RuntimeError(body.decode("utf-8", "replace"))
 
-print("pg_prepared_rows", rows, "rowdesc", saw_t)
-assert saw_t, "expected RowDescription from Execute Streaming path"
+print(
+    "pg_prepared_rows", rows,
+    "rowdesc", rowdesc_count,
+    "paramdesc", paramdesc,
+    "nodata", nodata,
+)
+assert paramdesc >= 1, "expected ParameterDescription from Describe(S)"
+assert nodata == 0, "explicit SELECT list must not return NoData"
+# Describe(S) + Describe(P) each send RowDescription; Execute suppresses third T.
+assert rowdesc_count == 2, f"expected 2 RowDescription (S+P), got {rowdesc_count}"
 assert rows == 1, f"expected max_rows=1, got {rows}"
 print("pg_prepared_ok")
 sock.close()
@@ -270,6 +290,40 @@ PY
 )"
 echo "$pg_prep_out"
 echo "$pg_prep_out" | grep -q 'pg_prepared_ok'
+
+echo "==> A10 PostgreSQL psycopg3 prepared max_rows=1 (Describe + RowDescription)"
+# Full client path: requires Describe → RowDescription (not NoData).
+# Integer binds may arrive as binary INT2 even under text format codes.
+pg_psycopg_out="$(docker run --rm --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
+  bash -lc 'pip install -q --disable-pip-version-check "psycopg[binary]>=3.1" >/tmp/pip.log 2>&1 || { cat /tmp/pip.log; exit 1; }
+python - <<"PY"
+import psycopg
+with psycopg.connect(
+    "host=host.docker.internal port=9089 user=postgres password=postgres dbname=analytics",
+    autocommit=True,
+) as conn:
+    with conn.cursor() as cur:
+        # int param (may be binary INT2 on the wire)
+        cur.execute(
+            "SELECT id, name FROM stream_smoke WHERE id > %s ORDER BY id",
+            (0,),
+        )
+        rows = cur.fetchall()
+        print("psycopg_rows", len(rows), rows)
+        assert len(rows) == 1, rows
+        assert int(rows[0][0]) == 1, rows
+        # text param path still works
+        cur.execute(
+            "SELECT id, name FROM stream_smoke WHERE id > %s ORDER BY id",
+            ("0",),
+        )
+        rows2 = cur.fetchall()
+        assert len(rows2) == 1, rows2
+print("psycopg_prepared_ok")
+PY
+')"
+echo "$pg_psycopg_out"
+echo "$pg_psycopg_out" | grep -q 'psycopg_prepared_ok'
 
 echo "==> metrics execute_path present after traffic"
 metrics="$(curl -fsS http://127.0.0.1:8082/metrics || true)"

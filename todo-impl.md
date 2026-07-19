@@ -146,6 +146,7 @@ examples/        smoke + gateway config 样例
 | A10 | PG Execute Streaming（`564b231`） | feat(a10) |
 | A10 | 协议 smoke prepared Streaming max_rows（`a3140b9`） | feat(a10) |
 | A09 | portal JSON backend_window 分片文档 + multi-row smoke | feat(a09) |
+| A10 | PG Describe 显式 SELECT → RowDescription + psycopg smoke | feat(a10) |
 
 ---
 

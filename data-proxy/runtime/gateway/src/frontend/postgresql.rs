@@ -33,6 +33,15 @@ pub struct PostgreSqlFrontendProtocol {
     portal_params: HashMap<String, u16>,
     /// A10: portal → result format codes from Bind (0=text, 1=binary).
     portal_result_formats: HashMap<String, Vec<i16>>,
+    /// A10: statement → inferred result columns (explicit SELECT list only).
+    prepared_columns: HashMap<String, Vec<GatewayColumn>>,
+    /// A10: portal → inferred result columns (copied from statement on Bind).
+    portal_columns: HashMap<String, Vec<GatewayColumn>>,
+    /// A10: portals that already received RowDescription via Describe('P').
+    /// Execute must not re-send RowDescription for these (psycopg extended protocol).
+    portal_row_described: HashMap<String, bool>,
+    /// Suppress the next resultset header encode (set on Execute when portal was Described).
+    suppress_next_row_description: bool,
 }
 
 impl PostgreSqlFrontendProtocol {
@@ -47,6 +56,10 @@ impl PostgreSqlFrontendProtocol {
             portal_args: HashMap::new(),
             portal_params: HashMap::new(),
             portal_result_formats: HashMap::new(),
+            prepared_columns: HashMap::new(),
+            portal_columns: HashMap::new(),
+            portal_row_described: HashMap::new(),
+            suppress_next_row_description: false,
         }
     }
 
@@ -61,6 +74,10 @@ impl PostgreSqlFrontendProtocol {
             portal_args: HashMap::new(),
             portal_params: HashMap::new(),
             portal_result_formats: HashMap::new(),
+            prepared_columns: HashMap::new(),
+            portal_columns: HashMap::new(),
+            portal_row_described: HashMap::new(),
+            suppress_next_row_description: false,
         }
     }
 
@@ -119,11 +136,18 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
         session: &mut SessionState,
     ) -> GatewayResult<Vec<GatewayCommand>> {
         match decode_frontend_message(frame).map_err(postgresql_protocol_error)? {
-            FrontendMessage::Query(sql) => Ok(vec![decode_query_command(sql, session)]),
+            FrontendMessage::Query(sql) => {
+                self.suppress_next_row_description = false;
+                Ok(vec![decode_query_command(sql, session)])
+            }
             FrontendMessage::Terminate => Ok(vec![GatewayCommand::Quit]),
-            FrontendMessage::Sync => Ok(vec![GatewayCommand::ClientWire {
-                packets: vec![encode_ready_for_query(transaction_status(session))],
-            }]),
+            FrontendMessage::Sync => {
+                // Sync ends the extended-query unit; clear one-shot header suppress.
+                self.suppress_next_row_description = false;
+                Ok(vec![GatewayCommand::ClientWire {
+                    packets: vec![encode_ready_for_query(transaction_status(session))],
+                }])
+            }
             FrontendMessage::Flush => Ok(vec![]),
             FrontendMessage::Parse {
                 statement,
@@ -132,6 +156,13 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             } => {
                 let nparams = count_pg_placeholders_frontend(&query);
                 self.prepared_params.insert(statement.clone(), nparams);
+                // Infer explicit SELECT-list columns for Describe RowDescription.
+                // Wildcards / unparseable SQL leave no cache → Describe falls back to NoData.
+                if let Some(cols) = infer_select_result_columns(&query) {
+                    self.prepared_columns.insert(statement.clone(), cols);
+                } else {
+                    self.prepared_columns.remove(&statement);
+                }
                 self.prepared.insert(statement, query);
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_parse_complete()],
@@ -163,6 +194,12 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 // Validate arity against $n placeholders (still fail-closed).
                 let _ = bind_pg_text_params(&sql, &params)?;
                 // Keep SQL with $n; backend binds via prepared protocol (A10).
+                if let Some(cols) = self.prepared_columns.get(&statement).cloned() {
+                    self.portal_columns.insert(portal.clone(), cols);
+                } else {
+                    self.portal_columns.remove(&portal);
+                }
+                self.portal_row_described.remove(&portal);
                 self.portals.insert(portal.clone(), sql);
                 self.portal_args.insert(portal.clone(), params);
                 self.portal_params.insert(portal.clone(), nparams);
@@ -173,9 +210,10 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 }])
             }
             FrontendMessage::Describe { target, name } => {
-                // Describe statement ('S') or portal ('P'):
-                // ParameterDescription + NoData (row metadata still unavailable without
-                // backend describe — honest A10 boundary).
+                // Describe statement ('S'): ParameterDescription + RowDescription|NoData.
+                // Describe portal ('P'): RowDescription|NoData only (params already bound).
+                // Column metadata is inferred from explicit SELECT lists (A10); wildcards
+                // and non-SELECT still return NoData (honest boundary).
                 let nparams = if target == b'S' {
                     self.prepared_params.get(&name).copied().or_else(|| {
                         self.prepared
@@ -186,11 +224,60 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     self.portal_params.get(&name).copied()
                 };
                 let n = nparams.unwrap_or(0) as usize;
-                // unknown OIDs (0) — clients treat as unspecified / text.
-                let oids = vec![0i32; n];
-                Ok(vec![GatewayCommand::ClientWire {
-                    packets: vec![encode_parameter_description(&oids), encode_no_data()],
-                }])
+                // Advertise TEXT (OID 25) so clients like psycopg bind parameters in
+                // text format. OID 0 (unspecified) often triggers binary binds that
+                // then fail against backend typed prepare (INT4 vs client int8, etc.).
+                let oids = vec![25i32; n];
+
+                let columns = if target == b'S' {
+                    self.prepared_columns.get(&name).cloned()
+                } else {
+                    self.portal_columns.get(&name).cloned()
+                };
+                let format_code = if target == b'P' {
+                    self.portal_result_formats
+                        .get(&name)
+                        .map(|fmts| {
+                            if fmts.iter().any(|f| *f == 1) {
+                                1i16
+                            } else {
+                                0
+                            }
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+
+                let mut packets = Vec::new();
+                if target == b'S' {
+                    packets.push(encode_parameter_description(&oids));
+                }
+                match columns {
+                    Some(cols) if !cols.is_empty() => {
+                        let fields: Vec<FieldDescription> = cols
+                            .iter()
+                            .map(|c| {
+                                let mut f = gateway_column_to_postgresql_field(c);
+                                f.format_code = format_code;
+                                f
+                            })
+                            .collect();
+                        packets.push(
+                            encode_row_description(&fields).map_err(postgresql_protocol_error)?,
+                        );
+                        if target == b'P' {
+                            self.portal_row_described.insert(name, true);
+                        }
+                    }
+                    _ => {
+                        packets.push(encode_no_data());
+                        if target == b'P' {
+                            self.portal_row_described.remove(&name);
+                        }
+                    }
+                }
+                Ok(vec![GatewayCommand::ClientWire { packets }])
             }
             FrontendMessage::Execute { portal, max_rows: _ } => {
                 let sql = self.portals.get(&portal).cloned().ok_or_else(|| {
@@ -210,6 +297,13 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     .map(|fmts| fmts.iter().any(|f| *f == 1))
                     .unwrap_or(false);
                 session.prefer_binary_result = want_binary;
+                // If Describe('P') already sent RowDescription, suppress the header on
+                // the upcoming Streaming/Complete encode so clients do not see T twice.
+                self.suppress_next_row_description = self
+                    .portal_row_described
+                    .get(&portal)
+                    .copied()
+                    .unwrap_or(false);
                 if parameters.is_empty() {
                     Ok(vec![GatewayCommand::Query { sql }])
                 } else {
@@ -220,11 +314,14 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 if target == b'S' {
                     self.prepared.remove(&name);
                     self.prepared_params.remove(&name);
+                    self.prepared_columns.remove(&name);
                 } else {
                     self.portals.remove(&name);
                     self.portal_args.remove(&name);
                     self.portal_params.remove(&name);
                     self.portal_result_formats.remove(&name);
+                    self.portal_columns.remove(&name);
+                    self.portal_row_described.remove(&name);
                 }
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_close_complete()],
@@ -250,10 +347,14 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 ready,
             ]),
             GatewayResponse::ResultSet { columns, rows } => {
+                let skip_header = self.suppress_next_row_description;
+                if skip_header {
+                    self.suppress_next_row_description = false;
+                }
                 if session.prefer_binary_result {
-                    encode_resultset_binary(columns, rows, ready)
+                    encode_resultset_binary_opts(columns, rows, ready, skip_header)
                 } else {
-                    encode_resultset(columns, rows, ready)
+                    encode_resultset_opts(columns, rows, ready, skip_header)
                 }
             }
             GatewayResponse::Wire { packets } => Ok(packets),
@@ -278,6 +379,11 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
         columns: &[GatewayColumn],
         session: &SessionState,
     ) -> GatewayResult<Vec<Vec<u8>>> {
+        if self.suppress_next_row_description {
+            // Describe('P') already sent RowDescription for this portal.
+            self.suppress_next_row_description = false;
+            return Ok(vec![]);
+        }
         if session.prefer_binary_result {
             encode_pg_resultset_header_formats(columns, 1)
         } else {
@@ -432,6 +538,273 @@ fn count_pg_placeholders_frontend(sql: &str) -> u16 {
         i += 1;
     }
     max
+}
+
+/// Infer result column names from an explicit top-level SELECT list.
+/// Returns `None` for wildcards, non-SELECT, or unparseable lists (Describe → NoData).
+/// Types default to `text` (OID 25) — sufficient for psycopg text-format DataRows.
+fn infer_select_result_columns(sql: &str) -> Option<Vec<GatewayColumn>> {
+    let trimmed = sql.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    if !upper.starts_with("SELECT") {
+        return None;
+    }
+    let after_select = trimmed[6..].trim_start();
+    let after_select = if after_select.to_ascii_uppercase().starts_with("DISTINCT") {
+        after_select[8..].trim_start()
+    } else if after_select.to_ascii_uppercase().starts_with("ALL") {
+        // SELECT ALL … is rare but legal.
+        after_select[3..].trim_start()
+    } else {
+        after_select
+    };
+
+    // Prefer FROM as list terminator; bare `SELECT 1` has no FROM.
+    let select_list = if let Some(from_idx) = find_top_level_keyword_frontend(after_select, "FROM") {
+        after_select[..from_idx].trim()
+    } else if let Some(idx) = find_top_level_keyword_frontend(after_select, "WHERE")
+        .or_else(|| find_top_level_keyword_frontend(after_select, "GROUP"))
+        .or_else(|| find_top_level_keyword_frontend(after_select, "ORDER"))
+        .or_else(|| find_top_level_keyword_frontend(after_select, "LIMIT"))
+        .or_else(|| find_top_level_keyword_frontend(after_select, "OFFSET"))
+        .or_else(|| find_top_level_keyword_frontend(after_select, "UNION"))
+        .or_else(|| find_top_level_keyword_frontend(after_select, "EXCEPT"))
+        .or_else(|| find_top_level_keyword_frontend(after_select, "INTERSECT"))
+        .or_else(|| find_top_level_keyword_frontend(after_select, "FETCH"))
+        .or_else(|| find_top_level_keyword_frontend(after_select, "FOR"))
+    {
+        after_select[..idx].trim()
+    } else {
+        after_select.trim()
+    };
+
+    if select_list.is_empty() {
+        return None;
+    }
+    if select_list == "*" || select_list.ends_with(".*") {
+        return None;
+    }
+    // Any bare wildcard item → cannot describe without catalog.
+    let parts = split_select_list_frontend(select_list);
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.iter().any(|p| {
+        let t = p.trim();
+        t == "*" || t.ends_with(".*")
+    }) {
+        return None;
+    }
+
+    let mut cols = Vec::with_capacity(parts.len());
+    for (i, part) in parts.iter().enumerate() {
+        let name = select_item_output_name(part, i);
+        cols.push(GatewayColumn {
+            name,
+            // Unknown type → text; binary OIDs are refined only when backend types known.
+            data_type: "text".into(),
+        });
+    }
+    Some(cols)
+}
+
+fn select_item_output_name(item: &str, index: usize) -> String {
+    let item = item.trim();
+    // alias: expr AS name / expr name
+    if let Some(as_idx) = find_top_level_keyword_frontend(item, "AS") {
+        let alias = item[as_idx + 2..].trim();
+        let alias = unquote_ident(alias).unwrap_or(alias);
+        if !alias.is_empty() && !alias.contains(char::is_whitespace) {
+            return alias.to_string();
+        }
+    }
+    // trailing bare alias after last whitespace at depth 0 (heuristic)
+    if let Some(alias) = trailing_bare_alias(item) {
+        return alias;
+    }
+    // bare column / table.column / $n
+    let bare = item
+        .rsplit(|c: char| c == '.' || c == '(')
+        .next()
+        .unwrap_or(item)
+        .trim();
+    let bare = unquote_ident(bare).unwrap_or(bare);
+    if bare.is_empty() || bare == "*" {
+        format!("column{}", index + 1)
+    } else if bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+        bare.to_string()
+    } else {
+        format!("column{}", index + 1)
+    }
+}
+
+fn trailing_bare_alias(item: &str) -> Option<String> {
+    // If last token looks like an identifier and is not after AS, treat as alias.
+    let bytes = item.as_bytes();
+    let mut depth = 0i32;
+    let mut last_ws = None;
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b' ' | b'\t' | b'\n' | b'\r' if depth == 0 => last_ws = Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    let start = last_ws? + 1;
+    let alias = item[start..].trim();
+    if alias.is_empty() {
+        return None;
+    }
+    // Reject if the whole item has no space (no alias).
+    if last_ws.is_none() {
+        return None;
+    }
+    // Reject function calls etc. where last token is still part of expr without AS —
+    // only accept simple identifier aliases.
+    let alias_u = unquote_ident(alias).unwrap_or(alias);
+    if alias_u.eq_ignore_ascii_case("ASC")
+        || alias_u.eq_ignore_ascii_case("DESC")
+        || alias_u.eq_ignore_ascii_case("NULLS")
+    {
+        return None;
+    }
+    if alias_u
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && alias_u
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+    {
+        // Ensure prefix is not empty and not just the same token.
+        let prefix = item[..start].trim();
+        if prefix.is_empty() {
+            return None;
+        }
+        // Avoid treating `table.col` as alias of itself when only one token with dots —
+        // already handled by no last_ws. OK.
+        return Some(alias_u.to_string());
+    }
+    None
+}
+
+fn unquote_ident(s: &str) -> Option<&str> {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        return Some(&s[1..s.len() - 1]);
+    }
+    None
+}
+
+fn find_top_level_keyword_frontend(sql: &str, keyword: &str) -> Option<usize> {
+    let upper = sql.to_ascii_uppercase();
+    let key = keyword.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    let key_bytes = key.as_bytes();
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0usize;
+    while i + key_bytes.len() <= bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {
+                if depth == 0 && bytes[i..].starts_with(key_bytes) {
+                    let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                    let after = i + key_bytes.len();
+                    let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+                    if before_ok && after_ok {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn split_select_list_frontend(list: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = list.as_bytes();
+    for (i, &c) in bytes.iter().enumerate() {
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        if in_double {
+            if c == b'"' {
+                in_double = false;
+            }
+            continue;
+        }
+        match c {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                let part = list[start..i].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = list[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
 }
 
 /// Substitute `$n` placeholders with SQL literals (text-format Bind params).
@@ -620,7 +993,20 @@ fn encode_resultset(
     rows: Vec<Vec<GatewayValue>>,
     ready: Vec<u8>,
 ) -> GatewayResult<Vec<Vec<u8>>> {
-    let mut messages = encode_pg_resultset_header(&columns)?;
+    encode_resultset_opts(columns, rows, ready, false)
+}
+
+fn encode_resultset_opts(
+    columns: Vec<GatewayColumn>,
+    rows: Vec<Vec<GatewayValue>>,
+    ready: Vec<u8>,
+    skip_header: bool,
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut messages = if skip_header {
+        Vec::new()
+    } else {
+        encode_pg_resultset_header(&columns)?
+    };
     messages.extend(encode_pg_resultset_rows(&columns, &rows)?);
     messages.push(encode_command_complete(&format!("SELECT {}", rows.len())));
     messages.push(ready);
@@ -632,7 +1018,20 @@ fn encode_resultset_binary(
     rows: Vec<Vec<GatewayValue>>,
     ready: Vec<u8>,
 ) -> GatewayResult<Vec<Vec<u8>>> {
-    let mut messages = encode_pg_resultset_header_formats(&columns, 1)?;
+    encode_resultset_binary_opts(columns, rows, ready, false)
+}
+
+fn encode_resultset_binary_opts(
+    columns: Vec<GatewayColumn>,
+    rows: Vec<Vec<GatewayValue>>,
+    ready: Vec<u8>,
+    skip_header: bool,
+) -> GatewayResult<Vec<Vec<u8>>> {
+    let mut messages = if skip_header {
+        Vec::new()
+    } else {
+        encode_pg_resultset_header_formats(&columns, 1)?
+    };
     messages.extend(encode_pg_resultset_rows_binary(&columns, &rows)?);
     messages.push(encode_command_complete(&format!("SELECT {}", rows.len())));
     messages.push(ready);
@@ -1122,10 +1521,11 @@ mod tests {
         let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
         let mut session = SessionState::default();
 
-        // Build Parse frame: statement "s1", query "SELECT $1, $2", 0 type oids.
+        // Build Parse frame: statement "s1", query "SELECT $1 AS a, $2 AS b", 0 type oids.
+        // Explicit aliases → RowDescription (not NoData).
         let mut body = Vec::new();
         body.extend_from_slice(b"s1\0");
-        body.extend_from_slice(b"SELECT $1, $2\0");
+        body.extend_from_slice(b"SELECT $1 AS a, $2 AS b\0");
         body.extend_from_slice(&0i16.to_be_bytes());
         let mut parse = vec![b'P'];
         let len = (body.len() + 4) as i32;
@@ -1147,12 +1547,135 @@ mod tests {
             GatewayCommand::ClientWire { packets } => {
                 assert_eq!(packets.len(), 2);
                 assert_eq!(packets[0][0], b't'); // ParameterDescription
-                assert_eq!(packets[1][0], b'n'); // NoData
+                assert_eq!(packets[1][0], b'T'); // RowDescription (explicit SELECT list)
                 // nparams = 2 (after 1-byte tag + 4-byte length)
+                assert_eq!(i16::from_be_bytes([packets[0][5], packets[0][6]]), 2);
+                // ncol = 2 in RowDescription
+                assert_eq!(i16::from_be_bytes([packets[1][5], packets[1][6]]), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a10_describe_wildcard_still_nodata() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let mut session = SessionState::default();
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(b"SELECT * FROM t WHERE id = $1\0");
+        body.extend_from_slice(&0i16.to_be_bytes());
+        let mut parse = vec![b'P'];
+        let len = (body.len() + 4) as i32;
+        parse.extend_from_slice(&len.to_be_bytes());
+        parse.extend_from_slice(&body);
+        protocol.decode(&parse, &mut session).unwrap();
+
+        let mut dbody = vec![b'S'];
+        dbody.extend_from_slice(b"s1\0");
+        let mut describe = vec![b'D'];
+        let dlen = (dbody.len() + 4) as i32;
+        describe.extend_from_slice(&dlen.to_be_bytes());
+        describe.extend_from_slice(&dbody);
+        let cmds = protocol.decode(&describe, &mut session).unwrap();
+        match &cmds[0] {
+            GatewayCommand::ClientWire { packets } => {
+                assert_eq!(packets[0][0], b't');
+                assert_eq!(packets[1][0], b'n'); // NoData for wildcard
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a10_describe_portal_rowdescription_suppresses_execute_header() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let mut session = SessionState::default();
+
+        // Parse
+        let mut body = Vec::new();
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(b"SELECT id, name FROM stream_smoke WHERE id > $1\0");
+        body.extend_from_slice(&0i16.to_be_bytes());
+        let mut parse = vec![b'P'];
+        let len = (body.len() + 4) as i32;
+        parse.extend_from_slice(&len.to_be_bytes());
+        parse.extend_from_slice(&body);
+        protocol.decode(&parse, &mut session).unwrap();
+
+        // Bind portal p1
+        let mut bbody = Vec::new();
+        bbody.extend_from_slice(b"p1\0");
+        bbody.extend_from_slice(b"s1\0");
+        bbody.extend_from_slice(&0i16.to_be_bytes());
+        bbody.extend_from_slice(&1i16.to_be_bytes());
+        bbody.extend_from_slice(&1i32.to_be_bytes());
+        bbody.extend_from_slice(b"0");
+        bbody.extend_from_slice(&0i16.to_be_bytes());
+        let mut bind = vec![b'B'];
+        let blen = (bbody.len() + 4) as i32;
+        bind.extend_from_slice(&blen.to_be_bytes());
+        bind.extend_from_slice(&bbody);
+        protocol.decode(&bind, &mut session).unwrap();
+
+        // Describe portal p1 → RowDescription
+        let mut dbody = vec![b'P'];
+        dbody.extend_from_slice(b"p1\0");
+        let mut describe = vec![b'D'];
+        let dlen = (dbody.len() + 4) as i32;
+        describe.extend_from_slice(&dlen.to_be_bytes());
+        describe.extend_from_slice(&dbody);
+        let cmds = protocol.decode(&describe, &mut session).unwrap();
+        match &cmds[0] {
+            GatewayCommand::ClientWire { packets } => {
+                assert_eq!(packets.len(), 1);
+                assert_eq!(packets[0][0], b'T');
                 assert_eq!(i16::from_be_bytes([packets[0][5], packets[0][6]]), 2);
             }
             other => panic!("{other:?}"),
         }
+
+        // Execute p1 → suppress next header
+        let mut ebody = Vec::new();
+        ebody.extend_from_slice(b"p1\0");
+        ebody.extend_from_slice(&0i32.to_be_bytes());
+        let mut exec = vec![b'E'];
+        let elen = (ebody.len() + 4) as i32;
+        exec.extend_from_slice(&elen.to_be_bytes());
+        exec.extend_from_slice(&ebody);
+        protocol.decode(&exec, &mut session).unwrap();
+        assert!(protocol.suppress_next_row_description);
+
+        let cols = vec![
+            GatewayColumn {
+                name: "id".into(),
+                data_type: "int4".into(),
+            },
+            GatewayColumn {
+                name: "name".into(),
+                data_type: "text".into(),
+            },
+        ];
+        let header = protocol
+            .encode_resultset_header(&cols, &session)
+            .unwrap();
+        assert!(header.is_empty(), "Describe already sent RowDescription");
+        assert!(!protocol.suppress_next_row_description);
+    }
+
+    #[test]
+    fn a10_infer_select_result_columns_aliases_and_bare() {
+        let cols = infer_select_result_columns(
+            "SELECT id, name AS n, upper(name) uname FROM t WHERE id > $1",
+        )
+        .unwrap();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[1].name, "n");
+        assert_eq!(cols[2].name, "uname");
+        assert!(infer_select_result_columns("SELECT * FROM t").is_none());
+        assert!(infer_select_result_columns("INSERT INTO t VALUES (1)").is_none());
     }
 
     #[test]

@@ -271,11 +271,17 @@ fn decode_bind_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
             *param_formats.get(i).unwrap_or(&0)
         };
         let value = if fmt == 0 {
-            Some(
-                std::str::from_utf8(raw)
-                    .map_err(|e| ProtocolError::InvalidUtf8(e.to_string()))?
-                    .to_string(),
-            )
+            // Text format. Some clients still send raw binary for small integers when
+            // ParameterDescription advertised unspecified/text OIDs — detect NULs.
+            if raw.iter().any(|&b| b == 0) && matches!(raw.len(), 2 | 4 | 8) {
+                Some(decode_pg_binary_param_to_text(raw)?)
+            } else {
+                Some(
+                    std::str::from_utf8(raw)
+                        .map_err(|e| ProtocolError::InvalidUtf8(e.to_string()))?
+                        .to_string(),
+                )
+            }
         } else {
             // Binary → text representation for gateway IR (QueryParams binds as text/typed).
             Some(decode_pg_binary_param_to_text(raw)?)
@@ -321,11 +327,13 @@ fn decode_bind_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
 }
 
 /// A10: turn common binary Bind values into text for QueryParams IR.
-/// Length-based heuristic: 4→i32, 8→i64, 1→bool, else UTF-8 or hex.
+/// Length-based heuristic: 2→i16, 4→i32, 8→i64, 1→bool, else UTF-8 or error.
 fn decode_pg_binary_param_to_text(raw: &[u8]) -> Result<String, ProtocolError> {
     match raw.len() {
         0 => Ok(String::new()),
         1 => Ok((raw[0] != 0).to_string()),
+        // psycopg often binds small ints as INT2 binary (2 bytes).
+        2 => Ok(BigEndian::read_i16(raw).to_string()),
         4 => Ok(BigEndian::read_i32(raw).to_string()),
         8 => Ok(BigEndian::read_i64(raw).to_string()),
         _ => {
@@ -850,6 +858,60 @@ mod tests {
         body.extend_from_slice(&4i32.to_be_bytes()); // value len
         body.extend_from_slice(&0i32.to_be_bytes()); // i32 0
         body.extend_from_slice(&0i16.to_be_bytes()); // nresult_formats
+        let mut frame = vec![b'B'];
+        let len = (body.len() + 4) as i32;
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&body);
+        assert_eq!(
+            decode_frontend_message(&frame),
+            Ok(FrontendMessage::Bind {
+                portal: String::new(),
+                statement: "s1".into(),
+                parameters: vec![Some("0".into())],
+                result_formats: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn a10_decodes_bind_binary_i16_param_to_text() {
+        // psycopg often binds small ints as INT2 binary (fmt=1, len=2).
+        let mut body = Vec::new();
+        body.push(0);
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(&1i16.to_be_bytes());
+        body.extend_from_slice(&1i16.to_be_bytes());
+        body.extend_from_slice(&1i16.to_be_bytes());
+        body.extend_from_slice(&2i32.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes());
+        let mut frame = vec![b'B'];
+        let len = (body.len() + 4) as i32;
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&body);
+        assert_eq!(
+            decode_frontend_message(&frame),
+            Ok(FrontendMessage::Bind {
+                portal: String::new(),
+                statement: "s1".into(),
+                parameters: vec![Some("0".into())],
+                result_formats: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn a10_decodes_text_format_nul_i16_as_binary() {
+        // Some clients advertise text format codes but still send binary INT2 bytes
+        // (contains NUL) when ParameterDescription used unspecified/text OIDs.
+        let mut body = Vec::new();
+        body.push(0);
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(&0i16.to_be_bytes()); // nformats=0 → text
+        body.extend_from_slice(&1i16.to_be_bytes());
+        body.extend_from_slice(&2i32.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes()); // binary 0 as i16
+        body.extend_from_slice(&0i16.to_be_bytes());
         let mut frame = vec![b'B'];
         let len = (body.len() + 4) as i32;
         frame.extend_from_slice(&len.to_be_bytes());
