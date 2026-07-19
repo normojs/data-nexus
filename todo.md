@@ -168,6 +168,7 @@ examples/        smoke + gateway config 样例
 | A10 | MySQL binary DATE/TIME/DATETIME ISO 解码 | feat(a10) |
 | A08 | 生产 TLS pin require+CA（validate） | feat(a08) |
 | A10 | MySQL ISO string 参数绑 DATE/TIME/DATETIME | feat(a10) |
+| A10 | PG ISO string 参数绑 DATE/TIME/TIMESTAMP | feat(a10) |
 | UI04 | 策略只读页 + security-policies 扩展字段 | feat(ui04) |
 | T02 | Ticket/Vault 运维 runbook | feat(t02) |
 | UI03 | Audit stats 卡片 + source 角标 + 导出 | feat(ui03) |
@@ -192,7 +193,7 @@ examples/        smoke + gateway config 样例
 | **A07** | 编码直写 socket | MySQL/PG 会话用 `ResponseWriter` 边 encode 边写 | `handle_frame_to_writer` + socket writer；测试仍可 CollectingWriter | **完成** |
 | **A08** | PostgreSQL wire 透传 + backend TLS | idle pool + 事务 `tcp_txn`；PG/MySQL **ssl_mode + ssl_ca_file / ssl_accept_invalid_certs** | 默认 accept_invalid=true（兼容）；**prod 模板 require+CA+verify**；validate 拒绝 require+verify 无 CA；非 extended；MySQL prefer 可明文回落 | **部分** |
 | **A09** | Portal 端到端流式 | NDJSON：`execute_outcome` Streaming → 窗口 mask → HTTP chunk | multi-row NDJSON **强制** `backend_window`；**smoke 断言 json/csv 无 backend_window（仍物化）**；Complete 回退 B05b | **部分** |
-| **A10** | 预处理 / 事务透传矩阵 | MySQL **prepare/bind** + binary 行 + **Streaming 窗口** + 连接 stmt 缓存；PG QueryParams + Statement 缓存 + Streaming | **MySQL ISO 字符串参数启发式绑 DATE/TIME/DATETIME**；结果 ISO 解码；其它仍 scalar/VAR_STRING；PG 文本绑定；非 TCP passthrough | **部分** |
+| **A10** | 预处理 / 事务透传矩阵 | MySQL **prepare/bind** + binary 行 + **Streaming 窗口** + 连接 stmt 缓存；PG QueryParams + Statement 缓存 + Streaming | **双协议 ISO 字符串参数可绑原生时间类型**；结果 ISO/ binary encode 已有；其它 scalar/text；非 TCP passthrough | **部分** |
 
 ### 3.2 P1 — 策略 / 合规深化
 
@@ -240,7 +241,7 @@ examples/        smoke + gateway config 样例
 | Portal「流式」 | A09 NDJSON：Streaming backend 真窗口 + HTTP（smoke 强制 multi-row `backend_window`）；**json/csv smoke 断言无 backend_window（物化）**；Complete 回退 B05b |
 | 脱敏大数据 | A06 MySQL/PG Streaming 真窗口（含事务：producer 还 lease）；smoke 双协议 max_rows（**含 txn**）+ `execute_path=streaming`；峰值 ≈ 窗口 |
 | PG/MySQL backend TLS | A08：PG idle pool+tcp_txn；双协议 `ssl_mode`/`ssl_ca_file`/`ssl_accept_invalid_certs`；**默认 accept_invalid=true（兼容）**；**prod 模板 require+CA+verify**；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；非 extended |
-| 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；**MySQL QueryParams 走 COM_STMT_PREPARE/EXECUTE 绑定** + binary 行 + **Streaming 窗口** + 连接缓存；MySQL date/time binary 结果 ISO 文本；**ISO 字符串参数可绑 DATE/TIME/DATETIME**；其余 scalar/VAR_STRING；PG 文本绑定；非 TCP passthrough |
+| 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；**MySQL QueryParams 走 COM_STMT_PREPARE/EXECUTE 绑定** + binary 行 + **Streaming 窗口** + 连接缓存；MySQL date/time binary 结果 ISO 文本；**双协议 ISO 字符串参数可绑原生时间类型**；其余 scalar/text；非 TCP passthrough |
 | 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；**prod 模板已含 security.state**；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
 | L2 样本合规 | B08：**默认关**；L2+enabled 时物化 ResultSet 附截断样本；OpenDAL 需 `audit-opendal`；Streaming 路径不采样 |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
@@ -251,25 +252,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> push origin（需确认） 或 F31 Remote PDP（延后） 或 A10 PG 参数类型 <<<**
+**>>> push origin（需确认） 或 F31 Remote PDP（延后） <<<**
 
-本轮（A10 MySQL 参数类型细化）：
+本轮（A10 PG 参数类型细化）：
 
-- QueryParams 字符串若为 ISO date/datetime/time → COM_STMT 绑 `MYSQL_TYPE_DATE|DATETIME|TIME` + 原生 binary payload
-- 非法/普通字符串仍 `VAR_STRING`
-- TIME 小时≥24 折入 days；单测分类 + execute payload
+- QueryParams：ISO date/datetime/time 字符串 → chrono `NaiveDate`/`NaiveDateTime`/`NaiveTime` 绑定
+- 物化 + Streaming 路径统一 `PgParamBind`
+- 非法/普通字符串仍 text；单测分类
 
 ```bash
-cargo test -p runtime_gateway --lib a10_param_type_classifies
-cargo test -p runtime_gateway --lib a10_encode_stmt_execute_binds
-# docker 可用时：./examples/run-smoke-matrix.sh default
+cargo test -p runtime_gateway --lib a10_pg_param_bind
+cargo test -p runtime_gateway --lib 'backend::postgresql::tests::a10_'
 ```
 
 建议下一刀：
 
-1. **push origin**（需明确同意）  
+1. **push origin**（需明确同意；领先 origin）  
 2. **F31** — Remote PDP（延后）  
-3. **A10** — PG 侧类型化绑定（仍文本 ToSql）
+3. 体验债 / 文档收口
 
 
 ---

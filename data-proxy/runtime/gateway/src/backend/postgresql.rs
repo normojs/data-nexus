@@ -23,6 +23,7 @@ use postgresql_protocol::{
 use tokio_postgres::{types::ToSql, Client, Config as PgConfig, NoTls, Row, SimpleQueryMessage, Statement};
 use tracing::error;
 use postgres_native_tls::MakeTlsConnector;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
 use super::pg_tcp_relay::{
     new_tcp_txn_slot, PgTcpIdlePool, PgTcpSession, PgTcpTxnSlot, SessionReturn,
@@ -412,24 +413,14 @@ impl PostgreSqlBackendConnector {
         parameters: &[GatewayValue],
         mode: ExecuteMode,
     ) -> GatewayResult<GatewayResponse> {
-        let text_params: Vec<Option<String>> = parameters
-            .iter()
-            .map(gateway_value_to_pg_param_text)
-            .collect();
-        let to_sql: Vec<&(dyn ToSql + Sync)> = text_params
-            .iter()
-            .map(|p| p as &(dyn ToSql + Sync))
-            .collect();
+        let bind = PgParamBind::from_values(parameters);
+        let to_sql = bind.as_tosql();
 
         // A10: prepare-once cache on this connection; retry once if cache is stale.
         let mut retried = false;
         loop {
             let stmt = conn.get_or_prepare(sql).await?;
-            match conn
-                .client()?
-                .query(&stmt, to_sql.as_slice())
-                .await
-            {
+            match conn.client()?.query(&stmt, to_sql.as_slice()).await {
                 Ok(rows) => return rows_to_gateway_response(rows, mode),
                 Err(e) => {
                     let msg = e.to_string();
@@ -743,10 +734,7 @@ impl PostgreSqlBackendConnector {
             self.acquire_conn(&endpoint, session).await?
         };
 
-        let text_params: Vec<Option<String>> = parameters
-            .iter()
-            .map(gateway_value_to_pg_param_text)
-            .collect();
+        let bind = PgParamBind::from_values(parameters);
 
         let stmt = match conn.get_or_prepare(sql).await {
             Ok(s) => s,
@@ -768,10 +756,7 @@ impl PostgreSqlBackendConnector {
             }
         };
 
-        let to_sql: Vec<&(dyn ToSql + Sync)> = text_params
-            .iter()
-            .map(|p| p as &(dyn ToSql + Sync))
-            .collect();
+        let to_sql = bind.as_tosql();
 
         let raw = match client.query_raw(&stmt, to_sql.iter().copied()).await {
             Ok(s) => s,
@@ -1489,6 +1474,125 @@ fn gateway_value_to_pg_param_text(v: &GatewayValue) -> Option<String> {
     }
 }
 
+/// A10: typed bind set for QueryParams. ISO date/time strings become chrono values
+/// so PostgreSQL receives DATE/TIME/TIMESTAMP OIDs instead of generic text.
+enum PgParamSlot {
+    Null,
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Text(String),
+    Date(NaiveDate),
+    Timestamp(NaiveDateTime),
+    Time(NaiveTime),
+}
+
+struct PgParamBind {
+    slots: Vec<PgParamSlot>,
+}
+
+impl PgParamBind {
+    fn from_values(parameters: &[GatewayValue]) -> Self {
+        let slots = parameters
+            .iter()
+            .map(|v| match v {
+                GatewayValue::Null => PgParamSlot::Null,
+                GatewayValue::Boolean(b) => PgParamSlot::Bool(*b),
+                GatewayValue::Integer(i) => PgParamSlot::I64(*i),
+                GatewayValue::UnsignedInteger(u) => {
+                    // Prefer i64 when it fits; else text to avoid silent wrap.
+                    if *u <= i64::MAX as u64 {
+                        PgParamSlot::I64(*u as i64)
+                    } else {
+                        PgParamSlot::Text(u.to_string())
+                    }
+                }
+                GatewayValue::Float(f) => PgParamSlot::F64(*f),
+                GatewayValue::Decimal(s) => PgParamSlot::Text(s.clone()),
+                GatewayValue::String(s) => classify_pg_string_param(s),
+                GatewayValue::Bytes(b) => {
+                    let mut hex = String::with_capacity(2 + b.len() * 2);
+                    hex.push_str("\\x");
+                    for byte in b {
+                        hex.push_str(&format!("{byte:02x}"));
+                    }
+                    PgParamSlot::Text(hex)
+                }
+            })
+            .collect();
+        Self { slots }
+    }
+
+    fn as_tosql(&self) -> Vec<&(dyn ToSql + Sync)> {
+        self.slots
+            .iter()
+            .map(|s| match s {
+                PgParamSlot::Null => {
+                    // Option<String>::None encodes NULL for any type in text/binary.
+                    // Use a typed null via Option<i32> is awkward without owned Option;
+                    // keep text null as Option<&str> through a static.
+                    static NULL_TEXT: Option<String> = None;
+                    &NULL_TEXT as &(dyn ToSql + Sync)
+                }
+                PgParamSlot::Bool(b) => b as &(dyn ToSql + Sync),
+                PgParamSlot::I64(i) => i as &(dyn ToSql + Sync),
+                PgParamSlot::F64(f) => f as &(dyn ToSql + Sync),
+                PgParamSlot::Text(t) => t as &(dyn ToSql + Sync),
+                PgParamSlot::Date(d) => d as &(dyn ToSql + Sync),
+                PgParamSlot::Timestamp(ts) => ts as &(dyn ToSql + Sync),
+                PgParamSlot::Time(t) => t as &(dyn ToSql + Sync),
+            })
+            .collect()
+    }
+}
+
+fn classify_pg_string_param(s: &str) -> PgParamSlot {
+    let t = s.trim();
+    if let Some(ts) = parse_pg_param_datetime(t) {
+        return PgParamSlot::Timestamp(ts);
+    }
+    if let Some(d) = parse_pg_param_date(t) {
+        return PgParamSlot::Date(d);
+    }
+    if let Some(tm) = parse_pg_param_time(t) {
+        return PgParamSlot::Time(tm);
+    }
+    PgParamSlot::Text(s.to_owned())
+}
+
+fn parse_pg_param_date(s: &str) -> Option<NaiveDate> {
+    // YYYY-MM-DD
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
+fn parse_pg_param_datetime(s: &str) -> Option<NaiveDateTime> {
+    let s = s.trim().replace('T', " ");
+    // Prefer full forms first.
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(ts) = NaiveDateTime::parse_from_str(&s, fmt) {
+            return Some(ts);
+        }
+    }
+    None
+}
+
+fn parse_pg_param_time(s: &str) -> Option<NaiveTime> {
+    // Reject pure dates.
+    if s.contains('-') && !s.contains(':') {
+        return None;
+    }
+    for fmt in ["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"] {
+        if let Ok(t) = NaiveTime::parse_from_str(s, fmt) {
+            return Some(t);
+        }
+    }
+    None
+}
+
 fn rows_to_gateway_response(
     rows: Vec<Row>,
     mode: ExecuteMode,
@@ -2050,6 +2154,29 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a10_pg_param_bind_classifies_iso_temporal_strings() {
+        let bind = PgParamBind::from_values(&[
+            GatewayValue::String("2024-08-31".into()),
+            GatewayValue::String("2022-08-31 07:16:16".into()),
+            GatewayValue::String("07:16:16".into()),
+            GatewayValue::String("plain".into()),
+            GatewayValue::Null,
+            GatewayValue::Integer(3),
+        ]);
+        assert!(matches!(bind.slots[0], PgParamSlot::Date(_)));
+        assert!(matches!(bind.slots[1], PgParamSlot::Timestamp(_)));
+        assert!(matches!(bind.slots[2], PgParamSlot::Time(_)));
+        assert!(matches!(bind.slots[3], PgParamSlot::Text(ref s) if s == "plain"));
+        assert!(matches!(bind.slots[4], PgParamSlot::Null));
+        assert!(matches!(bind.slots[5], PgParamSlot::I64(3)));
+        // as_tosql length matches arity (smoke that null/static refs work)
+        assert_eq!(bind.as_tosql().len(), 6);
+        // invalid date stays text
+        let bad = PgParamBind::from_values(&[GatewayValue::String("2024-13-40".into())]);
+        assert!(matches!(bad.slots[0], PgParamSlot::Text(_)));
     }
 
     #[test]
