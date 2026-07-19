@@ -32,7 +32,7 @@ paths: **/*
 4. **`security.enabled=false` 必须保持 v1 行为**（默认关安全）。
 5. **默认二进制精简**：Cedar / OpenDAL / OTel 继续 optional feature；开 feature 要写进文档与 smoke。
 6. **Fail-closed 可配且生产默认偏安全**：解析失败、策略失败行为必须显式。
-7. **配置不得静默 no-op**：未实现能力（如 F31 remote PDP）必须在校验阶段拒绝。
+7. **配置不得静默 no-op**：未实现能力必须在校验阶段拒绝；已实现能力（如 F31 remote PDP）须有真实行为与 fail-closed 语义。
 
 ## 2. 开发流程（DoD）
 
@@ -93,7 +93,7 @@ docs/            架构与路线图（权威细节）
 ## 6. 配置与兼容
 
 - 新配置项：**默认安全/关闭**，向后兼容。
-- `security.pdp.backend`：`local` | `cedar`（需 feature）；**`remote` 在 F31 前必须校验失败**。
+- `security.pdp.backend`：`local` | `cedar`（需 feature）| `remote`（F31 HTTP 旁路；需 `remote_url`，超时默认 fail_closed）。
 - 生产模板禁止真实密钥；`__DN_*__` + env。
 - rustc：**1.94.1**。
 
