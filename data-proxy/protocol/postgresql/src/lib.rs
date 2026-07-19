@@ -215,6 +215,7 @@ fn decode_bind_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
     }
     let nformats = BigEndian::read_i16(&rest[0..2]) as usize;
     let mut offset = 2;
+    let mut param_formats = Vec::with_capacity(nformats);
     for _ in 0..nformats {
         if rest.len() < offset + 2 {
             return Err(ProtocolError::InvalidLength {
@@ -223,9 +224,11 @@ fn decode_bind_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
             });
         }
         let fmt = BigEndian::read_i16(&rest[offset..offset + 2]);
-        if fmt != 0 {
+        // 0 = text, 1 = binary (A10: accept both; binary decoded heuristically below).
+        if fmt != 0 && fmt != 1 {
             return Err(ProtocolError::UnsupportedFrontendMessage(b'B'));
         }
+        param_formats.push(fmt);
         offset += 2;
     }
     if rest.len() < offset + 2 {
@@ -237,7 +240,7 @@ fn decode_bind_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
     let nparams = BigEndian::read_i16(&rest[offset..offset + 2]) as usize;
     offset += 2;
     let mut parameters = Vec::with_capacity(nparams);
-    for _ in 0..nparams {
+    for i in 0..nparams {
         if rest.len() < offset + 4 {
             return Err(ProtocolError::InvalidLength {
                 expected: Some(offset + 4),
@@ -257,10 +260,27 @@ fn decode_bind_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
                 actual: rest.len(),
             });
         }
-        let s = std::str::from_utf8(&rest[offset..offset + len])
-            .map_err(|e| ProtocolError::InvalidUtf8(e.to_string()))?
-            .to_string();
-        parameters.push(Some(s));
+        let raw = &rest[offset..offset + len];
+        // PG: if nformats==0 all text; if nformats==1 apply that format to all;
+        // if nformats==nparams use per-param format.
+        let fmt = if param_formats.is_empty() {
+            0
+        } else if param_formats.len() == 1 {
+            param_formats[0]
+        } else {
+            *param_formats.get(i).unwrap_or(&0)
+        };
+        let value = if fmt == 0 {
+            Some(
+                std::str::from_utf8(raw)
+                    .map_err(|e| ProtocolError::InvalidUtf8(e.to_string()))?
+                    .to_string(),
+            )
+        } else {
+            // Binary → text representation for gateway IR (QueryParams binds as text/typed).
+            Some(decode_pg_binary_param_to_text(raw)?)
+        };
+        parameters.push(value);
         offset += len;
     }
     if rest.len() < offset + 2 {
@@ -298,6 +318,25 @@ fn decode_bind_body(body: &[u8]) -> Result<FrontendMessage, ProtocolError> {
         parameters,
         result_formats,
     })
+}
+
+/// A10: turn common binary Bind values into text for QueryParams IR.
+/// Length-based heuristic: 4→i32, 8→i64, 1→bool, else UTF-8 or hex.
+fn decode_pg_binary_param_to_text(raw: &[u8]) -> Result<String, ProtocolError> {
+    match raw.len() {
+        0 => Ok(String::new()),
+        1 => Ok((raw[0] != 0).to_string()),
+        4 => Ok(BigEndian::read_i32(raw).to_string()),
+        8 => Ok(BigEndian::read_i64(raw).to_string()),
+        _ => {
+            if let Ok(s) = std::str::from_utf8(raw) {
+                Ok(s.to_string())
+            } else {
+                // Fail closed on opaque binary we cannot represent as text bind.
+                Err(ProtocolError::UnsupportedFrontendMessage(b'B'))
+            }
+        }
+    }
 }
 
 fn decode_describe_or_close_body(
@@ -797,5 +836,32 @@ mod tests {
             FrontendMessage::Bind { result_formats, .. } => assert!(result_formats.is_empty()),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a10_decodes_bind_binary_i32_param_to_text() {
+        // psycopg often binds integers as binary (fmt=1, len=4).
+        let mut body = Vec::new();
+        body.push(0); // portal ""
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(&1i16.to_be_bytes()); // nformats=1
+        body.extend_from_slice(&1i16.to_be_bytes()); // binary
+        body.extend_from_slice(&1i16.to_be_bytes()); // nparams=1
+        body.extend_from_slice(&4i32.to_be_bytes()); // value len
+        body.extend_from_slice(&0i32.to_be_bytes()); // i32 0
+        body.extend_from_slice(&0i16.to_be_bytes()); // nresult_formats
+        let mut frame = vec![b'B'];
+        let len = (body.len() + 4) as i32;
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&body);
+        assert_eq!(
+            decode_frontend_message(&frame),
+            Ok(FrontendMessage::Bind {
+                portal: String::new(),
+                statement: "s1".into(),
+                parameters: vec![Some("0".into())],
+                result_formats: vec![],
+            })
+        );
     }
 }

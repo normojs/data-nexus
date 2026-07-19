@@ -1892,7 +1892,7 @@ fn build_frontend_protocol(
             String::new(),
             String::new(),
             database.unwrap_or_default(),
-            "8.0".into(),
+            "8.0.36".into(),
         ))),
         ProtocolKind::PostgreSql => Ok(Box::new(PostgreSqlFrontendProtocol::new("14.0".into()))),
     }
@@ -1953,7 +1953,7 @@ mod tests {
                 "app".into(),
                 "secret".into(),
                 "test".into(),
-                "8.0".into(),
+                "8.0.36".into(),
             )),
             Arc::new(MySqlBackendConnector::new()),
             SessionState::default(),
@@ -1979,7 +1979,7 @@ mod tests {
                 "app".into(),
                 "secret".into(),
                 "test".into(),
-                "8.0".into(),
+                "8.0.36".into(),
             )),
             Arc::new(StaticBackendConnector {
                 protocol: ProtocolKind::MySql,
@@ -2019,7 +2019,7 @@ mod tests {
                 "app".into(),
                 "secret".into(),
                 "test".into(),
-                "8.0".into(),
+                "8.0.36".into(),
             )),
             Arc::new(StaticBackendConnector {
                 protocol: ProtocolKind::MySql,
@@ -2601,7 +2601,7 @@ mod tests {
                 "app".into(),
                 "secret".into(),
                 "test".into(),
-                "8.0".into(),
+                "8.0.36".into(),
             )),
             Arc::new(StaticBackendConnector {
                 protocol: ProtocolKind::PostgreSql,
@@ -2641,7 +2641,7 @@ mod tests {
                 "app".into(),
                 "secret".into(),
                 "test".into(),
-                "8.0".into(),
+                "8.0.36".into(),
             )),
             Arc::new(StaticBackendConnector {
                 protocol: ProtocolKind::PostgreSql,

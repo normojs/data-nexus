@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # A06: streaming max_rows truncates on MySQL and PostgreSQL protocol paths.
+# A10: prepared / QueryParams protocol paths also honor max_rows under Streaming.
 # security.streaming.max_rows=1, window_rows=2 (config: security-stream-gateway-config.toml).
 set -euo pipefail
 
@@ -141,11 +142,140 @@ pg_txn_lines="$(echo "$pg_txn_data" | sed '/^$/d' | wc -l | tr -d ' ')"
 }
 echo "$pg_txn_data" | grep -qE '1\|a'
 
+echo "==> A10 MySQL COM_STMT_PREPARE/EXECUTE max_rows=1 (binary prepared)"
+# mysql-connector prepared=True uses COM_STMT_* (not text rewrite).
+# Install drivers inside a throwaway Python image so host packages are not required.
+mysql_prep_out="$(docker run --rm --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
+  bash -lc 'pip install -q --disable-pip-version-check mysql-connector-python >/tmp/pip.log 2>&1 || { cat /tmp/pip.log; exit 1; }
+python - <<"PY"
+import mysql.connector
+cnx = mysql.connector.connect(
+    host="host.docker.internal",
+    port=9088,
+    user="root",
+    password="root",
+    database="orders",
+    ssl_disabled=True,
+    connection_timeout=10,
+)
+try:
+    cur = cnx.cursor(prepared=True)
+    cur.execute(
+        "SELECT id, name FROM stream_smoke WHERE id > %s ORDER BY id",
+        (0,),
+    )
+    rows = cur.fetchall()
+    print("mysql_prepared_rows", len(rows), rows)
+    assert len(rows) == 1, rows
+    assert int(rows[0][0]) == 1, rows
+    cur.close()
+finally:
+    cnx.close()
+print("mysql_prepared_ok")
+PY
+')"
+echo "$mysql_prep_out"
+echo "$mysql_prep_out" | grep -q 'mysql_prepared_ok'
+
+echo "==> A10 PostgreSQL Bind/Execute (QueryParams) max_rows=1"
+# Speak extended protocol without Describe: our Describe still returns NoData
+# (no backend column describe yet), which makes psycopg reject later DataRows.
+# Raw Parse/Bind/Execute/Sync hits frontend QueryParams → Streaming + max_rows.
+pg_prep_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
+  python - <<'PY'
+import socket, struct
+
+def i32(n):
+    return struct.pack("!i", n)
+
+def i16(n):
+    return struct.pack("!h", n)
+
+def cstr(s: str) -> bytes:
+    return s.encode() + b"\x00"
+
+def msg(tag: bytes, body: bytes) -> bytes:
+    return tag + i32(len(body) + 4) + body
+
+def read_msg(sock):
+    hdr = b""
+    while len(hdr) < 5:
+        chunk = sock.recv(5 - len(hdr))
+        if not chunk:
+            raise RuntimeError("eof header")
+        hdr += chunk
+    tag = hdr[0:1]
+    (length,) = struct.unpack("!i", hdr[1:5])
+    body = b""
+    need = length - 4
+    while len(body) < need:
+        chunk = sock.recv(need - len(body))
+        if not chunk:
+            raise RuntimeError("eof body")
+        body += chunk
+    return tag, body
+
+sock = socket.create_connection(("host.docker.internal", 9089), timeout=10)
+# startup
+params = cstr("user") + cstr("postgres") + cstr("database") + cstr("analytics") + b"\x00"
+startup = i32(8 + len(params)) + i32(196608) + params
+sock.sendall(startup)
+# read until ReadyForQuery
+while True:
+    tag, body = read_msg(sock)
+    if tag == b"Z":
+        break
+    if tag == b"E":
+        raise RuntimeError(body)
+
+sql = "SELECT id, name FROM stream_smoke WHERE id > $1 ORDER BY id"
+# Parse unnamed statement
+sock.sendall(msg(b"P", cstr("") + cstr(sql) + i16(0)))
+# Bind: portal "", stmt "", 0 param formats, 1 text param "0", 0 result formats
+bind = cstr("") + cstr("") + i16(0) + i16(1) + i32(1) + b"0" + i16(0)
+sock.sendall(msg(b"B", bind))
+# Execute portal "", max_rows=0 (all)
+sock.sendall(msg(b"E", cstr("") + i32(0)))
+# Sync
+sock.sendall(msg(b"S", b""))
+
+rows = 0
+saw_t = False
+while True:
+    tag, body = read_msg(sock)
+    if tag == b"1":  # ParseComplete
+        continue
+    if tag == b"2":  # BindComplete
+        continue
+    if tag == b"T":
+        saw_t = True
+        continue
+    if tag == b"D":
+        rows += 1
+        continue
+    if tag == b"C":  # CommandComplete
+        continue
+    if tag == b"Z":
+        break
+    if tag == b"E":
+        # error fields are null-separated
+        raise RuntimeError(body.decode("utf-8", "replace"))
+
+print("pg_prepared_rows", rows, "rowdesc", saw_t)
+assert saw_t, "expected RowDescription from Execute Streaming path"
+assert rows == 1, f"expected max_rows=1, got {rows}"
+print("pg_prepared_ok")
+sock.close()
+PY
+)"
+echo "$pg_prep_out"
+echo "$pg_prep_out" | grep -q 'pg_prepared_ok'
+
 echo "==> metrics execute_path present after traffic"
 metrics="$(curl -fsS http://127.0.0.1:8082/metrics || true)"
 if echo "$metrics" | grep -q 'gateway_execute_path_total'; then
   echo "$metrics" | grep 'gateway_execute_path_total' | head -8 || true
-  # max_rows obligation forces Streaming (not wire passthrough).
+  # max_rows obligation forces Streaming (not wire passthrough), including A10 prepared.
   if echo "$metrics" | grep -q 'execute_path="streaming"'; then
     echo "streaming path counter observed"
   else

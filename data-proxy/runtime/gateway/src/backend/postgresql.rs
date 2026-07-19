@@ -1513,6 +1513,9 @@ fn gateway_value_to_pg_param_text(v: &GatewayValue) -> Option<String> {
 enum PgParamSlot {
     Null,
     Bool(bool),
+    /// Prefer i32 when it fits so INT4 prepared params serialize (tokio-postgres
+    /// i64 → INT8 fails against INT4 placeholders like `id > $1`).
+    I32(i32),
     I64(i64),
     F64(f64),
     Text(String),
@@ -1532,10 +1535,17 @@ impl PgParamBind {
             .map(|v| match v {
                 GatewayValue::Null => PgParamSlot::Null,
                 GatewayValue::Boolean(b) => PgParamSlot::Bool(*b),
-                GatewayValue::Integer(i) => PgParamSlot::I64(*i),
+                GatewayValue::Integer(i) => {
+                    if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
+                        PgParamSlot::I32(*i as i32)
+                    } else {
+                        PgParamSlot::I64(*i)
+                    }
+                }
                 GatewayValue::UnsignedInteger(u) => {
-                    // Prefer i64 when it fits; else text to avoid silent wrap.
-                    if *u <= i64::MAX as u64 {
+                    if *u <= i32::MAX as u64 {
+                        PgParamSlot::I32(*u as i32)
+                    } else if *u <= i64::MAX as u64 {
                         PgParamSlot::I64(*u as i64)
                     } else {
                         PgParamSlot::Text(u.to_string())
@@ -1569,6 +1579,7 @@ impl PgParamBind {
                     &NULL_TEXT as &(dyn ToSql + Sync)
                 }
                 PgParamSlot::Bool(b) => b as &(dyn ToSql + Sync),
+                PgParamSlot::I32(i) => i as &(dyn ToSql + Sync),
                 PgParamSlot::I64(i) => i as &(dyn ToSql + Sync),
                 PgParamSlot::F64(f) => f as &(dyn ToSql + Sync),
                 PgParamSlot::Text(t) => t as &(dyn ToSql + Sync),
@@ -1582,6 +1593,21 @@ impl PgParamBind {
 
 fn classify_pg_string_param(s: &str) -> PgParamSlot {
     let t = s.trim();
+    // A10: pure integers from text Bind (or binary→text IR) must bind as numbers so
+    // comparisons like `id > $1` against int columns serialize correctly.
+    if !t.contains('-')
+        && !t.contains('+')
+        && !t.contains('.')
+        && !t.contains(':')
+        && !t.is_empty()
+    {
+        if let Ok(i) = t.parse::<i32>() {
+            return PgParamSlot::I32(i);
+        }
+        if let Ok(i) = t.parse::<i64>() {
+            return PgParamSlot::I64(i);
+        }
+    }
     if let Some(ts) = parse_pg_param_datetime(t) {
         return PgParamSlot::Timestamp(ts);
     }
@@ -1590,6 +1616,12 @@ fn classify_pg_string_param(s: &str) -> PgParamSlot {
     }
     if let Some(tm) = parse_pg_param_time(t) {
         return PgParamSlot::Time(tm);
+    }
+    if t.eq_ignore_ascii_case("true") || t == "t" {
+        return PgParamSlot::Bool(true);
+    }
+    if t.eq_ignore_ascii_case("false") || t == "f" {
+        return PgParamSlot::Bool(false);
     }
     PgParamSlot::Text(s.to_owned())
 }
@@ -1666,14 +1698,98 @@ fn rows_to_gateway_response(
 fn typed_row_to_gateway_values(row: &Row) -> GatewayResult<Vec<GatewayValue>> {
     let mut values = Vec::with_capacity(row.len());
     for i in 0..row.len() {
-        // Prefer text representation for all types (stable, works with our binary encode).
-        let v: Option<String> = row.try_get(i).map_err(|e| {
-            GatewayError::Backend(format!("postgresql row get col {i}: {e}"))
-        })?;
-        values.push(match v {
-            None => GatewayValue::Null,
-            Some(s) => GatewayValue::String(s),
-        });
+        // Prepared/query_raw results are binary; try type-specific gets first, then fallbacks.
+        let col_type = row.columns().get(i).map(|c| c.type_().name()).unwrap_or("");
+        let value = match col_type {
+            "bool" => match row.try_get::<_, Option<bool>>(i) {
+                Ok(None) => GatewayValue::Null,
+                Ok(Some(b)) => GatewayValue::Boolean(b),
+                Err(e) => {
+                    return Err(GatewayError::Backend(format!(
+                        "postgresql row get col {i} ({col_type}): {e}"
+                    )))
+                }
+            },
+            "int2" => match row.try_get::<_, Option<i16>>(i) {
+                Ok(None) => GatewayValue::Null,
+                Ok(Some(n)) => GatewayValue::Integer(n as i64),
+                Err(e) => {
+                    return Err(GatewayError::Backend(format!(
+                        "postgresql row get col {i} ({col_type}): {e}"
+                    )))
+                }
+            },
+            "int4" => match row.try_get::<_, Option<i32>>(i) {
+                Ok(None) => GatewayValue::Null,
+                Ok(Some(n)) => GatewayValue::Integer(n as i64),
+                Err(e) => {
+                    return Err(GatewayError::Backend(format!(
+                        "postgresql row get col {i} ({col_type}): {e}"
+                    )))
+                }
+            },
+            "int8" => match row.try_get::<_, Option<i64>>(i) {
+                Ok(None) => GatewayValue::Null,
+                Ok(Some(n)) => GatewayValue::Integer(n),
+                Err(e) => {
+                    return Err(GatewayError::Backend(format!(
+                        "postgresql row get col {i} ({col_type}): {e}"
+                    )))
+                }
+            },
+            "float4" => match row.try_get::<_, Option<f32>>(i) {
+                Ok(None) => GatewayValue::Null,
+                Ok(Some(n)) => GatewayValue::Float(n as f64),
+                Err(e) => {
+                    return Err(GatewayError::Backend(format!(
+                        "postgresql row get col {i} ({col_type}): {e}"
+                    )))
+                }
+            },
+            "float8" => match row.try_get::<_, Option<f64>>(i) {
+                Ok(None) => GatewayValue::Null,
+                Ok(Some(n)) => GatewayValue::Float(n),
+                Err(e) => {
+                    return Err(GatewayError::Backend(format!(
+                        "postgresql row get col {i} ({col_type}): {e}"
+                    )))
+                }
+            },
+            _ => {
+                // text/varchar/name/unknown/date/time/json…: string first, then numeric fallbacks.
+                if let Ok(v) = row.try_get::<_, Option<String>>(i) {
+                    match v {
+                        None => GatewayValue::Null,
+                        Some(s) => GatewayValue::String(s),
+                    }
+                } else if let Ok(v) = row.try_get::<_, Option<i64>>(i) {
+                    match v {
+                        None => GatewayValue::Null,
+                        Some(n) => GatewayValue::Integer(n),
+                    }
+                } else if let Ok(v) = row.try_get::<_, Option<i32>>(i) {
+                    match v {
+                        None => GatewayValue::Null,
+                        Some(n) => GatewayValue::Integer(n as i64),
+                    }
+                } else if let Ok(v) = row.try_get::<_, Option<f64>>(i) {
+                    match v {
+                        None => GatewayValue::Null,
+                        Some(n) => GatewayValue::Float(n),
+                    }
+                } else if let Ok(v) = row.try_get::<_, Option<bool>>(i) {
+                    match v {
+                        None => GatewayValue::Null,
+                        Some(b) => GatewayValue::Boolean(b),
+                    }
+                } else {
+                    return Err(GatewayError::Backend(format!(
+                        "postgresql row get col {i} ({col_type}): unsupported binary type"
+                    )));
+                }
+            }
+        };
+        values.push(value);
     }
     Ok(values)
 }
@@ -2199,15 +2315,19 @@ mod tests {
             GatewayValue::String("plain".into()),
             GatewayValue::Null,
             GatewayValue::Integer(3),
+            GatewayValue::String("0".into()),
+            GatewayValue::String("42".into()),
         ]);
         assert!(matches!(bind.slots[0], PgParamSlot::Date(_)));
         assert!(matches!(bind.slots[1], PgParamSlot::Timestamp(_)));
         assert!(matches!(bind.slots[2], PgParamSlot::Time(_)));
         assert!(matches!(bind.slots[3], PgParamSlot::Text(ref s) if s == "plain"));
         assert!(matches!(bind.slots[4], PgParamSlot::Null));
-        assert!(matches!(bind.slots[5], PgParamSlot::I64(3)));
+        assert!(matches!(bind.slots[5], PgParamSlot::I32(3)));
+        assert!(matches!(bind.slots[6], PgParamSlot::I32(0)));
+        assert!(matches!(bind.slots[7], PgParamSlot::I32(42)));
         // as_tosql length matches arity (smoke that null/static refs work)
-        assert_eq!(bind.as_tosql().len(), 6);
+        assert_eq!(bind.as_tosql().len(), 8);
         // invalid date stays text
         let bad = PgParamBind::from_values(&[GatewayValue::String("2024-13-40".into())]);
         assert!(matches!(bad.slots[0], PgParamSlot::Text(_)));

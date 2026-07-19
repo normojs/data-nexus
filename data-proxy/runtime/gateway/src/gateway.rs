@@ -149,7 +149,8 @@ impl GatewayRuntime {
             protocol: protocol_name(&plan.listener().protocol).to_owned(),
             listen_addr: plan.listener().listen_addr.clone(),
             server_version: match plan.listener().protocol {
-                ProtocolKind::MySql => "8.0".into(),
+                // Full x.y.z — mysql-connector-python rejects bare "8.0" (Failed parsing MySQL version).
+                ProtocolKind::MySql => "8.0.36".into(),
                 ProtocolKind::PostgreSql => "14.0".into(),
             },
         })
@@ -189,7 +190,8 @@ impl GatewayRuntime {
         let listener_name = listener_plan.listener().name.clone();
         let listen_addr = listener_plan.listener().listen_addr.clone();
         let server_version = match protocol {
-            ProtocolKind::MySql => "8.0".to_owned(),
+            // Full x.y.z required by strict MySQL clients (A10 prepared smoke uses connector).
+            ProtocolKind::MySql => "8.0.36".to_owned(),
             ProtocolKind::PostgreSql => "14.0".to_owned(),
         };
         let auth_database = listener_plan.default_database().unwrap_or_default().to_owned();
@@ -872,7 +874,7 @@ mod tests {
         assert_eq!(listener.name, "mysql-listener");
         assert_eq!(listener.listen_addr, "127.0.0.1:3307");
         assert_eq!(listener.protocol, "mysql");
-        assert_eq!(listener.server_version, "8.0");
+        assert_eq!(listener.server_version, "8.0.36");
     }
 
     #[test]

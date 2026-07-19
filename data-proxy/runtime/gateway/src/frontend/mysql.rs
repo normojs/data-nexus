@@ -34,7 +34,7 @@ use mysql_protocol::{
     err::ProtocolError,
     mysql_const::{
         ColumnType, ComType, COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE,
-        COM_STMT_EXECUTE, COM_STMT_PREPARE,
+        COM_STMT_EXECUTE, COM_STMT_PREPARE, COM_STMT_RESET,
     },
     server::{
         auth::{handshake, ServerHandshakeCodec},
@@ -136,6 +136,9 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
             COM_STMT_CLOSE => {
                 GatewayCommand::CloseStatement { statement_id: decode_statement_id(payload)? }
             }
+            // A10: clients (mysql-connector-python) send COM_STMT_RESET between executes.
+            // Gateway-owned prepared has no server-side cursor/long-data state; reply OK.
+            COM_STMT_RESET => GatewayCommand::Ping,
             other => {
                 return Err(GatewayError::Unsupported(format!(
                     "unsupported mysql command byte {}",
@@ -1184,7 +1187,7 @@ mod tests {
     use super::*;
 
     fn adapter() -> MySqlFrontendProtocol {
-        MySqlFrontendProtocol::new("app".into(), "secret".into(), "test".into(), "8.0".into())
+        MySqlFrontendProtocol::new("app".into(), "secret".into(), "test".into(), "8.0.36".into())
     }
 
     #[test]
@@ -1234,6 +1237,17 @@ mod tests {
             commands,
             Ok(vec![GatewayCommand::CloseStatement { statement_id: "42".into() }])
         );
+    }
+
+    #[test]
+    fn a10_decodes_stmt_reset_as_noop_ok_path() {
+        // mysql-connector-python sends COM_STMT_RESET (0x1a) between executes.
+        let mut adapter = adapter();
+        let mut session = SessionState::default();
+        let mut frame = vec![COM_STMT_RESET];
+        frame.extend_from_slice(&7u32.to_le_bytes());
+        let commands = adapter.decode(&frame, &mut session).unwrap();
+        assert_eq!(commands, vec![GatewayCommand::Ping]);
     }
 
     #[test]
@@ -1417,7 +1431,7 @@ mod tests {
             "u".into(),
             "p".into(),
             "db".into(),
-            "8.0".into(),
+            "8.0.36".into(),
         );
         let session = SessionState::default();
         let columns = vec![
