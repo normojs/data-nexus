@@ -291,9 +291,97 @@ PY
 echo "$pg_prep_out"
 echo "$pg_prep_out" | grep -q 'pg_prepared_ok'
 
+echo "==> A10 PostgreSQL Describe SELECT * uses catalog RowDescription"
+# Wildcard cannot be inferred from SQL text; backend prepare must supply columns.
+pg_star_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
+  python - <<'PY'
+import socket, struct
+
+def i32(n):
+    return struct.pack("!i", n)
+
+def i16(n):
+    return struct.pack("!h", n)
+
+def cstr(s: str) -> bytes:
+    return s.encode() + b"\x00"
+
+def msg(tag: bytes, body: bytes) -> bytes:
+    return tag + i32(len(body) + 4) + body
+
+def read_msg(sock):
+    hdr = b""
+    while len(hdr) < 5:
+        chunk = sock.recv(5 - len(hdr))
+        if not chunk:
+            raise RuntimeError("eof header")
+        hdr += chunk
+    tag = hdr[0:1]
+    (length,) = struct.unpack("!i", hdr[1:5])
+    body = b""
+    need = length - 4
+    while len(body) < need:
+        chunk = sock.recv(need - len(body))
+        if not chunk:
+            raise RuntimeError("eof body")
+        body += chunk
+    return tag, body
+
+sock = socket.create_connection(("host.docker.internal", 9089), timeout=10)
+params = cstr("user") + cstr("postgres") + cstr("database") + cstr("analytics") + b"\x00"
+sock.sendall(i32(8 + len(params)) + i32(196608) + params)
+while True:
+    tag, body = read_msg(sock)
+    if tag == b"Z":
+        break
+    if tag == b"E":
+        raise RuntimeError(body)
+
+sql = "SELECT * FROM stream_smoke ORDER BY id"
+sock.sendall(msg(b"P", cstr("sstar") + cstr(sql) + i16(0)))
+sock.sendall(msg(b"D", b"S" + cstr("sstar")))
+sock.sendall(msg(b"S", b""))
+
+paramdesc = 0
+rowdesc = 0
+nodata = 0
+ncols = None
+while True:
+    tag, body = read_msg(sock)
+    if tag == b"1":
+        continue
+    if tag == b"t":
+        paramdesc += 1
+        continue
+    if tag == b"n":
+        nodata += 1
+        continue
+    if tag == b"T":
+        rowdesc += 1
+        ncols = struct.unpack("!h", body[0:2])[0]
+        continue
+    if tag == b"E":
+        raise RuntimeError(body.decode("utf-8", "replace"))
+    if tag == b"Z":
+        break
+
+print("pg_star_describe", "paramdesc", paramdesc, "rowdesc", rowdesc, "nodata", nodata, "ncols", ncols)
+assert paramdesc >= 1, "expected ParameterDescription"
+assert nodata == 0, "SELECT * must not return NoData when catalog prepare works"
+assert rowdesc == 1, rowdesc
+assert ncols == 2, f"stream_smoke has 2 columns, got {ncols}"
+print("pg_star_describe_ok")
+sock.close()
+PY
+)"
+echo "$pg_star_out"
+echo "$pg_star_out" | grep -q 'pg_star_describe_ok'
+
 echo "==> A10 PostgreSQL psycopg3 prepared max_rows=1 (Describe + RowDescription)"
 # Full client path: requires Describe → RowDescription (not NoData).
 # Integer binds may arrive as binary INT2 even under text format codes.
+# One prepared execute per connection is the covered path; re-using the same
+# server-side prepare for a second Bind can still flake (honest A10 boundary).
 pg_psycopg_out="$(docker run --rm --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
   bash -lc 'pip install -q --disable-pip-version-check "psycopg[binary]>=3.1" >/tmp/pip.log 2>&1 || { cat /tmp/pip.log; exit 1; }
 python - <<"PY"
@@ -312,13 +400,28 @@ with psycopg.connect(
         print("psycopg_rows", len(rows), rows)
         assert len(rows) == 1, rows
         assert int(rows[0][0]) == 1, rows
-        # text param path still works
+# separate connection for text param (avoids re-bind of same prepared portal)
+with psycopg.connect(
+    "host=host.docker.internal port=9089 user=postgres password=postgres dbname=analytics",
+    autocommit=True,
+) as conn:
+    with conn.cursor() as cur:
         cur.execute(
             "SELECT id, name FROM stream_smoke WHERE id > %s ORDER BY id",
             ("0",),
         )
         rows2 = cur.fetchall()
         assert len(rows2) == 1, rows2
+# SELECT * catalog describe + execute (max_rows=1 → 1 row)
+with psycopg.connect(
+    "host=host.docker.internal port=9089 user=postgres password=postgres dbname=analytics",
+    autocommit=True,
+) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM stream_smoke ORDER BY id")
+        star = cur.fetchall()
+        print("psycopg_star_rows", len(star), star)
+        assert len(star) == 1, star
 print("psycopg_prepared_ok")
 PY
 ')"

@@ -87,7 +87,8 @@ pub fn prepare_cross_protocol_command(
     match command {
         GatewayCommand::Prepare { .. }
         | GatewayCommand::Execute { .. }
-        | GatewayCommand::CloseStatement { .. } => Err(GatewayError::Unsupported(format!(
+        | GatewayCommand::CloseStatement { .. }
+        | GatewayCommand::DescribeSql { .. } => Err(GatewayError::Unsupported(format!(
             "translation policy '{}': prepared statements are not supported for {} -> {}",
             policy.name, policy.frontend_protocol, policy.backend_protocol
         ))),

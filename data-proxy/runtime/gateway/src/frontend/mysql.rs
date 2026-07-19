@@ -179,6 +179,8 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
                 statement_id,
                 parameter_count,
             } => encode_mysql_prepare_response(&statement_id, parameter_count),
+            // A10: catalog describe is a PG extended-protocol concern; MySQL FE ignores.
+            GatewayResponse::RowDescription { .. } => Ok(vec![]),
         }
     }
 

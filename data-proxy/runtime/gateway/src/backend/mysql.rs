@@ -1258,6 +1258,11 @@ impl BackendConnector for MySqlBackendConnector {
                     last_insert_id: None,
                 })
             }
+            // A10: MySQL COM_STMT catalog describe is not wired for frontend Describe yet
+            // (PG extended protocol is the consumer). Return empty → NoData honestly.
+            GatewayCommand::DescribeSql { .. } => Ok(GatewayResponse::RowDescription {
+                columns: Vec::new(),
+            }),
             GatewayCommand::ClientWire { packets } => Ok(GatewayResponse::Wire { packets }),
         }
     }

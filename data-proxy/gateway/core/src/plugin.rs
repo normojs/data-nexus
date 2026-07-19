@@ -11,6 +11,7 @@ pub enum CommandSummary {
     Prepare { sql: String },
     Execute { statement_id: String },
     CloseStatement { statement_id: String },
+    DescribeSql { sql: String },
     ClientWire,
     UseDatabase { database: String },
     Begin,
@@ -32,6 +33,7 @@ impl CommandSummary {
             GatewayCommand::CloseStatement { statement_id } => {
                 Self::CloseStatement { statement_id: statement_id.clone() }
             }
+            GatewayCommand::DescribeSql { sql } => Self::DescribeSql { sql: sql.clone() },
             GatewayCommand::ClientWire { .. } => Self::ClientWire,
             GatewayCommand::UseDatabase { database } => {
                 Self::UseDatabase { database: database.clone() }
@@ -47,7 +49,10 @@ impl CommandSummary {
     /// Text used by regex-based governance plugins (SQL body when available).
     pub fn match_text(&self) -> &str {
         match self {
-            Self::Query { sql } | Self::QueryParams { sql } | Self::Prepare { sql } => sql.as_str(),
+            Self::Query { sql }
+            | Self::QueryParams { sql }
+            | Self::Prepare { sql }
+            | Self::DescribeSql { sql } => sql.as_str(),
             Self::Execute { statement_id } | Self::CloseStatement { statement_id } => {
                 statement_id.as_str()
             }

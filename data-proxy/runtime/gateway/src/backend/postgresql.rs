@@ -1049,6 +1049,37 @@ impl BackendConnector for PostgreSqlBackendConnector {
                     last_insert_id: None,
                 })
             }
+            // A10: catalog prepare for Describe — columns only, no rows executed.
+            GatewayCommand::DescribeSql { sql } => {
+                let endpoint = self.select_endpoint(session)?;
+                let in_txn = session.transaction_state == TransactionState::Active
+                    || self.txn_lease.lock().is_some();
+                let conn = if in_txn {
+                    self.take_or_acquire_lease(&endpoint, session).await?
+                } else {
+                    self.acquire_conn(&endpoint, session).await?
+                };
+                let result = match conn.get_or_prepare(&sql).await {
+                    Ok(stmt) => {
+                        let columns: Vec<GatewayColumn> = stmt
+                            .columns()
+                            .iter()
+                            .map(|c| GatewayColumn {
+                                name: c.name().to_string(),
+                                data_type: c.type_().name().to_string(),
+                            })
+                            .collect();
+                        Ok(GatewayResponse::RowDescription { columns })
+                    }
+                    Err(e) => Err(e),
+                };
+                if in_txn {
+                    self.store_lease(conn);
+                } else {
+                    drop(conn);
+                }
+                result
+            }
             GatewayCommand::ClientWire { packets } => Ok(GatewayResponse::Wire { packets }),
         }
     }

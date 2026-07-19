@@ -153,6 +153,9 @@ pub enum GatewayCommand {
     Prepare { sql: String },
     Execute { statement_id: String, parameters: Vec<GatewayValue> },
     CloseStatement { statement_id: String },
+    /// A10: describe result columns for SQL via backend prepare/catalog (no rows).
+    /// Used when frontend cannot infer SELECT-list columns (e.g. `SELECT *`).
+    DescribeSql { sql: String },
     /// Frontend-only wire packets (A10 extended protocol acks: ParseComplete, BindComplete, Sync…).
     /// Backend must return these unchanged as [`GatewayResponse::Wire`].
     ClientWire { packets: Vec<Vec<u8>> },
@@ -176,6 +179,9 @@ pub enum GatewayResponse {
     /// `PacketSend::Encode` expects). PostgreSQL: full backend messages.
     Wire { packets: Vec<Vec<u8>> },
     Prepared { statement_id: String, parameter_count: u16 },
+    /// A10: column metadata only (extended-protocol Describe / catalog prepare).
+    /// Frontend encodes as RowDescription (or NoData if empty); no CommandComplete.
+    RowDescription { columns: Vec<Column> },
     Pong,
     Bye,
 }

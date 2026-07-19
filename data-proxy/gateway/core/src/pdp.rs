@@ -702,7 +702,8 @@ impl LocalPdp {
             }
             GatewayCommand::Query { sql }
             | GatewayCommand::QueryParams { sql, .. }
-            | GatewayCommand::Prepare { sql } => {
+            | GatewayCommand::Prepare { sql }
+            | GatewayCommand::DescribeSql { sql } => {
                 if let Some(set) = objects {
                     if set.parse_failed && set.objects.is_empty() && __p.fail_closed {
                         return SecurityDecision::Deny {

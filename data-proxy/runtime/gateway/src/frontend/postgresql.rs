@@ -37,11 +37,28 @@ pub struct PostgreSqlFrontendProtocol {
     prepared_columns: HashMap<String, Vec<GatewayColumn>>,
     /// A10: portal → inferred result columns (copied from statement on Bind).
     portal_columns: HashMap<String, Vec<GatewayColumn>>,
-    /// A10: portals that already received RowDescription via Describe('P').
+    /// A10: portals that already received RowDescription via Describe('P') or
+    /// inherited from a statement that was Described before Bind.
     /// Execute must not re-send RowDescription for these (psycopg extended protocol).
     portal_row_described: HashMap<String, bool>,
+    /// A10: statements that already received RowDescription via Describe('S')
+    /// (local infer or catalog). Bind copies this to portal_row_described.
+    prepared_row_described: HashMap<String, bool>,
     /// Suppress the next resultset header encode (set on Execute when portal was Described).
     suppress_next_row_description: bool,
+    /// A10: pending DescribeSql — when set, next RowDescription response is for this
+    /// statement/portal and should be cached + encoded without ReadyForQuery.
+    pending_describe: Option<PendingDescribe>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingDescribe {
+    /// 'S' statement or 'P' portal
+    target: u8,
+    name: String,
+    /// ParameterDescription already encoded for Describe('S') (sent with RowDescription).
+    param_desc: Option<Vec<u8>>,
+    format_code: i16,
 }
 
 impl PostgreSqlFrontendProtocol {
@@ -59,7 +76,9 @@ impl PostgreSqlFrontendProtocol {
             prepared_columns: HashMap::new(),
             portal_columns: HashMap::new(),
             portal_row_described: HashMap::new(),
+            prepared_row_described: HashMap::new(),
             suppress_next_row_description: false,
+            pending_describe: None,
         }
     }
 
@@ -77,7 +96,9 @@ impl PostgreSqlFrontendProtocol {
             prepared_columns: HashMap::new(),
             portal_columns: HashMap::new(),
             portal_row_described: HashMap::new(),
+            prepared_row_described: HashMap::new(),
             suppress_next_row_description: false,
+            pending_describe: None,
         }
     }
 
@@ -142,8 +163,10 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             }
             FrontendMessage::Terminate => Ok(vec![GatewayCommand::Quit]),
             FrontendMessage::Sync => {
-                // Sync ends the extended-query unit; clear one-shot header suppress.
+                // Sync ends the extended-query unit; clear one-shot header suppress /
+                // unfinished catalog Describe.
                 self.suppress_next_row_description = false;
+                self.pending_describe = None;
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_ready_for_query(transaction_status(session))],
                 }])
@@ -199,7 +222,18 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 } else {
                     self.portal_columns.remove(&portal);
                 }
-                self.portal_row_described.remove(&portal);
+                // Inherit statement-level RowDescription so Execute does not re-send T
+                // after Parse/Describe(S)/Bind/Execute (common psycopg path).
+                if self
+                    .prepared_row_described
+                    .get(&statement)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    self.portal_row_described.insert(portal.clone(), true);
+                } else {
+                    self.portal_row_described.remove(&portal);
+                }
                 self.portals.insert(portal.clone(), sql);
                 self.portal_args.insert(portal.clone(), params);
                 self.portal_params.insert(portal.clone(), nparams);
@@ -212,8 +246,8 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             FrontendMessage::Describe { target, name } => {
                 // Describe statement ('S'): ParameterDescription + RowDescription|NoData.
                 // Describe portal ('P'): RowDescription|NoData only (params already bound).
-                // Column metadata is inferred from explicit SELECT lists (A10); wildcards
-                // and non-SELECT still return NoData (honest boundary).
+                // Explicit SELECT lists are inferred locally; wildcards fall through to
+                // backend prepare (DescribeSql) for catalog columns (A10).
                 let nparams = if target == b'S' {
                     self.prepared_params.get(&name).copied().or_else(|| {
                         self.prepared
@@ -249,10 +283,12 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     0
                 };
 
-                let mut packets = Vec::new();
-                if target == b'S' {
-                    packets.push(encode_parameter_description(&oids));
-                }
+                let param_desc = if target == b'S' {
+                    Some(encode_parameter_description(&oids))
+                } else {
+                    None
+                };
+
                 match columns {
                     Some(cols) if !cols.is_empty() => {
                         let fields: Vec<FieldDescription> = cols
@@ -263,21 +299,51 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                                 f
                             })
                             .collect();
+                        let mut packets = Vec::new();
+                        if let Some(pd) = param_desc {
+                            packets.push(pd);
+                        }
                         packets.push(
                             encode_row_description(&fields).map_err(postgresql_protocol_error)?,
                         );
                         if target == b'P' {
                             self.portal_row_described.insert(name, true);
+                        } else if target == b'S' {
+                            self.prepared_row_described.insert(name, true);
                         }
+                        Ok(vec![GatewayCommand::ClientWire { packets }])
                     }
                     _ => {
-                        packets.push(encode_no_data());
-                        if target == b'P' {
-                            self.portal_row_described.remove(&name);
+                        // Catalog path: resolve SQL for statement/portal and ask backend.
+                        let sql = if target == b'S' {
+                            self.prepared.get(&name).cloned()
+                        } else {
+                            self.portals.get(&name).cloned()
+                        };
+                        match sql {
+                            Some(sql) if looks_like_select(&sql) => {
+                                self.pending_describe = Some(PendingDescribe {
+                                    target,
+                                    name,
+                                    param_desc,
+                                    format_code,
+                                });
+                                Ok(vec![GatewayCommand::DescribeSql { sql }])
+                            }
+                            _ => {
+                                let mut packets = Vec::new();
+                                if let Some(pd) = param_desc {
+                                    packets.push(pd);
+                                }
+                                packets.push(encode_no_data());
+                                if target == b'P' {
+                                    self.portal_row_described.remove(&name);
+                                }
+                                Ok(vec![GatewayCommand::ClientWire { packets }])
+                            }
                         }
                     }
                 }
-                Ok(vec![GatewayCommand::ClientWire { packets }])
             }
             FrontendMessage::Execute { portal, max_rows: _ } => {
                 let sql = self.portals.get(&portal).cloned().ok_or_else(|| {
@@ -315,6 +381,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     self.prepared.remove(&name);
                     self.prepared_params.remove(&name);
                     self.prepared_columns.remove(&name);
+                    self.prepared_row_described.remove(&name);
                 } else {
                     self.portals.remove(&name);
                     self.portal_args.remove(&name);
@@ -371,6 +438,48 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 )),
                 ready,
             ]),
+            // A10: catalog DescribeSql result — encode ParameterDescription (if any) +
+            // RowDescription / NoData. No ReadyForQuery (extended protocol unit ends at Sync).
+            GatewayResponse::RowDescription { columns } => {
+                let pending = self.pending_describe.take();
+                let (target, name, param_desc, format_code) = match pending {
+                    Some(p) => (p.target, p.name, p.param_desc, p.format_code),
+                    None => (b'S', String::new(), None, 0i16),
+                };
+                let mut packets = Vec::new();
+                if let Some(pd) = param_desc {
+                    packets.push(pd);
+                }
+                if columns.is_empty() {
+                    packets.push(encode_no_data());
+                    if target == b'P' {
+                        self.portal_row_described.remove(&name);
+                    }
+                } else {
+                    // Cache for subsequent portal Bind / Execute suppress.
+                    if target == b'S' {
+                        self.prepared_columns
+                            .insert(name.clone(), columns.clone());
+                        self.prepared_row_described.insert(name.clone(), true);
+                    } else if target == b'P' {
+                        self.portal_columns
+                            .insert(name.clone(), columns.clone());
+                        self.portal_row_described.insert(name, true);
+                    }
+                    let fields: Vec<FieldDescription> = columns
+                        .iter()
+                        .map(|c| {
+                            let mut f = gateway_column_to_postgresql_field(c);
+                            f.format_code = format_code;
+                            f
+                        })
+                        .collect();
+                    packets.push(
+                        encode_row_description(&fields).map_err(postgresql_protocol_error)?,
+                    );
+                }
+                Ok(packets)
+            }
         }
     }
 
@@ -540,9 +649,14 @@ fn count_pg_placeholders_frontend(sql: &str) -> u16 {
     max
 }
 
+fn looks_like_select(sql: &str) -> bool {
+    let t = sql.trim_start();
+    t.len() >= 6 && t[..6].eq_ignore_ascii_case("select")
+}
+
 /// Infer result column names from an explicit top-level SELECT list.
-/// Returns `None` for wildcards, non-SELECT, or unparseable lists (Describe → NoData).
-/// Types default to `text` (OID 25) — sufficient for psycopg text-format DataRows.
+/// Returns `None` for wildcards, non-SELECT, or unparseable lists (Describe → catalog /
+/// NoData). Types default to `text` (OID 25) — sufficient for psycopg text-format DataRows.
 fn infer_select_result_columns(sql: &str) -> Option<Vec<GatewayColumn>> {
     let trimmed = sql.trim_start();
     let upper = trimmed.to_ascii_uppercase();
@@ -1579,13 +1693,53 @@ mod tests {
         describe.extend_from_slice(&dlen.to_be_bytes());
         describe.extend_from_slice(&dbody);
         let cmds = protocol.decode(&describe, &mut session).unwrap();
+        // Wildcard cannot be inferred locally → DescribeSql for backend catalog prepare.
         match &cmds[0] {
-            GatewayCommand::ClientWire { packets } => {
-                assert_eq!(packets[0][0], b't');
-                assert_eq!(packets[1][0], b'n'); // NoData for wildcard
+            GatewayCommand::DescribeSql { sql } => {
+                assert!(sql.contains("SELECT *"), "{sql}");
             }
-            other => panic!("{other:?}"),
+            other => panic!("expected DescribeSql, got {other:?}"),
         }
+        assert!(protocol.pending_describe.is_some());
+    }
+
+    #[test]
+    fn a10_encode_row_description_from_catalog_describe() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState::default();
+        protocol.pending_describe = Some(PendingDescribe {
+            target: b'S',
+            name: "s1".into(),
+            param_desc: Some(encode_parameter_description(&[25])),
+            format_code: 0,
+        });
+        let packets = protocol
+            .encode(
+                GatewayResponse::RowDescription {
+                    columns: vec![
+                        GatewayColumn {
+                            name: "id".into(),
+                            data_type: "int4".into(),
+                        },
+                        GatewayColumn {
+                            name: "name".into(),
+                            data_type: "text".into(),
+                        },
+                    ],
+                },
+                &session,
+            )
+            .unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0][0], b't'); // ParameterDescription
+        assert_eq!(packets[1][0], b'T'); // RowDescription
+        assert_eq!(i16::from_be_bytes([packets[1][5], packets[1][6]]), 2);
+        // Cached for later Bind/portal Describe.
+        assert_eq!(
+            protocol.prepared_columns.get("s1").map(|c| c.len()),
+            Some(2)
+        );
+        assert!(protocol.pending_describe.is_none());
     }
 
     #[test]

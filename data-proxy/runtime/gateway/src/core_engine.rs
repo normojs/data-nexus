@@ -495,7 +495,8 @@ impl CoreGatewayConnection {
             let (audit_sql, audit_tables) = match &command {
                 GatewayCommand::Query { sql }
                 | GatewayCommand::QueryParams { sql, .. }
-                | GatewayCommand::Prepare { sql } => {
+                | GatewayCommand::Prepare { sql }
+                | GatewayCommand::DescribeSql { sql } => {
                     let set = crate::object_extract::extract_object_set(
                         sql,
                         self.frontend.protocol().as_str(),
@@ -518,7 +519,8 @@ impl CoreGatewayConnection {
                 let objects = match &command {
                     GatewayCommand::Query { sql }
                     | GatewayCommand::QueryParams { sql, .. }
-                    | GatewayCommand::Prepare { sql } => {
+                    | GatewayCommand::Prepare { sql }
+                    | GatewayCommand::DescribeSql { sql } => {
                         let set = crate::object_extract::extract_object_set(
                             sql,
                             self.frontend.protocol().as_str(),
@@ -1051,6 +1053,7 @@ impl CoreGatewayConnection {
                 GatewayResponse::Pong => "pong".to_owned(),
                 GatewayResponse::Bye => "bye".to_owned(),
                 GatewayResponse::Prepared { .. } => "prepared".to_owned(),
+                GatewayResponse::RowDescription { .. } => "row_description".to_owned(),
             };
             let execute_path = match &response {
                 GatewayResponse::Wire { .. } => "passthrough",
@@ -1204,6 +1207,7 @@ fn command_metric_type(command: &GatewayCommand) -> &'static str {
         GatewayCommand::Prepare { .. } => "PREPARE",
         GatewayCommand::Execute { .. } => "EXECUTE",
         GatewayCommand::CloseStatement { .. } => "CLOSE",
+        GatewayCommand::DescribeSql { .. } => "DESCRIBE_SQL",
         GatewayCommand::ClientWire { .. } => "CLIENT_WIRE",
         GatewayCommand::UseDatabase { .. } => "USE",
         GatewayCommand::Begin => "BEGIN",
