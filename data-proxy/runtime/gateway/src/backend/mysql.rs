@@ -1271,10 +1271,19 @@ impl BackendConnector for MySqlBackendConnector {
         // A06: windowed yield for Streaming SELECT (txn and non-txn).
         // In-transaction: producer returns the leased connection to `txn_lease`
         // after draining so COMMIT/ROLLBACK still share the same backend conn.
-        let streaming = matches!(mode, ExecuteMode::Streaming { .. });
+        //
+        // Materialized row-returning commands are promoted to Streaming so we
+        // never assemble a full ResultSet as the only path (peak ≈ window).
+        // BEGIN/COMMIT/Ping keep Materialized via execute_with_mode below.
         let is_query = matches!(command, GatewayCommand::Query { .. });
         let is_query_params = matches!(command, GatewayCommand::QueryParams { .. });
         let is_execute = matches!(command, GatewayCommand::Execute { .. });
+        let mode = if is_query || is_query_params || is_execute {
+            mode.promote_row_stream()
+        } else {
+            mode
+        };
+        let streaming = matches!(mode, ExecuteMode::Streaming { .. });
         let in_txn = session.transaction_state == TransactionState::Active
             || self.txn_lease.lock().is_some();
 
@@ -2994,6 +3003,17 @@ mod tests {
         let c = MySqlBackendConnector::with_endpoints(vec![endpoint()]);
         assert!(!c.has_transaction_lease());
         assert!(c.txn_lease.lock().is_none());
+    }
+
+    #[test]
+    fn a06_materialized_query_mode_promotes_to_streaming() {
+        // execute_outcome promotes Materialized → Streaming for Query/QueryParams/Execute.
+        let promoted = ExecuteMode::Materialized.promote_row_stream();
+        assert!(promoted.is_streaming());
+        assert_eq!(promoted.window_rows(), Some(256));
+        // Control paths keep Materialized (Ping/Begin not promoted by promote_row_stream alone;
+        // execute_outcome only promotes row-returning commands).
+        assert!(!ExecuteMode::Materialized.is_streaming());
     }
 
     #[test]

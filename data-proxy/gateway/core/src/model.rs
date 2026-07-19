@@ -224,6 +224,22 @@ impl ExecuteMode {
     pub fn is_passthrough(self) -> bool {
         matches!(self, Self::Passthrough)
     }
+
+    /// A06: promote Materialized → Streaming for row-returning commands.
+    ///
+    /// Control statements (BEGIN/COMMIT/Ping) keep Materialized. SELECT / QueryParams /
+    /// prepared Execute should not assemble a full `Vec<Vec<_>>` when a windowed path
+    /// exists — peak retained rows stay ≈ one backend window + one encode window.
+    pub fn promote_row_stream(self) -> Self {
+        match self {
+            Self::Materialized => Self::from_streaming_config(256, None),
+            other => other,
+        }
+    }
+
+    pub fn is_streaming(self) -> bool {
+        matches!(self, Self::Streaming { .. })
+    }
 }
 
 #[cfg(test)]
@@ -235,5 +251,20 @@ mod execute_mode_tests {
         let m = ExecuteMode::from_streaming_config(0, Some(10));
         assert_eq!(m.window_rows(), Some(1));
         assert_eq!(m.effective_max_rows(), Some(10));
+    }
+
+    #[test]
+    fn a06_promote_materialized_row_stream() {
+        let m = ExecuteMode::Materialized.promote_row_stream();
+        assert!(m.is_streaming());
+        assert_eq!(m.window_rows(), Some(256));
+        assert_eq!(m.effective_max_rows(), None);
+        // Streaming / Passthrough unchanged.
+        let s = ExecuteMode::from_streaming_config(64, Some(10));
+        assert_eq!(s.promote_row_stream(), s);
+        assert_eq!(
+            ExecuteMode::Passthrough.promote_row_stream(),
+            ExecuteMode::Passthrough
+        );
     }
 }

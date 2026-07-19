@@ -330,11 +330,16 @@ metrics="$(curl -fsS http://127.0.0.1:8082/metrics || true)"
 if echo "$metrics" | grep -q 'gateway_execute_path_total'; then
   echo "$metrics" | grep 'gateway_execute_path_total' | head -8 || true
   # max_rows obligation forces Streaming (not wire passthrough), including A10 prepared.
+  # A06: multi-row SELECT with max_rows must observe execute_path=streaming.
   if echo "$metrics" | grep -q 'execute_path="streaming"'; then
     echo "streaming path counter observed"
   else
-    echo "note: streaming label not present (counter naming may differ); continuing"
+    echo "FAIL: expected execute_path=streaming after max_rows Streaming traffic" >&2
+    echo "$metrics" | grep 'gateway_execute_path_total' || true
+    exit 1
   fi
+else
+  echo "note: gateway_execute_path_total metric missing; continuing"
 fi
 
 echo "smoke-security-stream: OK"

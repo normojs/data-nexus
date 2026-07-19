@@ -726,6 +726,84 @@ mod tests {
         assert_eq!(writer.packets.last().unwrap(), &vec![3u8]);
     }
 
+    /// A06 honesty: Streaming path never holds more than one window of rows at a time
+    /// in the encode loop (peak retained ≈ window_rows, not full ResultSet).
+    #[tokio::test]
+    async fn a06_streaming_encode_peak_rows_bounded_by_window() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct PeakTrackStream {
+            remaining: Vec<Vec<GatewayValue>>,
+            peak: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl RowStream for PeakTrackStream {
+            async fn poll_window(
+                &mut self,
+                max_rows: usize,
+            ) -> GatewayResult<Option<Vec<Vec<GatewayValue>>>> {
+                if self.remaining.is_empty() {
+                    return Ok(None);
+                }
+                let n = max_rows.min(self.remaining.len());
+                let chunk: Vec<_> = self.remaining.drain(..n).collect();
+                let cur = chunk.len();
+                let prev = self.peak.load(Ordering::Relaxed);
+                if cur > prev {
+                    self.peak.store(cur, Ordering::Relaxed);
+                }
+                Ok(Some(chunk))
+            }
+        }
+
+        let peak = Arc::new(AtomicUsize::new(0));
+        let rows = (0..100)
+            .map(|i| vec![GatewayValue::Integer(i)])
+            .collect::<Vec<_>>();
+        let query = StreamingQuery {
+            columns: vec![Column {
+                name: "id".into(),
+                data_type: "int".into(),
+            }],
+            stream: Box::new(PeakTrackStream {
+                remaining: rows,
+                peak: peak.clone(),
+            }),
+        };
+        let mut fe = FakeFrontend {
+            header_calls: 0,
+            row_calls: 0,
+            footer_calls: 0,
+        };
+        let session = SessionState::default();
+        let mut writer = CollectingWriter::new();
+        let window = 7usize;
+        let stats = write_streaming_query_with_obligations(
+            &mut fe,
+            &session,
+            query,
+            window,
+            None,
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.total_rows, 100);
+        assert!(stats.windows >= (100 / window) as u64);
+        // Producer never emitted a window larger than `window`.
+        assert!(
+            peak.load(Ordering::Relaxed) <= window,
+            "peak window {} > {}",
+            peak.load(Ordering::Relaxed),
+            window
+        );
+        // Encode path called once per window (header once).
+        assert_eq!(fe.header_calls, 1);
+        assert!(fe.row_calls >= 14);
+    }
+
     #[tokio::test]
     async fn b08_streaming_first_window_sample_after_mask() {
         use crate::{MaskAlgorithm, MaskSpec, Obligations};

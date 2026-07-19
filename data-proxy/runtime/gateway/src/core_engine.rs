@@ -732,6 +732,9 @@ impl CoreGatewayConnection {
             // QueryParams uses bound prepare path (not TCP wire passthrough).
             // A4: cross-protocol never uses wire passthrough; force Streaming so
             // backend max_rows/window apply and encode path is windowed.
+            // A06: Materialized is never the production default for row-returning
+            // work — promote_row_stream at the backend is the last line of defense;
+            // here we also avoid selecting Materialized when stream_mode is already Streaming.
             let exec_mode = if want_passthrough {
                 ExecuteMode::Passthrough
             } else if self.translation_policy.is_some() || has_result_obl {
@@ -754,6 +757,17 @@ impl CoreGatewayConnection {
                             (None, None) => None,
                         },
                     },
+                    // Materialized stream_mode on Query* → promote so peak ≈ window.
+                    ExecuteMode::Materialized
+                        if matches!(
+                            command,
+                            GatewayCommand::Query { .. }
+                                | GatewayCommand::QueryParams { .. }
+                                | GatewayCommand::Execute { .. }
+                        ) =>
+                    {
+                        ExecuteMode::from_streaming_config(256, pending_obligations.max_rows)
+                    }
                     other => other,
                 }
             };
