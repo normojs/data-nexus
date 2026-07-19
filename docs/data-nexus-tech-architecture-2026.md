@@ -226,7 +226,26 @@ Data Nexus = 高性能数据库协议 PEP
 
 1. S0–S1：内部 `Decision + Obligations` 结构 + 简单 TOML/YAML 规则（快速交付）。  
 2. S2+：规则编译/映射到 **Cedar schema + policies**（或双写）。  
-3. 企业已有 OPA：实现 `PdpBackend::Remote`，**不**把 OPA 放进每行 mask 循环。
+3. 企业已有 OPA：实现 **F31 Remote PDP**（`security.pdp.backend=remote`），**不**把 OPA 放进每行 mask 循环。
+
+#### A.1 F31 Remote PDP（已实现切片）
+
+命令级 **表/动作** HTTP 旁路，与 Local/Cedar 共用 PEP 义务路径：
+
+| 项 | 约定 |
+|----|------|
+| 配置 | `backend=remote`；必填 `remote_url`（http/https）；`remote_timeout_ms` 默认 50（1..=30000）；可选 `remote_token`；`remote_fail_closed` 默认 true |
+| 调用时机 | 本地表规则 Allow 之后、时间窗/高危票/列 ACL/mask 之前；**仅命令路径** |
+| 请求 JSON | `{ subject_id, service, action, tables[], sql_fingerprint? }` |
+| 响应 JSON | `{ allow: bool, rule?, message? }` |
+| 失败语义 | 超时/传输/非 2xx/坏 JSON → `remote_fail_closed=true` 时 **Deny**（默认） |
+| 非目标 | 远程返回 mask 算法、行过滤、per-row 决策、OPA 包路径自动发现 |
+
+```text
+Local rules (table) → [Cedar?] → [Remote HTTP?] → time/ticket → column ACL → mask obligations
+```
+
+运维：生产模板见 `data-proxy/examples/prod/gateway.example.toml` 注释；单元测 `gateway_core` 的 `f31_*`。
 
 #### B. 为什么热路径不用 Arrow / DataFusion？
 
@@ -271,7 +290,7 @@ OpenDAL 0.58 提供统一 `Operator`、分层 retry/metrics/otel，避免 `s3/os
 ┌────────────────────────────────▼─────────────────────────────────────────┐
 │                         Control Plane (新建)                             │
 │  PolicyRepo · SubjectStore · ApprovalService · AuditQuery · SchemaCache  │
-│  PDP (Cedar/Local) · 编译缓存 · 热更新（epoch）                            │
+│  PDP (Local/Cedar/Remote F31) · 编译缓存 · 热更新（epoch）                 │
 └────────────────────────────────┬─────────────────────────────────────────┘
                                  │ Decision / Obligations / Risk
 ┌────────────────────────────────▼─────────────────────────────────────────┐
@@ -620,6 +639,16 @@ sources = ["protocol_user", "proxy_protocol"]
 backend = "local"          # local | cedar | remote
 policy_dir = "./policies"
 cache_epoch_reload = true
+# F31 remote (when backend = "remote"):
+# remote_url = "https://pdp.example/v1/data_nexus"
+# remote_timeout_ms = 50
+# remote_token = ""          # optional Bearer
+# remote_fail_closed = true
+# F29 cedar attrs (when backend = "cedar"):
+# [[security.pdp.subject_attrs]]
+# subject_id = "alice"
+# tenant = "acme"
+# clearance = "secret"
 
 [security.streaming]
 window_rows = 256
@@ -672,6 +701,7 @@ tables = ["*.*.secret_*"]
 | B5b | 行谓词注入 / 结果行过滤 | **行级管控** | 租户隔离 E2E |
 | B5c | 敏感列标签 + 规则/词典识别（MVP） | **敏感数据识别** | 标签驱动默认 mask |
 | B6 | Cedar backend 可选 feature | 高级可分析策略 | 与 Local 一致集 |
+| B6b | **F31 Remote PDP** HTTP 旁路 | 企业 OPA/外部决策 | 超时 fail_closed；表/动作 gate |
 | B7 | 时间维 / 审批门闩 / 导出通道 | 高级策略·工单 | 高危 SQL 阻断 |
 
 ### Track C — 审计与运营

@@ -171,6 +171,7 @@ examples/        smoke + gateway config 样例
 | A10 | PG ISO string 参数绑 DATE/TIME/TIMESTAMP | feat(a10) |
 | B08 | Streaming 首窗样本（脱敏后） | feat(b08) |
 | F31 | Remote PDP HTTP 旁路（表/动作） | feat(f31) |
+| F31 | 架构文档 Remote PDP 收口 | docs(f31) |
 | UI04 | 策略只读页 + security-policies 扩展字段 | feat(ui04) |
 | T02 | Ticket/Vault 运维 runbook | feat(t02) |
 | UI03 | Audit stats 卡片 + source 角标 + 导出 | feat(ui03) |
@@ -255,25 +256,24 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> 文档/体验收口 或 A 轨继续 或 下一发版验证 <<<**
+**>>> A 轨剩余债 或 发版前 full smoke 或体验/文档小刀 <<<**
 
-本轮（F31 Remote PDP）：
+本轮（F31 文档收口）：
 
-- 配置：`security.pdp.backend=remote` + `remote_url`（必填）+ `remote_timeout_ms` + `remote_token` + `remote_fail_closed`
-- 热路径：命令级表/动作 HTTP POST；超时/传输错误默认 deny
-- 义务（mask/行过滤）仍走 Local 规则；禁止 per-row 远程
-- 单测：fixed allow/deny、fail_closed/open、配置校验
+- 架构文：F31 契约表、配置样例、Track B6b、PDP 图标注
+- 开发规则已允许 `backend=remote`（前轮）
+- 建议 Docker 可用时再跑 default/all smoke 回归
 
 ```bash
 cargo test -p gateway_core --lib f31_
-cargo test -p gateway_core --lib security::tests
+./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. 文档收口（架构文 remote 段）  
-2. A 轨剩余债  
-3. 发版前再跑 full smoke（Docker 可用时）
+1. **default/all smoke**（Docker 可用）  
+2. A 轨剩余债（A09 物化边界诚实账已在）  
+3. 体验小刀（若有）
 
 
 ---
