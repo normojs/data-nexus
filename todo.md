@@ -192,7 +192,7 @@ examples/        smoke + gateway config 样例
 
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
-| **F29** | Cedar 实体属性 | Subject/Table 属性（tenant/clearance）进 Entities；与 Local 对照用例 | 现仅 User/Action/Table 字符串 id | **延后** |
+| **F29** | Cedar 实体属性 | Subject/Table 属性（tenant/clearance）进 Entities；与 Local 对照用例 | `subject_attrs`/`table_attrs` → Entities；uid-only 兼容；对照单测 + attrs-example.cedar | **完成** |
 | **B08** | L2 样本 / 大 payload | 可选结果样本上传 OpenDAL；体积/采样可配 | `sample_enabled` + max_rows/bytes；物化 ResultSet 附样本；worker 可选 OpenDAL；默认关；Streaming 不采样 | **部分** |
 | **F31** | Remote PDP 适配器 | HTTP 旁路 OPA/外部 PDP；超时 fail_closed | 配置已 **拒绝** `backend=remote`（防静默 no-op）；实现后放开 | **延后** |
 | **F30** | 敏感识别增强 | 静态列标签之外的规则/词典 MVP（仍不做全量 DLP） | 仅 `column_tags` + mask 规则 | **延后** |
@@ -244,26 +244,26 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> F29 Cedar 实体属性 或 F31 Remote PDP（延后） 或 发版准备 <<<**
+**>>> F31 Remote PDP（延后） 或 发版准备 <<<**
 
-本轮（B08 L2 样本）：
+本轮（F29 Cedar 实体属性）：
 
-- 配置：`security.audit.sample_enabled` / `sample_max_rows` / `sample_max_bytes` / `sample_prefix` / `sample_inline`
-- 热路径：仅 `default_audit_level=L2` 且 enabled 时对 **物化 ResultSet** 附 `sample_body`（脱敏后）
-- Worker：可选 OpenDAL 上传 → `sample_ref`；默认 inline 保留截断 body
-- 默认 **关**；Streaming 不采样（诚实）
+- 配置：`security.pdp.subject_attrs` / `table_attrs`（tenant/clearance/roles/classification）
+- 评估：按请求构建 `Entities`（User + Table）；无属性目录时保持 `Entities::empty()`（F26 兼容）
+- Local 对照单测：表 deny vs clearance 不足同结果
+- 样例：`examples/cedar-policies-attrs/attrs-example.cedar`（与默认 orders.cedar 分目录）
 
 ```bash
-cargo test -p gateway_core --lib audit::tests
-cargo test -p gateway_core --lib 'security::tests::b08_'
+cargo test -p gateway_core --features security-cedar --lib cedar_pdp
 ./examples/run-smoke-matrix.sh default
+# 可选：./examples/run-smoke-matrix.sh cedar
 ```
 
 建议下一刀：
 
-1. **F29** — Cedar 实体属性  
-2. **F31** — Remote PDP（延后）  
-3. **发版准备** — `/dn-release` 前 full smoke
+1. **F31** — Remote PDP（延后）  
+2. **发版准备** — full smoke + cedar  
+3. 体验债 / 文档收口
 
 
 ---

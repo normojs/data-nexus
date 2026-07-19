@@ -1,14 +1,18 @@
-//! Optional Cedar PDP (F26) + policy hot-reload (epoch / keep-old).
+//! Optional Cedar PDP (F26) + policy hot-reload (epoch / keep-old) + entity attrs (F29).
 //!
 //! Compiled only with `--features security-cedar`. Evaluates **table + action**
 //! authorization using [Cedar](https://www.cedarpolicy.com/) policies loaded from
 //! `security.pdp.policy_dir`. Column masks, row filters, tickets, and time rules
 //! remain on the Local path and are composed after Cedar allows the statement.
 //!
-//! Entity model (MVP):
-//! - principal: `User::"<subject_id>"`
+//! Entity model:
+//! - principal: `User::"<subject_id>"` with optional attrs `tenant`, `clearance`, `roles`
 //! - action: `Action::"select|insert|update|delete|ddl|tcl|other"`
-//! - resource: `Table::"<table>"` (bare name, lower-case recommended in policies)
+//! - resource: `Table::"<table>"` with optional attrs `tenant`, `clearance`, `classification`
+//!
+//! Attr directories come from static config (`security.pdp.subject_attrs` /
+//! `security.pdp.table_attrs`). Empty directories keep F26 behaviour (`Entities::empty()`
+//! is still valid for uid-only policies).
 //!
 //! Empty object set (e.g. `SELECT 1`) uses resource `Table::"__none__"`.
 //!
@@ -18,6 +22,7 @@
 
 #![cfg(feature = "security-cedar")]
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
@@ -25,9 +30,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cedar_policy::{Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request};
+use cedar_policy::{
+    Authorizer, Context, Decision, Entities, Entity, EntityUid, PolicySet, Request,
+    RestrictedExpression,
+};
 use tracing::info;
 
+use crate::security::{SecuritySubjectAttrConfig, SecurityTableAttrConfig};
 use crate::{GatewayError, GatewayResult, StatementAction};
 
 static GLOBAL: OnceLock<Arc<CedarPolicyStore>> = OnceLock::new();
@@ -258,15 +267,39 @@ impl CedarPolicyStore {
         action: StatementAction,
         table: &str,
     ) -> Result<bool, String> {
+        self.is_allowed_with_attrs(subject_id, action, table, &[], &[])
+    }
+
+    /// F29: authorize with optional static subject/table attribute directories.
+    pub fn is_allowed_with_attrs(
+        &self,
+        subject_id: &str,
+        action: StatementAction,
+        table: &str,
+        subject_attrs: &[SecuritySubjectAttrConfig],
+        table_attrs: &[SecurityTableAttrConfig],
+    ) -> Result<bool, String> {
         let principal = entity_uid("User", &sanitize_id(subject_id))?;
         let action_uid = entity_uid("Action", action.as_str())?;
         let resource = entity_uid("Table", &sanitize_id(table))?;
-        let request = Request::new(principal, action_uid, resource, Context::empty(), None)
-            .map_err(|e| format!("cedar request: {e}"))?;
+        let request = Request::new(
+            principal.clone(),
+            action_uid,
+            resource.clone(),
+            Context::empty(),
+            None,
+        )
+        .map_err(|e| format!("cedar request: {e}"))?;
+        let entities = build_entities(
+            subject_id,
+            table,
+            &principal,
+            &resource,
+            subject_attrs,
+            table_attrs,
+        )?;
         self.with_policies(|policies| {
-            let response = self
-                .authorizer
-                .is_authorized(&request, policies, &Entities::empty());
+            let response = self.authorizer.is_authorized(&request, policies, &entities);
             response.decision() == Decision::Allow
         })
     }
@@ -277,8 +310,26 @@ impl CedarPolicyStore {
         action: StatementAction,
         tables: &[String],
     ) -> Result<(), String> {
+        self.authorize_tables_with_attrs(subject_id, action, tables, &[], &[])
+    }
+
+    /// F29: authorize each table with entity attributes.
+    pub fn authorize_tables_with_attrs(
+        &self,
+        subject_id: &str,
+        action: StatementAction,
+        tables: &[String],
+        subject_attrs: &[SecuritySubjectAttrConfig],
+        table_attrs: &[SecurityTableAttrConfig],
+    ) -> Result<(), String> {
         if tables.is_empty() {
-            if self.is_allowed(subject_id, action, "__none__")? {
+            if self.is_allowed_with_attrs(
+                subject_id,
+                action,
+                "__none__",
+                subject_attrs,
+                table_attrs,
+            )? {
                 return Ok(());
             }
             return Err(format!(
@@ -288,7 +339,13 @@ impl CedarPolicyStore {
         }
         for table in tables {
             let bare = bare_table_name(table);
-            if !self.is_allowed(subject_id, action, bare)? {
+            if !self.is_allowed_with_attrs(
+                subject_id,
+                action,
+                bare,
+                subject_attrs,
+                table_attrs,
+            )? {
                 return Err(format!(
                     "cedar deny: subject '{subject_id}' action '{}' on table '{bare}'",
                     action.as_str()
@@ -303,11 +360,28 @@ impl CedarPolicyStore {
 #[derive(Debug, Clone)]
 pub struct CedarEngine {
     store: Arc<CedarPolicyStore>,
+    /// F29: static attr directories cloned from `security.pdp` at load/reload time.
+    subject_attrs: Arc<Vec<SecuritySubjectAttrConfig>>,
+    table_attrs: Arc<Vec<SecurityTableAttrConfig>>,
 }
 
 impl CedarEngine {
     pub fn from_store(store: Arc<CedarPolicyStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            subject_attrs: Arc::new(Vec::new()),
+            table_attrs: Arc::new(Vec::new()),
+        }
+    }
+
+    pub fn with_attr_dirs(
+        mut self,
+        subject_attrs: Vec<SecuritySubjectAttrConfig>,
+        table_attrs: Vec<SecurityTableAttrConfig>,
+    ) -> Self {
+        self.subject_attrs = Arc::new(subject_attrs);
+        self.table_attrs = Arc::new(table_attrs);
+        self
     }
 
     pub fn store(&self) -> &Arc<CedarPolicyStore> {
@@ -325,14 +399,14 @@ impl CedarEngine {
     /// Load every `*.cedar` file under `policy_dir` into the **global** store.
     pub fn load_dir(policy_dir: &str) -> GatewayResult<Self> {
         let store = install_cedar_store(policy_dir)?;
-        Ok(Self { store })
+        Ok(Self::from_store(store))
     }
 
     /// Parse policies from an in-memory string into a **private** store (tests).
     pub fn from_str_policies(source: &str, text: &str) -> GatewayResult<Self> {
         let store = Arc::new(CedarPolicyStore::empty());
         store.reload_from_str(source, text)?;
-        Ok(Self { store })
+        Ok(Self::from_store(store))
     }
 
     pub fn is_allowed(
@@ -341,7 +415,13 @@ impl CedarEngine {
         action: StatementAction,
         table: &str,
     ) -> Result<bool, String> {
-        self.store.is_allowed(subject_id, action, table)
+        self.store.is_allowed_with_attrs(
+            subject_id,
+            action,
+            table,
+            &self.subject_attrs,
+            &self.table_attrs,
+        )
     }
 
     pub fn authorize_tables(
@@ -350,7 +430,13 @@ impl CedarEngine {
         action: StatementAction,
         tables: &[String],
     ) -> Result<(), String> {
-        self.store.authorize_tables(subject_id, action, tables)
+        self.store.authorize_tables_with_attrs(
+            subject_id,
+            action,
+            tables,
+            &self.subject_attrs,
+            &self.table_attrs,
+        )
     }
 }
 
@@ -428,6 +514,14 @@ pub fn try_load_from_config(policy_dir: &str) -> GatewayResult<Option<CedarEngin
     Ok(Some(CedarEngine::load_dir(policy_dir.trim())?))
 }
 
+/// F29: load policies + static entity attribute directories from full PDP config.
+pub fn try_load_from_pdp_config(
+    pdp: &crate::security::SecurityPdpConfig,
+) -> GatewayResult<Option<CedarEngine>> {
+    let eng = try_load_from_config(&pdp.policy_dir)?;
+    Ok(eng.map(|e| e.with_attr_dirs(pdp.subject_attrs.clone(), pdp.table_attrs.clone())))
+}
+
 fn entity_uid(ty: &str, id: &str) -> Result<EntityUid, String> {
     let s = format!(r#"{ty}::"{id}""#);
     EntityUid::from_str(&s).map_err(|e| format!("entity uid {s}: {e}"))
@@ -460,6 +554,94 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// F29: build Entities for one request (principal + resource). Empty attrs → empty Entities.
+fn build_entities(
+    subject_id: &str,
+    table: &str,
+    principal: &EntityUid,
+    resource: &EntityUid,
+    subject_attrs: &[SecuritySubjectAttrConfig],
+    table_attrs: &[SecurityTableAttrConfig],
+) -> Result<Entities, String> {
+    let subj = find_subject_attrs(subject_id, subject_attrs);
+    let tbl = find_table_attrs(table, table_attrs);
+    if subj.is_none() && tbl.is_none() {
+        // Preserve F26 behaviour for uid-only policies.
+        return Ok(Entities::empty());
+    }
+
+    let mut entities = Vec::with_capacity(2);
+    let mut user_attrs = HashMap::new();
+    if let Some(s) = subj {
+        if !s.tenant.is_empty() {
+            user_attrs.insert("tenant".into(), string_attr(&s.tenant)?);
+        }
+        if !s.clearance.is_empty() {
+            user_attrs.insert("clearance".into(), string_attr(&s.clearance)?);
+        }
+        if !s.roles.is_empty() {
+            user_attrs.insert("roles".into(), set_string_attr(&s.roles)?);
+        }
+    }
+    entities.push(
+        Entity::new(principal.clone(), user_attrs, HashSet::new())
+            .map_err(|e| format!("cedar User entity: {e}"))?,
+    );
+
+    let mut table_map = HashMap::new();
+    if let Some(t) = tbl {
+        if !t.tenant.is_empty() {
+            table_map.insert("tenant".into(), string_attr(&t.tenant)?);
+        }
+        if !t.clearance.is_empty() {
+            table_map.insert("clearance".into(), string_attr(&t.clearance)?);
+        }
+        if !t.classification.is_empty() {
+            table_map.insert("classification".into(), string_attr(&t.classification)?);
+        }
+    }
+    entities.push(
+        Entity::new(resource.clone(), table_map, HashSet::new())
+            .map_err(|e| format!("cedar Table entity: {e}"))?,
+    );
+
+    Entities::from_entities(entities, None).map_err(|e| format!("cedar entities: {e}"))
+}
+
+fn find_subject_attrs<'a>(
+    subject_id: &str,
+    dirs: &'a [SecuritySubjectAttrConfig],
+) -> Option<&'a SecuritySubjectAttrConfig> {
+    dirs.iter()
+        .find(|s| s.subject_id.eq_ignore_ascii_case(subject_id))
+}
+
+fn find_table_attrs<'a>(
+    table: &str,
+    dirs: &'a [SecurityTableAttrConfig],
+) -> Option<&'a SecurityTableAttrConfig> {
+    let bare = bare_table_name(table);
+    dirs.iter()
+        .find(|t| t.table.eq_ignore_ascii_case(bare) || t.table.eq_ignore_ascii_case(table))
+}
+
+fn string_attr(value: &str) -> Result<RestrictedExpression, String> {
+    // RestrictedExpression string literal needs JSON-style quotes.
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    RestrictedExpression::from_str(&format!("\"{escaped}\""))
+        .map_err(|e| format!("cedar string attr: {e}"))
+}
+
+fn set_string_attr(values: &[String]) -> Result<RestrictedExpression, String> {
+    let mut parts = Vec::with_capacity(values.len());
+    for v in values {
+        let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+        parts.push(format!("\"{escaped}\""));
+    }
+    let lit = format!("[{}]", parts.join(", "));
+    RestrictedExpression::from_str(&lit).map_err(|e| format!("cedar set attr: {e}"))
 }
 
 #[cfg(test)]
@@ -506,6 +688,195 @@ permit (principal, action == Action::"select", resource == Table::"__none__");
         assert!(eng
             .is_allowed("alice", StatementAction::Select, "orders")
             .unwrap());
+    }
+
+    /// F29: clearance / tenant attributes gate select on secret classification tables.
+    const FIXTURE_ATTRS: &str = r#"
+// Default allow select on non-secret tables (uid-only path still works without attrs).
+permit (
+  principal,
+  action == Action::"select",
+  resource
+)
+when { resource != Table::"payroll" && resource != Table::"secret_tokens" };
+
+permit (
+  principal,
+  action == Action::"select",
+  resource == Table::"__none__"
+);
+
+// Attribute gate: only clearance >= secret may read payroll.
+permit (
+  principal,
+  action == Action::"select",
+  resource
+)
+when {
+  resource == Table::"payroll" &&
+  principal has clearance &&
+  principal.clearance == "secret" &&
+  principal has tenant &&
+  resource has tenant &&
+  principal.tenant == resource.tenant
+};
+
+forbid (
+  principal,
+  action,
+  resource
+)
+when { resource == Table::"secret_tokens" };
+"#;
+
+    #[test]
+    fn f29_attr_allow_same_tenant_secret_clearance() {
+        let eng = CedarEngine::from_str_policies("attrs", FIXTURE_ATTRS)
+            .unwrap()
+            .with_attr_dirs(
+                vec![SecuritySubjectAttrConfig {
+                    subject_id: "alice".into(),
+                    tenant: "acme".into(),
+                    clearance: "secret".into(),
+                    roles: vec!["analyst".into()],
+                }],
+                vec![SecurityTableAttrConfig {
+                    table: "payroll".into(),
+                    tenant: "acme".into(),
+                    clearance: "secret".into(),
+                    classification: "pii".into(),
+                }],
+            );
+        assert!(
+            eng.is_allowed("alice", StatementAction::Select, "payroll")
+                .unwrap(),
+            "same tenant + secret clearance should allow"
+        );
+        assert!(
+            eng.is_allowed("alice", StatementAction::Select, "orders")
+                .unwrap(),
+            "non-attr tables still allowed"
+        );
+    }
+
+    #[test]
+    fn f29_attr_deny_low_clearance_or_wrong_tenant() {
+        let eng = CedarEngine::from_str_policies("attrs", FIXTURE_ATTRS)
+            .unwrap()
+            .with_attr_dirs(
+                vec![
+                    SecuritySubjectAttrConfig {
+                        subject_id: "bob".into(),
+                        tenant: "acme".into(),
+                        clearance: "internal".into(),
+                        roles: vec![],
+                    },
+                    SecuritySubjectAttrConfig {
+                        subject_id: "carol".into(),
+                        tenant: "other".into(),
+                        clearance: "secret".into(),
+                        roles: vec![],
+                    },
+                ],
+                vec![SecurityTableAttrConfig {
+                    table: "payroll".into(),
+                    tenant: "acme".into(),
+                    clearance: "secret".into(),
+                    classification: "pii".into(),
+                }],
+            );
+        assert!(
+            !eng.is_allowed("bob", StatementAction::Select, "payroll")
+                .unwrap(),
+            "internal clearance must not read secret table"
+        );
+        assert!(
+            !eng.is_allowed("carol", StatementAction::Select, "payroll")
+                .unwrap(),
+            "wrong tenant must not read even with secret clearance"
+        );
+        // Unknown subject (no attrs) also denied by attr policy.
+        assert!(
+            !eng.is_allowed("nobody", StatementAction::Select, "payroll")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn f29_uid_only_policies_still_work_without_attr_dirs() {
+        // Empty attr dirs → Entities::empty(); FIXTURE uid-only policies unchanged.
+        let eng = CedarEngine::from_str_policies("fixture", FIXTURE).unwrap();
+        assert!(eng
+            .is_allowed("alice", StatementAction::Select, "orders")
+            .unwrap());
+        assert!(!eng
+            .is_allowed("alice", StatementAction::Select, "secret_tokens")
+            .unwrap());
+    }
+
+    /// F29 vs Local: same intent expressed two ways — Local deny-table vs Cedar attr gate.
+    #[test]
+    fn f29_local_contrast_table_deny_matches_cedar_attr_deny() {
+        use crate::pdp::{LocalPdp, Subject};
+        use crate::security::{SecurityPolicyConfig, SecurityRuleConfig};
+        use crate::{GatewayCommand, HeuristicDialectParser};
+
+        // Local: explicit deny on payroll for everyone.
+        let mut local_cfg = SecurityPolicyConfig::default();
+        local_cfg.enabled = true;
+        local_cfg.rules.push(SecurityRuleConfig {
+            name: "deny-payroll".into(),
+            effect: "deny".into(),
+            actions: vec!["select".into()],
+            tables: vec!["payroll".into()],
+            columns: vec![],
+            subjects: vec![],
+            row_filter: None,
+        });
+        // Allow other selects so only payroll is the contrast point.
+        local_cfg.rules.push(SecurityRuleConfig {
+            name: "allow-select".into(),
+            effect: "allow".into(),
+            actions: vec!["select".into()],
+            tables: vec!["*".into()],
+            columns: vec![],
+            subjects: vec![],
+            row_filter: None,
+        });
+        let local = LocalPdp::from_config_isolated(&local_cfg).expect("local pdp");
+        let subject = Subject::from_protocol_user(Some("bob"), Some("orders"));
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Query {
+            sql: "SELECT id FROM payroll".into(),
+        };
+        let local_dec = local.authorize_command(&subject, "orders", &cmd, &dialect);
+        assert!(
+            local_dec.is_deny(),
+            "local should deny payroll: {local_dec:?}"
+        );
+
+        // Cedar attr path: bob lacks secret clearance → deny payroll (same outcome).
+        let eng = CedarEngine::from_str_policies("attrs", FIXTURE_ATTRS)
+            .unwrap()
+            .with_attr_dirs(
+                vec![SecuritySubjectAttrConfig {
+                    subject_id: "bob".into(),
+                    tenant: "acme".into(),
+                    clearance: "internal".into(),
+                    roles: vec![],
+                }],
+                vec![SecurityTableAttrConfig {
+                    table: "payroll".into(),
+                    tenant: "acme".into(),
+                    clearance: "secret".into(),
+                    classification: "pii".into(),
+                }],
+            );
+        assert!(
+            !eng.is_allowed("bob", StatementAction::Select, "payroll")
+                .unwrap(),
+            "cedar attr path should deny like Local table deny"
+        );
     }
 
     #[test]

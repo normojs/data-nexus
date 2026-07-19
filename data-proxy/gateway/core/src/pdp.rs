@@ -182,7 +182,7 @@ impl LocalPdpInner {
     fn from_config(config: &SecurityPolicyConfig) -> Self {
         #[cfg(feature = "security-cedar")]
         let (cedar, cedar_required) = if config.pdp.backend.eq_ignore_ascii_case("cedar") {
-            match crate::cedar_pdp::try_load_from_config(&config.pdp.policy_dir) {
+            match crate::cedar_pdp::try_load_from_pdp_config(&config.pdp) {
                 Ok(eng) => (eng, true),
                 Err(e) => {
                     tracing::error!(

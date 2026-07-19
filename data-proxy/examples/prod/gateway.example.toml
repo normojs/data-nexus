@@ -51,6 +51,16 @@ backend = "local"
 # For Cedar: backend = "cedar", policy_dir = "/etc/data-nexus/cedar", cache_epoch_reload = true
 policy_dir = ""
 cache_epoch_reload = true
+# F29: static Cedar entity attributes (only used when backend=cedar).
+# [[security.pdp.subject_attrs]]
+# subject_id = "app_ro"
+# tenant = "prod"
+# clearance = "internal"
+# [[security.pdp.table_attrs]]
+# table = "customers"
+# tenant = "prod"
+# clearance = "internal"
+# classification = "pii"
 
 [security.streaming]
 window_rows = 256

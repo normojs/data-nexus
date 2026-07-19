@@ -76,7 +76,8 @@ pub use policy_file::{
 pub use security::{
     SecurityAuditConfig, SecurityColumnTagConfig, SecurityHighRiskRuleConfig,
     SecurityMaskRuleConfig, SecurityPdpConfig, SecurityPolicyConfig, SecurityRuleConfig,
-    SecurityStateConfig, SecurityStreamingConfig, SecuritySubjectConfig, SecurityWatermarkConfig,
+    SecurityStateConfig, SecurityStreamingConfig, SecuritySubjectAttrConfig, SecuritySubjectConfig,
+    SecurityTableAttrConfig, SecurityWatermarkConfig,
 };
 pub use state_crypto::{
     decode_maybe_encrypted, decrypt_blob, encrypt_blob, parse_encrypt_key,

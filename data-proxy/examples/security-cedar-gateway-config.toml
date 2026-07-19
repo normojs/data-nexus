@@ -21,6 +21,17 @@ sources = ["protocol_user"]
 [security.pdp]
 backend = "cedar"
 policy_dir = "examples/cedar-policies"
+# F29: optional static entity attributes for Cedar (tenant/clearance).
+# For ABAC demos use policy_dir = "examples/cedar-policies-attrs" + attrs below.
+# [[security.pdp.subject_attrs]]
+# subject_id = "root"
+# tenant = "acme"
+# clearance = "secret"
+# [[security.pdp.table_attrs]]
+# table = "payroll"
+# tenant = "acme"
+# clearance = "secret"
+# classification = "pii"
 
 [security.streaming]
 window_rows = 256
