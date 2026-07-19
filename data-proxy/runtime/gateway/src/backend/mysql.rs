@@ -218,7 +218,13 @@ fn gateway_value_mysql_param_type(v: &GatewayValue) -> (u8, bool) {
         GatewayValue::UnsignedInteger(_) => (ColumnType::MYSQL_TYPE_LONGLONG as u8, true),
         GatewayValue::Float(_) => (ColumnType::MYSQL_TYPE_DOUBLE as u8, false),
         GatewayValue::Decimal(_) => (ColumnType::MYSQL_TYPE_NEWDECIMAL as u8, false),
-        GatewayValue::String(_) => (ColumnType::MYSQL_TYPE_VAR_STRING as u8, false),
+        // A10: ISO-looking strings bind as native temporal types when unambiguous.
+        GatewayValue::String(s) => match classify_mysql_temporal_string(s) {
+            Some(MySqlTemporalKind::Date) => (ColumnType::MYSQL_TYPE_DATE as u8, false),
+            Some(MySqlTemporalKind::DateTime) => (ColumnType::MYSQL_TYPE_DATETIME as u8, false),
+            Some(MySqlTemporalKind::Time) => (ColumnType::MYSQL_TYPE_TIME as u8, false),
+            None => (ColumnType::MYSQL_TYPE_VAR_STRING as u8, false),
+        },
         GatewayValue::Bytes(_) => (ColumnType::MYSQL_TYPE_BLOB as u8, false),
     }
 }
@@ -246,15 +252,202 @@ fn encode_binary_param_value(out: &mut Vec<u8>, v: &GatewayValue) -> GatewayResu
             encode_lenc_bytes(out, s.as_bytes());
             Ok(())
         }
-        GatewayValue::String(s) => {
-            encode_lenc_bytes(out, s.as_bytes());
-            Ok(())
-        }
+        GatewayValue::String(s) => match classify_mysql_temporal_string(s) {
+            Some(MySqlTemporalKind::Date) => encode_mysql_binary_date_param(out, s),
+            Some(MySqlTemporalKind::DateTime) => encode_mysql_binary_datetime_param(out, s),
+            Some(MySqlTemporalKind::Time) => encode_mysql_binary_time_param(out, s),
+            None => {
+                encode_lenc_bytes(out, s.as_bytes());
+                Ok(())
+            }
+        },
         GatewayValue::Bytes(b) => {
             encode_lenc_bytes(out, b);
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MySqlTemporalKind {
+    Date,
+    DateTime,
+    Time,
+}
+
+/// Heuristic classification for ISO-like temporal strings used as QueryParams.
+/// Prefer datetime when both date and time parts are present; date-only and time-only next.
+fn classify_mysql_temporal_string(s: &str) -> Option<MySqlTemporalKind> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if parse_mysql_param_datetime(t).is_some() {
+        return Some(MySqlTemporalKind::DateTime);
+    }
+    if parse_mysql_param_date(t).is_some() {
+        return Some(MySqlTemporalKind::Date);
+    }
+    if parse_mysql_param_time(t).is_some() {
+        return Some(MySqlTemporalKind::Time);
+    }
+    None
+}
+
+fn encode_mysql_binary_date_param(out: &mut Vec<u8>, s: &str) -> GatewayResult<()> {
+    let (y, m, d) = parse_mysql_param_date(s).ok_or_else(|| {
+        GatewayError::Protocol(format!("invalid mysql DATE param '{s}'"))
+    })?;
+    out.push(4);
+    out.extend_from_slice(&y.to_le_bytes());
+    out.push(m);
+    out.push(d);
+    Ok(())
+}
+
+fn encode_mysql_binary_datetime_param(out: &mut Vec<u8>, s: &str) -> GatewayResult<()> {
+    let (y, mo, d, h, mi, sec, micro) = parse_mysql_param_datetime(s).ok_or_else(|| {
+        GatewayError::Protocol(format!("invalid mysql DATETIME param '{s}'"))
+    })?;
+    if micro == 0 {
+        out.push(7);
+        out.extend_from_slice(&y.to_le_bytes());
+        out.push(mo);
+        out.push(d);
+        out.push(h);
+        out.push(mi);
+        out.push(sec);
+    } else {
+        out.push(11);
+        out.extend_from_slice(&y.to_le_bytes());
+        out.push(mo);
+        out.push(d);
+        out.push(h);
+        out.push(mi);
+        out.push(sec);
+        out.extend_from_slice(&micro.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn encode_mysql_binary_time_param(out: &mut Vec<u8>, s: &str) -> GatewayResult<()> {
+    let (neg, days, h, m, sec, micro) = parse_mysql_param_time(s).ok_or_else(|| {
+        GatewayError::Protocol(format!("invalid mysql TIME param '{s}'"))
+    })?;
+    if micro == 0 {
+        out.push(8);
+        out.push(if neg { 1 } else { 0 });
+        out.extend_from_slice(&days.to_le_bytes());
+        out.push(h);
+        out.push(m);
+        out.push(sec);
+    } else {
+        out.push(12);
+        out.push(if neg { 1 } else { 0 });
+        out.extend_from_slice(&days.to_le_bytes());
+        out.push(h);
+        out.push(m);
+        out.push(sec);
+        out.extend_from_slice(&micro.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn parse_mysql_param_date(s: &str) -> Option<(u16, u8, u8)> {
+    let s = s.trim();
+    let mut parts = s.split('-');
+    let y: u16 = parts.next()?.parse().ok()?;
+    let m: u8 = parts.next()?.parse().ok()?;
+    let d: u8 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+fn parse_mysql_param_hms_micro(s: &str) -> Option<(u8, u8, u8, u32)> {
+    let s = s.trim();
+    let (hms, micro) = if let Some((left, frac)) = s.split_once('.') {
+        let digits: String = frac.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() || digits.len() > 6 {
+            return None;
+        }
+        let padded = format!("{digits:0<6}");
+        let us: u32 = padded.parse().ok()?;
+        (left, us)
+    } else {
+        (s, 0)
+    };
+    let mut parts = hms.split(':');
+    let h: u8 = parts.next()?.parse().ok()?;
+    let m: u8 = parts.next()?.parse().ok()?;
+    let sec: u8 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if h > 23 || m > 59 || sec > 59 {
+        return None;
+    }
+    Some((h, m, sec, micro))
+}
+
+fn parse_mysql_param_datetime(s: &str) -> Option<(u16, u8, u8, u8, u8, u8, u32)> {
+    let s = s.trim().replace('T', " ");
+    let (date, time) = s.split_once(' ')?;
+    let (y, mo, d) = parse_mysql_param_date(date)?;
+    let (h, mi, sec, micro) = parse_mysql_param_hms_micro(time)?;
+    Some((y, mo, d, h, mi, sec, micro))
+}
+
+fn parse_mysql_param_time(s: &str) -> Option<(bool, u32, u8, u8, u8, u32)> {
+    let s = s.trim();
+    // Reject pure dates so "2024-01-01" is not treated as time.
+    if s.contains('-') && !s.contains(':') {
+        return None;
+    }
+    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r.trim())
+    } else {
+        (false, s)
+    };
+    // Optional leading days: "D HH:MM:SS" or just "HH:MM:SS"
+    let (days, time_part) = if let Some((d, t)) = rest.split_once(' ') {
+        let days: u32 = d.parse().ok()?;
+        (days, t.trim())
+    } else {
+        (0u32, rest)
+    };
+    // TIME may allow hour > 23 when days==0 (MySQL TIME range); keep bind liberal up to 838.
+    let s = time_part.trim();
+    let (hms, micro) = if let Some((left, frac)) = s.split_once('.') {
+        let digits: String = frac.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() || digits.len() > 6 {
+            return None;
+        }
+        let padded = format!("{digits:0<6}");
+        let us: u32 = padded.parse().ok()?;
+        (left, us)
+    } else {
+        (s, 0)
+    };
+    let mut parts = hms.split(':');
+    let h: u32 = parts.next()?.parse().ok()?;
+    let m: u8 = parts.next()?.parse().ok()?;
+    let sec: u8 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if m > 59 || sec > 59 || h > 838 {
+        return None;
+    }
+    // Protocol TIME hour field is 0–23; fold excess hours into days.
+    let extra_days = h / 24;
+    let hour = (h % 24) as u8;
+    let days = days.saturating_add(extra_days);
+    Some((neg, days, hour, m, sec, micro))
 }
 
 fn encode_lenc_bytes(out: &mut Vec<u8>, data: &[u8]) {
@@ -2515,6 +2708,65 @@ mod tests {
         // only non-null value encoded: 42 i64
         let val = &payload[payload.len() - 8..];
         assert_eq!(val, &42i64.to_le_bytes());
+    }
+
+    #[test]
+    fn a10_param_type_classifies_iso_temporal_strings() {
+        assert_eq!(
+            gateway_value_mysql_param_type(&GatewayValue::String("2024-08-31".into())),
+            (ColumnType::MYSQL_TYPE_DATE as u8, false)
+        );
+        assert_eq!(
+            gateway_value_mysql_param_type(&GatewayValue::String(
+                "2022-08-31 07:16:16".into()
+            )),
+            (ColumnType::MYSQL_TYPE_DATETIME as u8, false)
+        );
+        assert_eq!(
+            gateway_value_mysql_param_type(&GatewayValue::String("07:16:16".into())),
+            (ColumnType::MYSQL_TYPE_TIME as u8, false)
+        );
+        // ordinary text stays VAR_STRING
+        assert_eq!(
+            gateway_value_mysql_param_type(&GatewayValue::String("alice".into())),
+            (ColumnType::MYSQL_TYPE_VAR_STRING as u8, false)
+        );
+        // ambiguous "not-a-date" stays string
+        assert_eq!(
+            gateway_value_mysql_param_type(&GatewayValue::String("2024-13-40".into())),
+            (ColumnType::MYSQL_TYPE_VAR_STRING as u8, false)
+        );
+    }
+
+    #[test]
+    fn a10_encode_stmt_execute_binds_date_datetime_time() {
+        let payload = encode_stmt_execute_payload(
+            1,
+            &[
+                GatewayValue::String("2024-08-31".into()),
+                GatewayValue::String("2022-08-31 07:16:16".into()),
+                GatewayValue::String("-1 10:08:21".into()),
+            ],
+        )
+        .unwrap();
+        // types after null_bitmap(1)+new_params_bound: 3 * (type, flags)
+        // stmt_id(4)+flags(1)+iter(4)+null_bitmap(1)+new(1)=11
+        assert_eq!(payload[11], ColumnType::MYSQL_TYPE_DATE as u8);
+        assert_eq!(payload[13], ColumnType::MYSQL_TYPE_DATETIME as u8);
+        assert_eq!(payload[15], ColumnType::MYSQL_TYPE_TIME as u8);
+        let values = &payload[17..];
+        // DATE: 4 + year LE + mon + day
+        assert_eq!(&values[0..5], &[4, 0xe8, 0x07, 8, 31]);
+        // DATETIME: 7 + y m d h mi s
+        assert_eq!(
+            &values[5..13],
+            &[7, 0xe6, 0x07, 8, 31, 7, 16, 16]
+        );
+        // TIME: 8 + neg days h m s
+        assert_eq!(
+            &values[13..22],
+            &[8, 1, 1, 0, 0, 0, 10, 8, 21]
+        );
     }
 
     #[test]
