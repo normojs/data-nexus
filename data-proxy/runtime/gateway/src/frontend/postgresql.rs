@@ -8,9 +8,9 @@ use postgresql_protocol::{
     decode_frontend_message, decode_startup_packet, encode_authentication_ok,
     encode_backend_key_data, encode_bind_complete, encode_close_complete, encode_command_complete,
     encode_data_row, encode_error_response, encode_no_data, encode_parameter_description,
-    encode_parameter_status, encode_parse_complete, encode_ready_for_query, encode_row_description,
-    FieldDescription, FrontendMessage, StartupMessage, StartupPacket, TransactionStatus,
-    MAX_STARTUP_PACKET_LEN,
+    encode_parameter_status, encode_parse_complete, encode_portal_suspended,
+    encode_ready_for_query, encode_row_description, FieldDescription, FrontendMessage,
+    StartupMessage, StartupPacket, TransactionStatus, MAX_STARTUP_PACKET_LEN,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -171,6 +171,8 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 self.portal_row_described.clear();
                 session.prefer_binary_result = false;
                 session.pg_extended_query = false;
+                session.pg_execute_max_rows = None;
+                session.result_truncated = false;
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_ready_for_query(transaction_status(session))],
                 }])
@@ -344,8 +346,16 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     }
                 }
             }
-            FrontendMessage::Execute { portal, max_rows: _ } => {
+            FrontendMessage::Execute { portal, max_rows } => {
                 session.pg_extended_query = true;
+                // Client Execute max_rows: 0 = unlimited. When > 0 and stream is
+                // truncated at this page, footer emits PortalSuspended.
+                session.pg_execute_max_rows = if max_rows > 0 {
+                    Some(max_rows as u32)
+                } else {
+                    None
+                };
+                session.result_truncated = false;
                 let sql = self.portals.get(&portal).cloned().ok_or_else(|| {
                     GatewayError::Protocol(format!(
                         "postgresql Execute: unknown portal '{portal}'"
@@ -540,16 +550,34 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
         _columns: &[GatewayColumn],
         total_rows: usize,
         session: &SessionState,
+        truncated: bool,
     ) -> GatewayResult<Vec<Vec<u8>>> {
         // Extended-query Execute must NOT send ReadyForQuery — the client expects
         // more messages until Sync (which alone emits Z). Emitting Z early makes
         // clients drop subsequent Bind/Execute responses (same-conn re-execute).
-        let complete = encode_command_complete(&format!("SELECT {total_rows}"));
-        if session.pg_extended_query {
-            Ok(vec![complete])
+        //
+        // A10 PortalSuspended: only when the *client* Execute max_rows page stopped
+        // early with more rows remaining. Security max_rows still uses CommandComplete
+        // so fetchall() terminates (honest policy cap).
+        let client_page = session
+            .pg_execute_max_rows
+            .map(|m| m as usize)
+            .filter(|m| *m > 0);
+        let portal_suspended = session.pg_extended_query
+            && truncated
+            && client_page.is_some()
+            && client_page.map(|m| total_rows >= m).unwrap_or(false);
+
+        if portal_suspended {
+            Ok(vec![encode_portal_suspended()])
         } else {
-            let ready = encode_ready_for_query(transaction_status(session));
-            Ok(vec![complete, ready])
+            let complete = encode_command_complete(&format!("SELECT {total_rows}"));
+            if session.pg_extended_query {
+                Ok(vec![complete])
+            } else {
+                let ready = encode_ready_for_query(transaction_status(session));
+                Ok(vec![complete, ready])
+            }
         }
     }
 }
@@ -1784,7 +1812,7 @@ mod tests {
             ..SessionState::default()
         };
         let footer = protocol
-            .encode_resultset_footer(&[], 1, &session)
+            .encode_resultset_footer(&[], 1, &session, false)
             .unwrap();
         assert_eq!(footer.len(), 1);
         assert_eq!(footer[0][0], b'C'); // CommandComplete only
@@ -1796,11 +1824,41 @@ mod tests {
         let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
         let session = SessionState::default();
         let footer = protocol
-            .encode_resultset_footer(&[], 2, &session)
+            .encode_resultset_footer(&[], 2, &session, false)
             .unwrap();
         assert_eq!(footer.len(), 2);
         assert_eq!(footer[0][0], b'C');
         assert_eq!(footer[1][0], b'Z');
+    }
+
+    #[test]
+    fn a10_portal_suspended_when_client_page_truncated() {
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState {
+            pg_extended_query: true,
+            pg_execute_max_rows: Some(1),
+            ..SessionState::default()
+        };
+        let footer = protocol
+            .encode_resultset_footer(&[], 1, &session, true)
+            .unwrap();
+        assert_eq!(footer.len(), 1);
+        assert_eq!(footer[0][0], b's'); // PortalSuspended
+    }
+
+    #[test]
+    fn a10_security_truncate_still_command_complete() {
+        // Security max_rows sets truncated=true but no client page → CommandComplete.
+        let mut protocol = PostgreSqlFrontendProtocol::new("14.0".into());
+        let session = SessionState {
+            pg_extended_query: true,
+            pg_execute_max_rows: None,
+            ..SessionState::default()
+        };
+        let footer = protocol
+            .encode_resultset_footer(&[], 1, &session, true)
+            .unwrap();
+        assert_eq!(footer[0][0], b'C');
     }
 
     #[test]

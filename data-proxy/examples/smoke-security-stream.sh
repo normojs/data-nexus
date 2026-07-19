@@ -17,10 +17,13 @@ PROXY_LOG="${TMPDIR:-/tmp}/data-nexus-security-stream.log"
 COMPOSE=(docker compose -f "$COMPOSE_FILE")
 
 cleanup() {
-  if [[ -n "${PROXY_PID:-}" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
-    kill "$PROXY_PID" 2>/dev/null || true
-    wait "$PROXY_PID" 2>/dev/null || true
-  fi
+  for pid_var in PROXY_PID PAGE_PROXY_PID; do
+    pid="${!pid_var:-}"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
 }
 trap cleanup EXIT
 
@@ -66,9 +69,11 @@ PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
     || [[ "$ROOT/runtime/gateway/src/backend/postgresql.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/frontend/postgresql.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/frontend/mysql.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/runtime/gateway/src/core_engine.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/server/metrics.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/gateway/core/src/transport.rs" -nt "$PROXY_BIN" ]] \
-    || [[ "$ROOT/gateway/core/src/model.rs" -nt "$PROXY_BIN" ]]; then
+    || [[ "$ROOT/gateway/core/src/model.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/protocol/postgresql/src/lib.rs" -nt "$PROXY_BIN" ]]; then
     cargo build -p data-proxy --bin proxy
   fi
   "$PROXY_BIN" daemon -c "$CONFIG_FILE"
@@ -419,6 +424,81 @@ PY
 echo "$pg_star_out"
 echo "$pg_star_out" | grep -q 'pg_star_describe_ok'
 
+echo "==> A10 PostgreSQL client Execute max_rows=1 under policy max_rows=1 → CommandComplete"
+# Policy and client page both 1: backend stream ends at policy → no remainder → C (not s).
+pg_policy_page_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
+  python - <<'PY'
+import socket, struct
+
+def i32(n):
+    return struct.pack("!i", n)
+
+def i16(n):
+    return struct.pack("!h", n)
+
+def cstr(s: str) -> bytes:
+    return s.encode() + b"\x00"
+
+def msg(tag: bytes, body: bytes) -> bytes:
+    return tag + i32(len(body) + 4) + body
+
+def read_msg(sock):
+    hdr = b""
+    while len(hdr) < 5:
+        chunk = sock.recv(5 - len(hdr))
+        if not chunk:
+            raise RuntimeError("eof header")
+        hdr += chunk
+    tag = hdr[0:1]
+    (length,) = struct.unpack("!i", hdr[1:5])
+    body = b""
+    need = length - 4
+    while len(body) < need:
+        chunk = sock.recv(need - len(body))
+        if not chunk:
+            raise RuntimeError("eof body")
+        body += chunk
+    return tag, body
+
+sock = socket.create_connection(("host.docker.internal", 9089), timeout=10)
+params = cstr("user") + cstr("postgres") + cstr("database") + cstr("analytics") + b"\x00"
+sock.sendall(i32(8 + len(params)) + i32(196608) + params)
+while True:
+    tag, body = read_msg(sock)
+    if tag == b"Z":
+        break
+    if tag == b"E":
+        raise RuntimeError(body)
+
+sql = "SELECT id, name FROM stream_smoke ORDER BY id"
+sock.sendall(msg(b"P", cstr("spage") + cstr(sql) + i16(0)))
+sock.sendall(msg(b"B", cstr("ppage") + cstr("spage") + i16(0) + i16(0) + i16(0)))
+sock.sendall(msg(b"E", cstr("ppage") + i32(1)))
+sock.sendall(msg(b"S", b""))
+
+tags = []
+rows = 0
+while True:
+    tag, body = read_msg(sock)
+    tags.append(tag.decode("latin1"))
+    if tag == b"D":
+        rows += 1
+    if tag == b"E":
+        raise RuntimeError(body.decode("utf-8", "replace"))
+    if tag == b"Z":
+        break
+
+print("pg_policy_page_tags", tags, "rows", rows)
+assert rows == 1, rows
+assert "C" in tags, f"policy cap must CommandComplete, got {tags}"
+assert "s" not in tags, f"policy cap must not PortalSuspended, got {tags}"
+print("pg_portal_policy_command_complete_ok")
+sock.close()
+PY
+)"
+echo "$pg_policy_page_out"
+echo "$pg_policy_page_out" | grep -q 'pg_portal_policy_command_complete_ok'
+
 echo "==> A10 PostgreSQL psycopg3 prepared max_rows=1 (same-conn re-Execute)"
 # Full client path: Describe → RowDescription; Execute footer must not emit Z
 # (only Sync does) so same-connection re-execute works under max_rows.
@@ -474,6 +554,116 @@ PY
 echo "$pg_psycopg_out"
 echo "$pg_psycopg_out" | grep -q 'psycopg_prepared_ok'
 echo "$pg_psycopg_out" | grep -q 'psycopg_rebind_rows'
+
+echo "==> A10 PostgreSQL PortalSuspended (client page=1, policy max_rows=100)"
+# Second gateway on 8083/9090 (main stays on 8082/9088/9089). High policy max_rows so
+# client Execute page=1 leaves backend remainder → PortalSuspended tag `s`.
+PAGE_CONFIG_FILE="$ROOT/examples/security-stream-page-gateway-config.toml"
+PAGE_PROXY_LOG="${TMPDIR:-/tmp}/data-nexus-security-stream-page.log"
+# Free page ports if a previous run left a proxy hanging.
+for port in 8083 9090; do
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      # shellcheck disable=SC2086
+      kill $pids 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+done
+(
+  cd "$ROOT"
+  "$PROXY_BIN" daemon -c "$PAGE_CONFIG_FILE"
+) >"$PAGE_PROXY_LOG" 2>&1 &
+PAGE_PROXY_PID=$!
+for _ in $(seq 1 60); do
+  if curl -fsS "http://127.0.0.1:8083/healthz" >/dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "$PAGE_PROXY_PID" 2>/dev/null; then
+    cat "$PAGE_PROXY_LOG"
+    exit 1
+  fi
+  sleep 1
+done
+curl -fsS "http://127.0.0.1:8083/healthz" >/dev/null
+pg_suspend_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
+  python - <<'PY'
+import socket, struct
+
+def i32(n):
+    return struct.pack("!i", n)
+
+def i16(n):
+    return struct.pack("!h", n)
+
+def cstr(s: str) -> bytes:
+    return s.encode() + b"\x00"
+
+def msg(tag: bytes, body: bytes) -> bytes:
+    return tag + i32(len(body) + 4) + body
+
+def read_msg(sock):
+    hdr = b""
+    while len(hdr) < 5:
+        chunk = sock.recv(5 - len(hdr))
+        if not chunk:
+            raise RuntimeError("eof header")
+        hdr += chunk
+    tag = hdr[0:1]
+    (length,) = struct.unpack("!i", hdr[1:5])
+    body = b""
+    need = length - 4
+    while len(body) < need:
+        chunk = sock.recv(need - len(body))
+        if not chunk:
+            raise RuntimeError("eof body")
+        body += chunk
+    return tag, body
+
+sock = socket.create_connection(("host.docker.internal", 9090), timeout=10)
+params = cstr("user") + cstr("postgres") + cstr("database") + cstr("analytics") + b"\x00"
+sock.sendall(i32(8 + len(params)) + i32(196608) + params)
+while True:
+    tag, body = read_msg(sock)
+    if tag == b"Z":
+        break
+    if tag == b"E":
+        raise RuntimeError(body)
+
+sql = "SELECT id, name FROM stream_smoke ORDER BY id"
+sock.sendall(msg(b"P", cstr("ssus") + cstr(sql) + i16(0)))
+sock.sendall(msg(b"B", cstr("psus") + cstr("ssus") + i16(0) + i16(0) + i16(0)))
+sock.sendall(msg(b"E", cstr("psus") + i32(1)))
+sock.sendall(msg(b"S", b""))
+
+tags = []
+rows = 0
+while True:
+    tag, body = read_msg(sock)
+    tags.append(tag.decode("latin1"))
+    if tag == b"D":
+        rows += 1
+    if tag == b"E":
+        raise RuntimeError(body.decode("utf-8", "replace"))
+    if tag == b"Z":
+        break
+
+print("pg_suspend_tags", tags, "rows", rows)
+assert rows == 1, rows
+assert "s" in tags, f"expected PortalSuspended tag s, got {tags}"
+assert "C" not in tags, f"must not CommandComplete when page suspends, got {tags}"
+print("pg_portal_suspended_ok")
+sock.close()
+PY
+)"
+echo "$pg_suspend_out"
+echo "$pg_suspend_out" | grep -q 'pg_portal_suspended_ok'
+if [[ -n "${PAGE_PROXY_PID:-}" ]] && kill -0 "$PAGE_PROXY_PID" 2>/dev/null; then
+  kill "$PAGE_PROXY_PID" 2>/dev/null || true
+  wait "$PAGE_PROXY_PID" 2>/dev/null || true
+  PAGE_PROXY_PID=""
+fi
 
 echo "==> metrics execute_path + A06 encode peak after traffic"
 metrics="$(curl -fsS http://127.0.0.1:8082/metrics || true)"

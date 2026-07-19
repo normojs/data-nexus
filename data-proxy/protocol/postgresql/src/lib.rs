@@ -539,6 +539,12 @@ pub fn encode_command_complete(tag: &str) -> Vec<u8> {
     encode_message(b'C', &body)
 }
 
+/// A10: PortalSuspended — more rows remain for this portal (Execute max_rows page).
+/// Empty body; tag `s`.
+pub fn encode_portal_suspended() -> Vec<u8> {
+    encode_message(b's', &[])
+}
+
 pub fn encode_row_description(fields: &[FieldDescription]) -> Result<Vec<u8>, ProtocolError> {
     let mut body = Vec::new();
     push_i16(&mut body, checked_i16(fields.len())?);

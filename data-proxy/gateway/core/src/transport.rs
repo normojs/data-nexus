@@ -40,11 +40,14 @@ pub trait FrontendProtocolAdapter: Send {
     ) -> GatewayResult<Vec<Vec<u8>>>;
 
     /// Trailing EOF / CommandComplete / ReadyForQuery (A2).
+    /// `truncated` is true when a row cap stopped encoding with more backend rows remaining
+    /// (A10: PG may emit PortalSuspended for client Execute max_rows pages).
     fn encode_resultset_footer(
         &mut self,
         columns: &[Column],
         total_rows: usize,
         session: &SessionState,
+        truncated: bool,
     ) -> GatewayResult<Vec<Vec<u8>>>;
 }
 
@@ -240,6 +243,9 @@ pub struct StreamingEncodeStats {
     /// A06 honesty: max rows held in one encode window (should be ≤ configured window).
     /// Not process RSS — logical peak retained for encode, not full ResultSet.
     pub peak_window_rows: u64,
+    /// True when a row cap stopped encoding while the backend stream still had rows
+    /// (A10 PortalSuspended / honest truncated Complete).
+    pub truncated: bool,
     /// B08: optional first-window sample body (already masked), when requested.
     pub sample_body: Option<String>,
     pub sample_row_count: Option<u32>,
@@ -328,7 +334,15 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
     loop {
         if let Some(max) = max_total {
             if stats.total_rows >= max {
-                while query.stream.poll_window(window).await?.is_some() {}
+                // Hit row cap: drain remaining backend windows so the connection
+                // can be reused, and mark truncated when more rows were available.
+                let mut saw_more = false;
+                while let Some(chunk) = query.stream.poll_window(window).await? {
+                    if !chunk.is_empty() {
+                        saw_more = true;
+                    }
+                }
+                stats.truncated = saw_more || stats.truncated;
                 break;
             }
         }
@@ -339,6 +353,14 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
         let Some(mut chunk) = query.stream.poll_window(want).await? else {
             break;
         };
+        // If the window returned more than remaining cap allows, trim and mark truncated.
+        if let Some(max) = max_total {
+            let remain = max.saturating_sub(stats.total_rows) as usize;
+            if chunk.len() > remain {
+                chunk.truncate(remain);
+                stats.truncated = true;
+            }
+        }
         if has_masks {
             apply_masks_to_rows(&mut chunk, &mask_idx);
             stats.masked_rows += chunk.len() as u64;
@@ -410,6 +432,7 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
             &columns,
             stats.total_rows as usize,
             session,
+            stats.truncated,
         )?)
         .await?;
     Ok(stats)
@@ -461,11 +484,13 @@ pub async fn write_resultset_windowed_with_obligations<W: ResponseWriter + ?Size
 ) -> GatewayResult<StreamingEncodeStats> {
     let window = window_rows.max(1);
 
+    let mut truncated = false;
     if let Some(obl) = obligations {
         if let Some(max) = obl.max_rows {
             let max = max as usize;
             if rows.len() > max {
                 rows.truncate(max);
+                truncated = true;
             }
         }
         if let Some(wm) = &obl.watermark {
@@ -480,6 +505,7 @@ pub async fn write_resultset_windowed_with_obligations<W: ResponseWriter + ?Size
 
     let mut stats = StreamingEncodeStats {
         total_rows: rows.len() as u64,
+        truncated,
         ..Default::default()
     };
     writer
@@ -512,6 +538,7 @@ pub async fn write_resultset_windowed_with_obligations<W: ResponseWriter + ?Size
             &columns,
             stats.total_rows as usize,
             session,
+            stats.truncated,
         )?)
         .await?;
     Ok(stats)
@@ -568,6 +595,7 @@ mod tests {
             _columns: &[Column],
             total_rows: usize,
             _session: &SessionState,
+            _truncated: bool,
         ) -> GatewayResult<Vec<Vec<u8>>> {
             self.footer_calls += 1;
             Ok(vec![vec![total_rows as u8]])
@@ -942,5 +970,45 @@ mod tests {
         assert_eq!(fe.header_calls, 1);
         assert_eq!(fe.footer_calls, 1);
         assert!(fe.row_calls >= 1);
+    }
+
+    #[tokio::test]
+    async fn a10_streaming_marks_truncated_when_cap_leaves_remainder() {
+        // max_rows=1 with 3 producer rows → encode 1 and truncated=true after drain sees more.
+        let mut fe = FakeFrontend {
+            header_calls: 0,
+            row_calls: 0,
+            footer_calls: 0,
+        };
+        let session = SessionState::default();
+        let columns = vec![Column {
+            name: "id".into(),
+            data_type: "int".into(),
+        }];
+        let rows = (0..3)
+            .map(|i| vec![GatewayValue::Integer(i)])
+            .collect::<Vec<_>>();
+        let mut obl = Obligations::default();
+        obl.max_rows = Some(1);
+        let query = StreamingQuery {
+            columns,
+            stream: Box::new(VecRowStream::new(rows)),
+        };
+        let mut writer = CollectingWriter::new();
+        let stats = write_streaming_query_with_obligations(
+            &mut fe,
+            &session,
+            query,
+            10,
+            Some(&obl),
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.total_rows, 1);
+        assert!(
+            stats.truncated,
+            "expected truncated when more backend rows remained"
+        );
     }
 }

@@ -210,6 +210,7 @@ impl FrontendProtocolAdapter for MySqlFrontendProtocol {
         _columns: &[GatewayColumn],
         _total_rows: usize,
         _session: &SessionState,
+        _truncated: bool,
     ) -> GatewayResult<Vec<Vec<u8>>> {
         Ok(vec![make_eof_packet()[4..].to_vec()])
     }

@@ -885,8 +885,19 @@ impl CoreGatewayConnection {
                         );
                     }
                     let window = exec_mode.window_rows().unwrap_or(256).max(1);
-                    let obl = if pending_obligations.has_result_obligations() {
-                        Some(&pending_obligations)
+                    // A10: encode path uses obligations.max_rows for truncation. Fold
+                    // client Execute max_rows so PortalSuspended can fire when the
+                    // page ends with more backend rows remaining.
+                    let mut encode_obl = pending_obligations.clone();
+                    if let Some(page) = self.session.pg_execute_max_rows {
+                        let page = page as u64;
+                        encode_obl.max_rows = Some(match encode_obl.max_rows {
+                            Some(m) => m.min(page),
+                            None => page,
+                        });
+                    }
+                    let obl = if encode_obl.has_result_obligations() {
+                        Some(&encode_obl)
                     } else {
                         None
                     };
@@ -911,8 +922,10 @@ impl CoreGatewayConnection {
                         sample_opts,
                     )
                     .await?;
-                    // A10: binary flag is one-shot per Execute response.
+                    // A10: clear one-shot Execute page flags after encode.
                     self.session.prefer_binary_result = false;
+                    self.session.pg_execute_max_rows = None;
+                    self.session.result_truncated = false;
                     // O01/A06: mask / window / encode-byte / peak-window counters on Secure streaming path.
                     self.metrics.record_secure_encode_peak(
                         &labels,

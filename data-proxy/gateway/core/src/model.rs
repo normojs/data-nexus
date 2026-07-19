@@ -123,6 +123,15 @@ pub struct SessionState {
     /// before Sync). Result footers must not emit ReadyForQuery — only Sync does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pg_extended_query: bool,
+    /// A10: client Execute max_rows for current portal page (0 / None = unlimited).
+    /// When set and the stream is truncated at this limit, PG frontend may emit
+    /// PortalSuspended instead of CommandComplete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg_execute_max_rows: Option<u32>,
+    /// A10: last streaming encode hit a row cap with more backend rows remaining
+    /// (set by transport; consumed by PG footer for PortalSuspended).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub result_truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
