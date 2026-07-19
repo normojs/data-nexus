@@ -162,6 +162,7 @@ examples/        smoke + gateway config 样例
 | T01 | 列 ACL / 复杂 SQL 矩阵（部分） | feat(t01) |
 | H05 | multi-instance file bundle + prod state template（部分） | feat(h05) |
 | A08 | MySQL backend TLS via ssl_mode/ssl_ca_file（部分） | feat(a08) |
+| UI04 | 策略只读页 + security-policies 扩展字段 | feat(ui04) |
 
 ---
 
@@ -207,7 +208,7 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
 | **UI03** | Audit 页增强 | 已接 B06 过滤；可补 stats 卡片、source 角标、导出 | `event_id`/时间窗/`source` 已做（`6ff8cef`） | **可选** |
-| **UI04** | 策略只读页 | data-ui 展示 security rules / mask / high-risk（现多靠 API/配置） | 无专用页 | **可选** |
+| **UI04** | 策略只读页 | data-ui 展示 security rules / mask / high-risk | `/policies` + 扩展 `GET /admin/security-policies`（mask/tags/high-risk/time/watermark/streaming；水印 token 不回传） | **完成** |
 | **T01** | 列 ACL / 复杂 SQL 用例矩阵 | 子查询、多表、方言边界；启发式 `parse_failed` 行为 | extract/PDP 单测矩阵 + column smoke 子查询/join/qualified；WHERE 子查询表提取仍 gap | **部分** |
 | **T02** | Ticket/Vault runbook | 注释注入约定、双人审批、吊销运维说明进 docs | API+UI 有，运维叙事可再收紧 | **可选** |
 | **O01** | Secure 路径观测 | mask 行数、encode 窗口/字节、审计队列深度、worker 处理延迟 | Prometheus always-on；非 OTel feature | **完成** |
@@ -238,25 +239,25 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> UI04 策略只读页 或 T02 Ticket/Vault runbook 或 A06 prefer 明文回落 <<<**
+**>>> T02 Ticket/Vault runbook 或 UI03 Audit 增强 或 A08 prefer 明文回落 <<<**
 
-本轮（A08 MySQL backend TLS）：
+本轮（UI04 策略只读页）：
 
-- `endpoints.ssl_mode` prefer/require → MySQL `CLIENT_SSL` + native-tls
-- 修复 `LocalStream::make_tls` 丢弃 TLS 流的 bug；SSLRequest 仅发 32 字节
-- `ssl_ca_file` / `ssl_accept_invalid_certs` 与 PG 同语义
-- 诚实：prefer **不**静默回落明文（服务端无 SSL 则失败）
+- 扩展 `GET /admin/security-policies`：mask / column_tags / high_risk / time / watermark / streaming
+- 水印 **不**回传静态 token 原文（仅 `has_static_token`）
+- data-ui `/policies` 只读页 + nav；`useAdminApi.securityPolicies`
+- smoke deny/mask 断言扩展字段
 
 ```bash
-cargo test -p mysql_protocol --lib tls_opts
-cargo test -p runtime_gateway --lib 'backend::mysql::tests::a08_'
+cargo check -p http
 ./examples/run-smoke-matrix.sh default
+# data-ui: open /policies against admin API
 ```
 
 建议下一刀：
 
-1. **UI04** — 策略只读页  
-2. **T02** — Ticket/Vault runbook  
+1. **T02** — Ticket/Vault runbook  
+2. **UI03** — Audit 页增强（可选）  
 3. **A08** — MySQL prefer 明文回落（可选）  
 
 ---

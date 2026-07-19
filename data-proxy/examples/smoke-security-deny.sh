@@ -105,7 +105,22 @@ assert data["rule_count"] >= 2, data
 names=sorted(r["name"] for r in data["rules"])
 assert "deny-secret-tables" in names, names
 assert "deny-ddl" in names, names
-print("security-policies:", data["rule_count"], "rules", names)
+# UI04: extended read-only fields must be present (arrays even if empty)
+for key in ("mask_rules", "column_tags", "high_risk_rules", "time_rules", "watermark", "streaming"):
+    assert key in data, (key, sorted(data.keys()))
+assert isinstance(data["mask_rules"], list), data["mask_rules"]
+assert isinstance(data["column_tags"], list), data["column_tags"]
+assert isinstance(data["high_risk_rules"], list), data["high_risk_rules"]
+assert isinstance(data["time_rules"], list), data["time_rules"]
+assert "enabled" in data["watermark"], data["watermark"]
+assert "window_rows" in data["streaming"], data["streaming"]
+# watermark static token value must never leak
+assert "token" not in data["watermark"], data["watermark"]
+assert "has_static_token" in data["watermark"], data["watermark"]
+print("security-policies:", data["rule_count"], "rules", names,
+      "masks", len(data["mask_rules"]),
+      "tags", len(data["column_tags"]),
+      "high_risk", len(data["high_risk_rules"]))
 PY
 
 mysql_via_gateway() {

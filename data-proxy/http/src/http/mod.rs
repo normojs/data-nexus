@@ -477,8 +477,21 @@ struct AdminSecurityPoliciesResponse {
     star_policy: String,
     default_audit_level: String,
     pdp_backend: String,
+    /// Present when `security.pdp.policy_dir` is set (Cedar / file PDP).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pdp_policy_dir: Option<String>,
     rule_count: usize,
     rules: Vec<AdminSecurityRuleSummary>,
+    /// UI04: mask algorithms (name + algorithm only; no secrets).
+    mask_rules: Vec<AdminSecurityMaskRuleSummary>,
+    /// UI04: column → mask_rule bindings.
+    column_tags: Vec<AdminSecurityColumnTagSummary>,
+    /// UI04: high-risk gates that require tickets.
+    high_risk_rules: Vec<AdminSecurityHighRiskSummary>,
+    /// UI04: time-window rules (F27).
+    time_rules: Vec<AdminSecurityTimeRuleSummary>,
+    watermark: AdminSecurityWatermarkSummary,
+    streaming: AdminSecurityStreamingSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -489,6 +502,72 @@ struct AdminSecurityRuleSummary {
     tables: Vec<String>,
     columns: Vec<String>,
     subjects: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row_filter: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminSecurityMaskRuleSummary {
+    name: String,
+    algorithm: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    replace_with: String,
+    prefix_len: usize,
+    suffix_len: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminSecurityColumnTagSummary {
+    column: String,
+    tables: Vec<String>,
+    subjects: Vec<String>,
+    mask_rule: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminSecurityHighRiskSummary {
+    name: String,
+    kind: String,
+    ticket_type: String,
+    actions: Vec<String>,
+    tables: Vec<String>,
+    subjects: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminSecurityTimeRuleSummary {
+    name: String,
+    effect: String,
+    outside: bool,
+    days: Vec<String>,
+    start: String,
+    end: String,
+    timezone: String,
+    actions: Vec<String>,
+    subjects: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminSecurityWatermarkSummary {
+    enabled: bool,
+    mode: String,
+    column: String,
+    /// True when a static token is configured (value never returned).
+    has_static_token: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminSecurityStreamingSummary {
+    window_rows: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_bytes: Option<u64>,
+    passthrough: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -970,12 +1049,18 @@ impl AxumServer {
             Some(config) => match gateway_config_snapshot(config) {
                 Ok(config) => {
                     let security = &config.gateway.security;
+                    let pdp_policy_dir = if security.pdp.policy_dir.is_empty() {
+                        None
+                    } else {
+                        Some(security.pdp.policy_dir.clone())
+                    };
                     json_response(&AdminSecurityPoliciesResponse {
                         enabled: security.enabled,
                         fail_closed: security.fail_closed,
                         star_policy: security.star_policy.clone(),
                         default_audit_level: security.default_audit_level.clone(),
                         pdp_backend: security.pdp.backend.clone(),
+                        pdp_policy_dir,
                         rule_count: security.rules.len(),
                         rules: security
                             .rules
@@ -987,8 +1072,71 @@ impl AxumServer {
                                 tables: rule.tables.clone(),
                                 columns: rule.columns.clone(),
                                 subjects: rule.subjects.clone(),
+                                row_filter: rule.row_filter.clone(),
                             })
                             .collect(),
+                        mask_rules: security
+                            .mask_rules
+                            .iter()
+                            .map(|r| AdminSecurityMaskRuleSummary {
+                                name: r.name.clone(),
+                                algorithm: r.algorithm.clone(),
+                                replace_with: r.replace_with.clone(),
+                                prefix_len: r.prefix_len,
+                                suffix_len: r.suffix_len,
+                            })
+                            .collect(),
+                        column_tags: security
+                            .column_tags
+                            .iter()
+                            .map(|t| AdminSecurityColumnTagSummary {
+                                column: t.column.clone(),
+                                tables: t.tables.clone(),
+                                subjects: t.subjects.clone(),
+                                mask_rule: t.mask_rule.clone(),
+                                label: t.label.clone(),
+                            })
+                            .collect(),
+                        high_risk_rules: security
+                            .high_risk_rules
+                            .iter()
+                            .map(|r| AdminSecurityHighRiskSummary {
+                                name: r.name.clone(),
+                                kind: r.kind.clone(),
+                                ticket_type: r.ticket_type.clone(),
+                                actions: r.actions.clone(),
+                                tables: r.tables.clone(),
+                                subjects: r.subjects.clone(),
+                                message: r.message.clone(),
+                            })
+                            .collect(),
+                        time_rules: security
+                            .time_rules
+                            .iter()
+                            .map(|r| AdminSecurityTimeRuleSummary {
+                                name: r.name.clone(),
+                                effect: r.effect.clone(),
+                                outside: r.outside,
+                                days: r.days.clone(),
+                                start: r.start.clone(),
+                                end: r.end.clone(),
+                                timezone: r.timezone.clone(),
+                                actions: r.actions.clone(),
+                                subjects: r.subjects.clone(),
+                            })
+                            .collect(),
+                        watermark: AdminSecurityWatermarkSummary {
+                            enabled: security.watermark.enabled,
+                            mode: security.watermark.mode.clone(),
+                            column: security.watermark.column.clone(),
+                            has_static_token: !security.watermark.token.is_empty(),
+                        },
+                        streaming: AdminSecurityStreamingSummary {
+                            window_rows: security.streaming.window_rows,
+                            max_rows: security.streaming.max_rows,
+                            max_bytes: security.streaming.max_bytes,
+                            passthrough: security.streaming.passthrough,
+                        },
                     })
                 }
                 Err(response) => response,

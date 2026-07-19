@@ -112,6 +112,23 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 
+echo "==> UI04 GET /admin/security-policies includes mask_rules + column_tags"
+curl -fsS "http://127.0.0.1:8082/admin/security-policies" >/tmp/data-nexus-security-policies-mask.json
+python3 - <<'PY'
+import json
+data=json.load(open("/tmp/data-nexus-security-policies-mask.json"))
+assert data["enabled"] is True, data
+assert "mask_rules" in data and "column_tags" in data, sorted(data.keys())
+mask_names=sorted(r["name"] for r in data["mask_rules"])
+assert len(mask_names) >= 1, mask_names
+assert all("algorithm" in r for r in data["mask_rules"]), data["mask_rules"]
+assert all("mask_rule" in t and "column" in t for t in data["column_tags"]), data["column_tags"]
+# static watermark token value must not leak if present
+wm=data.get("watermark") or {}
+assert "token" not in wm, wm
+print("ui04 mask policies:", mask_names, "tags", len(data["column_tags"]))
+PY
+
 mysql_via_gateway() {
   local sql="$1"
   docker run --rm --add-host=host.docker.internal:host-gateway mysql:8.0 \

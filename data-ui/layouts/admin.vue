@@ -41,6 +41,7 @@ const links = computed(() => {
     { to: '/tickets', label: 'Tickets' },
     { to: '/vault', label: 'Vault' },
     { to: '/portal', label: 'SQL Portal' },
+    { to: '/policies', label: 'Policies' },
     { to: '/cedar', label: 'Cedar' },
   ]
   if (canReload.value) {

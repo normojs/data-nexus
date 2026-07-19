@@ -162,6 +162,82 @@ export type AdminCedarStatus = {
   message?: string
 }
 
+/** UI04: read-only security policy snapshot from GET /admin/security-policies */
+export type AdminSecurityRule = {
+  name: string
+  effect: string
+  actions: string[]
+  tables: string[]
+  columns: string[]
+  subjects: string[]
+  row_filter?: string | null
+}
+
+export type AdminSecurityMaskRule = {
+  name: string
+  algorithm: string
+  replace_with?: string
+  prefix_len: number
+  suffix_len: number
+}
+
+export type AdminSecurityColumnTag = {
+  column: string
+  tables: string[]
+  subjects: string[]
+  mask_rule: string
+  label?: string
+}
+
+export type AdminSecurityHighRiskRule = {
+  name: string
+  kind: string
+  ticket_type: string
+  actions: string[]
+  tables: string[]
+  subjects: string[]
+  message?: string
+}
+
+export type AdminSecurityTimeRule = {
+  name: string
+  effect: string
+  outside: boolean
+  days: string[]
+  start: string
+  end: string
+  timezone: string
+  actions: string[]
+  subjects: string[]
+}
+
+export type AdminSecurityPolicies = {
+  enabled: boolean
+  fail_closed: boolean
+  star_policy: string
+  default_audit_level: string
+  pdp_backend: string
+  pdp_policy_dir?: string | null
+  rule_count: number
+  rules: AdminSecurityRule[]
+  mask_rules?: AdminSecurityMaskRule[]
+  column_tags?: AdminSecurityColumnTag[]
+  high_risk_rules?: AdminSecurityHighRiskRule[]
+  time_rules?: AdminSecurityTimeRule[]
+  watermark?: {
+    enabled: boolean
+    mode: string
+    column: string
+    has_static_token: boolean
+  }
+  streaming?: {
+    window_rows: number
+    max_rows?: number | null
+    max_bytes?: number | null
+    passthrough: boolean
+  }
+}
+
 export type AdminCedarReloadInfo = {
   epoch: number
   source: string
@@ -375,6 +451,9 @@ export function useAdminApi() {
       adminFetch<AdminCedarReloadInfo>('/admin/security/cedar/reload', {
         method: 'POST',
       }, base),
+    // UI04: read-only security policy (Local PDP rules / mask / high-risk / time)
+    securityPolicies: (base?: string) =>
+      getJson<AdminSecurityPolicies>('/admin/security-policies', base),
     portalQuery: (body: {
       service: string
       sql: string
