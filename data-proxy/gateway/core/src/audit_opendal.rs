@@ -103,12 +103,41 @@ impl OpendalArchive {
         };
         let bytes =
             std::fs::read(local).map_err(|e| format!("read {}: {e}", local.display()))?;
+        self.write_key(&key, &bytes)
+    }
+
+    /// B08: write raw sample bytes under `sample_prefix/name` (joined with archive prefix).
+    pub fn write_bytes(
+        &self,
+        sample_prefix: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<String, String> {
+        let sp = sample_prefix.trim().trim_matches('/');
+        let name = name.trim().trim_start_matches('/');
+        if name.is_empty() {
+            return Err("sample object name empty".into());
+        }
+        let mut parts = Vec::new();
+        if !self.prefix.is_empty() {
+            parts.push(self.prefix.trim_matches('/').to_owned());
+        }
+        if !sp.is_empty() {
+            parts.push(sp.to_owned());
+        }
+        parts.push(name.to_owned());
+        let key = parts.join("/");
+        self.write_key(&key, bytes)
+    }
+
+    fn write_key(&self, key: &str, bytes: &[u8]) -> Result<String, String> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("tokio runtime: {e}"))?;
         let op = self.op.clone();
-        let key_cl = key.clone();
+        let key_cl = key.to_owned();
+        let bytes = bytes.to_vec();
         // Simple retry for transient cloud errors (worker path only).
         let mut last_err = String::new();
         for attempt in 1..=3 {
@@ -116,7 +145,7 @@ impl OpendalArchive {
             let key_cl = key_cl.clone();
             let bytes = bytes.clone();
             match rt.block_on(async move { op.write(&key_cl, bytes).await }) {
-                Ok(_) => return Ok(key),
+                Ok(_) => return Ok(key.to_owned()),
                 Err(e) => {
                     last_err = format!("opendal write {key} attempt {attempt}: {e}");
                     std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));

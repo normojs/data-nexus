@@ -226,6 +226,30 @@ impl SecurityPolicyConfig {
             ));
         }
 
+        // B08: sample knobs only meaningful when enabled; keep fail-closed on nonsense.
+        if self.audit.sample_enabled {
+            if self.audit.sample_max_rows == 0 {
+                return Err(GatewayError::Configuration(
+                    "security.audit.sample_max_rows must be >= 1 when sample_enabled=true".into(),
+                ));
+            }
+            if self.audit.sample_max_bytes == 0 {
+                return Err(GatewayError::Configuration(
+                    "security.audit.sample_max_bytes must be >= 1 when sample_enabled=true".into(),
+                ));
+            }
+            if self.audit.sample_max_bytes > 1_048_576 {
+                return Err(GatewayError::Configuration(
+                    "security.audit.sample_max_bytes must be <= 1048576 (1 MiB hard cap)".into(),
+                ));
+            }
+            if self.audit.sample_max_rows > 10_000 {
+                return Err(GatewayError::Configuration(
+                    "security.audit.sample_max_rows must be <= 10000".into(),
+                ));
+            }
+        }
+
         for (idx, rule) in self.rules.iter().enumerate() {
             if rule.name.trim().is_empty() {
                 return Err(GatewayError::Configuration(format!(
@@ -402,6 +426,45 @@ pub struct SecurityPdpConfig {
     pub policy_dir: String,
     #[serde(default = "default_true")]
     pub cache_epoch_reload: bool,
+    /// F29: static Subject attribute directory for Cedar Entities (tenant/clearance/…).
+    /// Looked up by `subject_id` (case-insensitive). Empty = no principal attrs.
+    #[serde(default)]
+    pub subject_attrs: Vec<SecuritySubjectAttrConfig>,
+    /// F29: static Table attribute directory for Cedar Entities.
+    /// Looked up by bare table name (case-insensitive). Empty = no resource attrs.
+    #[serde(default)]
+    pub table_attrs: Vec<SecurityTableAttrConfig>,
+}
+
+/// F29: attributes attached to Cedar `User::"<subject_id>"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SecuritySubjectAttrConfig {
+    /// Data-plane subject id (protocol user / portal subject), not Admin JWT.
+    pub subject_id: String,
+    /// Tenant / org key (string). Empty = omit attribute.
+    #[serde(default)]
+    pub tenant: String,
+    /// Clearance label, e.g. `public` | `internal` | `secret` (string equality in policies).
+    #[serde(default)]
+    pub clearance: String,
+    /// Optional role labels for `principal.roles` set (Cedar set of strings).
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+/// F29: attributes attached to Cedar `Table::"<name>"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SecurityTableAttrConfig {
+    /// Bare table name (matches extract bare name; case-insensitive lookup).
+    pub table: String,
+    #[serde(default)]
+    pub tenant: String,
+    /// Table sensitivity / min clearance label (policy-defined string).
+    #[serde(default)]
+    pub clearance: String,
+    /// Optional free-form classification label (e.g. `pii`, `secret`).
+    #[serde(default)]
+    pub classification: String,
 }
 
 fn default_pdp_backend() -> String {
@@ -414,6 +477,8 @@ impl Default for SecurityPdpConfig {
             backend: default_pdp_backend(),
             policy_dir: String::new(),
             cache_epoch_reload: true,
+            subject_attrs: Vec::new(),
+            table_attrs: Vec::new(),
         }
     }
 }
@@ -508,6 +573,24 @@ pub struct SecurityAuditConfig {
     /// F32: max characters of SQL stored at L1/L2 (`sql_text`). Default 2048.
     #[serde(default = "default_sql_text_max_chars")]
     pub sql_text_max_chars: u32,
+    /// B08: when true and effective audit level is L2, attach a small result sample.
+    /// Default **false** (samples are optional / opt-in).
+    #[serde(default)]
+    pub sample_enabled: bool,
+    /// B08: max rows included in a sample (default 5).
+    #[serde(default = "default_sample_max_rows")]
+    pub sample_max_rows: u32,
+    /// B08: hard cap on serialized sample JSON bytes (default 4096).
+    #[serde(default = "default_sample_max_bytes")]
+    pub sample_max_bytes: u32,
+    /// B08: object-key prefix for OpenDAL sample upload (under `opendal_prefix`).
+    /// Empty → `samples`.
+    #[serde(default = "default_sample_prefix")]
+    pub sample_prefix: String,
+    /// B08: when true, keep a truncated sample body on the event JSONL if OpenDAL
+    /// is not configured. When false, only `sample_ref` (after upload) or drop body.
+    #[serde(default = "default_true")]
+    pub sample_inline: bool,
 }
 
 fn default_queue_capacity() -> u32 {
@@ -538,6 +621,18 @@ fn default_sql_text_max_chars() -> u32 {
     2048
 }
 
+fn default_sample_max_rows() -> u32 {
+    5
+}
+
+fn default_sample_max_bytes() -> u32 {
+    4096
+}
+
+fn default_sample_prefix() -> String {
+    "samples".into()
+}
+
 impl Default for SecurityAuditConfig {
     fn default() -> Self {
         Self {
@@ -561,6 +656,11 @@ impl Default for SecurityAuditConfig {
             opendal_session_token: String::new(),
             index_path: String::new(),
             sql_text_max_chars: default_sql_text_max_chars(),
+            sample_enabled: false,
+            sample_max_rows: default_sample_max_rows(),
+            sample_max_bytes: default_sample_max_bytes(),
+            sample_prefix: default_sample_prefix(),
+            sample_inline: true,
         }
     }
 }
@@ -708,6 +808,40 @@ mod tests {
         let mut cfg = SecurityPolicyConfig::default();
         cfg.default_audit_level = "full".into();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn b08_sample_defaults_valid_when_disabled() {
+        let cfg = SecurityPolicyConfig::default();
+        assert!(!cfg.audit.sample_enabled);
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn b08_sample_enabled_rejects_zero_rows() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.audit.sample_enabled = true;
+        cfg.audit.sample_max_rows = 0;
+        let err = cfg.validate().expect_err("zero rows");
+        assert!(err.to_string().contains("sample_max_rows"), "{err}");
+    }
+
+    #[test]
+    fn b08_sample_enabled_rejects_huge_bytes() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.audit.sample_enabled = true;
+        cfg.audit.sample_max_bytes = 2_000_000;
+        let err = cfg.validate().expect_err("too large");
+        assert!(err.to_string().contains("sample_max_bytes"), "{err}");
+    }
+
+    #[test]
+    fn b08_sample_enabled_ok() {
+        let mut cfg = SecurityPolicyConfig::default();
+        cfg.audit.sample_enabled = true;
+        cfg.audit.sample_max_rows = 5;
+        cfg.audit.sample_max_bytes = 4096;
+        assert_eq!(cfg.validate(), Ok(()));
     }
 
     #[test]

@@ -99,7 +99,7 @@ pub enum AuditLevel {
     L0,
     /// + truncated SQL text (`sql_text`).
     L1,
-    /// + sample refs (B08); SQL text same as L1 until samples land.
+    /// + truncated SQL (like L1) and optional result sample (B08).
     L2,
 }
 
@@ -182,20 +182,73 @@ pub struct AuditEvent {
     /// Tables involved (best-effort, S4 L0).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<String>,
+    /// B08: optional result sample (already-masked rows as JSON array-of-arrays).
+    /// Hot path may attach this when `sample_enabled` and effective level is L2.
+    /// Pipeline may strip it after OpenDAL upload (keeping only `sample_ref`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_body: Option<String>,
+    /// B08: object key / local path reference after sample upload (or inline marker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_ref: Option<String>,
+    /// B08: number of rows included in the sample (not full result size).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_row_count: Option<u32>,
+    /// B08: serialized sample bytes before truncation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_bytes: Option<u32>,
+    /// B08: true when sample was truncated to `sample_max_bytes`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sample_truncated: bool,
 }
 
-/// F32: apply audit level payload policy to an event **before** queue/index/disk.
+/// B08 knobs used by [`apply_audit_level_payload`] and sample builders.
+#[derive(Debug, Clone, Copy)]
+pub struct AuditSamplePolicy {
+    pub enabled: bool,
+    pub max_rows: usize,
+    pub max_bytes: usize,
+    pub inline: bool,
+}
+
+impl Default for AuditSamplePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_rows: 5,
+            max_bytes: 4096,
+            inline: true,
+        }
+    }
+}
+
+/// F32 + B08: apply audit level payload policy to an event **before** queue/index/disk.
 ///
-/// | Level | SQL text | Fingerprint | Tables / metadata |
-/// |-------|----------|-------------|-------------------|
-/// | L0    | stripped | kept        | kept              |
-/// | L1/L2 | truncated (max_chars) | kept | kept |
+/// | Level | SQL text | Sample body | Fingerprint / tables |
+/// |-------|----------|-------------|----------------------|
+/// | L0    | stripped | stripped    | kept                 |
+/// | L1    | truncated| stripped    | kept                 |
+/// | L2    | truncated| kept if `sample.enabled` and size-capped | kept |
 ///
-/// Callers may set `sql_text` freely; this function enforces the configured level.
+/// Callers may set `sql_text` / `sample_body` freely; this function enforces the configured level.
 pub fn apply_audit_level_payload(
     event: &mut AuditEvent,
     configured_level: AuditLevel,
     max_sql_chars: usize,
+) {
+    apply_audit_level_payload_with_sample(
+        event,
+        configured_level,
+        max_sql_chars,
+        AuditSamplePolicy::default(),
+    );
+}
+
+/// Like [`apply_audit_level_payload`] but honours B08 sample policy.
+pub fn apply_audit_level_payload_with_sample(
+    event: &mut AuditEvent,
+    configured_level: AuditLevel,
+    max_sql_chars: usize,
+    sample: AuditSamplePolicy,
 ) {
     let event_level = event
         .audit_level
@@ -210,11 +263,145 @@ pub fn apply_audit_level_payload(
     match effective {
         AuditLevel::L0 => {
             event.sql_text = None;
+            strip_sample_fields(event);
         }
-        AuditLevel::L1 | AuditLevel::L2 => {
+        AuditLevel::L1 => {
             if let Some(sql) = event.sql_text.take() {
                 event.sql_text = Some(truncate_sql_text(&sql, max_sql_chars));
             }
+            strip_sample_fields(event);
+        }
+        AuditLevel::L2 => {
+            if let Some(sql) = event.sql_text.take() {
+                event.sql_text = Some(truncate_sql_text(&sql, max_sql_chars));
+            }
+            if !sample.enabled {
+                strip_sample_fields(event);
+            } else if let Some(body) = event.sample_body.take() {
+                let (kept, truncated) = truncate_sample_body(&body, sample.max_bytes);
+                event.sample_truncated = event.sample_truncated || truncated;
+                event.sample_bytes = Some(body.len().min(u32::MAX as usize) as u32);
+                if sample.inline {
+                    event.sample_body = Some(kept);
+                } else {
+                    // Keep body only until worker upload sets sample_ref.
+                    event.sample_body = Some(kept);
+                }
+            }
+        }
+    }
+}
+
+fn strip_sample_fields(event: &mut AuditEvent) {
+    event.sample_body = None;
+    event.sample_ref = None;
+    event.sample_row_count = None;
+    event.sample_bytes = None;
+    event.sample_truncated = false;
+}
+
+fn truncate_sample_body(body: &str, max_bytes: usize) -> (String, bool) {
+    if max_bytes == 0 {
+        return (String::new(), !body.is_empty());
+    }
+    if body.len() <= max_bytes {
+        return (body.to_owned(), false);
+    }
+    // Truncate on UTF-8 char boundary.
+    let mut end = max_bytes.min(body.len());
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = body[..end].to_owned();
+    out.push('…');
+    (out, true)
+}
+
+/// B08: build a JSON sample from column names + already-masked rows.
+///
+/// Shape: `{"columns":[...],"rows":[[...],...],"truncated":bool}`
+/// Caps at `max_rows` and `max_bytes` (serialized). Never panics.
+pub fn build_result_sample(
+    columns: &[String],
+    rows: &[Vec<crate::GatewayValue>],
+    max_rows: usize,
+    max_bytes: usize,
+) -> Option<(String, u32, u32, bool)> {
+    if max_rows == 0 || max_bytes == 0 {
+        return None;
+    }
+    let take = rows.len().min(max_rows);
+    let sample_rows: Vec<Vec<serde_json::Value>> = rows[..take]
+        .iter()
+        .map(|r| r.iter().map(gateway_value_to_json).collect())
+        .collect();
+    let mut payload = serde_json::json!({
+        "columns": columns,
+        "rows": sample_rows,
+        "truncated": rows.len() > take,
+    });
+    let mut body = serde_json::to_string(&payload).ok()?;
+    let mut truncated = rows.len() > take;
+    if body.len() > max_bytes {
+        // Drop rows until under cap (keep at least empty rows array).
+        let mut n = take;
+        while n > 0 && body.len() > max_bytes {
+            n -= 1;
+            let fewer: Vec<Vec<serde_json::Value>> = rows[..n]
+                .iter()
+                .map(|r| r.iter().map(gateway_value_to_json).collect())
+                .collect();
+            payload = serde_json::json!({
+                "columns": columns,
+                "rows": fewer,
+                "truncated": true,
+            });
+            body = serde_json::to_string(&payload).ok()?;
+            truncated = true;
+        }
+        if body.len() > max_bytes {
+            let (kept, _) = truncate_sample_body(&body, max_bytes);
+            body = kept;
+            truncated = true;
+        }
+    }
+    let bytes = body.len().min(u32::MAX as usize) as u32;
+    let row_count = payload
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len().min(u32::MAX as usize) as u32)
+        .unwrap_or(0);
+    Some((body, row_count, bytes, truncated))
+}
+
+fn gateway_value_to_json(v: &crate::GatewayValue) -> serde_json::Value {
+    use crate::GatewayValue::*;
+    match v {
+        Null => serde_json::Value::Null,
+        Boolean(b) => serde_json::Value::Bool(*b),
+        Integer(i) => serde_json::json!(*i),
+        UnsignedInteger(u) => serde_json::json!(*u),
+        Float(f) => {
+            // JSON numbers must be finite; fall back to string for NaN/Inf.
+            if f.is_finite() {
+                serde_json::json!(*f)
+            } else {
+                serde_json::Value::String(f.to_string())
+            }
+        }
+        Decimal(s) | String(s) => serde_json::Value::String(s.clone()),
+        Bytes(b) => {
+            // Hex-encode binary to keep samples text-safe and size-bounded.
+            let max = 64.min(b.len());
+            let mut hex = std::string::String::with_capacity(max * 2 + 3);
+            for byte in &b[..max] {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+            }
+            if b.len() > max {
+                hex.push('…');
+            }
+            serde_json::Value::String(hex)
         }
     }
 }
@@ -315,5 +502,97 @@ mod tests {
         apply_audit_level_payload(&mut e, AuditLevel::L0, 2048);
         assert!(e.sql_text.is_none());
         assert_eq!(e.audit_level.as_deref(), Some("L0"));
+    }
+
+    #[test]
+    fn b08_l1_strips_sample_body() {
+        let mut e = AuditEvent {
+            audit_level: Some("L1".into()),
+            sql_text: Some("SELECT 1".into()),
+            sample_body: Some(r#"{"rows":[]}"#.into()),
+            sample_row_count: Some(0),
+            ..AuditEvent::default()
+        };
+        apply_audit_level_payload_with_sample(
+            &mut e,
+            AuditLevel::L1,
+            100,
+            AuditSamplePolicy {
+                enabled: true,
+                max_rows: 5,
+                max_bytes: 4096,
+                inline: true,
+            },
+        );
+        assert!(e.sample_body.is_none());
+        assert!(e.sql_text.is_some());
+    }
+
+    #[test]
+    fn b08_l2_keeps_sample_when_enabled() {
+        let mut e = AuditEvent {
+            audit_level: Some("L2".into()),
+            sql_text: Some("SELECT id FROM t".into()),
+            sample_body: Some(r#"{"columns":["id"],"rows":[[1]],"truncated":false}"#.into()),
+            sample_row_count: Some(1),
+            ..AuditEvent::default()
+        };
+        apply_audit_level_payload_with_sample(
+            &mut e,
+            AuditLevel::L2,
+            100,
+            AuditSamplePolicy {
+                enabled: true,
+                max_rows: 5,
+                max_bytes: 4096,
+                inline: true,
+            },
+        );
+        assert!(e.sample_body.as_deref().unwrap().contains("rows"));
+        assert_eq!(e.audit_level.as_deref(), Some("L2"));
+    }
+
+    #[test]
+    fn b08_l2_disabled_strips_sample() {
+        let mut e = AuditEvent {
+            audit_level: Some("L2".into()),
+            sample_body: Some(r#"{"rows":[[1]]}"#.into()),
+            ..AuditEvent::default()
+        };
+        apply_audit_level_payload_with_sample(
+            &mut e,
+            AuditLevel::L2,
+            100,
+            AuditSamplePolicy::default(), // enabled=false
+        );
+        assert!(e.sample_body.is_none());
+    }
+
+    #[test]
+    fn b08_build_result_sample_caps_rows() {
+        use crate::GatewayValue;
+        let cols = vec!["id".into(), "name".into()];
+        let rows: Vec<Vec<GatewayValue>> = (0..20)
+            .map(|i| vec![GatewayValue::Integer(i), GatewayValue::String(format!("r{i}"))])
+            .collect();
+        let (body, n, _bytes, truncated) =
+            build_result_sample(&cols, &rows, 3, 4096).expect("sample");
+        assert_eq!(n, 3);
+        assert!(truncated);
+        assert!(body.contains("\"truncated\":true"));
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn b08_build_result_sample_caps_bytes() {
+        use crate::GatewayValue;
+        let cols = vec!["blob".into()];
+        let rows = vec![vec![GatewayValue::String("x".repeat(200))]];
+        let (body, _n, bytes, truncated) =
+            build_result_sample(&cols, &rows, 5, 80).expect("sample");
+        assert!(truncated || body.len() <= 81);
+        assert!(bytes as usize <= body.len().max(80) + 4);
+        assert!(body.len() <= 81); // max_bytes + ellipsis
     }
 }

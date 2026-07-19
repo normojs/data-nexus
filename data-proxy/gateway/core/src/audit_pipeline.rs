@@ -9,7 +9,9 @@
 //! B07: deny / require_approval use a separate bounded priority queue so a
 //! flood of allow/execute under `drop_new` cannot discard critical events.
 
-use crate::audit::{apply_audit_level_payload, AuditEvent, AuditLevel};
+use crate::audit::{
+    apply_audit_level_payload_with_sample, AuditEvent, AuditLevel, AuditSamplePolicy,
+};
 use crate::audit_index::{AuditIndex, AuditQueryFilter};
 use crate::security::SecurityAuditConfig;
 use std::collections::VecDeque;
@@ -71,6 +73,64 @@ fn configure_opendal_archive(config: &SecurityAuditConfig) {
                 scheme = %config.opendal_scheme,
                 "opendal_scheme set but binary built without audit-opendal feature"
             );
+        }
+    }
+}
+
+fn sample_policy_from_config(config: &SecurityAuditConfig) -> AuditSamplePolicy {
+    AuditSamplePolicy {
+        enabled: config.sample_enabled,
+        max_rows: config.sample_max_rows.max(1) as usize,
+        max_bytes: config.sample_max_bytes.max(1) as usize,
+        inline: config.sample_inline,
+    }
+}
+
+/// B08: best-effort upload of `sample_body` via OpenDAL; sets `sample_ref`.
+/// Worker path only. Without OpenDAL / feature, keep or drop body per `inline`.
+fn maybe_upload_sample(event: &mut AuditEvent, sample_prefix: &str, inline: bool) {
+    let Some(body) = event.sample_body.as_ref() else {
+        return;
+    };
+    if body.is_empty() {
+        return;
+    }
+    #[cfg(feature = "audit-opendal")]
+    {
+        if let Some(arch) = crate::audit_opendal::global_archive() {
+            let event_id = event
+                .event_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("unknown");
+            let key_name = format!("{event_id}.sample.json");
+            match arch.write_bytes(sample_prefix, &key_name, body.as_bytes()) {
+                Ok(key) => {
+                    event.sample_ref = Some(format!("opendal:{key}"));
+                    if !inline {
+                        event.sample_body = None;
+                    }
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "data_nexus::audit",
+                        error = %e,
+                        "B08 sample OpenDAL upload failed; keeping inline policy"
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "audit-opendal"))]
+    {
+        let _ = sample_prefix;
+    }
+    if !inline {
+        // No archive available and operator asked not to keep body on the event.
+        event.sample_body = None;
+        if event.sample_ref.is_none() {
+            event.sample_ref = Some("dropped:no_archive".into());
         }
     }
 }
@@ -157,6 +217,10 @@ pub struct AuditPipeline {
     payload_level: Mutex<AuditLevel>,
     /// F32: max SQL chars at L1/L2.
     sql_text_max_chars: Mutex<usize>,
+    /// B08: sample attach / size policy (applied on try_send).
+    sample_policy: Mutex<AuditSamplePolicy>,
+    /// B08: OpenDAL object prefix for sample uploads (under opendal_prefix).
+    sample_prefix: Mutex<String>,
     file_path: Mutex<Option<PathBuf>>,
     file_policy: Mutex<FileSinkPolicy>,
     write_file: AtomicBool,
@@ -201,6 +265,12 @@ impl AuditPipeline {
         } else {
             config.sql_text_max_chars as usize
         };
+        let sample_policy = sample_policy_from_config(config);
+        let sample_prefix = if config.sample_prefix.trim().is_empty() {
+            "samples".to_owned()
+        } else {
+            config.sample_prefix.trim().trim_matches('/').to_owned()
+        };
         Self {
             capacity,
             priority_capacity,
@@ -208,6 +278,8 @@ impl AuditPipeline {
             overflow: OverflowPolicy::parse(&config.overflow),
             payload_level: Mutex::new(level),
             sql_text_max_chars: Mutex::new(max_sql),
+            sample_policy: Mutex::new(sample_policy),
+            sample_prefix: Mutex::new(sample_prefix),
             file_path: Mutex::new(file_path),
             file_policy: Mutex::new(FileSinkPolicy::from_config(config)),
             write_file: AtomicBool::new(write_file),
@@ -249,6 +321,16 @@ impl AuditPipeline {
                 AuditLevel::DEFAULT_SQL_TEXT_MAX_CHARS
             } else {
                 config.sql_text_max_chars as usize
+            };
+        }
+        if let Ok(mut sp) = self.sample_policy.lock() {
+            *sp = sample_policy_from_config(config);
+        }
+        if let Ok(mut pref) = self.sample_prefix.lock() {
+            *pref = if config.sample_prefix.trim().is_empty() {
+                "samples".to_owned()
+            } else {
+                config.sample_prefix.trim().trim_matches('/').to_owned()
             };
         }
         if !config.file_path.trim().is_empty() {
@@ -301,7 +383,7 @@ impl AuditPipeline {
         if event.ts_unix_ms.is_none() {
             event.ts_unix_ms = Some(now_unix_ms());
         }
-        // F32: enforce L0/L1/L2 payload policy before ring/queue/index.
+        // F32/B08: enforce L0/L1/L2 payload policy before ring/queue/index.
         let level = self
             .payload_level
             .lock()
@@ -312,7 +394,12 @@ impl AuditPipeline {
             .lock()
             .map(|g| *g)
             .unwrap_or(AuditLevel::DEFAULT_SQL_TEXT_MAX_CHARS);
-        apply_audit_level_payload(&mut event, level, max_sql);
+        let sample = self
+            .sample_policy
+            .lock()
+            .map(|g| *g)
+            .unwrap_or_default();
+        apply_audit_level_payload_with_sample(&mut event, level, max_sql, sample);
         {
             let mut state = self.state.lock().expect("audit state");
             if state.recent.len() >= self.recent_capacity {
@@ -570,17 +657,37 @@ impl AuditPipeline {
     }
 
     fn dispatch(&self, event: &AuditEvent) {
+        // B08: worker-side sample upload (never on try_send / hot path).
+        let event_owned: Option<AuditEvent> = if event.sample_body.is_some() {
+            let mut e = event.clone();
+            let prefix = self
+                .sample_prefix
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_else(|_| "samples".into());
+            let inline = self
+                .sample_policy
+                .lock()
+                .map(|g| g.inline)
+                .unwrap_or(true);
+            maybe_upload_sample(&mut e, &prefix, inline);
+            Some(e)
+        } else {
+            None
+        };
+        let event_ref = event_owned.as_ref().unwrap_or(event);
         if self.write_tracing.load(Ordering::Relaxed) {
             tracing::info!(
                 target: crate::audit::AUDIT_TARGET,
-                event_id = event.event_id.as_deref().unwrap_or(""),
-                action = event.action.as_deref().unwrap_or(""),
-                decision = event.decision.as_deref().unwrap_or(""),
-                subject_id = event.subject_id.as_deref().unwrap_or(""),
-                service = event.service.as_deref().unwrap_or(""),
-                listener = event.listener.as_deref().unwrap_or(""),
-                outcome = event.outcome.as_deref().unwrap_or(""),
-                rule = event.rule.as_deref().unwrap_or(""),
+                event_id = event_ref.event_id.as_deref().unwrap_or(""),
+                action = event_ref.action.as_deref().unwrap_or(""),
+                decision = event_ref.decision.as_deref().unwrap_or(""),
+                subject_id = event_ref.subject_id.as_deref().unwrap_or(""),
+                service = event_ref.service.as_deref().unwrap_or(""),
+                listener = event_ref.listener.as_deref().unwrap_or(""),
+                outcome = event_ref.outcome.as_deref().unwrap_or(""),
+                rule = event_ref.rule.as_deref().unwrap_or(""),
+                sample_ref = event_ref.sample_ref.as_deref().unwrap_or(""),
                 "audit pipeline event"
             );
         }
@@ -597,7 +704,7 @@ impl AuditPipeline {
                             rotate_keep: 0,
                             archive_dir: None,
                         });
-                    match append_jsonl_with_rotate(path, event, &policy) {
+                    match append_jsonl_with_rotate(path, event_ref, &policy) {
                         Ok(RotateOutcome::Rotated) => {
                             self.rotated.fetch_add(1, Ordering::Relaxed);
                         }
@@ -609,7 +716,7 @@ impl AuditPipeline {
         }
         // B06: side-index insert on worker only (never blocks try_send).
         if let Some(idx) = self.index() {
-            if let Err(e) = idx.insert(event) {
+            if let Err(e) = idx.insert(event_ref) {
                 idx.record_error();
                 tracing::warn!(
                     target: "data_nexus::audit",

@@ -58,6 +58,10 @@ pub struct CoreGatewayConnection {
     security: Option<gateway_core::LocalPdp>,
     /// F32: deployment default audit level (L0/L1/L2) for event tagging.
     default_audit_level: String,
+    /// B08: opt-in result sample attach for L2 events.
+    audit_sample_enabled: bool,
+    audit_sample_max_rows: u32,
+    audit_sample_max_bytes: u32,
     /// Result read mode from security.streaming (A1).
     stream_mode: ExecuteMode,
     /// When true and same-protocol + no obligations, prefer wire passthrough (A3).
@@ -86,6 +90,9 @@ impl CoreGatewayConnection {
             frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
             security: None,
             default_audit_level: "L0".into(),
+            audit_sample_enabled: false,
+            audit_sample_max_rows: 5,
+            audit_sample_max_bytes: 4096,
             stream_mode: ExecuteMode::Materialized,
             passthrough_enabled: false,
             metrics: MySQLServerMetricsCollector,
@@ -105,6 +112,9 @@ impl CoreGatewayConnection {
         stream_mode: ExecuteMode,
         passthrough_enabled: bool,
         default_audit_level: String,
+        audit_sample_enabled: bool,
+        audit_sample_max_rows: u32,
+        audit_sample_max_bytes: u32,
     ) -> Self {
         let frontend_protocol = frontend.protocol();
         Self {
@@ -119,6 +129,9 @@ impl CoreGatewayConnection {
             frontend_dialect: Arc::from(runtime_dialect_parser(&frontend_protocol)),
             security,
             default_audit_level,
+            audit_sample_enabled,
+            audit_sample_max_rows,
+            audit_sample_max_bytes,
             stream_mode,
             passthrough_enabled,
             metrics: MySQLServerMetricsCollector,
@@ -139,6 +152,48 @@ impl CoreGatewayConnection {
     pub fn with_stream_mode(mut self, stream_mode: ExecuteMode) -> Self {
         self.stream_mode = stream_mode;
         self
+    }
+
+    /// B08: build L2 result sample from a materialized ResultSet (post-obligation if possible).
+    /// Streaming / wire paths intentionally return None (no full materialization for samples).
+    fn build_audit_sample(
+        &self,
+        response: &GatewayResponse,
+        pending: &gateway_core::Obligations,
+    ) -> Option<(String, u32, u32, bool)> {
+        if !self.audit_sample_enabled {
+            return None;
+        }
+        if !self.default_audit_level.eq_ignore_ascii_case("L2") {
+            return None;
+        }
+        let GatewayResponse::ResultSet { columns, rows } = response else {
+            return None;
+        };
+        let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        // If result obligations exist, sample from a masked copy (do not mutate response).
+        let masked;
+        let rows_ref: &Vec<Vec<gateway_core::GatewayValue>> = if pending.has_result_obligations() {
+            let mut tmp = GatewayResponse::ResultSet {
+                columns: columns.clone(),
+                rows: rows.clone(),
+            };
+            tmp = gateway_core::apply_obligations_to_response(tmp, pending);
+            if let GatewayResponse::ResultSet { rows: r, .. } = tmp {
+                masked = r;
+                &masked
+            } else {
+                rows
+            }
+        } else {
+            rows
+        };
+        gateway_core::build_result_sample(
+            &col_names,
+            rows_ref,
+            self.audit_sample_max_rows.max(1) as usize,
+            self.audit_sample_max_bytes.max(1) as usize,
+        )
     }
 
     /// A07: encode a response through a progressive writer (socket or collector).
@@ -1004,6 +1059,9 @@ impl CoreGatewayConnection {
                 latency_ms = started_at.elapsed().as_millis() as u64,
                 "gateway command audited"
             );
+            // B08: attach small result sample only for L2 + sample_enabled + ResultSet.
+            // Prefer post-obligation rows when encode-path deferred masks are present.
+            let sample_fields = self.build_audit_sample(&response, &pending_obligations);
             gateway_core::try_audit(gateway_core::AuditEvent {
                 action: Some(gateway_core::AuditAction::Query.as_str().into()),
                 decision: Some(gateway_core::AuditDecision::Execute.as_str().into()),
@@ -1026,6 +1084,10 @@ impl CoreGatewayConnection {
                 sql_fingerprint: audit_sql.as_deref().map(gateway_core::sql_fingerprint),
                 sql_text: audit_sql,
                 tables: audit_tables,
+                sample_body: sample_fields.as_ref().map(|s| s.0.clone()),
+                sample_row_count: sample_fields.as_ref().map(|s| s.1),
+                sample_bytes: sample_fields.as_ref().map(|s| s.2),
+                sample_truncated: sample_fields.as_ref().map(|s| s.3).unwrap_or(false),
                 ..gateway_core::AuditEvent::default()
             });
 
@@ -1251,6 +1313,10 @@ pub struct CoreGatewayListenerPlan {
     passthrough_enabled: bool,
     /// F32: copy of security.default_audit_level for event tagging.
     default_audit_level: String,
+    /// B08: when true and level is L2, attach result samples on audit events.
+    audit_sample_enabled: bool,
+    audit_sample_max_rows: u32,
+    audit_sample_max_bytes: u32,
 }
 
 impl PartialEq for CoreGatewayListenerPlan {
@@ -1337,6 +1403,9 @@ impl CoreGatewayListenerPlan {
         // Passthrough only for same-protocol; default true from security.streaming.
         let passthrough_enabled = config.security.streaming.passthrough;
         let default_audit_level = config.security.default_audit_level.clone();
+        let audit_sample_enabled = config.security.audit.sample_enabled;
+        let audit_sample_max_rows = config.security.audit.sample_max_rows;
+        let audit_sample_max_bytes = config.security.audit.sample_max_bytes;
 
         Ok(Self {
             listener: listener.clone(),
@@ -1351,6 +1420,9 @@ impl CoreGatewayListenerPlan {
             stream_mode,
             passthrough_enabled,
             default_audit_level,
+            audit_sample_enabled,
+            audit_sample_max_rows,
+            audit_sample_max_bytes,
         })
     }
 
@@ -1401,6 +1473,9 @@ impl CoreGatewayListenerPlan {
             self.stream_mode,
             self.passthrough_enabled,
             self.default_audit_level.clone(),
+            self.audit_sample_enabled,
+            self.audit_sample_max_rows,
+            self.audit_sample_max_bytes,
         );
         if let Some(plugin_config) = &self.plugin_config {
             connection = connection.with_plugins(PluginPhase::new(plugin_config.clone()));

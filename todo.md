@@ -193,7 +193,7 @@ examples/        smoke + gateway config 样例
 | ID | 项 | 说明 | 现状 / 债务 | 状态 |
 |----|----|------|-------------|:----:|
 | **F29** | Cedar 实体属性 | Subject/Table 属性（tenant/clearance）进 Entities；与 Local 对照用例 | 现仅 User/Action/Table 字符串 id | **延后** |
-| **B08** | L2 样本 / 大 payload | 可选结果样本上传 OpenDAL；体积/采样可配 | 有 `AuditLevel::L2` 枚举，**无**样本上传实现 | **延后** |
+| **B08** | L2 样本 / 大 payload | 可选结果样本上传 OpenDAL；体积/采样可配 | `sample_enabled` + max_rows/bytes；物化 ResultSet 附样本；worker 可选 OpenDAL；默认关；Streaming 不采样 | **部分** |
 | **F31** | Remote PDP 适配器 | HTTP 旁路 OPA/外部 PDP；超时 fail_closed | 配置已 **拒绝** `backend=remote`（防静默 no-op）；实现后放开 | **延后** |
 | **F30** | 敏感识别增强 | 静态列标签之外的规则/词典 MVP（仍不做全量 DLP） | 仅 `column_tags` + mask 规则 | **延后** |
 | **F32** | 审计 L0/L1 载荷裁剪 | 按 `default_audit_level` 裁剪 `sql_text`；L0 剥离、L1/L2 截断 | L2 样本上传仍未做（B08） | **完成** |
@@ -236,7 +236,7 @@ examples/        smoke + gateway config 样例
 | PG/MySQL backend TLS | A08：PG idle pool+tcp_txn；双协议 `ssl_mode`/`ssl_ca_file`/`ssl_accept_invalid_certs`；默认 accept_invalid=true；**MySQL prefer 可明文回落**；require 硬失败；非 extended |
 | 预处理语句 | A10：PG QueryParams + Statement 缓存 + Streaming 窗口；**MySQL QueryParams 走 COM_STMT_PREPARE/EXECUTE 绑定** + binary 行 + **Streaming 窗口** + 连接缓存；date/time binary 结果 hex MVP；非 TCP passthrough |
 | 多副本 | H05：ticket/vault file+lock+可选 AES-GCM；审计 SQLite；LocalPdp mtime 轮询；**prod 模板已含 security.state**；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
-| L2 样本合规 | **未实现**（B08） |
+| L2 样本合规 | B08：**默认关**；L2+enabled 时物化 ResultSet 附截断样本；OpenDAL 需 `audit-opendal`；Streaming 路径不采样 |
 | Remote PDP | **未实现**（F31）；误配会被配置校验拒绝 |
 | 复杂 SQL / 列 ACL | T01：JOIN/CTE/WHERE·HAVING·EXISTS·IN 子查询表可抽；**列 rewrite 不深改嵌套 SELECT 列表**；极端方言/解析失败仍走 heuristic |
 
@@ -244,26 +244,27 @@ examples/        smoke + gateway config 样例
 
 ## 4. 当前下一动作（唯一焦点）
 
-**>>> F29 Cedar 实体属性（延后） 或 B08 L2 样本（延后） 或 F31 Remote PDP（延后） <<<**
+**>>> F29 Cedar 实体属性 或 F31 Remote PDP（延后） 或 发版准备 <<<**
 
-本轮（T01 WHERE 子查询表提取）：
+本轮（B08 L2 样本）：
 
-- PG/sqlparser：WHERE / HAVING / JOIN ON / SELECT 列表 / EXISTS / IN (SELECT) 子查询表
-- MySQL：WHERE/HAVING + `InExpr` 内 `SubQueryExpr` / EXISTS / CompSubQuery
-- 单测硬断言双表；smoke-column WHERE IN secret_tokens deny
-- 仍 **部分**：嵌套 SELECT 列表列 rewrite 深度有限
+- 配置：`security.audit.sample_enabled` / `sample_max_rows` / `sample_max_bytes` / `sample_prefix` / `sample_inline`
+- 热路径：仅 `default_audit_level=L2` 且 enabled 时对 **物化 ResultSet** 附 `sample_body`（脱敏后）
+- Worker：可选 OpenDAL 上传 → `sample_ref`；默认 inline 保留截断 body
+- 默认 **关**；Streaming 不采样（诚实）
 
 ```bash
-cargo test -p runtime_gateway --lib 'object_extract::tests::t01_'
+cargo test -p gateway_core --lib audit::tests
+cargo test -p gateway_core --lib 'security::tests::b08_'
 ./examples/run-smoke-matrix.sh default
 ```
 
 建议下一刀：
 
-1. **F29** — Cedar 实体属性（延后）  
-2. **B08** — L2 样本（延后）  
-3. **F31** — Remote PDP（延后）  
-   或体验向小刀 / 发版准备  
+1. **F29** — Cedar 实体属性  
+2. **F31** — Remote PDP（延后）  
+3. **发版准备** — `/dn-release` 前 full smoke
+
 
 ---
 
