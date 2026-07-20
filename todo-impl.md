@@ -158,6 +158,7 @@ examples/        smoke + gateway config 样例
 | A09 | portal cross-protocol MySQL→PG backend_window smoke | feat(a09) |
 | A08 | default ssl_accept_invalid=false + PG passthrough smoke | feat(a08) |
 | A09 | portal reverse cross-protocol PG→MySQL backend_window smoke | feat(a09) |
+| H05 | vault backend_password ZeroizeOnDrop + runbook honesty | feat(h05) |
 
 ---
 

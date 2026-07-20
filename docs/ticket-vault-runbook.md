@@ -271,7 +271,8 @@ UI：`/vault`、`/portal`。回归：`smoke-security-portal.sh`、`smoke-securit
 | `security.state.backend=file` | ticket/vault JSON + advisory lock |
 | `ticket_path` / `vault_path` | 共享路径（NFS/共享盘等） |
 | `ticket_encrypt_key` / `vault_encrypt_key` | 64 hex；vault 无密钥则 **不落盘密码** |
-| | 进程内密码仍明文；文件全量替换 last-writer-wins |
+| 进程内 secret | 活跃 lease 的 backend 密码在 RAM 中为普通 `String`；**revoke / prune / store Drop** 时 `zeroize` 擦除（**非** mlock / 安全堆）；`backend_identity` 返回副本，调用方勿记日志 |
+| 文件一致性 | 全文件替换 + advisory lock，**last-writer-wins，非 CRDT** |
 
 生产模板：[`data-proxy/examples/prod/`](../data-proxy/examples/prod/README.md)。
 
@@ -339,7 +340,8 @@ vault_encrypt_key = "__DN_VAULT_ENCRYPT_KEY__"
 - 非外部 BPM / 通知 / SLA；无邮件审批流。  
 - 指纹是规范化文本，不是语义等价证明。  
 - write_no_where 为启发式（顶层 WHERE）。  
-- 多实例文件态非 CRDT；进程内存 vault 密码仍明文。  
+- 多实例文件态非 CRDT（last-writer-wins）。  
+- 进程内 vault 密码：活跃期在 RAM；revoke/prune/Drop 时 zeroize（非 mlock）；`backend_identity` 返回副本。  
 - Admin JWT 不会自动成为数据面 subject。
 
 ---

@@ -30,6 +30,8 @@ fs2 = "0.4"
 # H05/H08: optional AES-256-GCM envelope for vault file state (when encrypt key set).
 aes-gcm = "0.10"
 base64 = "0.22"
+# H05: wipe vault backend secrets on Drop / revoke (best-effort; not mlock).
+zeroize = { version = "1", features = ["derive"] }
 # Pinned major line; 4.4+ works with rustc 1.94 (MSRV of latest transitive deps).
 cedar-policy = { version = "4.4", optional = true }
 # Default features bring rustls TLS + memory + tokio executor (consumers cannot

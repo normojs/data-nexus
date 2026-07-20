@@ -82,9 +82,9 @@ cd data-proxy
   - 路径：audit sample attach、`audit-opendal` feature
 
 - [ ] **H05** 多实例状态外置（含 H08 vault 文件加密）  
-  - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板  
-  - 仍欠：**全文件替换非 CRDT**；**进程内存 vault 密码仍明文**；轮询默认 1s  
-  - 路径：ticket/vault file backend、prod 模板
+  - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板；**vault `backend_password` ZeroizeOnDrop + revoke zeroize**（文档诚实边界）  
+  - 仍欠：**全文件替换非 CRDT**；活跃 lease 密码仍在进程 RAM（非 mlock）；`backend_identity` 副本未强制调用方擦除；轮询默认 1s  
+  - 路径：ticket/vault file backend、`vault.rs` zeroize、prod 模板、runbook
 
 - [ ] **H04b** 真 IdP OIDC 联调  
   - 已有：文档 + 模板  
@@ -120,7 +120,7 @@ cd data-proxy
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；控制语句/Complete 小结果仍可物化；**非进程 RSS CI** |
 | PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；dev 可显式 true；prod 模板 require+CA；simple Query 透传有 smoke；**非 extended 透传** |
 | 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended（客户端 page）**；策略截断仍 C；真游标续读未做；非 TCP passthrough |
-| 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
+| 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；活跃 vault 密码在 RAM；revoke/prune/Drop zeroize（非 mlock） |
 | L2 样本 | B08：默认关；有界 rows/bytes；OpenDAL 需 feature |
 | Remote PDP | F31 已交付：表/动作 gate；超时 fail_closed；**非**热路径逐行 mask |
 | Cedar ABAC | F29 已交付：静态 `subject_attrs`/`table_attrs`；非动态 IdP 同步 |
@@ -137,7 +137,7 @@ cd data-proxy
 1. **A08** extended 透传（可选；当前 simple Query 已透传）  
 2. **A06/A09** 进程峰值 CI（可选）  
 3. **A10** PortalSuspended 真游标续读（可选）  
-4. **H05** 多副本语义 / 进程内 vault 明文边界  
+4. **H05** 多副本 CRDT / mlock（可选；zeroize 边界已文档化）  
 5. 体验小刀；**F30/P0x 延后项未点名勿做**
 
 ```bash

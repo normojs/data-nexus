@@ -9,6 +9,12 @@
 //! H05/H08: optional AES-256-GCM file envelope (`security.state.vault_encrypt_key`)
 //! stores sealed lease metadata **and** backend secrets for multi-instance
 //! recovery. Without a key, file backend remains plaintext metadata only.
+//!
+//! **H05 memory boundary (honest):** active leases keep `backend_password` in
+//! process RAM as a normal `String`. On `revoke`, `prune` (drop), and store Drop,
+//! the string is zeroized best-effort via `zeroize` (no mlock / no secure heap).
+//! Callers of `backend_identity` receive a **copy** they must not log; the
+//! gateway does not re-zero that copy after use.
 
 use crate::state_crypto::{
     decode_maybe_encrypted, encrypt_blob, parse_encrypt_key,
@@ -23,6 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 static GLOBAL: OnceLock<Arc<VaultStore>> = OnceLock::new();
 
@@ -126,12 +133,27 @@ fn default_ttl() -> u64 {
     900
 }
 
-#[derive(Debug)]
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
 struct LeaseRecord {
+    #[zeroize(skip)]
     lease: VaultLease,
     /// Backend password kept only server-side; never in VaultLease JSON.
     backend_password: String,
+    #[zeroize(skip)]
     backend_username: String,
+}
+
+/// On-disk lease row when encryption is enabled (includes backend secret).
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+struct SealedLeaseRecord {
+    #[serde(flatten)]
+    #[zeroize(skip)]
+    lease: VaultLease,
+    #[serde(default)]
+    #[zeroize(skip)]
+    backend_username: String,
+    #[serde(default)]
+    backend_password: String,
 }
 
 #[derive(Debug)]
@@ -143,17 +165,6 @@ pub struct VaultStore {
     path: Mutex<Option<PathBuf>>,
     /// H05/H08: AES-256 key for sealed file (None = plaintext metadata only).
     encrypt_key: Mutex<Option<[u8; 32]>>,
-}
-
-/// On-disk lease row when encryption is enabled (includes backend secret).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SealedLeaseRecord {
-    #[serde(flatten)]
-    lease: VaultLease,
-    #[serde(default)]
-    backend_username: String,
-    #[serde(default)]
-    backend_password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -245,7 +256,7 @@ impl VaultStore {
         let mut map = HashMap::new();
         let mut max_seq = 1u64;
         if key.is_some() && !file.sealed_leases.is_empty() {
-            for rec in file.sealed_leases {
+            for mut rec in file.sealed_leases {
                 if let Some(n) = rec
                     .lease
                     .lease_id
@@ -255,14 +266,17 @@ impl VaultStore {
                 {
                     max_seq = max_seq.max(n + 1);
                 }
+                // ZeroizeOnDrop forbids field moves; take password, clone public fields.
+                let backend_password = std::mem::take(&mut rec.backend_password);
                 map.insert(
                     rec.lease.lease_id.clone(),
                     LeaseRecord {
-                        lease: rec.lease,
-                        backend_password: rec.backend_password,
-                        backend_username: rec.backend_username,
+                        lease: rec.lease.clone(),
+                        backend_password,
+                        backend_username: rec.backend_username.clone(),
                     },
                 );
+                // rec Drop zeroizes remaining (empty) password buffer.
             }
         } else {
             for lease in file.leases {
@@ -482,7 +496,8 @@ impl VaultStore {
         rec.lease.revoked_by = revoked_by.map(|s| s.to_owned());
         rec.lease.access_token = format!("revoked-{}", rec.lease.lease_id);
         rec.lease.expires_at_unix_ms = now;
-        rec.backend_password.clear();
+        // H05: best-effort wipe (ZeroizeOnDrop also runs when record is pruned/dropped).
+        rec.backend_password.zeroize();
         let out = rec.lease.clone();
         drop(guard);
         let _ = self.persist();
@@ -531,7 +546,11 @@ impl VaultStore {
         if rec.backend_password.is_empty() {
             return None;
         }
-        Some((rec.backend_username.clone(), rec.backend_password.clone()))
+        // Callers receive a copy; store retains the secret until revoke/prune/Drop.
+        Some((
+            rec.backend_username.clone(),
+            rec.backend_password.clone(),
+        ))
     }
 }
 
@@ -611,6 +630,10 @@ mod tests {
         assert!(store.get_valid_lease_by_token(&token).is_none());
         assert!(store.backend_identity(&lease.lease_id).is_none());
         assert!(store.revoke(&lease.lease_id, None).is_err());
+        // After revoke the in-map record keeps empty zeroized password (still listed as revoked
+        // until prune). Prune drops the record and ZeroizeOnDrop runs again.
+        assert_eq!(store.prune_expired(), 1);
+        assert!(store.get_lease(&lease.lease_id).is_none());
     }
 
     #[test]
