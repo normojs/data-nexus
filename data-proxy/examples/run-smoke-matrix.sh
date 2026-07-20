@@ -74,6 +74,7 @@ security_extended_smokes=(
   smoke-security-dual-control.sh
   smoke-security-time.sh
   smoke-cross-protocol-stream.sh
+  smoke-security-portal-xproto.sh
 )
 
 cedar_smokes=(

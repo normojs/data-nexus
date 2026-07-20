@@ -63,9 +63,9 @@ cd data-proxy
   - 路径：`backend/postgresql`、endpoint 配置与 validate
 
 - [ ] **A09** Portal 端到端流式  
-  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** NDJSON/CSV/JSON 均按窗口 HTTP chunk（`x-data-nexus-stream: chunked`，非 backend_window）；JSON 分片文档 UI 可 parse  
-  - 仍欠：Complete 路径 ResultSet 在 backend 侧仍可能先物化（无 RowStream 时不可避免）；跨协议 portal 边界；无进程峰值 CI  
-  - 路径：`http` portal_execute_{ndjson,csv,json}_streaming + `*_chunked_response`；`smoke-security-portal.sh`
+  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`；JSON 分片文档 UI 可 parse；**跨协议 portal**（MySQL SQL surface → PG backend）：translation + 列类型映射 + multi-row 三格式 `backend_window` smoke（`smoke-security-portal-xproto.sh`，`window_rows=2`）  
+  - 仍欠：Complete 路径 ResultSet 在 backend 侧仍可能先物化（无 RowStream 时不可避免）；无进程峰值 CI；反向 PG→MySQL portal 未单独 smoke  
+  - 路径：`http` portal_execute_*_streaming + `portal_prepare` translation；`security-portal-xproto-gateway-config.toml`；`smoke-security-portal{,-xproto}.sh`
 
 - [ ] **A10** 预处理 / 事务透传矩阵  
   - 已有：MySQL COM_STMT + Streaming + PREPARE 列定义；PG Parse/Bind/Execute + Streaming；Describe 显式 SELECT + `SELECT *` catalog；扩展协议 Execute 不发 Z；**客户端 Execute max_rows 截断 → PortalSuspended（s）**（策略 max_rows 仍 C）；`StreamingEncodeStats.truncated` + core_engine 折叠 page 进 encode max_rows；协议 smoke（policy C + page 独立网关 max_rows=100 强制 `s`）+ mysql description + psycopg 同连接 rebind  
@@ -116,7 +116,7 @@ cd data-proxy
 
 | 主题 | 限制 |
 |------|------|
-| Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`；**Complete → `chunked` 窗口 HTTP**（非 backend_window）；backend 无 RowStream 时 ResultSet 仍可能先物化 |
+| Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`（**含跨协议 MySQL→PG portal**）；**Complete → `chunked`**；backend 无 RowStream 时仍可能先物化；无进程峰值 CI |
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；控制语句/Complete 小结果仍可物化；**非进程 RSS CI** |
 | PG/MySQL backend TLS | A08：默认 accept_invalid=true；prod 模板 require+CA+verify；非 extended |
 | 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended（客户端 page）**；策略截断仍 C；真游标续读未做；非 TCP passthrough |
@@ -134,8 +134,8 @@ cd data-proxy
 
 建议优先级：
 
-1. **A09** 跨协议 portal / 进程峰值 CI  
-2. **A08** extended 透传 / TLS 默认硬化  
+1. **A08** extended 透传 / TLS 默认硬化  
+2. **A06/A09** 进程峰值 CI（可选）或 A09 反向 PG→MySQL portal smoke  
 3. **A10** PortalSuspended 真游标续读（可选）  
 4. **H05** 多副本语义 / 进程内 vault 明文边界  
 5. 体验小刀；**F30/P0x 延后项未点名勿做**
@@ -144,8 +144,10 @@ cd data-proxy
 # A 轨相关回归入口
 ./examples/smoke-security-stream.sh
 ./examples/smoke-security-portal.sh
+./examples/smoke-security-portal-xproto.sh
 cargo test -p postgresql_protocol a10_decodes_bind
 cargo test -p runtime_gateway --lib a10_prepared_execute_streaming
+cargo test -p http@0.1.0 --lib a09_portal_prepare
 ```
 
 ---

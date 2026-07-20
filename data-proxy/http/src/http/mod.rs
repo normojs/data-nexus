@@ -4954,4 +4954,47 @@ service = "missing-service"
         assert_eq!(mode.window_rows(), Some(256));
         assert_eq!(mode.effective_max_rows(), Some(10));
     }
+
+    #[test]
+    fn a09_portal_prepare_applies_cross_protocol_translation() {
+        // Portal SQL is written in the listener (frontend) dialect; when the
+        // service has a translation_policy, portal_prepare rewrites before backend.
+        use gateway_core::{
+            default_dialect_parser, prepare_cross_protocol_command, GatewayCommand, ProtocolKind,
+            TranslationPolicyConfig, TranslationStatementKind,
+        };
+        let policy = TranslationPolicyConfig {
+            name: "mysql-to-pg".into(),
+            enabled: true,
+            frontend_protocol: ProtocolKind::MySql,
+            backend_protocol: ProtocolKind::PostgreSql,
+            allowed_statements: vec![TranslationStatementKind::Select],
+        };
+        let dialect = default_dialect_parser(&ProtocolKind::MySql);
+        let cmd = prepare_cross_protocol_command(
+            &policy,
+            GatewayCommand::Query {
+                sql: "SELECT `id`, IFNULL(name, '') FROM portal_xproto WHERE id=1".into(),
+            },
+            &dialect,
+        )
+        .expect("translation");
+        match cmd {
+            GatewayCommand::Query { sql } => {
+                assert!(
+                    sql.contains("COALESCE") || sql.contains("coalesce"),
+                    "expected IFNULL→COALESCE rewrite, got {sql}"
+                );
+                assert!(
+                    !sql.contains("IFNULL") && !sql.contains("ifnull"),
+                    "IFNULL should be rewritten: {sql}"
+                );
+                assert!(
+                    sql.contains("\"id\"") || sql.contains("id"),
+                    "id should remain: {sql}"
+                );
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
 }

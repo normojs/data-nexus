@@ -1,0 +1,68 @@
+# A09: portal cross-protocol Streaming → backend_window.
+# Admin portal SQL (MySQL dialect surface via listener) → PostgreSQL backend.
+# Pair with: docker compose -f examples/docker-compose.dev.yml up -d
+# Run: ./examples/smoke-security-portal-xproto.sh
+
+version = "2"
+
+[admin]
+host = "0.0.0.0"
+port = 8084
+log_level = "INFO"
+
+[security]
+enabled = true
+fail_closed = false
+star_policy = "allow"
+default_audit_level = "L0"
+
+[security.streaming]
+window_rows = 2
+passthrough = false
+
+[security.audit]
+queue_capacity = 1024
+overflow = "drop_new"
+sinks = ["tracing"]
+
+# Listener protocol defines portal frontend dialect (MySQL SQL surface).
+[[listeners]]
+name = "portal-mysql-to-pg"
+listen_addr = "0.0.0.0:9091"
+protocol = "mysql"
+service = "analytics-via-mysql"
+auth_policy = "local-users"
+
+[[services]]
+name = "analytics-via-mysql"
+backend_protocol = "postgresql"
+endpoints = ["analytics-primary"]
+route_policy = "analytics-balance"
+translation_policy = "mysql-to-pg"
+plugin_policies = []
+
+[[endpoints]]
+name = "analytics-primary"
+protocol = "postgresql"
+address = "127.0.0.1:15433"
+database = "analytics"
+username = "postgres"
+password = "postgres"
+weight = 1
+
+[[route_policies]]
+name = "analytics-balance"
+kind = "simple_load_balance"
+
+[[auth_policies]]
+name = "local-users"
+kind = "static"
+username = "root"
+password = "root"
+
+[[translation_policies]]
+name = "mysql-to-pg"
+enabled = true
+frontend_protocol = "mysql"
+backend_protocol = "postgresql"
+allowed_statements = ["select", "insert", "update", "delete"]
