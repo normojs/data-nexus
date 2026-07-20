@@ -157,6 +157,7 @@ examples/        smoke + gateway config 样例
 | A10 | client Execute max_rows → PortalSuspended footer | feat(a10) |
 | A09 | portal cross-protocol MySQL→PG backend_window smoke | feat(a09) |
 | A08 | default ssl_accept_invalid=false + PG passthrough smoke | feat(a08) |
+| A09 | portal reverse cross-protocol PG→MySQL backend_window smoke | feat(a09) |
 
 ---
 

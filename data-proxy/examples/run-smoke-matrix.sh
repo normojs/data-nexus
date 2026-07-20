@@ -75,6 +75,7 @@ security_extended_smokes=(
   smoke-security-time.sh
   smoke-cross-protocol-stream.sh
   smoke-security-portal-xproto.sh
+  smoke-security-portal-xproto-pg-mysql.sh
 )
 
 cedar_smokes=(

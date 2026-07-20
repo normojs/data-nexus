@@ -4997,4 +4997,47 @@ service = "missing-service"
             other => panic!("expected Query, got {other:?}"),
         }
     }
+
+    #[test]
+    fn a09_portal_prepare_applies_reverse_cross_protocol_translation() {
+        // Reverse: PostgreSQL SQL surface → MySQL backend (identifier quotes).
+        use gateway_core::{
+            default_dialect_parser, prepare_cross_protocol_command, GatewayCommand, ProtocolKind,
+            TranslationPolicyConfig, TranslationStatementKind,
+        };
+        let policy = TranslationPolicyConfig {
+            name: "pg-to-mysql".into(),
+            enabled: true,
+            frontend_protocol: ProtocolKind::PostgreSql,
+            backend_protocol: ProtocolKind::MySql,
+            allowed_statements: vec![TranslationStatementKind::Select],
+        };
+        let dialect = default_dialect_parser(&ProtocolKind::PostgreSql);
+        let cmd = prepare_cross_protocol_command(
+            &policy,
+            GatewayCommand::Query {
+                sql: "SELECT \"id\", COALESCE(name, '') FROM portal_xproto_rev WHERE id=1".into(),
+            },
+            &dialect,
+        )
+        .expect("translation");
+        match cmd {
+            GatewayCommand::Query { sql } => {
+                assert!(
+                    sql.contains("`id`") || sql.contains("id"),
+                    "expected MySQL-style id, got {sql}"
+                );
+                // Double-quoted identifiers should become backticks for MySQL.
+                assert!(
+                    !sql.contains("\"id\""),
+                    "PG double-quoted id should be rewritten: {sql}"
+                );
+                assert!(
+                    sql.contains("COALESCE") || sql.contains("coalesce"),
+                    "COALESCE is portable and should remain: {sql}"
+                );
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
 }

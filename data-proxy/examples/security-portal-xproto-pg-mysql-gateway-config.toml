@@ -1,0 +1,68 @@
+# A09: portal cross-protocol reverse Streaming → backend_window.
+# Admin portal SQL (PostgreSQL dialect surface via listener) → MySQL backend.
+# Pair with: docker compose -f examples/docker-compose.dev.yml up -d
+# Run: ./examples/smoke-security-portal-xproto-pg-mysql.sh
+
+version = "2"
+
+[admin]
+host = "0.0.0.0"
+port = 8085
+log_level = "INFO"
+
+[security]
+enabled = true
+fail_closed = false
+star_policy = "allow"
+default_audit_level = "L0"
+
+[security.streaming]
+window_rows = 2
+passthrough = false
+
+[security.audit]
+queue_capacity = 1024
+overflow = "drop_new"
+sinks = ["tracing"]
+
+# Listener protocol defines portal frontend dialect (PostgreSQL SQL surface).
+[[listeners]]
+name = "portal-pg-to-mysql"
+listen_addr = "0.0.0.0:9092"
+protocol = "postgresql"
+service = "orders-via-pg"
+auth_policy = "local-users"
+
+[[services]]
+name = "orders-via-pg"
+backend_protocol = "mysql"
+endpoints = ["orders-primary"]
+route_policy = "orders-balance"
+translation_policy = "pg-to-mysql"
+plugin_policies = []
+
+[[endpoints]]
+name = "orders-primary"
+protocol = "mysql"
+address = "127.0.0.1:13306"
+database = "orders"
+username = "root"
+password = "root"
+weight = 1
+
+[[route_policies]]
+name = "orders-balance"
+kind = "simple_load_balance"
+
+[[auth_policies]]
+name = "local-users"
+kind = "static"
+username = "root"
+password = "root"
+
+[[translation_policies]]
+name = "pg-to-mysql"
+enabled = true
+frontend_protocol = "postgresql"
+backend_protocol = "mysql"
+allowed_statements = ["select", "insert", "update", "delete"]
