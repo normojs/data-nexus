@@ -58,9 +58,9 @@ cd data-proxy
   - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
-  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落  
-  - 仍欠：默认 `accept_invalid=true`（兼容）；**非 extended 透传**；Streaming 仍用 pool  
-  - 路径：`backend/postgresql`、endpoint 配置与 validate
+  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**（WireRelay + txn `tcp_txn`，与 MySQL 同脚本）  
+  - 仍欠：**extended 协议不透传**（QueryParams/prepared 走 Streaming/re-encode）；Streaming 仍用 pool  
+  - 路径：`backend/postgresql` + `pg_tcp_relay`、endpoint 配置与 validate、`smoke-security-passthrough.sh`
 
 - [ ] **A09** Portal 端到端流式  
   - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`；JSON 分片文档 UI 可 parse；**跨协议 portal**（MySQL SQL surface → PG backend）：translation + 列类型映射 + multi-row 三格式 `backend_window` smoke（`smoke-security-portal-xproto.sh`，`window_rows=2`）  
@@ -118,7 +118,7 @@ cd data-proxy
 |------|------|
 | Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`（**含跨协议 MySQL→PG portal**）；**Complete → `chunked`**；backend 无 RowStream 时仍可能先物化；无进程峰值 CI |
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；控制语句/Complete 小结果仍可物化；**非进程 RSS CI** |
-| PG/MySQL backend TLS | A08：默认 accept_invalid=true；prod 模板 require+CA+verify；非 extended |
+| PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；dev 可显式 true；prod 模板 require+CA；simple Query 透传有 smoke；**非 extended 透传** |
 | 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended（客户端 page）**；策略截断仍 C；真游标续读未做；非 TCP passthrough |
 | 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；进程内存 vault 密码仍明文 |
 | L2 样本 | B08：默认关；有界 rows/bytes；OpenDAL 需 feature |
@@ -134,7 +134,7 @@ cd data-proxy
 
 建议优先级：
 
-1. **A08** extended 透传 / TLS 默认硬化  
+1. **A08** extended 透传（可选；当前 simple Query 已透传）  
 2. **A06/A09** 进程峰值 CI（可选）或 A09 反向 PG→MySQL portal smoke  
 3. **A10** PortalSuspended 真游标续读（可选）  
 4. **H05** 多副本语义 / 进程内 vault 明文边界  

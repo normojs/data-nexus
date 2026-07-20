@@ -5,9 +5,9 @@
 //!
 //! | `ssl_accept_invalid_certs` | `ssl_ca_file` | behavior |
 //! |----------------------------|--------------|----------|
-//! | `true` (default, MVP)      | any          | skip cert/hostname verification |
-//! | `false`                    | `None`       | system trust roots + hostname |
+//! | `false` (default)          | `None`       | system trust roots + hostname |
 //! | `false`                    | `Some(path)` | system roots + PEM CA(s) from file |
+//! | `true` (dev override)      | any          | skip cert/hostname verification |
 
 use std::fs;
 use std::path::Path;

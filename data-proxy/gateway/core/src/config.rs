@@ -51,12 +51,12 @@ pub struct EndpointConfig {
     #[serde(default)]
     pub ssl_mode: EndpointSslMode,
     /// A08: optional PEM file of extra CA cert(s) trusted for backend TLS.
-    /// Used when `ssl_mode` is prefer/require. Production should pair with
-    /// `ssl_accept_invalid_certs = false`.
+    /// Used when `ssl_mode` is prefer/require. Production keeps
+    /// `ssl_accept_invalid_certs = false` (default) and sets this path.
     #[serde(default)]
     pub ssl_ca_file: Option<String>,
-    /// A08: when true (default, MVP-compat), skip certificate / hostname
-    /// verification. Set false to enforce system roots + optional `ssl_ca_file`.
+    /// A08: when true, skip certificate / hostname verification (dev only).
+    /// Default is **false**: system roots + optional `ssl_ca_file`.
     #[serde(default = "default_ssl_accept_invalid_certs")]
     pub ssl_accept_invalid_certs: bool,
 }
@@ -66,8 +66,9 @@ fn default_endpoint_weight() -> u32 {
 }
 
 fn default_ssl_accept_invalid_certs() -> bool {
-    // Backward-compatible MVP default; pin CA via ssl_ca_file + false for prod.
-    true
+    // A08: fail-closed default — verify system roots (+ optional ssl_ca_file).
+    // Dev/self-signed: set ssl_accept_invalid_certs=true explicitly, or pin CA.
+    false
 }
 
 impl Default for EndpointConfig {
@@ -476,7 +477,7 @@ mod tests {
                 weight: 1,
                 ssl_mode: Default::default(),
                 ssl_ca_file: None,
-                ssl_accept_invalid_certs: true,
+                ssl_accept_invalid_certs: false,
             }],
             route_policies: vec![RoutePolicyConfig {
                 name: "primary-only".into(),
@@ -659,7 +660,8 @@ mod tests {
         .unwrap();
         assert_eq!(bare.ssl_mode, EndpointSslMode::Disable);
         assert!(bare.ssl_ca_file.is_none());
-        assert!(bare.ssl_accept_invalid_certs);
+        // A08: default is fail-closed (verify); disable mode does not use TLS.
+        assert!(!bare.ssl_accept_invalid_certs);
     }
 
     #[test]

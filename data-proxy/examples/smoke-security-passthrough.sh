@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A3: same-protocol wire passthrough E2E (MySQL).
+# A3/A08: same-protocol wire passthrough E2E (MySQL + PostgreSQL TCP frame relay).
 set -euo pipefail
 
 export PATH="/Volumes/fushilu/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${HOME}/.cargo/bin:/Volumes/fushilu/.rustup/toolchains/nightly-2025-01-07-aarch64-apple-darwin/bin:${PATH:-}"
@@ -34,8 +34,12 @@ for _ in $(seq 1 90); do
   "${COMPOSE[@]}" exec -T mysql-primary mysqladmin ping -h 127.0.0.1 -uroot -proot --silent 2>/dev/null && break
   sleep 2
 done
+for _ in $(seq 1 90); do
+  "${COMPOSE[@]}" exec -T postgres-primary pg_isready -U postgres -d analytics >/dev/null 2>&1 && break
+  sleep 2
+done
 
-echo "==> seed"
+echo "==> seed MySQL"
 "${COMPOSE[@]}" exec -T mysql-primary mysql -uroot -proot -e "
 CREATE DATABASE IF NOT EXISTS orders;
 USE orders;
@@ -44,12 +48,22 @@ INSERT INTO pass_smoke VALUES (1,'alice'),(2,'bob')
   ON DUPLICATE KEY UPDATE name=VALUES(name);
 "
 
-echo "==> start gateway (passthrough=true, no obligations)"
+echo "==> seed PostgreSQL"
+"${COMPOSE[@]}" exec -T postgres-primary \
+  psql -U postgres -d analytics -v ON_ERROR_STOP=1 -c \
+  "CREATE TABLE IF NOT EXISTS pass_smoke (id INT PRIMARY KEY, name TEXT);
+   INSERT INTO pass_smoke VALUES (1,'alice'),(2,'bob')
+     ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name;"
+
+echo "==> start gateway (passthrough=true, MySQL+PG, no obligations)"
 PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
 (
   cd "$ROOT"
   if [[ ! -x "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/backend/mysql.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/runtime/gateway/src/backend/postgresql.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/runtime/gateway/src/backend/pg_tcp_relay.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/gateway/core/src/config.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/core_engine.rs" -nt "$PROXY_BIN" ]]; then
     cargo build -p data-proxy --bin proxy
   fi
@@ -68,15 +82,32 @@ mysql_via_gateway() {
     mysql --ssl-mode=DISABLED -h host.docker.internal -P 9088 -uroot -proot -N -e "$1"
 }
 
-echo "==> SELECT via passthrough path"
+psql_via_gateway() {
+  docker run --rm --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+    env PGPASSWORD=postgres \
+    psql -h host.docker.internal -p 9089 -U postgres -d analytics -tAc "$1"
+}
+
+echo "==> MySQL SELECT via passthrough path"
 out="$(mysql_via_gateway 'SELECT id, name FROM pass_smoke ORDER BY id;')"
 echo "$out"
 echo "$out" | grep -q 'alice'
 echo "$out" | grep -q 'bob'
 
+echo "==> PostgreSQL SELECT via TCP WireRelay passthrough (A08)"
+out_pg="$(psql_via_gateway 'SELECT id || chr(124) || name FROM pass_smoke ORDER BY id;')"
+echo "$out_pg"
+echo "$out_pg" | grep -q 'alice'
+echo "$out_pg" | grep -q 'bob'
+
+echo "==> PostgreSQL in-transaction passthrough still works (tcp_txn)"
+out_txn="$(psql_via_gateway "BEGIN; SELECT name FROM pass_smoke WHERE id=1; COMMIT;")"
+echo "$out_txn"
+echo "$out_txn" | grep -q 'alice'
+
 # audit should show outcome passthrough if pipeline installed
 sleep 0.3
-if curl -fsS "http://127.0.0.1:8082/admin/audit/events?limit=20" >/tmp/dn-pt-events.json 2>/dev/null; then
+if curl -fsS "http://127.0.0.1:8082/admin/audit/events?limit=40" >/tmp/dn-pt-events.json 2>/dev/null; then
   python3 - <<'PY'
 import json
 data=json.load(open("/tmp/dn-pt-events.json"))
@@ -88,7 +119,9 @@ PY
 fi
 
 # ensure log mentions passthrough when possible
-if rg -q 'passthrough' "$PROXY_LOG"; then
+if command -v rg >/dev/null 2>&1 && rg -q 'passthrough' "$PROXY_LOG"; then
+  echo "log contains passthrough outcome"
+elif grep -q 'passthrough' "$PROXY_LOG" 2>/dev/null; then
   echo "log contains passthrough outcome"
 fi
 
@@ -98,10 +131,9 @@ python3 - <<'PY'
 text=open("/tmp/dn-pt-metrics.txt").read()
 assert "gateway_execute_path_total" in text, "missing gateway_execute_path_total"
 assert 'execute_path="passthrough"' in text or "execute_path=\"passthrough\"" in text, text[:2000]
-# bytes counter present (may be 0 if wire path not taken under this build, but series should exist after traffic)
+# bytes counter present after wire traffic
 assert "gateway_passthrough_bytes_total" in text, "missing gateway_passthrough_bytes_total"
 print("A05 metrics ok")
-# print matching lines for debug
 for line in text.splitlines():
     if "gateway_execute_path_total" in line or "gateway_passthrough_bytes_total" in line:
         if line.startswith("#"):

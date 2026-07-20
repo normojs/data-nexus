@@ -1,4 +1,5 @@
-# A3 same-protocol wire passthrough (no result obligations).
+# A3/A08 same-protocol wire passthrough (no result obligations).
+# MySQL + PostgreSQL listeners; PG uses TCP frame relay (WireRelay).
 version = "2"
 
 [admin]
@@ -28,11 +29,25 @@ protocol = "mysql"
 service = "orders"
 auth_policy = "local-users"
 
+[[listeners]]
+name = "analytics-postgresql"
+listen_addr = "0.0.0.0:9089"
+protocol = "postgresql"
+service = "analytics"
+auth_policy = "local-users"
+
 [[services]]
 name = "orders"
 backend_protocol = "mysql"
 endpoints = ["orders-primary"]
 route_policy = "orders-balance"
+plugin_policies = []
+
+[[services]]
+name = "analytics"
+backend_protocol = "postgresql"
+endpoints = ["analytics-primary"]
+route_policy = "analytics-balance"
 plugin_policies = []
 
 [[endpoints]]
@@ -43,9 +58,23 @@ database = "orders"
 username = "root"
 password = "root"
 weight = 1
+# ssl_mode default disable — plain docker backends
+
+[[endpoints]]
+name = "analytics-primary"
+protocol = "postgresql"
+address = "127.0.0.1:15433"
+database = "analytics"
+username = "postgres"
+password = "postgres"
+weight = 1
 
 [[route_policies]]
 name = "orders-balance"
+kind = "simple_load_balance"
+
+[[route_policies]]
+name = "analytics-balance"
 kind = "simple_load_balance"
 
 [[auth_policies]]

@@ -182,7 +182,7 @@ username = "__DN_MYSQL_USER__"
 password = "__DN_MYSQL_PASSWORD__"
 weight = 1
 # A08 production pin: require TLS + verify CA (no accept-invalid).
-# Local/dev may use ssl_mode=disable or accept_invalid=true without CA.
+# Local/dev self-signed: set ssl_accept_invalid_certs=true (default is false / verify).
 ssl_mode = "require"
 ssl_ca_file = "__DN_MYSQL_SSL_CA_FILE__"
 ssl_accept_invalid_certs = false
