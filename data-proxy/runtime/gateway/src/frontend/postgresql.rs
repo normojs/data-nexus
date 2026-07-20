@@ -173,6 +173,8 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 session.pg_extended_query = false;
                 session.pg_execute_max_rows = None;
                 session.result_truncated = false;
+                session.pg_portal_name = None;
+                session.pg_portal_skip_rows = 0;
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_ready_for_query(transaction_status(session))],
                 }])
@@ -235,6 +237,11 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 self.portal_row_described.remove(&portal);
                 // Clear any leftover one-shot suppress from a previous unit.
                 self.suppress_next_row_description = false;
+                // A10: re-Bind resets logical portal page offset for this portal name.
+                if session.pg_portal_name.as_deref() == Some(portal.as_str()) {
+                    session.pg_portal_skip_rows = 0;
+                }
+                session.pg_portal_name = Some(portal.clone());
                 self.portals.insert(portal.clone(), sql);
                 self.portal_args.insert(portal.clone(), params);
                 self.portal_params.insert(portal.clone(), nparams);
@@ -356,6 +363,14 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     None
                 };
                 session.result_truncated = false;
+                // A10 logical portal resume: same portal re-Execute keeps skip_rows;
+                // different portal name starts from offset 0.
+                if session.pg_portal_name.as_deref() != Some(portal.as_str()) {
+                    session.pg_portal_name = Some(portal.clone());
+                    session.pg_portal_skip_rows = 0;
+                } else {
+                    session.pg_portal_name = Some(portal.clone());
+                }
                 let sql = self.portals.get(&portal).cloned().ok_or_else(|| {
                     GatewayError::Protocol(format!(
                         "postgresql Execute: unknown portal '{portal}'"
@@ -397,6 +412,10 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     self.portal_result_formats.remove(&name);
                     self.portal_columns.remove(&name);
                     self.portal_row_described.remove(&name);
+                    if session.pg_portal_name.as_deref() == Some(name.as_str()) {
+                        session.pg_portal_name = None;
+                        session.pg_portal_skip_rows = 0;
+                    }
                 }
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_close_complete()],

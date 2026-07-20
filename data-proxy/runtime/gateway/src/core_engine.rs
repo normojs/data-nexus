@@ -922,6 +922,22 @@ impl CoreGatewayConnection {
                         sample_opts,
                     )
                     .await?;
+                    // A10: advance logical portal offset after this page.
+                    // On PortalSuspended (truncated + client page), keep skip so the
+                    // next Execute resumes; on CommandComplete clear the portal page.
+                    if encode_stats.truncated
+                        && self.session.pg_execute_max_rows.is_some()
+                        && self.session.pg_portal_name.is_some()
+                    {
+                        self.session.pg_portal_skip_rows = self
+                            .session
+                            .pg_portal_skip_rows
+                            .saturating_add(encode_stats.total_rows);
+                    } else if self.session.pg_portal_name.is_some() {
+                        // Finished portal (no more rows or unlimited fetch).
+                        self.session.pg_portal_skip_rows = 0;
+                        self.session.pg_portal_name = None;
+                    }
                     // A10: clear one-shot Execute page flags after encode.
                     self.session.prefer_binary_result = false;
                     self.session.pg_execute_max_rows = None;

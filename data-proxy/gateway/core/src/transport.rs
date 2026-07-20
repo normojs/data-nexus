@@ -314,6 +314,8 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
     let max_total = obligations.and_then(|o| o.max_rows);
     let header_width = columns.len();
     let has_masks = !mask_idx.is_empty();
+    // A10 logical portal resume: re-Execute re-runs SQL; skip already-sent rows.
+    let mut skip_remaining = session.pg_portal_skip_rows;
 
     writer
         .write_packets(frontend.encode_resultset_header(&columns, session)?)
@@ -346,13 +348,27 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
                 break;
             }
         }
-        let want = match max_total {
-            Some(max) => ((max - stats.total_rows) as usize).min(window).max(1),
-            None => window,
+        // Prefer filling the page window; when still skipping prior portal rows,
+        // poll larger chunks so skip drains quickly without encoding.
+        let want = if skip_remaining > 0 {
+            window.max(skip_remaining as usize).min(4096).max(1)
+        } else {
+            match max_total {
+                Some(max) => ((max - stats.total_rows) as usize).min(window).max(1),
+                None => window,
+            }
         };
         let Some(mut chunk) = query.stream.poll_window(want).await? else {
             break;
         };
+        if skip_remaining > 0 {
+            let skip_n = (skip_remaining as usize).min(chunk.len());
+            chunk.drain(..skip_n);
+            skip_remaining -= skip_n as u64;
+            if chunk.is_empty() {
+                continue;
+            }
+        }
         // If the window returned more than remaining cap allows, trim and mark truncated.
         if let Some(max) = max_total {
             let remain = max.saturating_sub(stats.total_rows) as usize;
@@ -1010,5 +1026,49 @@ mod tests {
             stats.truncated,
             "expected truncated when more backend rows remained"
         );
+    }
+
+    #[tokio::test]
+    async fn a10_streaming_skips_portal_offset_then_pages() {
+        // 3 rows, skip=1, max_rows=1 → encode only middle row; truncated (row 3 remains).
+        let mut fe = FakeFrontend {
+            header_calls: 0,
+            row_calls: 0,
+            footer_calls: 0,
+        };
+        let session = SessionState {
+            pg_portal_skip_rows: 1,
+            pg_portal_name: Some("p".into()),
+            ..SessionState::default()
+        };
+        let columns = vec![Column {
+            name: "id".into(),
+            data_type: "int".into(),
+        }];
+        let rows = (0..3)
+            .map(|i| vec![GatewayValue::Integer(i)])
+            .collect::<Vec<_>>();
+        let mut obl = Obligations::default();
+        obl.max_rows = Some(1);
+        let query = StreamingQuery {
+            columns,
+            stream: Box::new(VecRowStream::new(rows)),
+        };
+        let mut writer = CollectingWriter::new();
+        let stats = write_streaming_query_with_obligations(
+            &mut fe,
+            &session,
+            query,
+            10,
+            Some(&obl),
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.total_rows, 1);
+        assert!(stats.truncated, "row 2 still remaining after page");
+        // CollectingWriter records encoded row payloads as total_rows in footer [0]=1
+        assert_eq!(fe.footer_calls, 1);
+        assert!(fe.row_calls >= 1);
     }
 }

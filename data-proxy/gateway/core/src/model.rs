@@ -132,6 +132,16 @@ pub struct SessionState {
     /// (set by transport; consumed by PG footer for PortalSuspended).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub result_truncated: bool,
+    /// A10: portal name for logical multi-Execute paging (skip already-sent rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg_portal_name: Option<String>,
+    /// A10: rows already returned for `pg_portal_name` (re-Execute skips these).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub pg_portal_skip_rows: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
