@@ -1780,11 +1780,24 @@ fn push_unique(tables: &mut Vec<String>, name: String) {
     }
 }
 
-/// Strip denied columns from a simple SELECT list (heuristic, no full AST rewrite).
+/// Strip denied columns from SELECT lists (heuristic, no full AST rewrite).
 ///
-/// Returns `None` when the SQL shape is not a simple SELECT list rewrite target.
-/// Returns `Some` rewritten SQL (may have empty projection → caller should deny).
+/// T01: rewrites the **outermost** SELECT list and, when possible, **nested**
+/// SELECT lists inside parentheses (subqueries / derived tables). Still does
+/// not expand `*` / `t.*` and does not rewrite correlated expressions deeply.
+///
+/// Returns `None` when the outer SQL shape is not a simple SELECT list rewrite
+/// target. Returns `Some` rewritten SQL (empty outer projection → caller deny).
 fn rewrite_select_strip_columns(sql: &str, denied: &[(String, String)]) -> Option<String> {
+    if denied.is_empty() {
+        return Some(sql.to_owned());
+    }
+    let outer = rewrite_one_select_list(sql, denied)?;
+    Some(rewrite_nested_select_lists(&outer, denied))
+}
+
+/// Rewrite a single outermost SELECT list in `sql` (does not recurse).
+fn rewrite_one_select_list(sql: &str, denied: &[(String, String)]) -> Option<String> {
     if denied.is_empty() {
         return Some(sql.to_owned());
     }
@@ -1842,6 +1855,146 @@ fn rewrite_select_strip_columns(sql: &str, denied: &[(String, String)]) -> Optio
     out.push(' ');
     out.push_str(rest.trim_start());
     Some(out)
+}
+
+/// T01: walk `sql` for parenthesized subqueries that begin with SELECT and
+/// rewrite their projection lists for denied column names.
+fn rewrite_nested_select_lists(sql: &str, denied: &[(String, String)]) -> String {
+    if denied.is_empty() {
+        return sql.to_owned();
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_back = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            out.push(c as char);
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            out.push(c as char);
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_back {
+            out.push(c as char);
+            if c == b'`' {
+                in_back = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                out.push('\'');
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                out.push('"');
+                in_double = true;
+                i += 1;
+            }
+            b'`' => {
+                out.push('`');
+                in_back = true;
+                i += 1;
+            }
+            b'(' => {
+                // Look for nested SELECT subquery: ( SELECT ... )
+                let after = &sql[i + 1..];
+                let trimmed = after.trim_start();
+                let trim_off = after.len() - trimmed.len();
+                if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("SELECT") {
+                    if let Some(close_rel) = find_matching_paren(after) {
+                        // `after` starts right after '('; close_rel is index of ')' in `after`.
+                        let inner = &after[..close_rel];
+                        let rewritten_inner = match rewrite_one_select_list(inner, denied) {
+                            Some(s) => rewrite_nested_select_lists(&s, denied),
+                            None => rewrite_nested_select_lists(inner, denied),
+                        };
+                        out.push('(');
+                        // Preserve whitespace between '(' and SELECT when present.
+                        out.push_str(&after[..trim_off]);
+                        // rewrite_one_select_list may keep leading ws of `inner` if any;
+                        // we already preserved trim_off spaces — strip leading from rewrite.
+                        out.push_str(rewritten_inner.trim_start());
+                        out.push(')');
+                        i = i + 1 + close_rel + 1;
+                        continue;
+                    }
+                }
+                out.push('(');
+                i += 1;
+            }
+            _ => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Index of the matching `)` for a slice that starts **inside** a paren group
+/// (i.e. the opening `(` is already consumed). Returns index into `s` of `)`.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 1i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_back = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_back {
+            if c == b'`' {
+                in_back = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'`' => in_back = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
@@ -2321,7 +2474,7 @@ mod tests {
     #[test]
     fn t01_subquery_objectset_column_deny_rewrites_outer_list() {
         // ObjectSet as if extract walked subquery and outer SELECT list.
-        // Honest: rewriter may only strip top-level SELECT list; nested salary can remain.
+        // T01: outer + nested SELECT lists both strip denied columns.
         let pdp = pdp_with(vec![SecurityRuleConfig {
             name: "deny-salary".into(),
             effect: "deny".into(),
@@ -2342,17 +2495,27 @@ mod tests {
         };
         match pdp.authorize_command_with_objects(&sub, "hr", &cmd, &dialect, Some(&set)) {
             SecurityDecision::AllowRewrite { sql, .. } => {
-                // Outer list must not project salary; nested FROM may still mention it
-                // (known rewriter depth limit — documented in todo.md §4 honesty).
                 let lower = sql.to_ascii_lowercase();
-                let top = lower.split("from").next().unwrap_or(&lower);
                 assert!(
-                    !top.contains("salary"),
-                    "outer SELECT list still projects salary: {sql}"
+                    !lower.contains("salary"),
+                    "salary must be stripped from outer and nested lists: {sql}"
                 );
+                assert!(lower.contains("id"), "{sql}");
+                assert!(lower.contains("employees"), "{sql}");
             }
             other => panic!("expected rewrite, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn t01_rewrite_nested_select_lists_deep() {
+        let denied = vec![("r".into(), "salary".into())];
+        let sql = "SELECT id, salary FROM (SELECT id, salary FROM (SELECT id, salary, name FROM employees) x) y";
+        let out = rewrite_select_strip_columns(sql, &denied).unwrap();
+        let lower = out.to_ascii_lowercase();
+        assert!(!lower.contains("salary"), "{out}");
+        assert!(lower.contains("name"), "{out}");
+        assert!(lower.matches("select").count() >= 3, "{out}");
     }
 
     #[test]

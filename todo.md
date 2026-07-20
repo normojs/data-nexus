@@ -92,9 +92,9 @@ cd data-proxy
   - 路径：部署 runbook / 运维侧
 
 - [ ] **T01** 列 ACL / 复杂 SQL 用例矩阵  
-  - 已有：extract/PDP 单测；WHERE/HAVING/EXISTS/IN/标量子查询表提取；column smoke WHERE IN deny  
-  - 仍欠：**列 rewrite 不深改嵌套 SELECT 列表**；极端方言/解析失败仍 heuristic  
-  - 路径：`object_extract`、PDP column rewrite、smoke
+  - 已有：extract/PDP 单测；WHERE/HAVING/EXISTS/IN/标量子查询表提取；column smoke WHERE IN deny；**嵌套 SELECT 列表列 strip**（`rewrite_nested_select_lists`，含多层 derived table 单测）  
+  - 仍欠：**`*` / `t.*` 仍不展开**；相关子查询表达式/极端方言仍 heuristic  
+  - 路径：`object_extract`、`pdp::rewrite_select_strip_columns`、smoke
 
 - [ ] **F30** 敏感识别增强 — **延后**  
   - 现状：仅 `column_tags` + mask 规则  
@@ -124,7 +124,7 @@ cd data-proxy
 | L2 样本 | B08：默认关；有界 rows/bytes；**sample_enabled 强制 L2**；OpenDAL 需 feature；**非全量 L3** |
 | Remote PDP | F31 已交付：表/动作 gate；超时 fail_closed；**非**热路径逐行 mask |
 | Cedar ABAC | F29 已交付：静态 `subject_attrs`/`table_attrs`；非动态 IdP 同步 |
-| 复杂 SQL / 列 ACL | T01：表可抽；**列 rewrite 不深改嵌套 SELECT** |
+| 复杂 SQL / 列 ACL | T01：表可抽；**嵌套 SELECT 列表可 strip 列**；`*` 不展开 |
 
 ---
 
@@ -134,11 +134,11 @@ cd data-proxy
 
 建议优先级：
 
-1. **T01** 嵌套 SELECT 列 rewrite 加深（可选）  
-2. **A06/A09** 进程峰值 CI（可选）  
-3. **A10** backend 真游标 hold（可选；逻辑 skip 已交付）  
-4. **A08** extended TCP bind 帧中继（可选）  
-5. 体验小刀 / H05 CRDT；**F30/P0x 延后项未点名勿做**
+1. **A06/A09** 进程峰值 CI（可选）  
+2. **A10** backend 真游标 hold（可选；逻辑 skip 已交付）  
+3. **A08** extended TCP bind 帧中继（可选）  
+4. **H05** CRDT / mlock（可选）  
+5. 体验小刀；**F30/P0x 延后项未点名勿做**
 
 ```bash
 # A 轨相关回归入口

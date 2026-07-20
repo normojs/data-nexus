@@ -162,6 +162,7 @@ examples/        smoke + gateway config 样例
 | A10 | PortalSuspended multi-Execute logical skip resume | feat(a10) |
 | A08 | passthrough demotes extended QueryParams to Streaming + smoke | feat(a08) |
 | B08 | sample_enabled requires L2 + audit sample smoke + docs | feat(b08) |
+| T01 | nested SELECT list column strip rewrite | feat(t01) |
 
 ---
 
