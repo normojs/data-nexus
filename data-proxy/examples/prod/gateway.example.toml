@@ -89,7 +89,8 @@ archive_dir = "/var/log/data-nexus/audit/archive"
 index_path = "/var/log/data-nexus/audit/index.sqlite"
 # F32: max SQL chars at L1/L2 (L0 strips sql_text).
 sql_text_max_chars = 2048
-# B08: L2 result samples (default off). Requires default_audit_level=L2 to attach.
+# B08: L2 result samples (default off). sample_enabled=true REQUIRES default_audit_level=L2
+# (validate fails otherwise — avoids silent no-op). Bounded rows/bytes only; not full-result L3.
 # sample_enabled = false
 # sample_max_rows = 5
 # sample_max_bytes = 4096

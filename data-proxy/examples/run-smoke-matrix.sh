@@ -62,6 +62,7 @@ security_core_smokes=(
   smoke-security-column.sh
   smoke-security-mask.sh
   smoke-security-audit.sh
+  smoke-security-audit-sample.sh
   smoke-security-ticket.sh
   smoke-security-portal.sh
   smoke-security-vault.sh

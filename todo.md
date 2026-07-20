@@ -77,9 +77,9 @@ cd data-proxy
 ## 2. P1 — 策略 / 合规 / 运维
 
 - [ ] **B08** L2 样本 / 大 payload  
-  - 已有：物化 ResultSet + Streaming 首窗（脱敏后）；`sample_enabled` 默认关；OpenDAL 可选  
-  - 仍欠：默认关与有界语义文档化到位；勿宣传「全量 L2 合规样本」  
-  - 路径：audit sample attach、`audit-opendal` feature
+  - 已有：物化 ResultSet + Streaming 首窗（脱敏后）；`sample_enabled` 默认关；OpenDAL 可选；**validate：`sample_enabled` 必须 `default_audit_level=L2`**（防静默 no-op）；`OBSERVABILITY.md` + prod 模板诚实说明；smoke `smoke-security-audit-sample.sh` 断言 `sample_body` 有界  
+  - 仍欠：勿宣传「全量 L2 / L3 合规样本」；OpenDAL 上传仍需 feature；高 QPS 默认仍应关  
+  - 路径：`security.rs` validate、`audit` sample attach、`OBSERVABILITY.md`、`smoke-security-audit-sample.sh`
 
 - [ ] **H05** 多实例状态外置（含 H08 vault 文件加密）  
   - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板；**vault `backend_password` ZeroizeOnDrop + revoke zeroize**（文档诚实边界）  
@@ -121,7 +121,7 @@ cd data-proxy
 | PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；simple Query 透传；**extended 在 passthrough 配置下降级 Streaming（非 TCP bind 中继）** |
 | 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended + 逻辑 multi-Execute 续读（skip 重跑）**；策略截断仍 C；**非 backend 真游标**；非 TCP passthrough |
 | 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；活跃 vault 密码在 RAM；revoke/prune/Drop zeroize（非 mlock） |
-| L2 样本 | B08：默认关；有界 rows/bytes；OpenDAL 需 feature |
+| L2 样本 | B08：默认关；有界 rows/bytes；**sample_enabled 强制 L2**；OpenDAL 需 feature；**非全量 L3** |
 | Remote PDP | F31 已交付：表/动作 gate；超时 fail_closed；**非**热路径逐行 mask |
 | Cedar ABAC | F29 已交付：静态 `subject_attrs`/`table_attrs`；非动态 IdP 同步 |
 | 复杂 SQL / 列 ACL | T01：表可抽；**列 rewrite 不深改嵌套 SELECT** |
@@ -134,11 +134,11 @@ cd data-proxy
 
 建议优先级：
 
-1. **A08** extended TCP bind 帧中继（可选；当前 demote Streaming 已交付）  
+1. **T01** 嵌套 SELECT 列 rewrite 加深（可选）  
 2. **A06/A09** 进程峰值 CI（可选）  
 3. **A10** backend 真游标 hold（可选；逻辑 skip 已交付）  
-4. **H05** 多副本 CRDT / mlock（可选；zeroize 边界已文档化）  
-5. 体验小刀；**F30/P0x 延后项未点名勿做**
+4. **A08** extended TCP bind 帧中继（可选）  
+5. 体验小刀 / H05 CRDT；**F30/P0x 延后项未点名勿做**
 
 ```bash
 # A 轨相关回归入口

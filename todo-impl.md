@@ -161,6 +161,7 @@ examples/        smoke + gateway config 样例
 | H05 | vault backend_password ZeroizeOnDrop + runbook honesty | feat(h05) |
 | A10 | PortalSuspended multi-Execute logical skip resume | feat(a10) |
 | A08 | passthrough demotes extended QueryParams to Streaming + smoke | feat(a08) |
+| B08 | sample_enabled requires L2 + audit sample smoke + docs | feat(b08) |
 
 ---
 

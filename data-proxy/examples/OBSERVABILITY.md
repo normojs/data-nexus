@@ -123,6 +123,45 @@ Prometheus text metrics on `/metrics` remain available regardless of OTel.
 
 If the exporter fails to initialize, the process logs an error and continues with fmt-only logging.
 
+## Audit L2 samples (B08)
+
+Result samples are **opt-in** and **bounded**. They are **not** full-result capture.
+
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `security.default_audit_level` | `L0` | Must be **`L2`** for samples to attach |
+| `security.audit.sample_enabled` | `false` | Master switch; validate rejects `true` unless level is L2 |
+| `security.audit.sample_max_rows` | `5` | Max rows in sample (hard cap 10000) |
+| `security.audit.sample_max_bytes` | `4096` | Serialized JSON cap (hard cap 1 MiB) |
+| `security.audit.sample_inline` | `true` | Keep truncated body on event JSONL if no OpenDAL |
+| `security.audit.sample_prefix` | `samples` | OpenDAL key prefix under `opendal_prefix` |
+
+### Behaviour (honest)
+
+1. Hot path attaches sample only when **both** `sample_enabled` and effective level **L2**.
+2. Sample is built **after** obligations (mask / watermark) on a **window-sized** set for Streaming (first window / capped rows), never a second full ResultSet.
+3. Shape: `{"columns":[...],"rows":[[...],...],"truncated":bool}` on `sample_body`; Admin `GET /admin/audit/events` may include `sample_body` / `sample_ref` / `sample_row_count` / `sample_truncated`.
+4. OpenDAL upload (feature `audit-opendal`) may set `sample_ref=opendal:…` and drop body when `sample_inline=false`.
+5. **Not** L3 full-result audit. Do not enable on high-QPS paths expecting compliance archives of every row.
+
+### Minimal config
+
+```toml
+[security]
+enabled = true
+default_audit_level = "L2"
+
+[security.audit]
+sample_enabled = true
+sample_max_rows = 5
+sample_max_bytes = 4096
+sample_inline = true
+sinks = ["tracing", "file"]
+file_path = "/tmp/data-nexus-audit-events.jsonl"
+```
+
+Smoke: `./examples/smoke-security-audit-sample.sh`.
+
 ## Admin API auth (management plane)
 
 Optional. Default `admin_auth.enabled = false` keeps open Admin API (local dev).

@@ -240,7 +240,13 @@ impl SecurityPolicyConfig {
         }
 
         // B08: sample knobs only meaningful when enabled; keep fail-closed on nonsense.
+        // sample_enabled without L2 would silently never attach samples (config no-op).
         if self.audit.sample_enabled {
+            if !self.default_audit_level.eq_ignore_ascii_case("L2") {
+                return Err(GatewayError::Configuration(
+                    "security.audit.sample_enabled=true requires security.default_audit_level=L2 (samples never attach at L0/L1)".into(),
+                ));
+            }
             if self.audit.sample_max_rows == 0 {
                 return Err(GatewayError::Configuration(
                     "security.audit.sample_max_rows must be >= 1 when sample_enabled=true".into(),
@@ -606,8 +612,9 @@ pub struct SecurityAuditConfig {
     /// F32: max characters of SQL stored at L1/L2 (`sql_text`). Default 2048.
     #[serde(default = "default_sql_text_max_chars")]
     pub sql_text_max_chars: u32,
-    /// B08: when true and effective audit level is L2, attach a small result sample.
-    /// Default **false** (samples are optional / opt-in).
+    /// B08: when true **and** `security.default_audit_level=L2`, attach a small
+    /// result sample (post-mask, capped rows/bytes). Default **false**.
+    /// Config validate rejects `sample_enabled=true` with L0/L1 (would be a silent no-op).
     #[serde(default)]
     pub sample_enabled: bool,
     /// B08: max rows included in a sample (default 5).
@@ -853,6 +860,7 @@ mod tests {
     #[test]
     fn b08_sample_enabled_rejects_zero_rows() {
         let mut cfg = SecurityPolicyConfig::default();
+        cfg.default_audit_level = "L2".into();
         cfg.audit.sample_enabled = true;
         cfg.audit.sample_max_rows = 0;
         let err = cfg.validate().expect_err("zero rows");
@@ -862,6 +870,7 @@ mod tests {
     #[test]
     fn b08_sample_enabled_rejects_huge_bytes() {
         let mut cfg = SecurityPolicyConfig::default();
+        cfg.default_audit_level = "L2".into();
         cfg.audit.sample_enabled = true;
         cfg.audit.sample_max_bytes = 2_000_000;
         let err = cfg.validate().expect_err("too large");
@@ -871,10 +880,27 @@ mod tests {
     #[test]
     fn b08_sample_enabled_ok() {
         let mut cfg = SecurityPolicyConfig::default();
+        cfg.default_audit_level = "L2".into();
         cfg.audit.sample_enabled = true;
         cfg.audit.sample_max_rows = 5;
         cfg.audit.sample_max_bytes = 4096;
         assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn b08_sample_enabled_requires_l2_level() {
+        // Avoid silent no-op: samples only attach when default_audit_level is L2.
+        let mut cfg = SecurityPolicyConfig::default();
+        assert_eq!(cfg.default_audit_level, "L0");
+        cfg.audit.sample_enabled = true;
+        cfg.audit.sample_max_rows = 5;
+        cfg.audit.sample_max_bytes = 4096;
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default_audit_level=L2") || msg.contains("L2"),
+            "{msg}"
+        );
     }
 
     #[test]
