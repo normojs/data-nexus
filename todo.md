@@ -58,9 +58,9 @@ cd data-proxy
   - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
-  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**（WireRelay + txn `tcp_txn`，与 MySQL 同脚本）  
-  - 仍欠：**extended 协议不透传**（QueryParams/prepared 走 Streaming/re-encode）；Streaming 仍用 pool  
-  - 路径：`backend/postgresql` + `pg_tcp_relay`、endpoint 配置与 validate、`smoke-security-passthrough.sh`
+  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 配置下 extended Bind/Execute 降级 Streaming**（双协议 demote，禁止 Complete 物化；smoke 断言 `QUERY_PARAMS`→`execute_path=streaming`）  
+  - 仍欠：**extended 仍非 TCP 帧中继**（无 bind 原包透传）；Streaming 仍用 pool  
+  - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`smoke-security-passthrough.sh`
 
 - [ ] **A09** Portal 端到端流式  
   - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`；JSON 分片文档 UI 可 parse；**跨协议 portal 双向** smoke：MySQL→PG（`smoke-security-portal-xproto.sh`）与 **PG→MySQL**（`smoke-security-portal-xproto-pg-mysql.sh`），均 `window_rows=2` 强制三格式 `backend_window` + dialect rewrite + DDL 拒绝  
@@ -118,7 +118,7 @@ cd data-proxy
 |------|------|
 | Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`（**双向跨协议 portal** MySQL↔PG）；**Complete → `chunked`**；backend 无 RowStream 时仍可能先物化；无进程峰值 CI |
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；控制语句/Complete 小结果仍可物化；**非进程 RSS CI** |
-| PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；dev 可显式 true；prod 模板 require+CA；simple Query 透传有 smoke；**非 extended 透传** |
+| PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；simple Query 透传；**extended 在 passthrough 配置下降级 Streaming（非 TCP bind 中继）** |
 | 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended + 逻辑 multi-Execute 续读（skip 重跑）**；策略截断仍 C；**非 backend 真游标**；非 TCP passthrough |
 | 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；活跃 vault 密码在 RAM；revoke/prune/Drop zeroize（非 mlock） |
 | L2 样本 | B08：默认关；有界 rows/bytes；OpenDAL 需 feature |
@@ -134,7 +134,7 @@ cd data-proxy
 
 建议优先级：
 
-1. **A08** extended 透传（可选；当前 simple Query 已透传）  
+1. **A08** extended TCP bind 帧中继（可选；当前 demote Streaming 已交付）  
 2. **A06/A09** 进程峰值 CI（可选）  
 3. **A10** backend 真游标 hold（可选；逻辑 skip 已交付）  
 4. **H05** 多副本 CRDT / mlock（可选；zeroize 边界已文档化）  

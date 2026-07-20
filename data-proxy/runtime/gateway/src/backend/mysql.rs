@@ -1340,6 +1340,17 @@ impl BackendConnector for MySqlBackendConnector {
         let in_txn = session.transaction_state == TransactionState::Active
             || self.txn_lease.lock().is_some();
 
+        // A08 honesty: Passthrough + extended (QueryParams / prepared Execute)
+        // cannot wire-relay binds; demote to Streaming window path (parity with PG).
+        let (mode, streaming) = if matches!(mode, ExecuteMode::Passthrough)
+            && (is_query_params || is_execute)
+        {
+            let m = ExecuteMode::from_streaming_config(256, None);
+            (m, true)
+        } else {
+            (mode, streaming)
+        };
+
         if streaming && is_query {
             if let GatewayCommand::Query { sql } = command {
                 let endpoint = self.select_endpoint(session)?;

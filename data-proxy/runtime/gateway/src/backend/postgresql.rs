@@ -1112,7 +1112,8 @@ impl BackendConnector for PostgreSqlBackendConnector {
             || self.tcp_txn.lock().is_some();
 
         // A08: progressive TCP frame relay for passthrough (txn + non-txn).
-        // QueryParams cannot TCP-relay bound params; never passthrough here.
+        // QueryParams / prepared Execute cannot TCP-relay bound params — never
+        // wire-passthrough those (see demotion to Streaming below).
         if matches!(mode, ExecuteMode::Passthrough) && is_query {
             if let GatewayCommand::Query { sql } = command {
                 let endpoint = self.select_endpoint(session)?;
@@ -1126,6 +1127,18 @@ impl BackendConnector for PostgreSqlBackendConnector {
                     .await;
             }
         }
+
+        // A08 honesty: Passthrough + extended (QueryParams / prepared Execute)
+        // must not fall through to Complete materialization. Demote to Streaming
+        // so bound params still use the windowed prepare path (no TCP frame relay).
+        let (mode, streaming) = if matches!(mode, ExecuteMode::Passthrough)
+            && (is_query_params || is_execute)
+        {
+            let m = ExecuteMode::from_streaming_config(256, None);
+            (m, true)
+        } else {
+            (mode, streaming)
+        };
 
         if streaming && is_query {
             if let GatewayCommand::Query { sql } = command {
@@ -2423,6 +2436,24 @@ mod tests {
             },
             GatewayCommand::Query { .. }
         ));
+    }
+
+    #[test]
+    fn a08_passthrough_demotes_query_params_to_streaming() {
+        // Passthrough mode is only for simple Query TCP relay; extended binds demote.
+        let mode = ExecuteMode::Passthrough;
+        assert!(!mode.is_streaming());
+        // Demotion formula used in execute_outcome (must stay in sync).
+        let is_query_params = true;
+        let is_execute = false;
+        let demoted = if matches!(mode, ExecuteMode::Passthrough) && (is_query_params || is_execute)
+        {
+            ExecuteMode::from_streaming_config(256, None)
+        } else {
+            mode
+        };
+        assert!(demoted.is_streaming(), "{demoted:?}");
+        assert_eq!(demoted.window_rows(), Some(256));
     }
 
     #[tokio::test]

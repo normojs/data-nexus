@@ -160,6 +160,7 @@ examples/        smoke + gateway config 样例
 | A09 | portal reverse cross-protocol PG→MySQL backend_window smoke | feat(a09) |
 | H05 | vault backend_password ZeroizeOnDrop + runbook honesty | feat(h05) |
 | A10 | PortalSuspended multi-Execute logical skip resume | feat(a10) |
+| A08 | passthrough demotes extended QueryParams to Streaming + smoke | feat(a08) |
 
 ---
 

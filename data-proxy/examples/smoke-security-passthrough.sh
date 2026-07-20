@@ -125,6 +125,82 @@ elif grep -q 'passthrough' "$PROXY_LOG" 2>/dev/null; then
   echo "log contains passthrough outcome"
 fi
 
+echo "==> A08 PostgreSQL extended Bind/Execute under passthrough config (not WireRelay)"
+# Passthrough only applies to simple Query. Extended QueryParams must still work
+# via Streaming re-encode (no TCP bind relay). Assert rows + metrics streaming.
+pg_ext_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
+  python - <<'PY'
+import socket, struct
+
+def i32(n):
+    return struct.pack("!i", n)
+
+def i16(n):
+    return struct.pack("!h", n)
+
+def cstr(s: str) -> bytes:
+    return s.encode() + b"\x00"
+
+def msg(tag: bytes, body: bytes) -> bytes:
+    return tag + i32(len(body) + 4) + body
+
+def read_msg(sock):
+    hdr = b""
+    while len(hdr) < 5:
+        chunk = sock.recv(5 - len(hdr))
+        if not chunk:
+            raise RuntimeError("eof header")
+        hdr += chunk
+    tag = hdr[0:1]
+    (length,) = struct.unpack("!i", hdr[1:5])
+    body = b""
+    need = length - 4
+    while len(body) < need:
+        chunk = sock.recv(need - len(body))
+        if not chunk:
+            raise RuntimeError("eof body")
+        body += chunk
+    return tag, body
+
+sock = socket.create_connection(("host.docker.internal", 9089), timeout=10)
+params = cstr("user") + cstr("postgres") + cstr("database") + cstr("analytics") + b"\x00"
+sock.sendall(i32(8 + len(params)) + i32(196608) + params)
+while True:
+    tag, body = read_msg(sock)
+    if tag == b"Z":
+        break
+    if tag == b"E":
+        raise RuntimeError(body)
+
+sql = "SELECT id, name FROM pass_smoke WHERE id = $1 ORDER BY id"
+sock.sendall(msg(b"P", cstr("sext") + cstr(sql) + i16(0)))
+param = b"1"
+body = cstr("pext") + cstr("sext") + i16(0) + i16(1) + i32(len(param)) + param + i16(0)
+sock.sendall(msg(b"B", body))
+sock.sendall(msg(b"E", cstr("pext") + i32(0)))
+sock.sendall(msg(b"S", b""))
+
+tags = []
+rows = 0
+while True:
+    tag, body = read_msg(sock)
+    tags.append(tag.decode("latin1"))
+    if tag == b"D":
+        rows += 1
+    if tag == b"E":
+        raise RuntimeError(body.decode("utf-8", "replace"))
+    if tag == b"Z":
+        break
+print("pg_ext_tags", tags, "rows", rows)
+assert rows >= 1, rows
+assert "C" in tags or "s" in tags, tags
+print("pg_extended_under_passthrough_ok")
+sock.close()
+PY
+)"
+echo "$pg_ext_out"
+echo "$pg_ext_out" | grep -q 'pg_extended_under_passthrough_ok'
+
 echo "==> A05 Prometheus execute_path + passthrough_bytes"
 curl -fsS "http://127.0.0.1:8082/metrics" | tee /tmp/dn-pt-metrics.txt >/dev/null
 python3 - <<'PY'
@@ -133,6 +209,14 @@ assert "gateway_execute_path_total" in text, "missing gateway_execute_path_total
 assert 'execute_path="passthrough"' in text or "execute_path=\"passthrough\"" in text, text[:2000]
 # bytes counter present after wire traffic
 assert "gateway_passthrough_bytes_total" in text, "missing gateway_passthrough_bytes_total"
+# A08: extended Bind/Execute under passthrough config must use streaming re-encode
+# (not wire passthrough for QUERY_PARAMS).
+if 'type="QUERY_PARAMS"' in text or "type=\"QUERY_PARAMS\"" in text:
+    assert (
+        'execute_path="streaming"' in text
+        or "execute_path=\"streaming\"" in text
+    ), "expected streaming path for extended under passthrough config"
+    print("A08 extended under passthrough uses streaming path")
 print("A05 metrics ok")
 for line in text.splitlines():
     if "gateway_execute_path_total" in line or "gateway_passthrough_bytes_total" in line:
