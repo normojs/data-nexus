@@ -187,6 +187,23 @@ Read-only config snapshot: `GET /admin/security-policies` includes `audit_sample
 Admin Policies page surfaces the same knobs (UI04).
 
 
+## Audit levels (F32)
+
+| Level | `sql_text` | Result sample (B08) | Notes |
+|-------|------------|---------------------|-------|
+| **L0** (default) | **stripped** | never | Fingerprint / decision / objects only |
+| **L1** | truncated (`sql_text_max_chars`, default 2048) | never | No full SQL dump |
+| **L2** | truncated | only if `sample_enabled=true` | Samples bounded by rows/bytes; not L3 full result |
+
+Validate rejects `sample_enabled=true` unless `default_audit_level=L2` (silent no-op avoided).
+
+Smoke:
+
+- `smoke-security-audit.sh` — L0 deny events have fingerprint, **no** `sql_text`
+- `smoke-security-audit-sample.sh` — L2 sample events keep truncated `sql_text` + bounded `sample_body`
+
+Admin Audit UI: event detail shows `sql_text` when present; Sample column is B08-only.
+
 ## Admin API auth (management plane)
 
 Optional. Default `admin_auth.enabled = false` keeps open Admin API (local dev).

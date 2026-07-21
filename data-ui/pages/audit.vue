@@ -560,6 +560,7 @@ onMounted(() => {
         · decision={{ selectedEvent.decision || '—' }}
         · service={{ selectedEvent.service || '—' }}
         · subject={{ selectedEvent.subject_id || '—' }}
+        · tables={{ (selectedEvent.tables && selectedEvent.tables.length) ? selectedEvent.tables.join(',') : '—' }}
       </p>
       <p
         v-if="selectedEvent.sql_fingerprint"
