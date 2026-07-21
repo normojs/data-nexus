@@ -232,6 +232,28 @@ for e in ev:
     assert e.get("rule") == "$DENY_RULE", e
 assert data.get("source") == "index", data
 print("rule filter ok", "rule=$DENY_RULE", "events", len(ev))
+# pick action for UI22 (deny events are typically action=query)
+act = next((e.get("action") for e in ev if e.get("action")), None)
+if not act:
+    out=json.load(open("/tmp/dn-audit-outcome.json"))
+    act = next((e.get("action") for e in (out.get("events") or []) if e.get("action")), None)
+assert act, "expected deny event with action"
+open("/tmp/dn-audit-deny-action.txt","w").write(act)
+print("deny action", act)
+PY
+
+DENY_ACT=$(cat /tmp/dn-audit-deny-action.txt)
+echo "==> GET /admin/audit/events?action=$DENY_ACT"
+curl -fsS "http://127.0.0.1:8082/admin/audit/events?action=${DENY_ACT}&limit=20" | tee /tmp/dn-audit-action.json >/dev/null
+python3 - <<PY
+import json
+data=json.load(open("/tmp/dn-audit-action.json"))
+ev=data.get("events") or []
+assert ev, data
+for e in ev:
+    assert e.get("action") == "$DENY_ACT", e
+assert data.get("source") == "index", data
+print("action filter ok", "action=$DENY_ACT", "events", len(ev))
 PY
 
 echo "smoke-security-audit: OK"

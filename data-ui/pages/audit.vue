@@ -17,6 +17,7 @@ const auditLevel = ref('')
 const outcome = ref('')
 const listener = ref('')
 const rule = ref('')
+const action = ref('')
 const service = ref('')
 const subjectId = ref('')
 const eventId = ref('')
@@ -138,6 +139,7 @@ async function load() {
       outcome: outcome.value || undefined,
       listener: listener.value || undefined,
       rule: rule.value || undefined,
+      action: action.value || undefined,
       service: service.value || undefined,
       subject_id: subjectId.value || undefined,
       event_id: eventId.value || undefined,
@@ -174,6 +176,7 @@ function clearFilters() {
   outcome.value = ''
   listener.value = ''
   rule.value = ''
+  action.value = ''
   service.value = ''
   subjectId.value = ''
   eventId.value = ''
@@ -206,6 +209,7 @@ function exportJson() {
       outcome: outcome.value || null,
       listener: listener.value || null,
       rule: rule.value || null,
+      action: action.value || null,
       service: service.value || null,
       subject_id: subjectId.value || null,
       event_id: eventId.value || null,
@@ -298,7 +302,7 @@ function copyEventId(id?: string) {
 
 /** UI21: click a table cell value to apply that field as a filter and reload. */
 function applyFilter(
-  field: 'decision' | 'audit_level' | 'outcome' | 'listener' | 'rule' | 'service' | 'subject_id',
+  field: 'decision' | 'audit_level' | 'outcome' | 'listener' | 'rule' | 'action' | 'service' | 'subject_id',
   value?: string | null,
   ev?: Event,
 ) {
@@ -323,6 +327,9 @@ function applyFilter(
       break
     case 'rule':
       rule.value = v
+      break
+    case 'action':
+      action.value = v
       break
     case 'service':
       service.value = v
@@ -499,6 +506,22 @@ onMounted(() => {
           >
         </label>
         <label>
+          <span>Action</span>
+          <input
+            v-model="action"
+            class="input mono"
+            list="action-opts"
+            placeholder="query / admin_write"
+            @keyup.enter="load"
+          >
+          <datalist id="action-opts">
+            <option value="query" />
+            <option value="admin_write" />
+            <option value="portal_query" />
+            <option value="portal_export" />
+          </datalist>
+        </label>
+        <label>
           <span>Subject</span>
           <input
             v-model="subjectId"
@@ -545,11 +568,12 @@ onMounted(() => {
         </label>
       </div>
       <p class="hint">
-        UI03/UI16–UI21: stats from pipeline (B06 index / B07 priority queue);
+        UI03/UI16–UI22: stats from pipeline (B06 index / B07 priority queue);
         filters include <code class="mono">audit_level</code>,
-        <code class="mono">outcome</code>, <code class="mono">listener</code>, and
-        <code class="mono">rule</code>. Click decision / level / subject / service /
-        outcome / rule cells to apply that filter and reload.
+        <code class="mono">outcome</code>, <code class="mono">listener</code>,
+        <code class="mono">rule</code>, and <code class="mono">action</code>.
+        Click decision / level / subject / service / outcome / rule cells to
+        apply that filter and reload.
         When <code class="mono">security.audit.index_path</code> is set, badge shows
         <code class="mono">source=index</code>; otherwise
         <code class="mono">source=recent</code> (in-memory ring). Export is the

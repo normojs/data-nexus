@@ -454,6 +454,8 @@ export function useAdminApi() {
       listener?: string
       /** UI20: matched policy rule name filter. */
       rule?: string
+      /** UI22: action column filter (query / admin_write / portal_* …). */
+      action?: string
       from_ms?: number
       to_ms?: number
       limit?: number
@@ -467,6 +469,7 @@ export function useAdminApi() {
       if (params?.outcome) q.set('outcome', params.outcome)
       if (params?.listener) q.set('listener', params.listener)
       if (params?.rule) q.set('rule', params.rule)
+      if (params?.action) q.set('action', params.action)
       if (params?.from_ms != null) q.set('from_ms', String(params.from_ms))
       if (params?.to_ms != null) q.set('to_ms', String(params.to_ms))
       if (params?.limit) q.set('limit', String(params.limit))

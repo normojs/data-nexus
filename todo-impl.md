@@ -241,3 +241,4 @@ examples/        smoke + gateway config 样例
 | UI19 | Audit filter by listener (index col + recent + UI) | feat(ui19) |
 | UI20 | Audit filter by rule (index col + recent + UI) | feat(ui20) |
 | UI21 | Audit table click-to-filter (decision/level/subject/service/outcome/rule) | feat(ui21) |
+| UI22 | Audit filter by action (index col + recent + UI) | feat(ui22) |

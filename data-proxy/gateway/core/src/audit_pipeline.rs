@@ -555,6 +555,11 @@ impl AuditPipeline {
                         .map(|r| e.rule.as_deref() == Some(r))
                         .unwrap_or(true)
                     && filter
+                        .action
+                        .as_deref()
+                        .map(|a| e.action.as_deref() == Some(a))
+                        .unwrap_or(true)
+                    && filter
                         .from_ms
                         .map(|from| e.ts_unix_ms.unwrap_or(0) >= from)
                         .unwrap_or(true)

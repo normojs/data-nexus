@@ -651,6 +651,8 @@ struct AdminAuditEventsQuery {
     listener: Option<String>,
     /// UI20: filter by matched policy rule name.
     rule: Option<String>,
+    /// UI22: filter by action (`query`, `admin_write`, portal_*, …).
+    action: Option<String>,
     /// Inclusive lower bound, unix epoch milliseconds.
     from_ms: Option<u64>,
     /// Inclusive upper bound, unix epoch milliseconds.
@@ -1416,6 +1418,7 @@ impl AxumServer {
             outcome: query.outcome.clone(),
             listener: query.listener.clone(),
             rule: query.rule.clone(),
+            action: query.action.clone(),
             from_ms: query.from_ms,
             to_ms: query.to_ms,
             limit,
