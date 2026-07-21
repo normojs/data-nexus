@@ -46,6 +46,30 @@ function fmtNum(n?: number) {
   return String(n)
 }
 
+/** B08: compact sample presence for the event table. */
+function sampleLabel(e: AdminAuditEvent): string {
+  if (e.sample_row_count != null) {
+    return `${e.sample_row_count}r${e.sample_truncated ? '…' : ''}`
+  }
+  if (e.sample_ref) return 'ref'
+  if (e.sample_body) return 'body'
+  return '—'
+}
+
+function sampleTitle(e: AdminAuditEvent): string {
+  const parts: string[] = []
+  if (e.sample_row_count != null) parts.push(`rows=${e.sample_row_count}`)
+  if (e.sample_bytes != null) parts.push(`bytes=${e.sample_bytes}`)
+  if (e.sample_truncated) parts.push('truncated')
+  if (e.sample_ref) parts.push(`ref=${e.sample_ref}`)
+  if (e.sample_body) {
+    const preview =
+      e.sample_body.length > 240 ? `${e.sample_body.slice(0, 240)}…` : e.sample_body
+    parts.push(preview)
+  }
+  return parts.join(' · ') || 'no sample (need sample_enabled + default_audit_level=L2)'
+}
+
 const sourceBadgeClass = computed(() => {
   if (source.value === 'index') return 'src-index'
   if (source.value === 'recent') return 'src-recent'
@@ -408,6 +432,7 @@ onMounted(() => {
             <th>Service</th>
             <th>Outcome</th>
             <th>Rule</th>
+            <th>Sample</th>
             <th>Event id</th>
             <th>Message</th>
           </tr>
@@ -438,6 +463,12 @@ onMounted(() => {
             <td class="mono">
               {{ e.rule || '—' }}
             </td>
+            <td
+              class="mono sample"
+              :title="sampleTitle(e)"
+            >
+              {{ sampleLabel(e) }}
+            </td>
             <td class="mono eid">
               <button
                 v-if="e.event_id"
@@ -456,7 +487,7 @@ onMounted(() => {
           </tr>
           <tr v-if="!events.length">
             <td
-              colspan="8"
+              colspan="9"
               class="empty"
             >
               No events.

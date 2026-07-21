@@ -87,6 +87,12 @@ export type AdminAuditEvent = {
   sql_fingerprint?: string
   tables?: string[]
   audit_level?: string
+  /** B08: post-mask sample JSON (bounded; only when sample_enabled + L2). */
+  sample_body?: string | null
+  sample_ref?: string | null
+  sample_row_count?: number | null
+  sample_bytes?: number | null
+  sample_truncated?: boolean
 }
 
 export type AdminAuditStats = {
