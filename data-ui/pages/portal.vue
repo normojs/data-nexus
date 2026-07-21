@@ -219,9 +219,13 @@ onMounted(async () => {
             Export NDJSON
           </button>
         </div>
-        <p class="hint">
-          Leases never include backend passwords. SQL is authorized by Local PDP and executed via gateway backends only. Exports use the same PEP path with format=csv|ndjson.
+                <p class="hint">
+          Leases never include backend passwords. SQL is authorized by Local PDP and executed via gateway backends only.
+          Exports use the same PEP path (<code class="mono">csv|ndjson|json</code>).
+          Multi-row SELECT should report <code class="mono">stream=backend_window</code>; non-SELECT Complete fallbacks use
+          <code class="mono">stream=chunked</code> (HTTP windows, not a full-result dump claim).
         </p>
+
         <div
           v-if="projects.length"
           class="mini"

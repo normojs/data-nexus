@@ -98,21 +98,23 @@ async function issue() {
   }
 }
 
+function isSelfApprover(ticket: AdminTicket): boolean {
+  const me = adminMe.value?.subject?.trim()
+  if (!ticket.dual_control || !me || !ticket.issued_by)
+    return false
+  return ticket.issued_by.trim().toLowerCase() === me.toLowerCase()
+}
+
 async function approve(id: string) {
   const ticket = tickets.value.find(x => x.id === id)
-  const me = adminMe.value?.subject?.trim()
-  if (
-    ticket?.dual_control
-    && me
-    && ticket.issued_by
-    && ticket.issued_by.trim().toLowerCase() === me.toLowerCase()
-  ) {
+  if (ticket && isSelfApprover(ticket)) {
     setStatus(
       `Cannot self-approve dual-control ticket ${id}: approver must differ from issuer (${ticket.issued_by})`,
       'error',
     )
     return
   }
+  const me = adminMe.value?.subject?.trim()
   busy.value = true
   try {
     const t = await api.approveTicket(id, {}, apiBase.value)
@@ -388,7 +390,8 @@ onMounted(() => {
                 v-if="t.status === 'pending'"
                 type="button"
                 class="btn primary"
-                :disabled="busy"
+                :disabled="busy || isSelfApprover(t)"
+                :title="isSelfApprover(t) ? 'Dual-control: logged-in admin is the issuer; cannot self-approve' : 'Approve ticket'"
                 @click="approve(t.id)"
               >
                 Approve
