@@ -173,6 +173,7 @@ examples/        smoke + gateway config 样例
 | UI07 | Portal Context shows gateway streaming window_rows | feat(ui07) |
 | UI08 | Portal result meta shows stream badge + window_rows | feat(ui08) |
 | UI09 | Tickets dual-control self-approve guard + admin subject | feat(ui09) |
+| UI10 | Audit Sample detail expand for B08 sample_body | feat(ui10) |
 | chore | streaming rule INSERT chunked honesty; tickets dual-control hint | chore |
 | UI03 | Audit table Sample column for B08 sample_* | feat(ui03) |
 | UI05 | Portal query status shows stream + window_rows | feat(ui05) |

@@ -19,6 +19,7 @@ const eventId = ref('')
 const fromLocal = ref('')
 const toLocal = ref('')
 const limit = ref(100)
+const selectedEvent = ref<AdminAuditEvent | null>(null)
 
 function setStatus(msg: string, kind: 'ok' | 'error' | '' = '') {
   status.value = msg
@@ -54,6 +55,14 @@ function sampleLabel(e: AdminAuditEvent): string {
   if (e.sample_ref) return 'ref'
   if (e.sample_body) return 'body'
   return '—'
+}
+
+function selectEvent(e: AdminAuditEvent) {
+  if (selectedEvent.value?.event_id && selectedEvent.value.event_id === e.event_id) {
+    selectedEvent.value = null
+    return
+  }
+  selectedEvent.value = e
 }
 
 function sampleTitle(e: AdminAuditEvent): string {
@@ -463,11 +472,20 @@ onMounted(() => {
             <td class="mono">
               {{ e.rule || '—' }}
             </td>
-            <td
-              class="mono sample"
-              :title="sampleTitle(e)"
-            >
-              {{ sampleLabel(e) }}
+            <td class="mono sample">
+              <button
+                v-if="sampleLabel(e) !== '—'"
+                type="button"
+                class="linkish"
+                :title="sampleTitle(e)"
+                @click="selectEvent(e)"
+              >
+                {{ sampleLabel(e) }}
+              </button>
+              <span
+                v-else
+                title="no sample (need sample_enabled + default_audit_level=L2)"
+              >—</span>
             </td>
             <td class="mono eid">
               <button
@@ -495,6 +513,41 @@ onMounted(() => {
           </tr>
         </tbody>
       </table>
+    </div>
+
+    <div
+      v-if="selectedEvent && (selectedEvent.sample_body || selectedEvent.sample_ref)"
+      class="card sample-detail"
+    >
+      <div class="row">
+        <h3 class="page-title">
+          Sample detail
+        </h3>
+        <button
+          type="button"
+          class="btn"
+          @click="selectedEvent = null"
+        >
+          Close
+        </button>
+      </div>
+      <p class="hint mono">
+        event={{ selectedEvent.event_id || '—' }}
+        · rows={{ selectedEvent.sample_row_count ?? '—' }}
+        · bytes={{ selectedEvent.sample_bytes ?? '—' }}
+        · truncated={{ selectedEvent.sample_truncated ? 'yes' : 'no' }}
+        · ref={{ selectedEvent.sample_ref || '—' }}
+      </p>
+      <pre
+        v-if="selectedEvent.sample_body"
+        class="sample-pre mono"
+      >{{ selectedEvent.sample_body }}</pre>
+      <p
+        v-else
+        class="hint"
+      >
+        No inline sample_body (OpenDAL ref only or stripped).
+      </p>
     </div>
   </div>
 </template>
