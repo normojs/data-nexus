@@ -63,7 +63,7 @@ cd data-proxy
   - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`smoke-security-passthrough.sh`、`OBSERVABILITY.md`
 
 - [ ] **A09** Portal 端到端流式  
-  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`（smoke：INSERT NDJSON/JSON/CSV **强制** `x-data-nexus-stream: chunked`）；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**；**跨协议 portal 双向** smoke 同窗；**OBSERVABILITY** 标明 chunked ≠ backend_window  
+  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`（smoke：INSERT NDJSON/JSON/CSV **强制** `x-data-nexus-stream: chunked`）；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**；**跨协议 portal 双向** smoke 同窗；**响应头 `x-data-nexus-window-rows`**（CSV 无 body meta 时仍可钉窗）；**OBSERVABILITY** 标明 chunked ≠ backend_window  
   - 仍欠：Complete 路径 ResultSet 在 backend 侧仍可能先物化（无 RowStream 时不可避免）；无进程 RSS 峰值 CI（逻辑 window 已钉）  
   - 路径：`http` portal_execute_*_streaming；`security-portal-gateway-config.toml`；`security-portal-xproto{,-pg-mysql}-gateway-config.toml`；`smoke-security-portal{,-xproto,-xproto-pg-mysql}.sh`
 
@@ -116,7 +116,7 @@ cd data-proxy
 
 | 主题 | 限制 |
 |------|------|
-| Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`（**双向跨协议 portal** MySQL↔PG）；**Complete → `chunked`**；backend 无 RowStream 时仍可能先物化；无进程峰值 CI |
+| Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`（**双向跨协议 portal** MySQL↔PG）；**Complete → `chunked`**；**`x-data-nexus-window-rows` 头**（CSV 可钉窗）；backend 无 RowStream 时仍可能先物化；无进程峰值 CI |
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；控制语句/Complete 小结果仍可物化；**非进程 RSS CI**；见 `OBSERVABILITY` A-track 表 |
 | PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；simple Query 透传；**extended 在 passthrough 配置下降级 Streaming（非 TCP bind 中继）**；smoke 要求 passthrough+streaming 计数共存 |
 | 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended + 逻辑 multi-Execute 续读（skip 重跑）**；策略截断仍 C；**非 backend 真游标**；非 TCP passthrough |

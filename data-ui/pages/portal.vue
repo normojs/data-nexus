@@ -276,6 +276,7 @@ onMounted(async () => {
             <template v-if="streamingCfg.max_rows != null">
               · policy max_rows={{ streamingCfg.max_rows }}
             </template>
+            · peak=logical window (not RSS)
           </span>
         </label>
         <label class="field">
@@ -319,7 +320,8 @@ onMounted(async () => {
           Leases never include backend passwords. SQL is authorized by Local PDP and executed via gateway backends only.
           Exports use the same PEP path (<code class="mono">csv|ndjson|json</code>).
           Multi-row SELECT should report <code class="mono">stream=backend_window</code>; non-SELECT Complete fallbacks use
-          <code class="mono">stream=chunked</code> (HTTP windows, not a full-result dump claim).
+          <code class="mono">stream=chunked</code> (HTTP windows; backend ResultSet may already be materialized).
+          CSV exposes the pin via <code class="mono">x-data-nexus-window-rows</code> (no JSON meta).
         </p>
 
         <div

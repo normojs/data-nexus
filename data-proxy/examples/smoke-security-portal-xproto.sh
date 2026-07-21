@@ -130,6 +130,7 @@ hdr=open("/tmp/dn-portal-xproto-csv.hdr").read().lower()
 body=open("/tmp/dn-portal-xproto.csv").read()
 assert "text/csv" in hdr, hdr
 assert "x-data-nexus-stream: backend_window" in hdr, hdr
+assert "x-data-nexus-window-rows: 2" in hdr, hdr
 lines=[ln for ln in body.splitlines() if ln.strip() and not ln.startswith("#")]
 assert len(lines) >= 3, lines
 print("portal xproto csv backend_window ok", "lines", len(lines))

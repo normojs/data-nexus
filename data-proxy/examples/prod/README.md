@@ -38,7 +38,7 @@ cargo build -p data-proxy --bin proxy
 | Audit index | SQLite side-index (`index_path`) for Admin search; same `retain_days` prune |
 | OpenDAL archive | optional `audit-opendal` feature: `fs` / `s3` / `oss` after rotate; credentials via `DN_OPENDAL_*` |
 | High risk | DDL + write-without-WHERE require tickets |
-| Streaming | `window_rows=256`, `passthrough=true` |
+| Streaming | `window_rows=256`, `passthrough=true` (simple Query wire; **extended demotes Streaming**, not TCP bind relay; peak metrics are **logical window**, not process RSS) |
 | Multi-instance (H05) | `security.state.backend=file` + ticket/vault/policy paths; optional AES-GCM keys |
 
 ### H05 multi-instance notes

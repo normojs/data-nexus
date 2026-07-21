@@ -3172,7 +3172,8 @@ async fn portal_execute_ndjson_streaming(
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")
-                .header("x-data-nexus-stream", "backend_window");
+                .header("x-data-nexus-stream", "backend_window")
+                .header("x-data-nexus-window-rows", window.to_string());
             if download {
                 builder = builder.header(
                     header::CONTENT_DISPOSITION,
@@ -3369,7 +3370,8 @@ async fn portal_execute_csv_streaming(
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
-                .header("x-data-nexus-stream", "backend_window");
+                .header("x-data-nexus-stream", "backend_window")
+                .header("x-data-nexus-window-rows", window.to_string());
             if download {
                 builder = builder.header(
                     header::CONTENT_DISPOSITION,
@@ -3591,7 +3593,8 @@ async fn portal_execute_json_streaming(
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-                .header("x-data-nexus-stream", "backend_window");
+                .header("x-data-nexus-stream", "backend_window")
+                .header("x-data-nexus-window-rows", window.to_string());
             if download {
                 builder = builder.header(
                     header::CONTENT_DISPOSITION,
@@ -3818,7 +3821,8 @@ fn portal_ndjson_chunked_response(
 
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8")
-        .header("x-data-nexus-stream", "chunked");
+        .header("x-data-nexus-stream", "chunked")
+        .header("x-data-nexus-window-rows", window.to_string());
     if download {
         builder = builder.header(
             header::CONTENT_DISPOSITION,
@@ -3896,7 +3900,8 @@ fn portal_csv_chunked_response(
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
-        .header("x-data-nexus-stream", "chunked");
+        .header("x-data-nexus-stream", "chunked")
+        .header("x-data-nexus-window-rows", window.to_string());
     if download {
         builder = builder.header(
             header::CONTENT_DISPOSITION,
@@ -3973,7 +3978,8 @@ fn portal_json_chunked_response(
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-        .header("x-data-nexus-stream", "chunked");
+        .header("x-data-nexus-stream", "chunked")
+        .header("x-data-nexus-window-rows", window.to_string());
     if download {
         builder = builder.header(
             header::CONTENT_DISPOSITION,

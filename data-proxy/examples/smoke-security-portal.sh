@@ -244,10 +244,12 @@ body=open("/tmp/dn-portal-multi.csv").read()
 assert "text/csv" in hdr, hdr
 # MySQL non-txn Streaming should yield true backend_window for CSV now.
 assert "x-data-nexus-stream: backend_window" in hdr, hdr
+# A09 honesty: CSV has no JSON meta — window pin is only via response header.
+assert "x-data-nexus-window-rows: 2" in hdr, hdr
 lines=[ln for ln in body.splitlines() if ln.strip() and not ln.startswith("#")]
 assert len(lines) >= 3, lines  # header + >=2 data rows
 assert lines[0].lower().startswith("id"), lines[0]
-print("csv multi-row backend_window ok", "lines", len(lines))
+print("csv multi-row backend_window ok", "lines", len(lines), "window_header=2")
 PY
 
 
@@ -278,6 +280,8 @@ meta=json.loads(lines[0])
 assert meta.get("_meta") is True, meta
 assert meta.get("stream") == "chunked", meta
 assert meta.get("decision") == "allow", meta
+# Complete path still advertises the HTTP encode window (not backend RowStream).
+assert "x-data-nexus-window-rows:" in hdr, hdr
 print("portal complete insert chunked ok", "stream", meta.get("stream"), "lines", len(lines))
 PY
 
@@ -329,6 +333,7 @@ body=open("/tmp/dn-portal-insert.csv").read()
 assert "text/csv" in hdr, hdr
 assert "x-data-nexus-stream: chunked" in hdr, hdr
 assert "backend_window" not in hdr, hdr
+assert "x-data-nexus-window-rows:" in hdr, hdr
 lines=[ln for ln in body.splitlines() if ln.strip() and not ln.startswith("#")]
 assert len(lines) >= 1, lines
 print("portal complete insert csv chunked ok", "lines", len(lines), "head", lines[0][:40])

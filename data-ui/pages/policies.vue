@@ -314,6 +314,15 @@ onMounted(() => {
           <dt>streaming.passthrough</dt>
           <dd class="mono">
             {{ policy.streaming.passthrough }}
+            <span class="hint-inline">
+              (simple Query wire only; extended demotes to Streaming — not TCP bind relay)
+            </span>
+          </dd>
+        </div>
+        <div v-if="policy.streaming">
+          <dt>streaming peak</dt>
+          <dd class="mono">
+            logical encode window ≤ window_rows · not process RSS CI
           </dd>
         </div>
         <div v-if="policy.streaming?.max_rows != null">
