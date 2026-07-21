@@ -229,6 +229,7 @@ function exportCsv() {
     'listener',
     'command_type',
     'sql_fingerprint',
+    'sql_text',
     'message',
     'audit_level',
     'sample_row_count',
@@ -251,6 +252,7 @@ function exportCsv() {
       e.listener ?? '',
       e.command_type ?? '',
       e.sql_fingerprint ?? '',
+      e.sql_text ?? '',
       e.message ?? '',
       e.audit_level ?? '',
       e.sample_row_count ?? '',
@@ -509,15 +511,19 @@ onMounted(() => {
                 v-if="e.event_id"
                 type="button"
                 class="linkish"
-                :title="'Copy ' + e.event_id"
-                @click="copyEventId(e.event_id)"
+                :title="'Open detail · copy ' + e.event_id"
+                @click="selectEvent(e); copyEventId(e.event_id)"
               >
                 {{ e.event_id }}
               </button>
               <span v-else>—</span>
             </td>
-            <td class="msg">
-              {{ e.message || e.sql_fingerprint || '—' }}
+            <td
+              class="msg linkish-cell"
+              title="Open event detail"
+              @click="selectEvent(e)"
+            >
+              {{ e.message || e.sql_fingerprint || e.sql_text || '—' }}
             </td>
           </tr>
           <tr v-if="!events.length">
@@ -533,12 +539,12 @@ onMounted(() => {
     </div>
 
     <div
-      v-if="selectedEvent && (selectedEvent.sample_body || selectedEvent.sample_ref)"
+      v-if="selectedEvent"
       class="card sample-detail"
     >
       <div class="row">
         <h3 class="page-title">
-          Sample detail
+          Event detail
         </h3>
         <button
           type="button"
@@ -551,21 +557,49 @@ onMounted(() => {
       <p class="hint mono">
         event={{ selectedEvent.event_id || '—' }}
         · level={{ selectedEvent.audit_level || '—' }}
-        · rows={{ selectedEvent.sample_row_count ?? '—' }}
-        · bytes={{ selectedEvent.sample_bytes ?? '—' }}
-        · truncated={{ selectedEvent.sample_truncated ? 'yes' : 'no' }}
-        · ref={{ selectedEvent.sample_ref || '—' }}
+        · decision={{ selectedEvent.decision || '—' }}
+        · service={{ selectedEvent.service || '—' }}
+        · subject={{ selectedEvent.subject_id || '—' }}
       </p>
-      <pre
-        v-if="selectedEvent.sample_body"
-        class="sample-pre mono"
-      >{{ selectedEvent.sample_body }}</pre>
+      <p
+        v-if="selectedEvent.sql_fingerprint"
+        class="hint mono"
+      >
+        fingerprint={{ selectedEvent.sql_fingerprint }}
+      </p>
+      <div
+        v-if="selectedEvent.sql_text"
+        class="sql-block"
+      >
+        <div class="hint">
+          sql_text (L1/L2 truncated; L0 strips)
+        </div>
+        <pre class="sample-pre mono">{{ selectedEvent.sql_text }}</pre>
+      </div>
       <p
         v-else
         class="hint"
       >
-        No inline sample_body (OpenDAL ref only or stripped).
+        No sql_text (L0 strips SQL, or event never attached it).
       </p>
+      <template v-if="selectedEvent.sample_body || selectedEvent.sample_ref || selectedEvent.sample_row_count != null">
+        <p class="hint mono">
+          sample · rows={{ selectedEvent.sample_row_count ?? '—' }}
+          · bytes={{ selectedEvent.sample_bytes ?? '—' }}
+          · truncated={{ selectedEvent.sample_truncated ? 'yes' : 'no' }}
+          · ref={{ selectedEvent.sample_ref || '—' }}
+        </p>
+        <pre
+          v-if="selectedEvent.sample_body"
+          class="sample-pre mono"
+        >{{ selectedEvent.sample_body }}</pre>
+        <p
+          v-else-if="selectedEvent.sample_ref"
+          class="hint"
+        >
+          No inline sample_body (OpenDAL ref only or stripped).
+        </p>
+      </template>
     </div>
   </div>
 </template>

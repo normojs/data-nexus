@@ -228,3 +228,4 @@ examples/        smoke + gateway config 样例
 ---
 
 修订：从原 `todo.md` §1–§2 拆出；主看板仅保留未完成。
+| UI15 | Audit event detail shows F32 sql_text + sample | feat(ui15) |

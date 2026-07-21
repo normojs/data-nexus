@@ -85,6 +85,8 @@ export type AdminAuditEvent = {
   action?: string
   db_user?: string
   sql_fingerprint?: string
+  /** F32: truncated SQL at L1/L2 (stripped at L0). */
+  sql_text?: string | null
   tables?: string[]
   audit_level?: string
   /** B08: post-mask sample JSON (bounded; only when sample_enabled + L2). */
