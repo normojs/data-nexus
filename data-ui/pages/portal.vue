@@ -71,7 +71,13 @@ async function runQuery() {
       max_rows: maxRows.value || undefined,
     }, apiBase.value)
     result.value = res
-    setStatus(`OK · ${res.row_count} rows${res.truncated ? ' (truncated)' : ''}`, 'ok')
+    const streamBit = res.stream ? ` · stream=${res.stream}` : ''
+    const winBit =
+      res.window_rows != null ? ` · window_rows=${res.window_rows}` : ''
+    setStatus(
+      `OK · ${res.row_count} rows${res.truncated ? ' (truncated)' : ''}${streamBit}${winBit}`,
+      'ok',
+    )
   }
   catch (e: any) {
     setStatus(e?.data?.message || e?.message || String(e), 'error')

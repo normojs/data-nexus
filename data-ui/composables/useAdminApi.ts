@@ -287,6 +287,9 @@ export type AdminPortalQueryResult = {
   service: string
   decision: string
   message?: string | null
+  /** A09: backend_window | chunked when streaming export/query path. */
+  stream?: string | null
+  window_rows?: number | null
 }
 
 const AUTH_KEY = 'data-nexus-admin-auth'
