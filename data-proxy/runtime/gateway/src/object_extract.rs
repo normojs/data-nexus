@@ -845,7 +845,12 @@ fn heuristic_object_set(sql: &str, action: StatementAction) -> ObjectSet {
             .push(ObjectAccess::new(table, action).with_schema(schema));
     }
     let upper = sql.to_ascii_uppercase();
-    if upper.contains("SELECT *") || upper.contains("SELECT*") {
+    // Heuristic only: sqlparser path already marks SelectItem::Wildcard / QualifiedWildcard.
+    // Catch bare `SELECT *` and common `t.*` / `schema.t.*` forms when parse fails.
+    let bare_star = upper.contains("SELECT *") || upper.contains("SELECT*");
+    let qualified_star = upper.contains(".*")
+        && (upper.contains("SELECT ") || upper.starts_with("SELECT"));
+    if bare_star || qualified_star {
         for obj in &mut set.objects {
             if obj.op == StatementAction::Select {
                 obj.has_wildcard = true;
@@ -943,6 +948,22 @@ mod tests {
     fn select_star_sets_wildcard() {
         let set = extract_object_set("SELECT * FROM employees", "postgresql");
         assert!(set.has_wildcard());
+    }
+
+    #[test]
+    fn select_qualified_star_sets_wildcard() {
+        // T01 honesty: `t.*` / `employees.*` are wildcards (not expanded to columns).
+        for sql in [
+            "SELECT employees.* FROM employees",
+            "SELECT e.* FROM employees e",
+            "SELECT e.id, e.* FROM employees e",
+        ] {
+            let set = extract_object_set(sql, "mysql");
+            assert!(
+                set.has_wildcard(),
+                "expected has_wildcard for {sql:?}: {set:?}"
+            );
+        }
     }
 
     #[test]

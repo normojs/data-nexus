@@ -2340,6 +2340,37 @@ mod tests {
     }
 
     #[test]
+    fn qualified_star_wildcard_with_star_policy_deny() {
+        // T01 honesty: `t.*` is still a wildcard — we never expand it to strip denied cols.
+        let pdp = pdp_with(vec![SecurityRuleConfig {
+            name: "deny-salary".into(),
+            effect: "deny".into(),
+            actions: vec!["select".into()],
+            tables: vec!["employees".into()],
+            columns: vec!["salary".into()],
+            subjects: vec![],
+            row_filter: None,
+        }]);
+        let mut set = ObjectSet::empty();
+        let mut obj = ObjectAccess::new("employees", StatementAction::Select);
+        obj.has_wildcard = true;
+        set.objects.push(obj);
+        let sub = subject("app");
+        let dialect = HeuristicDialectParser::mysql();
+        for sql in [
+            "SELECT employees.* FROM employees",
+            "SELECT e.* FROM employees e",
+        ] {
+            let cmd = GatewayCommand::Query { sql: sql.into() };
+            assert!(
+                pdp.authorize_command_with_objects(&sub, "hr", &cmd, &dialect, Some(&set))
+                    .is_deny(),
+                "expected deny for {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_failed_fail_closed() {
         let pdp = pdp_with(vec![SecurityRuleConfig {
             name: "deny-secret".into(),

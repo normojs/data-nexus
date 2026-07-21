@@ -153,6 +153,27 @@ grep -qiE 'security|denied|deny|policy|wildcard' /tmp/data-nexus-security-column
   || grep -qi 'ERROR' /tmp/data-nexus-security-column-star-err.txt
 kill -0 "$PROXY_PID"
 
+echo "==> deny: SELECT employees.* (qualified star; not expanded, star_policy=deny)"
+set +e
+mysql_via_gateway 'SELECT employees.* FROM employees;' >/tmp/data-nexus-security-column-qstar-err.txt 2>&1
+qstar_rc=$?
+set -e
+[[ $qstar_rc -ne 0 ]]
+grep -qiE 'security|denied|deny|policy|wildcard' /tmp/data-nexus-security-column-qstar-err.txt \
+  || grep -qi 'ERROR' /tmp/data-nexus-security-column-qstar-err.txt
+kill -0 "$PROXY_PID"
+
+echo "==> deny: SELECT e.* FROM employees e (alias qualified star)"
+set +e
+mysql_via_gateway 'SELECT e.* FROM employees e;' >/tmp/data-nexus-security-column-astar-err.txt 2>&1
+astar_rc=$?
+set -e
+[[ $astar_rc -ne 0 ]]
+grep -qiE 'security|denied|deny|policy|wildcard' /tmp/data-nexus-security-column-astar-err.txt \
+  || grep -qi 'ERROR' /tmp/data-nexus-security-column-astar-err.txt
+kill -0 "$PROXY_PID"
+echo "T01 qualified/alias star deny ok (no * expansion; star_policy=deny)"
+
 echo "==> deny: secret table still blocked"
 set +e
 mysql_via_gateway 'SELECT id FROM secret_tokens;' >/tmp/data-nexus-security-column-secret-err.txt 2>&1

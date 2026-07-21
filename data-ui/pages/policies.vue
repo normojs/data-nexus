@@ -271,6 +271,9 @@ onMounted(() => {
           <dt>star_policy</dt>
           <dd class="mono">
             {{ policy.star_policy }}
+            <span class="hint-inline">
+              (deny blocks * / t.*; never expands wildcards to strip columns)
+            </span>
           </dd>
         </div>
         <div>

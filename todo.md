@@ -92,8 +92,8 @@ cd data-proxy
   - 路径：部署 runbook / 运维侧
 
 - [ ] **T01** 列 ACL / 复杂 SQL 用例矩阵  
-  - 已有：extract/PDP 单测；WHERE/HAVING/EXISTS/IN/标量子查询表提取；column smoke WHERE IN deny；**嵌套 SELECT 列表列 strip**（多层 derived table 单测 + `smoke-security-column` multi-level E2E）  
-  - 仍欠：**`*` / `t.*` 仍不展开**；相关子查询表达式/极端方言仍 heuristic  
+  - 已有：extract/PDP 单测；WHERE/HAVING/EXISTS/IN/标量子查询表提取；column smoke WHERE IN deny；**嵌套 SELECT 列表列 strip**（多层 derived table 单测 + `smoke-security-column` multi-level E2E）；**`*` / `t.*` / alias `e.*` 在 star_policy=deny 下拒绝**（smoke + unit；**不展开**为列再 strip）  
+  - 仍欠：**`*` / `t.*` 仍不展开**（allow 时也不自动 strip 隐式列）；相关子查询表达式/极端方言仍 heuristic  
   - 路径：`object_extract`、`pdp::rewrite_select_strip_columns`、`smoke-security-column.sh`
 
 - [ ] **F30** 敏感识别增强 — **延后**  
@@ -124,7 +124,7 @@ cd data-proxy
 | L2 样本 | B08：默认关；有界 rows/bytes；**sample_enabled 强制 L2**；OpenDAL 需 feature；**非全量 L3** |
 | Remote PDP | F31 已交付：表/动作 gate；超时 fail_closed；**非**热路径逐行 mask |
 | Cedar ABAC | F29 已交付：静态 `subject_attrs`/`table_attrs`；非动态 IdP 同步 |
-| 复杂 SQL / 列 ACL | T01：表可抽；**嵌套 SELECT 列表可 strip 列**；`*` 不展开 |
+| 复杂 SQL / 列 ACL | T01：表可抽；**嵌套 SELECT 列表可 strip 列**；`*` / `t.*` **不展开**（deny 时整句拒绝；allow 时不隐式 strip） |
 
 ---
 
