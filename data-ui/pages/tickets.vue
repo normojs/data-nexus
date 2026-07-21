@@ -22,10 +22,50 @@ const ttlSecs = ref(600)
 const maxUses = ref(1)
 const dualControl = ref(true)
 const note = ref('')
+/** UI23: client-side list filter (API still returns full page). */
+const statusFilter = ref('')
+const subjectFilter = ref('')
+const typeFilter = ref('')
+
+const filteredTickets = computed(() => {
+  const st = statusFilter.value.trim().toLowerCase()
+  const sub = subjectFilter.value.trim().toLowerCase()
+  const ty = typeFilter.value.trim().toLowerCase()
+  return tickets.value.filter((t) => {
+    if (st && (t.status || '').toLowerCase() !== st)
+      return false
+    if (sub && !(t.subject_id || '').toLowerCase().includes(sub))
+      return false
+    if (ty && !(t.ticket_type || '').toLowerCase().includes(ty))
+      return false
+    return true
+  })
+})
+
+const statusCounts = computed(() => {
+  const c: Record<string, number> = { pending: 0, active: 0, rejected: 0 }
+  for (const t of tickets.value) {
+    const s = (t.status || '').toLowerCase()
+    if (s in c)
+      c[s]++
+    else c[s] = (c[s] || 0) + 1
+  }
+  return c
+})
 
 function setStatus(msg: string, kind: 'ok' | 'error' | '' = '') {
   status.value = msg
   statusKind.value = kind
+}
+
+function clearListFilters() {
+  statusFilter.value = ''
+  subjectFilter.value = ''
+  typeFilter.value = ''
+}
+
+function setStatusFilter(s: string) {
+  statusFilter.value = statusFilter.value === s ? '' : s
 }
 
 function fmtMs(ms?: number | null) {
@@ -58,7 +98,9 @@ async function load() {
       ? ` · state=${st.backend}${st.ticket_encrypt_configured ? '+enc' : ''}`
       : ''
     const meBit = adminMe.value?.subject ? ` · as ${adminMe.value.subject}` : ''
-    setStatus(`${tickets.value.length} tickets${stateBit}${meBit}`, 'ok')
+    const counts = statusCounts.value
+    const countBit = ` · pending=${counts.pending || 0} active=${counts.active || 0} rejected=${counts.rejected || 0}`
+    setStatus(`${tickets.value.length} tickets${countBit}${stateBit}${meBit}`, 'ok')
   }
   catch (e: any) {
     setStatus(e?.data?.message || e?.message || String(e), 'error')
@@ -131,11 +173,20 @@ async function approve(id: string) {
 }
 
 async function reject(id: string) {
-  const reason = window.prompt('Reject reason (optional)') ?? undefined
+  const ticket = tickets.value.find(x => x.id === id)
+  // Reject is allowed for issuer (unlike approve); dual-control only blocks self-approve.
+  const raw = window.prompt(
+    ticket && isSelfApprover(ticket)
+      ? 'Reject your own dual-control ticket? Reason (optional)'
+      : 'Reject reason (optional)',
+  )
+  if (raw === null)
+    return
+  const reason = raw.trim() || undefined
   busy.value = true
   try {
     const t = await api.rejectTicket(id, { reason }, apiBase.value)
-    setStatus(`Rejected ${t.id}`, 'ok')
+    setStatus(`Rejected ${t.id}${t.rejected_by ? ` by ${t.rejected_by}` : ''}`, 'ok')
     await load()
   }
   catch (e: any) {
@@ -318,6 +369,92 @@ onMounted(() => {
     </div>
 
     <div class="card">
+      <div class="row list-filters">
+        <label>
+          <span class="sr">Status</span>
+          <select
+            v-model="statusFilter"
+            class="input"
+            aria-label="Filter by status"
+          >
+            <option value="">
+              All statuses
+            </option>
+            <option value="pending">
+              pending ({{ statusCounts.pending || 0 }})
+            </option>
+            <option value="active">
+              active ({{ statusCounts.active || 0 }})
+            </option>
+            <option value="rejected">
+              rejected ({{ statusCounts.rejected || 0 }})
+            </option>
+          </select>
+        </label>
+        <label>
+          <span class="sr">Subject</span>
+          <input
+            v-model="subjectFilter"
+            class="input"
+            placeholder="Filter subject…"
+            aria-label="Filter by subject"
+          >
+        </label>
+        <label>
+          <span class="sr">Type</span>
+          <input
+            v-model="typeFilter"
+            class="input"
+            placeholder="Filter type…"
+            aria-label="Filter by ticket type"
+          >
+        </label>
+        <button
+          type="button"
+          class="btn"
+          :disabled="!statusFilter && !subjectFilter && !typeFilter"
+          @click="clearListFilters"
+        >
+          Clear filters
+        </button>
+        <span class="hint-inline">
+          showing {{ filteredTickets.length }} / {{ tickets.length }}
+          <template v-if="statusFilter || subjectFilter || typeFilter">
+            (client-side)
+          </template>
+        </span>
+      </div>
+      <p class="hint">
+        UI23: status / subject / type filters are client-side over the loaded page
+        (API limit still applies). Status chips below also toggle the status filter.
+        Dual-control: Approve disabled when you are the issuer; Reject remains allowed.
+      </p>
+      <div class="row status-chips">
+        <button
+          type="button"
+          class="chip"
+          :class="{ on: statusFilter === 'pending' }"
+          @click="setStatusFilter('pending')"
+        >
+          pending {{ statusCounts.pending || 0 }}
+        </button>
+        <button
+          type="button"
+          class="chip"
+          :class="{ on: statusFilter === 'active' }"
+          @click="setStatusFilter('active')"
+        >
+          active {{ statusCounts.active || 0 }}
+        </button>
+        <button
+          type="button"
+          class="chip"
+          :class="{ on: statusFilter === 'rejected' }"
+          @click="setStatusFilter('rejected')"
+        >
+          rejected {{ statusCounts.rejected || 0 }}
+        </button>
+      </div>
       <table class="table">
         <thead>
           <tr>
@@ -334,7 +471,7 @@ onMounted(() => {
         </thead>
         <tbody>
           <tr
-            v-for="t in tickets"
+            v-for="t in filteredTickets"
             :key="t.id"
           >
             <td class="mono">
@@ -348,10 +485,15 @@ onMounted(() => {
               </button>
             </td>
             <td>
-              <span
-                class="badge"
+              <button
+                type="button"
+                class="badge linkish-badge"
                 :class="t.status"
-              >{{ t.status }}</span>
+                :title="`Filter status=${t.status}`"
+                @click="setStatusFilter(t.status)"
+              >
+                {{ t.status }}
+              </button>
               <span
                 v-if="t.dual_control"
                 class="badge dual"
@@ -416,12 +558,12 @@ onMounted(() => {
               </button>
             </td>
           </tr>
-          <tr v-if="!tickets.length">
+          <tr v-if="!filteredTickets.length">
             <td
               colspan="9"
               class="empty"
             >
-              No tickets yet.
+              {{ tickets.length ? 'No tickets match filters.' : 'No tickets yet.' }}
             </td>
           </tr>
         </tbody>
@@ -492,4 +634,25 @@ onMounted(() => {
 }
 .state-banner { font-size: .85rem; color: #374151; line-height: 1.45; margin-bottom: .75rem; }
 .hint-inline { color: #6b7280; font-family: inherit; font-size: .8rem; }
+.list-filters { margin-bottom: .5rem; gap: .55rem; }
+.list-filters label { display: flex; flex-direction: column; gap: .15rem; min-width: 8rem; }
+.list-filters .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.status-chips { margin: 0 0 .65rem; gap: .4rem; }
+.chip {
+  border: 1px solid #d0d7de;
+  background: #f6f8fa;
+  border-radius: 999px;
+  padding: .2rem .55rem;
+  font-size: .8rem;
+  cursor: pointer;
+  font: inherit;
+  color: #444;
+}
+.chip.on { border-color: #0969da; background: #ddf4ff; color: #0969da; font-weight: 600; }
+button.badge {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+button.badge:hover { filter: brightness(0.97); text-decoration: underline; }
 </style>
