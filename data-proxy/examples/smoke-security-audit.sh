@@ -138,4 +138,17 @@ else
   exit 1
 fi
 
+echo "==> GET /admin/audit/events?audit_level=L0"
+curl -fsS "http://127.0.0.1:8082/admin/audit/events?audit_level=L0&limit=20" | tee /tmp/dn-audit-l0.json >/dev/null
+python3 - <<'PY'
+import json
+data=json.load(open("/tmp/dn-audit-l0.json"))
+ev=data.get("events") or []
+assert ev, data
+for e in ev:
+    lvl=(e.get("audit_level") or "").upper()
+    assert lvl=="L0", e
+print("audit_level=L0 filter ok", "events", len(ev))
+PY
+
 echo "smoke-security-audit: OK"

@@ -547,6 +547,16 @@ impl AuditPipeline {
                         .to_ms
                         .map(|to| e.ts_unix_ms.unwrap_or(u64::MAX) <= to)
                         .unwrap_or(true)
+                    && filter
+                        .audit_level
+                        .as_deref()
+                        .map(|lvl| {
+                            e.audit_level
+                                .as_deref()
+                                .map(|el| el.eq_ignore_ascii_case(lvl))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(true)
             })
             .take(limit)
             .cloned()

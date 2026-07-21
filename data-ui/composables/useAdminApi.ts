@@ -431,6 +431,7 @@ export function useAdminApi() {
       subject_id?: string
       service?: string
       event_id?: string
+      audit_level?: string
       from_ms?: number
       to_ms?: number
       limit?: number
@@ -440,6 +441,7 @@ export function useAdminApi() {
       if (params?.subject_id) q.set('subject_id', params.subject_id)
       if (params?.service) q.set('service', params.service)
       if (params?.event_id) q.set('event_id', params.event_id)
+      if (params?.audit_level) q.set('audit_level', params.audit_level)
       if (params?.from_ms != null) q.set('from_ms', String(params.from_ms))
       if (params?.to_ms != null) q.set('to_ms', String(params.to_ms))
       if (params?.limit) q.set('limit', String(params.limit))

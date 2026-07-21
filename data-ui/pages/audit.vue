@@ -13,6 +13,7 @@ const statusKind = ref<'ok' | 'error' | ''>('')
 const source = ref('')
 const note = ref('')
 const decision = ref('')
+const auditLevel = ref('')
 const service = ref('')
 const subjectId = ref('')
 const eventId = ref('')
@@ -130,6 +131,7 @@ async function load() {
   try {
     const res = await api.auditEvents({
       decision: decision.value || undefined,
+      audit_level: auditLevel.value || undefined,
       service: service.value || undefined,
       subject_id: subjectId.value || undefined,
       event_id: eventId.value || undefined,
@@ -162,6 +164,7 @@ async function load() {
 
 function clearFilters() {
   decision.value = ''
+  auditLevel.value = ''
   service.value = ''
   subjectId.value = ''
   eventId.value = ''
@@ -190,6 +193,7 @@ function exportJson() {
     source: source.value,
     filters: {
       decision: decision.value || null,
+      audit_level: auditLevel.value || null,
       service: service.value || null,
       subject_id: subjectId.value || null,
       event_id: eventId.value || null,
@@ -379,6 +383,21 @@ onMounted(() => {
             <option value="allow_obligations" />
             <option value="require_ticket" />
             <option value="execute" />
+          </datalist>
+        </label>
+        <label>
+          <span>Audit level</span>
+          <input
+            v-model="auditLevel"
+            class="input mono"
+            list="level-opts"
+            placeholder="L0 / L1 / L2"
+            @keyup.enter="load"
+          >
+          <datalist id="level-opts">
+            <option value="L0" />
+            <option value="L1" />
+            <option value="L2" />
           </datalist>
         </label>
         <label>

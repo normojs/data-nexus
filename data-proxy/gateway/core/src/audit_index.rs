@@ -46,6 +46,8 @@ pub struct AuditQueryFilter {
     pub subject_id: Option<String>,
     pub service: Option<String>,
     pub event_id: Option<String>,
+    /// F32: filter by effective audit_level (L0/L1/L2), case-insensitive.
+    pub audit_level: Option<String>,
     /// Inclusive lower bound on `ts_unix_ms`.
     pub from_ms: Option<u64>,
     /// Inclusive upper bound on `ts_unix_ms`.
@@ -228,6 +230,11 @@ impl AuditIndex {
         if let Some(to) = filter.to_ms {
             sql.push_str(" AND ts_unix_ms <= ?");
             binds.push(Box::new(to as i64));
+        }
+        if let Some(ref lvl) = filter.audit_level {
+            // Stored on payload JSON (F32); avoid schema migration for older index files.
+            sql.push_str(" AND lower(coalesce(json_extract(payload, '$.audit_level'), '')) = lower(?)");
+            binds.push(Box::new(lvl.clone()));
         }
         sql.push_str(" ORDER BY ts_unix_ms DESC LIMIT ?");
         binds.push(Box::new(limit));
@@ -523,4 +530,34 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
+
+    #[test]
+    fn filter_by_audit_level_json_extract() {
+        let dir = std::env::temp_dir().join(format!("dn-audit-lvl-{}", now_unix_ms()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("idx.sqlite");
+        let idx = AuditIndex::open(&path).unwrap();
+        let mut e0 = sample("deny", "alice", "orders", 1000);
+        e0.audit_level = Some("L0".into());
+        e0.event_id = Some("ae-l0".into());
+        idx.insert(&e0).unwrap();
+        let mut e2 = sample("deny", "alice", "orders", 1001);
+        e2.audit_level = Some("L2".into());
+        e2.event_id = Some("ae-l2".into());
+        idx.insert(&e2).unwrap();
+
+        let only_l2 = idx
+            .query(&AuditQueryFilter {
+                audit_level: Some("l2".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(only_l2.len(), 1);
+        assert_eq!(only_l2[0].event_id.as_deref(), Some("ae-l2"));
+        assert_eq!(only_l2[0].audit_level.as_deref(), Some("L2"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
 }

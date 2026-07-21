@@ -613,6 +613,8 @@ struct AdminAuditEventsQuery {
     service: Option<String>,
     /// Exact event id lookup (B06 index / recent).
     event_id: Option<String>,
+    /// F32: filter by effective audit_level (L0/L1/L2).
+    audit_level: Option<String>,
     /// Inclusive lower bound, unix epoch milliseconds.
     from_ms: Option<u64>,
     /// Inclusive upper bound, unix epoch milliseconds.
@@ -1360,6 +1362,7 @@ impl AxumServer {
             subject_id: query.subject_id.clone(),
             service: query.service.clone(),
             event_id: query.event_id.clone(),
+            audit_level: query.audit_level.clone(),
             from_ms: query.from_ms,
             to_ms: query.to_ms,
             limit,

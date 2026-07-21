@@ -171,11 +171,13 @@ echo "==> O01 metrics: mask/encode counters present after Secure path"
 metrics="$(curl -fsS http://127.0.0.1:8082/metrics || true)"
 if echo "$metrics" | grep -q 'gateway_mask_rows_total'; then
   echo "$metrics" | grep 'gateway_mask_rows_total' | head -3 || true
-  # Counter may be namespaced as unisql_proxy_gateway_mask_rows_total
+  # O01: after mask traffic, at least one series must be > 0 (hard fail).
   if ! echo "$metrics" | grep -E 'gateway_mask_rows_total\{' | grep -q '[1-9]'; then
-    # allow zero if scrape race; still require series exists
-    echo "note: mask_rows series present (value may be 0 if scrape before inc)"
+    echo "FAIL: gateway_mask_rows_total present but all zero after mask traffic" >&2
+    echo "$metrics" | grep 'gateway_mask_rows_total' || true
+    exit 1
   fi
+  echo "mask_rows counter > 0"
 else
   echo "missing gateway_mask_rows_total in /metrics" >&2
   echo "$metrics" | head -20 >&2
@@ -183,6 +185,14 @@ else
 fi
 if echo "$metrics" | grep -q 'gateway_encode_windows_total'; then
   echo "$metrics" | grep 'gateway_encode_windows_total' | head -3 || true
+  if ! echo "$metrics" | grep -E 'gateway_encode_windows_total\{' | grep -q '[1-9]'; then
+    echo "FAIL: gateway_encode_windows_total all zero after mask traffic" >&2
+    exit 1
+  fi
+  echo "encode_windows counter > 0"
+else
+  echo "FAIL: missing gateway_encode_windows_total after Secure encode" >&2
+  exit 1
 fi
 if echo "$metrics" | grep -q 'gateway_audit_queue_len'; then
   echo "$metrics" | grep 'gateway_audit_queue_len' | head -5 || true
