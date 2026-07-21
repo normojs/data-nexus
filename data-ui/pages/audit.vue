@@ -230,6 +230,12 @@ function exportCsv() {
     'command_type',
     'sql_fingerprint',
     'message',
+    'audit_level',
+    'sample_row_count',
+    'sample_bytes',
+    'sample_truncated',
+    'sample_ref',
+    'sample_body',
   ]
   const lines = [headers.join(',')]
   for (const e of events.value) {
@@ -246,13 +252,20 @@ function exportCsv() {
       e.command_type ?? '',
       e.sql_fingerprint ?? '',
       e.message ?? '',
+      e.audit_level ?? '',
+      e.sample_row_count ?? '',
+      e.sample_bytes ?? '',
+      e.sample_truncated ? 'true' : '',
+      e.sample_ref ?? '',
+      // Keep sample_body last; may be large but still bounded server-side.
+      e.sample_body ?? '',
     ].map(csvEscape).join(','))
   }
   downloadBlob(
     `data-nexus-audit-${Date.now()}.csv`,
     new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' }),
   )
-  setStatus(`Exported ${events.value.length} events as CSV`, 'ok')
+  setStatus(`Exported ${events.value.length} events as CSV (includes sample_* when present)`, 'ok')
 }
 
 function copyEventId(id?: string) {
