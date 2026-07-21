@@ -25,6 +25,26 @@ const result = ref<AdminPortalQueryResult | null>(null)
 const status = ref('')
 const statusKind = ref<'ok' | 'error' | ''>('')
 
+function truncatedHint(res: AdminPortalQueryResult): string {
+  if (!res.truncated)
+    return ''
+  const client = maxRows.value || undefined
+  const policy = streamingCfg.value?.max_rows ?? undefined
+  const bits: string[] = []
+  if (client != null)
+    bits.push(`client max_rows=${client}`)
+  if (policy != null)
+    bits.push(`policy max_rows=${policy}`)
+  // Effective cap is the min of client request and policy when both set.
+  if (client != null && policy != null)
+    bits.push(`effective≤${Math.min(client, policy)}`)
+  else if (client != null)
+    bits.push(`effective≤${client}`)
+  else if (policy != null)
+    bits.push(`effective≤${policy}`)
+  return bits.length ? `truncated (${bits.join(', ')})` : 'truncated'
+}
+
 function setStatus(msg: string, kind: 'ok' | 'error' | '' = '') {
   status.value = msg
   statusKind.value = kind
@@ -79,7 +99,7 @@ async function runQuery() {
     const winBit =
       res.window_rows != null ? ` · window_rows=${res.window_rows}` : ''
     setStatus(
-      `OK · ${res.row_count} rows${res.truncated ? ' (truncated)' : ''}${streamBit}${winBit}`,
+      `OK · ${res.row_count} rows${res.truncated ? ` (${truncatedHint(res)})` : ''}${streamBit}${winBit}`,
       'ok',
     )
   }
@@ -277,7 +297,7 @@ onMounted(async () => {
         >
           <div class="meta">
             decision={{ result.decision }} · rows={{ result.row_count }}
-            <span v-if="result.truncated"> · truncated</span>
+            <span v-if="result.truncated"> · {{ truncatedHint(result) }}</span>
             <span
               v-if="result.stream"
               class="stream-badge"
