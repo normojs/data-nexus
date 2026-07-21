@@ -13,8 +13,8 @@
 //! **H05 memory boundary (honest):** active leases keep `backend_password` in
 //! process RAM as a normal `String`. On `revoke`, `prune` (drop), and store Drop,
 //! the string is zeroized best-effort via `zeroize` (no mlock / no secure heap).
-//! Callers of `backend_identity` receive a **copy** they must not log; the
-//! gateway does not re-zero that copy after use.
+//! `backend_identity` returns `(username, Zeroizing<String>)` so the password
+//! copy is wiped when the caller drops it. Still not mlock / secure heap.
 
 use crate::state_crypto::{
     decode_maybe_encrypted, encrypt_blob, parse_encrypt_key,
@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 static GLOBAL: OnceLock<Arc<VaultStore>> = OnceLock::new();
 
@@ -535,7 +535,11 @@ impl VaultStore {
         removed
     }
 
-    pub fn backend_identity(&self, lease_id: &str) -> Option<(String, String)> {
+    /// Returns `(username, password)` for an active lease.
+    ///
+    /// Password is wrapped in [`Zeroizing`] so it is best-effort wiped when dropped.
+    /// The store still keeps its own copy until revoke/prune/Drop.
+    pub fn backend_identity(&self, lease_id: &str) -> Option<(String, Zeroizing<String>)> {
         let now = now_ms();
         let guard = self.leases.lock().ok()?;
         let rec = guard.get(lease_id)?;
@@ -546,10 +550,9 @@ impl VaultStore {
         if rec.backend_password.is_empty() {
             return None;
         }
-        // Callers receive a copy; store retains the secret until revoke/prune/Drop.
         Some((
             rec.backend_username.clone(),
-            rec.backend_password.clone(),
+            Zeroizing::new(rec.backend_password.clone()),
         ))
     }
 }
@@ -724,7 +727,7 @@ mod tests {
             .backend_identity(&lease.lease_id)
             .expect("restored secret");
         assert_eq!(id.0, "root");
-        assert_eq!(id.1, "secret-pass");
+        assert_eq!(id.1.as_str(), "secret-pass");
 
         // Wrong / missing key must not silently load secrets.
         assert!(VaultStore::with_file(path.clone(), None).is_err());

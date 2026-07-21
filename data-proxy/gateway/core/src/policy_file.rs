@@ -349,7 +349,7 @@ mod tests {
             .backend_identity(&lease.lease_id)
             .expect("password restored with encrypt key");
         assert_eq!(user, "app");
-        assert_eq!(pass, "s3cret");
+        assert_eq!(pass.as_str(), "s3cret");
 
         let mut cfg_b = SecurityPolicyConfig::default();
         cfg_b.enabled = true;
