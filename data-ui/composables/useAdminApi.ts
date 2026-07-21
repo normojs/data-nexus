@@ -452,6 +452,8 @@ export function useAdminApi() {
       outcome?: string
       /** UI19: frontend listener name filter. */
       listener?: string
+      /** UI20: matched policy rule name filter. */
+      rule?: string
       from_ms?: number
       to_ms?: number
       limit?: number
@@ -464,6 +466,7 @@ export function useAdminApi() {
       if (params?.audit_level) q.set('audit_level', params.audit_level)
       if (params?.outcome) q.set('outcome', params.outcome)
       if (params?.listener) q.set('listener', params.listener)
+      if (params?.rule) q.set('rule', params.rule)
       if (params?.from_ms != null) q.set('from_ms', String(params.from_ms))
       if (params?.to_ms != null) q.set('to_ms', String(params.to_ms))
       if (params?.limit) q.set('limit', String(params.limit))

@@ -16,6 +16,7 @@ const decision = ref('')
 const auditLevel = ref('')
 const outcome = ref('')
 const listener = ref('')
+const rule = ref('')
 const service = ref('')
 const subjectId = ref('')
 const eventId = ref('')
@@ -136,6 +137,7 @@ async function load() {
       audit_level: auditLevel.value || undefined,
       outcome: outcome.value || undefined,
       listener: listener.value || undefined,
+      rule: rule.value || undefined,
       service: service.value || undefined,
       subject_id: subjectId.value || undefined,
       event_id: eventId.value || undefined,
@@ -171,6 +173,7 @@ function clearFilters() {
   auditLevel.value = ''
   outcome.value = ''
   listener.value = ''
+  rule.value = ''
   service.value = ''
   subjectId.value = ''
   eventId.value = ''
@@ -202,6 +205,7 @@ function exportJson() {
       audit_level: auditLevel.value || null,
       outcome: outcome.value || null,
       listener: listener.value || null,
+      rule: rule.value || null,
       service: service.value || null,
       subject_id: subjectId.value || null,
       event_id: eventId.value || null,
@@ -448,6 +452,15 @@ onMounted(() => {
           >
         </label>
         <label>
+          <span>Rule</span>
+          <input
+            v-model="rule"
+            class="input mono"
+            placeholder="deny-secret-tables"
+            @keyup.enter="load"
+          >
+        </label>
+        <label>
           <span>Subject</span>
           <input
             v-model="subjectId"
@@ -494,9 +507,10 @@ onMounted(() => {
         </label>
       </div>
       <p class="hint">
-        UI03/UI16/UI17/UI19: stats from pipeline (B06 index / B07 priority queue);
+        UI03/UI16/UI17/UI19/UI20: stats from pipeline (B06 index / B07 priority queue);
         filters include <code class="mono">audit_level</code>,
-        <code class="mono">outcome</code>, and <code class="mono">listener</code>.
+        <code class="mono">outcome</code>, <code class="mono">listener</code>, and
+        <code class="mono">rule</code>.
         When <code class="mono">security.audit.index_path</code> is set, badge shows
         <code class="mono">source=index</code>; otherwise
         <code class="mono">source=recent</code> (in-memory ring). Export is the

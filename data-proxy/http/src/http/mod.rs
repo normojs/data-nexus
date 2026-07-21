@@ -649,6 +649,8 @@ struct AdminAuditEventsQuery {
     outcome: Option<String>,
     /// UI19: filter by frontend listener name.
     listener: Option<String>,
+    /// UI20: filter by matched policy rule name.
+    rule: Option<String>,
     /// Inclusive lower bound, unix epoch milliseconds.
     from_ms: Option<u64>,
     /// Inclusive upper bound, unix epoch milliseconds.
@@ -1413,6 +1415,7 @@ impl AxumServer {
             audit_level: query.audit_level.clone(),
             outcome: query.outcome.clone(),
             listener: query.listener.clone(),
+            rule: query.rule.clone(),
             from_ms: query.from_ms,
             to_ms: query.to_ms,
             limit,

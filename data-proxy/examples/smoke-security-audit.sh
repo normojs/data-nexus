@@ -208,6 +208,30 @@ for e in ev:
     assert e.get("listener") == "$DENY_LSN", e
 assert data.get("source") == "index", data
 print("listener filter ok", "listener=$DENY_LSN", "events", len(ev))
+# pick a rule for UI20 filter
+rule = next((e.get("rule") for e in data.get("events") or [] if e.get("rule")), None)
+# Prefer deny rule from outcome events
+import json as _json
+out=json.load(open("/tmp/dn-audit-outcome.json"))
+rule = next((e.get("rule") for e in (out.get("events") or []) if e.get("rule")), rule)
+assert rule, "expected deny event with rule"
+open("/tmp/dn-audit-deny-rule.txt","w").write(rule)
+print("deny rule", rule)
+PY
+
+DENY_RULE=$(cat /tmp/dn-audit-deny-rule.txt)
+echo "==> GET /admin/audit/events?rule=$DENY_RULE"
+curl -fsS "http://127.0.0.1:8082/admin/audit/events?rule=${DENY_RULE}&limit=20" | tee /tmp/dn-audit-rule.json >/dev/null
+python3 - <<PY
+import json
+from urllib.parse import quote
+data=json.load(open("/tmp/dn-audit-rule.json"))
+ev=data.get("events") or []
+assert ev, data
+for e in ev:
+    assert e.get("rule") == "$DENY_RULE", e
+assert data.get("source") == "index", data
+print("rule filter ok", "rule=$DENY_RULE", "events", len(ev))
 PY
 
 echo "smoke-security-audit: OK"

@@ -39,6 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_subject_ts ON audit_events(subject_id, ts_u
 CREATE INDEX IF NOT EXISTS idx_audit_service_ts ON audit_events(service, ts_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_outcome_ts ON audit_events(outcome, ts_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_listener_ts ON audit_events(listener, ts_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_rule_ts ON audit_events(rule, ts_unix_ms DESC);
 "#;
 
 /// Filter for Admin / index queries (B06).
@@ -54,6 +55,8 @@ pub struct AuditQueryFilter {
     pub outcome: Option<String>,
     /// UI19: filter by frontend listener name (index column).
     pub listener: Option<String>,
+    /// UI20: filter by matched policy rule name (index column).
+    pub rule: Option<String>,
     /// Inclusive lower bound on `ts_unix_ms`.
     pub from_ms: Option<u64>,
     /// Inclusive upper bound on `ts_unix_ms`.
@@ -236,6 +239,10 @@ impl AuditIndex {
         if let Some(ref l) = filter.listener {
             sql.push_str(" AND listener = ?");
             binds.push(Box::new(l.clone()));
+        }
+        if let Some(ref r) = filter.rule {
+            sql.push_str(" AND rule = ?");
+            binds.push(Box::new(r.clone()));
         }
         if let Some(from) = filter.from_ms {
             sql.push_str(" AND ts_unix_ms >= ?");
@@ -653,6 +660,50 @@ mod tests {
             .unwrap();
         assert_eq!(only_pg.len(), 1);
         assert_eq!(only_pg[0].event_id.as_deref(), Some("ae-lsn-b"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn filter_by_rule_column() {
+        let path = tmp_path("rule");
+        let idx = AuditIndex::open(&path).unwrap();
+        let mut a = sample("deny", "u", "orders", 1000);
+        a.rule = Some("deny-secret-tables".into());
+        a.event_id = Some("ae-rule-a".into());
+        idx.insert(&a).unwrap();
+        let mut b = sample("deny", "u", "orders", 1001);
+        b.rule = Some("deny-ddl".into());
+        b.event_id = Some("ae-rule-b".into());
+        idx.insert(&b).unwrap();
+        let mut c = sample("execute", "u", "orders", 1002);
+        c.rule = Some("deny-secret-tables".into());
+        c.event_id = Some("ae-rule-c".into());
+        idx.insert(&c).unwrap();
+
+        let only_secret = idx
+            .query(&AuditQueryFilter {
+                rule: Some("deny-secret-tables".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(only_secret.len(), 2, "{only_secret:?}");
+        assert!(only_secret
+            .iter()
+            .all(|e| e.rule.as_deref() == Some("deny-secret-tables")));
+
+        let only_ddl = idx
+            .query(&AuditQueryFilter {
+                rule: Some("deny-ddl".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(only_ddl.len(), 1);
+        assert_eq!(only_ddl[0].event_id.as_deref(), Some("ae-rule-b"));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
