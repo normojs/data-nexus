@@ -240,3 +240,4 @@ examples/        smoke + gateway config 样例
 | UI18 | security-policies exposes F31 PDP remote knobs (no secrets) | feat(ui18) |
 | UI19 | Audit filter by listener (index col + recent + UI) | feat(ui19) |
 | UI20 | Audit filter by rule (index col + recent + UI) | feat(ui20) |
+| UI21 | Audit table click-to-filter (decision/level/subject/service/outcome/rule) | feat(ui21) |

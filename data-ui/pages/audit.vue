@@ -296,6 +296,44 @@ function copyEventId(id?: string) {
   })
 }
 
+/** UI21: click a table cell value to apply that field as a filter and reload. */
+function applyFilter(
+  field: 'decision' | 'audit_level' | 'outcome' | 'listener' | 'rule' | 'service' | 'subject_id',
+  value?: string | null,
+  ev?: Event,
+) {
+  if (ev) {
+    ev.stopPropagation()
+    ev.preventDefault()
+  }
+  const v = (value || '').trim()
+  if (!v) return
+  switch (field) {
+    case 'decision':
+      decision.value = v
+      break
+    case 'audit_level':
+      auditLevel.value = v
+      break
+    case 'outcome':
+      outcome.value = v
+      break
+    case 'listener':
+      listener.value = v
+      break
+    case 'rule':
+      rule.value = v
+      break
+    case 'service':
+      service.value = v
+      break
+    case 'subject_id':
+      subjectId.value = v
+      break
+  }
+  load()
+}
+
 onMounted(() => {
   hydrate()
   load()
@@ -507,10 +545,11 @@ onMounted(() => {
         </label>
       </div>
       <p class="hint">
-        UI03/UI16/UI17/UI19/UI20: stats from pipeline (B06 index / B07 priority queue);
+        UI03/UI16–UI21: stats from pipeline (B06 index / B07 priority queue);
         filters include <code class="mono">audit_level</code>,
         <code class="mono">outcome</code>, <code class="mono">listener</code>, and
-        <code class="mono">rule</code>.
+        <code class="mono">rule</code>. Click decision / level / subject / service /
+        outcome / rule cells to apply that filter and reload.
         When <code class="mono">security.audit.index_path</code> is set, badge shows
         <code class="mono">source=index</code>; otherwise
         <code class="mono">source=recent</code> (in-memory ring). Export is the
@@ -544,25 +583,72 @@ onMounted(() => {
               {{ fmtMs(e.ts_unix_ms) }}
             </td>
             <td>
-              <span
-                class="dec"
+              <button
+                v-if="e.decision"
+                type="button"
+                class="dec linkish-dec"
                 :class="{
                   deny: e.decision === 'deny',
                   allow: e.decision === 'allow' || e.decision === 'allow_obligations',
                   ticket: e.decision === 'require_ticket',
                 }"
-              >{{ e.decision || '—' }}</span>
+                title="Filter by this decision"
+                @click="applyFilter('decision', e.decision, $event)"
+              >{{ e.decision }}</button>
+              <span
+                v-else
+                class="dec"
+              >—</span>
             </td>
             <td class="mono">
-              {{ e.audit_level || '—' }}
+              <button
+                v-if="e.audit_level"
+                type="button"
+                class="linkish"
+                title="Filter by this audit level"
+                @click="applyFilter('audit_level', e.audit_level, $event)"
+              >{{ e.audit_level }}</button>
+              <span v-else>—</span>
             </td>
-            <td>{{ e.subject_id || '—' }}</td>
-            <td>{{ e.service || '—' }}</td>
-            <td class="mono">
-              {{ e.outcome || '—' }}
+            <td>
+              <button
+                v-if="e.subject_id"
+                type="button"
+                class="linkish"
+                title="Filter by this subject"
+                @click="applyFilter('subject_id', e.subject_id, $event)"
+              >{{ e.subject_id }}</button>
+              <span v-else>—</span>
+            </td>
+            <td>
+              <button
+                v-if="e.service"
+                type="button"
+                class="linkish"
+                title="Filter by this service"
+                @click="applyFilter('service', e.service, $event)"
+              >{{ e.service }}</button>
+              <span v-else>—</span>
             </td>
             <td class="mono">
-              {{ e.rule || '—' }}
+              <button
+                v-if="e.outcome"
+                type="button"
+                class="linkish"
+                title="Filter by this outcome"
+                @click="applyFilter('outcome', e.outcome, $event)"
+              >{{ e.outcome }}</button>
+              <span v-else>—</span>
+            </td>
+            <td class="mono">
+              <button
+                v-if="e.rule"
+                type="button"
+                class="linkish"
+                title="Filter by this rule"
+                @click="applyFilter('rule', e.rule, $event)"
+              >{{ e.rule }}</button>
+              <span v-else>—</span>
             </td>
             <td class="mono sample">
               <button
@@ -734,6 +820,12 @@ onMounted(() => {
   word-break: break-all;
 }
 .linkish:hover { text-decoration: underline; }
+button.dec {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+button.dec:hover { filter: brightness(0.97); text-decoration: underline; }
 .dec {
   display: inline-block;
   padding: .08rem .35rem;
