@@ -205,6 +205,9 @@ async function doReload() {
               · pdp={{ policies.pdp_backend || policies.pdp?.backend || '—' }}
               · audit={{ policies.default_audit_level || '—' }}
               · state={{ policies.state?.backend || '—' }}
+              <template v-if="policies.state?.backend === 'file'">
+                · last-writer-wins (not CRDT; vault RAM not mlock)
+              </template>
             </template>
             <template v-else>
               —

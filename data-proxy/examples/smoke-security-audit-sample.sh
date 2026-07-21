@@ -134,15 +134,17 @@ body=body_ev["sample_body"]
 payload=json.loads(body) if isinstance(body, str) else body
 assert "columns" in payload and "rows" in payload, payload
 rows=payload["rows"]
-# sample_max_rows=2 in config — must not dump all 3 as "full result"
+# sample_max_rows=2 in config — must not dump all 3 as "full result" / L3
 assert len(rows) <= 2, f"sample must be bounded to max_rows=2, got {len(rows)}"
+assert len(rows) < 3, "B08 must not attach full 3-row table as sample"
 assert body_ev.get("sample_row_count") in (None, len(rows), 1, 2) or int(body_ev.get("sample_row_count") or 0) <= 2
-# Must not look like full-table dump of 3 rows without truncated flag when more existed
-if len(rows) < 3:
-    # truncated may be true when more backend rows existed
-    pass
+# Table has 3 seed rows; sample_max_rows=2 → body.truncated and/or sample_truncated must signal bound
+assert payload.get("truncated") is True or body_ev.get("sample_truncated") is True, (
+    f"expected truncated sample when backend had 3 rows and max_rows=2; "
+    f"payload.truncated={payload.get('truncated')} sample_truncated={body_ev.get('sample_truncated')}"
+)
 print(
-    "b08 sample ok",
+    "b08 sample ok (not L3)",
     "rows", len(rows),
     "sample_row_count", body_ev.get("sample_row_count"),
     "truncated", payload.get("truncated"),
@@ -157,6 +159,8 @@ assert sql, f"L2 sample event should retain sql_text, keys={list(body_ev.keys())
 assert "audit_sample_t" in sql.lower() or "select" in sql.lower(), sql
 assert len(sql) < 10_000, f"sql_text unexpectedly huge: {len(sql)}"
 print("F32 L2 keeps sql_text ok", "chars", len(sql))
+# policies already asserted sample_enabled under L2; re-state non-L3 claim for operators
+print("B08 honesty: bounded sample only — not full-result L3 archive")
 PY
 
 echo "smoke-security-audit-sample: OK"

@@ -335,7 +335,7 @@ onMounted(() => {
           </dd>
         </div>
         <div v-if="policy.audit_sample">
-          <dt>audit.sample</dt>
+          <dt>audit.sample (B08)</dt>
           <dd class="mono">
             {{ policy.audit_sample.sample_enabled ? 'on' : 'off' }}
             · max_rows={{ policy.audit_sample.sample_max_rows }}
@@ -343,6 +343,9 @@ onMounted(() => {
             · inline={{ policy.audit_sample.sample_inline }}
             · prefix={{ policy.audit_sample.sample_prefix || 'samples' }}
             · needs L2
+            <span class="hint-inline">
+              (bounded post-mask sample only — not L3 full-result archive)
+            </span>
           </dd>
         </div>
         <div v-if="policy.audit_queue">

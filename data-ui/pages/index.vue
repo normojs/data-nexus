@@ -233,6 +233,9 @@ onUnmounted(() => {
             · window_rows={{ windowRows }}
           </template>
           · state={{ stateBackend }}
+          <template v-if="stateBackend === 'file'">
+            · last-writer-wins (not CRDT)
+          </template>
         </div>
       </NuxtLink>
       <NuxtLink

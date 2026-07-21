@@ -254,3 +254,4 @@ examples/        smoke + gateway config 样例
 | A06/A08/A10 | OBSERVABILITY A-track honesty + stream/passthrough smoke pins | docs(a-track)/test |
 | A09 | portal `x-data-nexus-window-rows` header + CSV/xproto smoke pin | feat(a09) |
 | T01 | qualified/alias star deny smoke + extract unit (no * expansion) | test(t01) |
+| B08/H05 | sample truncated hard-assert + UI non-L3/non-CRDT honesty | test(b08)/feat(ui) |
