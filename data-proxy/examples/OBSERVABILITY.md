@@ -49,6 +49,17 @@ Command metrics labels include listener, service, frontend protocol, backend pro
 
 `execute_path` values match B03: `passthrough` / `streaming` / `materialized` / `xproto_stream` / `n/a`.
 
+### Secure encode metrics (O01 / A06, always on)
+
+| Metric | Type | Labels | Notes |
+|--------|------|--------|-------|
+| `unisql_proxy_gateway_mask_rows_total` | counter | SQL base | Rows that applied a non-empty mask obligation |
+| `unisql_proxy_gateway_encode_windows_total` | counter | SQL base | Encode windows written (streaming / windowed ResultSet) |
+| `unisql_proxy_gateway_encode_bytes_total` | counter | SQL base | Approx. encoded payload bytes (not TCP framing) |
+| `unisql_proxy_gateway_encode_peak_window_rows` | gauge | SQL base | **Logical** high-water rows held in one encode window (A06). Smoke asserts ≤ `window_rows`. **Not** process RSS. |
+
+SQL base labels: `listener`, `service`, `frontend_protocol`, `backend_protocol`, `command_type`, `endpoint` (same as other gateway SQL series; metric names may be prefixed by the process exporter, e.g. `unisql_proxy_`).
+
 Example PromQL:
 
 ```text
@@ -57,6 +68,15 @@ sum(rate(unisql_proxy_gateway_execute_path_total{execute_path="passthrough"}[5m]
 /
 sum(rate(unisql_proxy_gateway_execute_path_total[5m]))
 ```
+
+### Audit pipeline metrics (always on)
+
+| Metric | Type | Labels | Notes |
+|--------|------|--------|-------|
+| `unisql_proxy_gateway_audit_queue_len` | gauge | `queue=main` / `priority` | In-memory queue depth snapshot |
+| `unisql_proxy_gateway_audit_process_duration_seconds` | histogram | `sink` | Worker per-event process latency |
+
+Audit must not block queries (bounded queue + async worker). See B07 priority queue for deny / require_approval.
 
 ## OpenTelemetry / OTLP (optional feature)
 

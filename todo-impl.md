@@ -171,6 +171,7 @@ examples/        smoke + gateway config 样例
 | UI05 | Portal query status shows stream + window_rows | feat(ui05) |
 | UI04 | security-policies exposes B08 audit_sample knobs | feat(ui04) |
 | chore | smoke matrix inventory + portal export stream header UI | chore(smoke/ui) |
+| A06 | OBSERVABILITY O01/A06 metrics + stream smoke hard-fail peak | docs(a06)/test |
 
 ---
 

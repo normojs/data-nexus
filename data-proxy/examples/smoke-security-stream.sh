@@ -778,7 +778,8 @@ if echo "$metrics" | grep -q 'gateway_encode_windows_total'; then
   fi
   echo "encode windows counter observed"
 else
-  echo "note: gateway_encode_windows_total missing; continuing"
+  echo "FAIL: gateway_encode_windows_total missing after Streaming traffic" >&2
+  exit 1
 fi
 
 if echo "$metrics" | grep -q 'gateway_encode_peak_window_rows'; then
@@ -799,7 +800,8 @@ if echo "$metrics" | grep -q 'gateway_encode_peak_window_rows'; then
   fi
   echo "encode peak_window_rows ≤ window_rows observed"
 else
-  echo "note: gateway_encode_peak_window_rows missing; continuing"
+  echo "FAIL: gateway_encode_peak_window_rows missing after Streaming traffic (A06 logical peak)" >&2
+  exit 1
 fi
 
 echo "smoke-security-stream: OK"

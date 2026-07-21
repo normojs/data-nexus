@@ -54,7 +54,7 @@ cd data-proxy
 
 - [ ] **A06** Backend→PEP 真行流  
   - 已有：MySQL/PG `RowStream` + channel（含事务 producer 还 lease）；smoke 双协议 max_rows（含 txn）；**Materialized Query* 升 Streaming**；encode 峰值单测；**`StreamingEncodeStats.peak_window_rows` + Prometheus `gateway_encode_peak_window_rows`**（逻辑峰值高水位，非 RSS）；smoke **强制** `execute_path=streaming` + `encode_windows>0` + **peak≤window_rows**  
-  - 仍欠：控制语句/空结果 Complete 仍可小物化；**无进程 RSS 峰值 CI**（仅逻辑窗口峰值）；portal Complete 见 A09  
+  - 仍欠：控制语句/空结果 Complete 仍可小物化；**无进程 RSS 峰值 CI**（仅逻辑窗口峰值；smoke 已强制 peak 指标存在且 ≤window）；portal Complete 见 A09  
   - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
