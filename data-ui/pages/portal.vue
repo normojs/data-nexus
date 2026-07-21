@@ -274,6 +274,19 @@ onMounted(async () => {
           <div class="meta">
             decision={{ result.decision }} · rows={{ result.row_count }}
             <span v-if="result.truncated"> · truncated</span>
+            <span
+              v-if="result.stream"
+              class="stream-badge"
+              :class="{
+                bw: result.stream === 'backend_window',
+                ch: result.stream === 'chunked',
+              }"
+            >
+              · stream={{ result.stream }}
+            </span>
+            <span v-if="result.window_rows != null">
+              · window_rows={{ result.window_rows }}
+            </span>
           </div>
           <table class="table">
             <thead>
@@ -329,4 +342,6 @@ onMounted(async () => {
 .meta.ok { color: #1a7f37; }
 .meta.error { color: #cf222e; }
 .field-hint { display: block; margin-top: .25rem; font-size: .75rem; color: #6b7280; }
+.stream-badge.bw { color: #047857; font-weight: 600; }
+.stream-badge.ch { color: #b45309; font-weight: 600; }
 </style>
