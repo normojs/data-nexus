@@ -55,7 +55,8 @@ PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
   if [[ ! -x "$PROXY_BIN" ]] \
     || [[ "$ROOT/gateway/core/src/security.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/gateway/core/src/audit.rs" -nt "$PROXY_BIN" ]] \
-    || [[ "$ROOT/runtime/gateway/src/core_engine.rs" -nt "$PROXY_BIN" ]]; then
+    || [[ "$ROOT/runtime/gateway/src/core_engine.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/http/src/http/mod.rs" -nt "$PROXY_BIN" ]]; then
     cargo build -p data-proxy --bin proxy
   fi
   "$PROXY_BIN" daemon -c "$CONFIG_FILE"
@@ -72,6 +73,18 @@ mysql_via_gateway() {
   docker run --rm --add-host=host.docker.internal:host-gateway mysql:8.0 \
     mysql --ssl-mode=DISABLED -h host.docker.internal -P 9088 -uroot -proot -N -e "$1"
 }
+
+echo "==> security-policies audit_sample enabled under L2"
+curl -fsS "http://127.0.0.1:8082/admin/security-policies" | tee /tmp/dn-audit-sample-policies.json >/dev/null
+python3 - <<'PY2'
+import json
+data=json.load(open("/tmp/dn-audit-sample-policies.json"))
+assert data.get("default_audit_level","").upper()=="L2", data.get("default_audit_level")
+s=data.get("audit_sample") or {}
+assert s.get("sample_enabled") is True, s
+assert int(s.get("sample_max_rows") or 0) == 2, s
+print("policies audit_sample", s)
+PY2
 
 echo "==> generate multi-row SELECT traffic"
 mysql_via_gateway 'SELECT id, name FROM audit_sample_t ORDER BY id;'
