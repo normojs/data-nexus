@@ -627,6 +627,8 @@ struct AdminAuditEventsQuery {
     event_id: Option<String>,
     /// F32: filter by effective audit_level (L0/L1/L2).
     audit_level: Option<String>,
+    /// UI17: filter by outcome (`security_deny`, `ok`, portal_*, …).
+    outcome: Option<String>,
     /// Inclusive lower bound, unix epoch milliseconds.
     from_ms: Option<u64>,
     /// Inclusive upper bound, unix epoch milliseconds.
@@ -1381,6 +1383,7 @@ impl AxumServer {
             service: query.service.clone(),
             event_id: query.event_id.clone(),
             audit_level: query.audit_level.clone(),
+            outcome: query.outcome.clone(),
             from_ms: query.from_ms,
             to_ms: query.to_ms,
             limit,

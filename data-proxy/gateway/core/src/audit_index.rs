@@ -37,6 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_decision_ts ON audit_events(decision, ts_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_subject_ts ON audit_events(subject_id, ts_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_service_ts ON audit_events(service, ts_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_outcome_ts ON audit_events(outcome, ts_unix_ms DESC);
 "#;
 
 /// Filter for Admin / index queries (B06).
@@ -48,6 +49,8 @@ pub struct AuditQueryFilter {
     pub event_id: Option<String>,
     /// F32: filter by effective audit_level (L0/L1/L2), case-insensitive.
     pub audit_level: Option<String>,
+    /// UI17: filter by outcome column (`security_deny`, `ok`, portal_*, …).
+    pub outcome: Option<String>,
     /// Inclusive lower bound on `ts_unix_ms`.
     pub from_ms: Option<u64>,
     /// Inclusive upper bound on `ts_unix_ms`.
@@ -222,6 +225,10 @@ impl AuditIndex {
         if let Some(ref s) = filter.service {
             sql.push_str(" AND service = ?");
             binds.push(Box::new(s.clone()));
+        }
+        if let Some(ref o) = filter.outcome {
+            sql.push_str(" AND outcome = ?");
+            binds.push(Box::new(o.clone()));
         }
         if let Some(from) = filter.from_ms {
             sql.push_str(" AND ts_unix_ms >= ?");
@@ -558,6 +565,49 @@ mod tests {
         assert_eq!(only_l2[0].audit_level.as_deref(), Some("L2"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn filter_by_outcome_column() {
+        let path = tmp_path("outcome");
+        let idx = AuditIndex::open(&path).unwrap();
+        let mut deny = sample("deny", "a", "s", 1000);
+        deny.outcome = Some("security_deny".into());
+        deny.event_id = Some("ae-out-deny".into());
+        idx.insert(&deny).unwrap();
+        let mut ok = sample("execute", "a", "s", 1001);
+        ok.outcome = Some("ok".into());
+        ok.event_id = Some("ae-out-ok".into());
+        idx.insert(&ok).unwrap();
+        let mut portal = sample("execute", "a", "s", 1002);
+        portal.outcome = Some("portal_query".into());
+        portal.event_id = Some("ae-out-portal".into());
+        idx.insert(&portal).unwrap();
+
+        let only_deny = idx
+            .query(&AuditQueryFilter {
+                outcome: Some("security_deny".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(only_deny.len(), 1, "{only_deny:?}");
+        assert_eq!(only_deny[0].outcome.as_deref(), Some("security_deny"));
+        assert_eq!(only_deny[0].event_id.as_deref(), Some("ae-out-deny"));
+
+        let only_portal = idx
+            .query(&AuditQueryFilter {
+                outcome: Some("portal_query".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(only_portal.len(), 1);
+        assert_eq!(only_portal[0].event_id.as_deref(), Some("ae-out-portal"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
 }

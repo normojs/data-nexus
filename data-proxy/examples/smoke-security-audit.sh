@@ -42,7 +42,10 @@ echo "==> start gateway"
 PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
 (
   cd "$ROOT"
-  if [[ ! -x "$PROXY_BIN" ]] || [[ "$ROOT/gateway/core/src/audit_pipeline.rs" -nt "$PROXY_BIN" ]]; then
+  if [[ ! -x "$PROXY_BIN" ]] \
+    || [[ "$ROOT/gateway/core/src/audit_pipeline.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/gateway/core/src/audit_index.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/http/src/http/mod.rs" -nt "$PROXY_BIN" ]]; then
     cargo build -p data-proxy --bin proxy
   fi
   "$PROXY_BIN" daemon -c "$CONFIG_FILE"
@@ -169,6 +172,19 @@ for e in ev:
     lvl=(e.get("audit_level") or "").upper()
     assert lvl=="L0", e
 print("audit_level=L0 filter ok", "events", len(ev))
+PY
+
+echo "==> GET /admin/audit/events?outcome=security_deny"
+curl -fsS "http://127.0.0.1:8082/admin/audit/events?outcome=security_deny&limit=20" | tee /tmp/dn-audit-outcome.json >/dev/null
+python3 - <<'PY'
+import json
+data=json.load(open("/tmp/dn-audit-outcome.json"))
+ev=data.get("events") or []
+assert ev, data
+for e in ev:
+    assert e.get("outcome") == "security_deny", e
+assert data.get("source") == "index", data
+print("outcome=security_deny filter ok", "events", len(ev))
 PY
 
 echo "smoke-security-audit: OK"

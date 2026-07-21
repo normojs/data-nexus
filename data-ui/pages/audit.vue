@@ -14,6 +14,7 @@ const source = ref('')
 const note = ref('')
 const decision = ref('')
 const auditLevel = ref('')
+const outcome = ref('')
 const service = ref('')
 const subjectId = ref('')
 const eventId = ref('')
@@ -132,6 +133,7 @@ async function load() {
     const res = await api.auditEvents({
       decision: decision.value || undefined,
       audit_level: auditLevel.value || undefined,
+      outcome: outcome.value || undefined,
       service: service.value || undefined,
       subject_id: subjectId.value || undefined,
       event_id: eventId.value || undefined,
@@ -165,6 +167,7 @@ async function load() {
 function clearFilters() {
   decision.value = ''
   auditLevel.value = ''
+  outcome.value = ''
   service.value = ''
   subjectId.value = ''
   eventId.value = ''
@@ -194,6 +197,7 @@ function exportJson() {
     filters: {
       decision: decision.value || null,
       audit_level: auditLevel.value || null,
+      outcome: outcome.value || null,
       service: service.value || null,
       subject_id: subjectId.value || null,
       event_id: eventId.value || null,
@@ -401,6 +405,27 @@ onMounted(() => {
           </datalist>
         </label>
         <label>
+          <span>Outcome</span>
+          <input
+            v-model="outcome"
+            class="input mono"
+            list="outcome-opts"
+            placeholder="security_deny / ok / portal_…"
+            @keyup.enter="load"
+          >
+          <datalist id="outcome-opts">
+            <option value="security_deny" />
+            <option value="ok" />
+            <option value="portal_query" />
+            <option value="portal_export" />
+            <option value="portal_deny" />
+            <option value="ticket_approved" />
+            <option value="ticket_rejected" />
+            <option value="vault_lease_issued" />
+            <option value="vault_lease_revoked" />
+          </datalist>
+        </label>
+        <label>
           <span>Service</span>
           <input
             v-model="service"
@@ -456,7 +481,9 @@ onMounted(() => {
         </label>
       </div>
       <p class="hint">
-        UI03: stats from pipeline (B06 index / B07 priority queue). When
+        UI03/UI16/UI17: stats from pipeline (B06 index / B07 priority queue);
+        filters include <code class="mono">audit_level</code> and
+        <code class="mono">outcome</code>. When
         <code class="mono">security.audit.index_path</code> is set, badge shows
         <code class="mono">source=index</code>; otherwise
         <code class="mono">source=recent</code> (in-memory ring). Export is the
