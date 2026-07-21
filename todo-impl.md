@@ -247,3 +247,5 @@ examples/        smoke + gateway config 样例
 | UI25 | Sessions listener/protocol/database/peer client filter | feat(ui25) |
 | UI26 | Portal project/lease picker client filters | feat(ui26) |
 | UI27 | Policies section/effect chips + click-to-filter | feat(ui27) |
+| UI28 | Overview security/ops summary cards + quick links | feat(ui28) |
+| UI29 | Cedar health banner + security-policies PDP context | feat(ui29) |

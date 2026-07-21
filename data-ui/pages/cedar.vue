@@ -14,6 +14,11 @@ const messageKind = ref<'ok' | 'error' | ''>('')
 const busy = ref(false)
 const canReload = ref(false)
 const reloadOut = ref('')
+const pdpBackend = ref('')
+const pdpPolicyDir = ref('')
+const remoteConfigured = ref(false)
+const remoteFailClosed = ref(true)
+const remoteTimeoutMs = ref(0)
 
 function setMessage(msg: string, kind: 'ok' | 'error' | '' = '') {
   message.value = msg
@@ -30,10 +35,34 @@ function fmtMs(ms?: number) {
   }
 }
 
+const healthLabel = computed(() => {
+  const s = status.value
+  if (!s)
+    return 'unknown'
+  if (s.ready)
+    return 'ready'
+  if (s.installed === false)
+    return 'not installed'
+  if (s.feature)
+    return 'feature missing'
+  return 'not ready'
+})
+
 async function load() {
   setMessage('Loading Cedar status…')
   try {
-    status.value = await api.cedarStatus(apiBase.value)
+    const [cedar, policies] = await Promise.all([
+      api.cedarStatus(apiBase.value),
+      api.securityPolicies(apiBase.value).catch(() => null),
+    ])
+    status.value = cedar
+    if (policies) {
+      pdpBackend.value = policies.pdp_backend || policies.pdp?.backend || ''
+      pdpPolicyDir.value = policies.pdp_policy_dir || policies.pdp?.policy_dir || ''
+      remoteConfigured.value = !!policies.pdp?.remote_configured
+      remoteFailClosed.value = policies.pdp?.remote_fail_closed ?? true
+      remoteTimeoutMs.value = policies.pdp?.remote_timeout_ms ?? 0
+    }
     if (status.value?.message && !status.value.ready) {
       setMessage(status.value.message, 'error')
     }
@@ -41,7 +70,11 @@ async function load() {
       setMessage(`Ready · epoch ${status.value.epoch}`, 'ok')
     }
     else if (status.value?.installed === false) {
-      setMessage('Cedar store not installed (security.pdp.backend may be local)', '')
+      const backend = pdpBackend.value || status.value?.pdp_backend || 'local'
+      setMessage(
+        `Cedar store not installed (security.pdp.backend=${backend}; need --features security-cedar + backend=cedar)`,
+        '',
+      )
     }
     else {
       setMessage('Loaded', 'ok')
@@ -138,8 +171,19 @@ onMounted(async () => {
       <p class="hint">
         F26b: hot-reload re-reads <code class="mono">security.pdp.policy_dir</code> when
         <code class="mono">cache_epoch_reload=true</code>. Failed reloads keep the previous epoch
-        (keep-old). Binary must be built with <code class="mono">--features security-cedar</code>.
+        (keep-old). Binary must be built with <code class="mono">--features security-cedar</code>
+        and <code class="mono">security.pdp.backend=cedar</code>. UI29 also surfaces the active
+        PDP backend from security-policies (including F31 remote knobs, never tokens).
       </p>
+      <div
+        class="health"
+        :class="healthLabel.replace(/\s+/g, '-')"
+      >
+        Health: <strong>{{ healthLabel }}</strong>
+        <template v-if="pdpBackend">
+          · config pdp={{ pdpBackend }}
+        </template>
+      </div>
       <dl
         v-if="status"
         class="kv"
@@ -207,6 +251,21 @@ onMounted(async () => {
             {{ status.feature }} — {{ status.message }}
           </dd>
         </div>
+        <div
+          v-if="pdpBackend"
+          class="span-2"
+        >
+          <dt>security-policies PDP (UI18/UI29)</dt>
+          <dd class="mono">
+            backend={{ pdpBackend }}
+            <template v-if="pdpPolicyDir">
+              · policy_dir={{ pdpPolicyDir }}
+            </template>
+            · remote_configured={{ remoteConfigured }}
+            · remote_timeout_ms={{ remoteTimeoutMs || '—' }}
+            · remote_fail_closed={{ remoteFailClosed }}
+          </dd>
+        </div>
       </dl>
       <div
         v-else
@@ -214,6 +273,28 @@ onMounted(async () => {
       >
         No status yet.
       </div>
+    </div>
+
+    <div class="card">
+      <h3>Related</h3>
+      <div class="row">
+        <NuxtLink
+          class="btn"
+          to="/policies"
+        >
+          Security policies
+        </NuxtLink>
+        <NuxtLink
+          class="btn"
+          to="/"
+        >
+          Overview
+        </NuxtLink>
+      </div>
+      <p class="hint">
+        Reload requires <code class="mono">policy:write</code> / <code class="mono">config:reload</code>
+        or admin/operator role when auth is enabled.
+      </p>
     </div>
 
     <div
@@ -260,6 +341,17 @@ onMounted(async () => {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .empty { color: #888; }
+.health {
+  margin: 0 0 .75rem;
+  padding: .45rem .6rem;
+  border-radius: 8px;
+  font-size: .88rem;
+  background: #f6f8fa;
+  color: #444;
+}
+.health.ready { background: #dafbe1; color: #1a7f37; }
+.health.not-installed, .health.feature-missing { background: #fff8c5; color: #9a6700; }
+.health.not-ready { background: #ffebe9; color: #cf222e; }
 @media (max-width: 640px) {
   .kv { grid-template-columns: 1fr; }
 }
