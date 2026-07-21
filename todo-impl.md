@@ -235,3 +235,4 @@ examples/        smoke + gateway config 样例
 | F32 | expose sql_text_max_chars on security-policies API/UI | feat(f32/ui) |
 | UI16 | Audit filter by audit_level; O01 mask smoke hard-fail | feat(ui16)/test |
 | B07 | smoke priority_accepted after deny + OBSERVABILITY | test(b07)/docs |
+| B07 | expose audit_queue on security-policies API/UI + smoke | feat(b07/ui) |

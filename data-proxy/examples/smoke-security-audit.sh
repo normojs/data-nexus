@@ -73,6 +73,19 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
+echo "==> security-policies exposes B07 audit_queue"
+curl -fsS "http://127.0.0.1:8082/admin/security-policies" | tee /tmp/dn-audit-policies.json >/dev/null
+python3 - <<'PY'
+import json
+data=json.load(open("/tmp/dn-audit-policies.json"))
+q=data.get("audit_queue") or {}
+assert int(q.get("queue_capacity") or 0) >= 1, q
+assert int(q.get("priority_queue_capacity") or 0) >= 1, q
+assert q.get("overflow"), q
+assert isinstance(q.get("sinks"), list) and q["sinks"], q
+print("policies audit_queue", q)
+PY
+
 echo "==> GET /admin/audit/stats"
 curl -fsS "http://127.0.0.1:8082/admin/audit/stats" | tee /tmp/dn-audit-stats.json
 python3 - <<'PY'

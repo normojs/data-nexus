@@ -496,6 +496,8 @@ struct AdminSecurityPoliciesResponse {
     streaming: AdminSecurityStreamingSummary,
     /// B08 sample attach policy (requires default_audit_level=L2 when enabled).
     audit_sample: AdminSecurityAuditSampleSummary,
+    /// B07 audit queue capacities / overflow / sinks (no file paths).
+    audit_queue: AdminSecurityAuditQueueSummary,
     /// H05 multi-instance ticket/vault/policy file backend (no secrets).
     state: AdminSecurityStateSummary,
 }
@@ -585,6 +587,16 @@ struct AdminSecurityAuditSampleSummary {
     sample_inline: bool,
     /// Empty uses default prefix `samples`.
     sample_prefix: String,
+}
+
+/// B07: audit queue policy (read-only; no secrets / paths with data).
+#[derive(Debug, Serialize)]
+struct AdminSecurityAuditQueueSummary {
+    queue_capacity: u32,
+    /// Separate queue for deny / require_ticket / require_approval; 0 = disabled split.
+    priority_queue_capacity: u32,
+    overflow: String,
+    sinks: Vec<String>,
 }
 
 /// H05: multi-instance state backend (read-only; no encrypt keys).
@@ -1182,6 +1194,12 @@ impl AxumServer {
                             sample_max_bytes: security.audit.sample_max_bytes,
                             sample_inline: security.audit.sample_inline,
                             sample_prefix: security.audit.sample_prefix.clone(),
+                        },
+                        audit_queue: AdminSecurityAuditQueueSummary {
+                            queue_capacity: security.audit.queue_capacity,
+                            priority_queue_capacity: security.audit.priority_queue_capacity,
+                            overflow: security.audit.overflow.clone(),
+                            sinks: security.audit.sinks.clone(),
                         },
                         state: AdminSecurityStateSummary {
                             backend: security.state.backend.clone(),

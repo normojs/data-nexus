@@ -198,6 +198,15 @@ onMounted(() => {
             · needs L2
           </dd>
         </div>
+        <div v-if="policy.audit_queue">
+          <dt>audit.queue (B07)</dt>
+          <dd class="mono">
+            capacity={{ policy.audit_queue.queue_capacity }}
+            · priority_capacity={{ policy.audit_queue.priority_queue_capacity }}
+            · overflow={{ policy.audit_queue.overflow }}
+            · sinks={{ (policy.audit_queue.sinks || []).join(',') || '—' }}
+          </dd>
+        </div>
         <div v-if="policy.state">
           <dt>state (H05)</dt>
           <dd class="mono">

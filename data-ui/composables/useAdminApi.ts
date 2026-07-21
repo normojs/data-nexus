@@ -280,6 +280,13 @@ export type AdminSecurityPolicies = {
     sample_inline: boolean
     sample_prefix: string
   }
+  /** B07: audit queue policy (capacities; no secrets). */
+  audit_queue?: {
+    queue_capacity: number
+    priority_queue_capacity: number
+    overflow: string
+    sinks: string[]
+  }
   /** H05: multi-instance state (paths only; encrypt keys never returned). */
   state?: {
     backend: string
