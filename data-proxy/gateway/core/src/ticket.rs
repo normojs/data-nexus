@@ -790,6 +790,32 @@ mod tests {
     }
 
     #[test]
+    fn dual_control_issuer_may_self_reject() {
+        // Unlike approve, reject does not require a second person — issuer can withdraw.
+        let store = TicketStore::new();
+        let t = store.issue(IssueTicketRequest {
+            subject_id: "root".into(),
+            sql: "DROP TABLE t".into(),
+            ticket_type: "ddl".into(),
+            ttl_secs: 60,
+            max_uses: 1,
+            note: None,
+            issued_by: Some("alice".into()),
+            dual_control: true,
+        });
+        let rejected = store
+            .reject(&t.id, "alice", Some("issuer withdraw".into()))
+            .expect("issuer self-reject");
+        assert_eq!(rejected.status, TicketStatus::Rejected);
+        assert_eq!(rejected.rejected_by.as_deref(), Some("alice"));
+        let sql = format!("/*dn_ticket:{}*/ DROP TABLE t", t.id);
+        let err = store
+            .consume(&t.id, "root", &sql, Some("ddl"))
+            .expect_err("rejected");
+        assert!(err.to_ascii_lowercase().contains("reject"), "err={err}");
+    }
+
+    #[test]
     fn h05_ticket_file_roundtrip() {
         let dir = std::env::temp_dir().join(format!("dn-h05-tkt-{}", now_unix_ms()));
         let _ = std::fs::create_dir_all(&dir);

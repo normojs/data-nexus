@@ -169,4 +169,38 @@ rc3=$?
 set -e
 [[ $rc3 -ne 0 ]]
 
+echo "==> issuer may self-reject dual-control (unlike self-approve)"
+# Honesty: dual-control blocks self-approve only; issuer can withdraw via reject.
+DDL3="CREATE TABLE IF NOT EXISTS smoke_dual_self_reject_t (id INT PRIMARY KEY)"
+curl -fsS -X POST "http://127.0.0.1:8082/admin/tickets" \
+  -H 'content-type: application/json' \
+  -d "$(python3 - <<PY
+import json
+print(json.dumps({
+  "subject_id": "root",
+  "sql": """$DDL3""",
+  "ticket_type": "ddl",
+  "ttl_secs": 300,
+  "issued_by": "issuer-alice",
+  "dual_control": True
+}))
+PY
+)" >/tmp/dn-dual-self-rej-ticket.json
+SELF_REJ_ID="$(python3 -c 'import json;print(json.load(open("/tmp/dn-dual-self-rej-ticket.json"))["id"])')"
+curl -fsS -X POST "http://127.0.0.1:8082/admin/tickets/${SELF_REJ_ID}/reject" \
+  -H 'content-type: application/json' \
+  -d '{"rejected_by":"issuer-alice","reason":"issuer withdraw"}' | tee /tmp/dn-dual-self-rejected.json
+python3 - <<'PY'
+import json
+t=json.load(open("/tmp/dn-dual-self-rejected.json"))
+assert t.get("status") == "rejected", t
+assert (t.get("rejected_by") or "").lower() == "issuer-alice", t
+print("issuer self-reject ok", t["id"])
+PY
+set +e
+mysql_via_gateway "/*dn_ticket:${SELF_REJ_ID}*/ ${DDL3};" >/tmp/dn-dual-self-rej-use.txt 2>&1
+rc4=$?
+set -e
+[[ $rc4 -ne 0 ]]
+
 echo "smoke-security-dual-control: OK"

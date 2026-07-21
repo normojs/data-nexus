@@ -256,3 +256,4 @@ examples/        smoke + gateway config 样例
 | T01 | qualified/alias star deny smoke + extract unit (no * expansion) | test(t01) |
 | B08/H05 | sample truncated hard-assert + UI non-L3/non-CRDT honesty | test(b08)/feat(ui) |
 | A08/B08 | config-validate smoke: sample L2 gate + require TLS needs CA | test(config) |
+| F18/A09 | dual-control issuer self-reject + portal metrics honesty (not CoreEngine) | test(f18/a09) |
