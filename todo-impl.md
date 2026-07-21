@@ -28,11 +28,11 @@
 | 组 | 脚本数 | 内容 |
 |----|:------:|------|
 | `l0` | 4 | admin-auth / dual-listener / cross-protocol ×2 |
-| `security-core` | 8 | deny / column / mask / audit / **audit-sample** / ticket / portal / vault |
+| `security-core` | 9 | deny / column / mask / audit / **audit-sample** / ticket / portal / vault / **state-file** |
 | `security-extended` | 8 | stream / passthrough / watermark / dual-control / time / xproto-stream / **portal-xproto×2** |
 | `cedar` | 2 | cedar + cedar-reload（需 `--features security-cedar`） |
-| **default** | **12** | l0 + security-core |
-| **all** | **20** | default + security-extended（不含 cedar） |
+| **default** | **13** | l0 + security-core |
+| **all** | **21** | default + security-extended（不含 cedar） |
 
 ### 可选 Cargo features
 
@@ -176,6 +176,7 @@ examples/        smoke + gateway config 样例
 | A09 | xproto portal smokes hard-assert window_rows==2 | test(a09) |
 | A08 | MySQL prepared under passthrough demotes Streaming smoke | test(a08) |
 | H05 | security-policies exposes state summary (no keys) | feat(h05/ui04) |
+| H05 | file state + AES-GCM restart smoke (state-file) | feat(h05) |
 
 ---
 

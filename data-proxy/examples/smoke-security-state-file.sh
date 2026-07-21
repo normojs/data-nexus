@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# H05: file state backend + AES-GCM ticket/vault; restart preserves records.
+# Asserts security-policies.state encrypt flags and sealed file magic prefixes.
+set -euo pipefail
+
+export PATH="/Volumes/fushilu/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${HOME}/.cargo/bin:${PATH:-}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/fushilu/.caches/data-nexus/cargo-target}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.1}"
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CONFIG_FILE="$ROOT/examples/security-state-file-gateway-config.toml"
+PROXY_LOG="${TMPDIR:-/tmp}/data-nexus-security-state-file.log"
+PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
+TICKET_PATH="/tmp/data-nexus-h05-tickets.json"
+VAULT_PATH="/tmp/data-nexus-h05-vault.json"
+POLICY_PATH="/tmp/data-nexus-h05-local-pdp.json"
+COMPOSE_FILE="$ROOT/examples/docker-compose.dev.yml"
+COMPOSE=(docker compose -f "$COMPOSE_FILE")
+
+cleanup() {
+  if [[ -n "${PROXY_PID:-}" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
+    kill "$PROXY_PID" 2>/dev/null || true
+    wait "$PROXY_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "missing $1" >&2; exit 1; }; }
+need curl; need cargo; need python3; need docker
+
+pkill -f '/debug/proxy' 2>/dev/null || true
+sleep 1
+rm -f "$TICKET_PATH" "$VAULT_PATH" "$POLICY_PATH" \
+  "${TICKET_PATH}.lock" "${VAULT_PATH}.lock" "${POLICY_PATH}.lock"
+
+start_proxy() {
+  (
+    cd "$ROOT"
+    if [[ ! -x "$PROXY_BIN" ]] \
+      || [[ "$ROOT/gateway/core/src/vault.rs" -nt "$PROXY_BIN" ]] \
+      || [[ "$ROOT/gateway/core/src/ticket.rs" -nt "$PROXY_BIN" ]] \
+      || [[ "$ROOT/http/src/http/mod.rs" -nt "$PROXY_BIN" ]]; then
+      cargo build -p data-proxy --bin proxy
+    fi
+    exec "$PROXY_BIN" daemon -c "$CONFIG_FILE"
+  ) >"$PROXY_LOG" 2>&1 &
+  PROXY_PID=$!
+  for _ in $(seq 1 120); do
+    curl -fsS "http://127.0.0.1:8082/healthz" >/dev/null 2>&1 && return 0
+    kill -0 "$PROXY_PID" 2>/dev/null || { cat "$PROXY_LOG"; exit 1; }
+    sleep 1
+  done
+  echo "gateway did not become healthy" >&2
+  cat "$PROXY_LOG" >&2
+  exit 1
+}
+
+stop_proxy() {
+  if [[ -n "${PROXY_PID:-}" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
+    kill "$PROXY_PID" 2>/dev/null || true
+    wait "$PROXY_PID" 2>/dev/null || true
+  fi
+  PROXY_PID=""
+  sleep 1
+}
+
+echo "==> backends (vault issue needs endpoint)"
+"${COMPOSE[@]}" up -d
+for _ in $(seq 1 90); do
+  "${COMPOSE[@]}" exec -T mysql-primary mysqladmin ping -h 127.0.0.1 -uroot -proot --silent 2>/dev/null && break
+  sleep 2
+done
+
+echo "==> start gateway (state.backend=file + encrypt keys)"
+start_proxy
+
+echo "==> security-policies.state shows file + encrypt configured"
+curl -fsS "http://127.0.0.1:8082/admin/security-policies" | tee /tmp/dn-h05-policies.json >/dev/null
+python3 - <<'PY'
+import json
+d=json.load(open("/tmp/dn-h05-policies.json"))
+s=d.get("state") or {}
+assert s.get("backend")=="file", s
+assert s.get("ticket_encrypt_configured") is True, s
+assert s.get("vault_encrypt_configured") is True, s
+assert "h05-tickets" in (s.get("ticket_path") or "")
+assert "h05-vault" in (s.get("vault_path") or "")
+raw=json.dumps(d)
+assert "ticket_encrypt_key" not in raw and "vault_encrypt_key" not in raw
+assert "0123456789abcdef" not in raw
+print("policies state file+enc ok", s.get("backend"), s.get("ticket_path"))
+PY
+
+echo "==> issue ticket + vault lease"
+curl -fsS -X POST "http://127.0.0.1:8082/admin/tickets" \
+  -H 'content-type: application/json' \
+  -d '{"subject_id":"root","sql":"CREATE TABLE h05_t (id INT)","ticket_type":"ddl","ttl_secs":600,"max_uses":1,"note":"h05-smoke"}' \
+  | tee /tmp/dn-h05-ticket.json >/dev/null
+curl -fsS -X POST "http://127.0.0.1:8082/admin/vault/leases" \
+  -H 'content-type: application/json' \
+  -d '{"project":"orders","environment":"dev","ttl_secs":600}' \
+  | tee /tmp/dn-h05-lease.json >/dev/null
+
+TICKET_ID="$(python3 -c 'import json; print(json.load(open("/tmp/dn-h05-ticket.json"))["id"])')"
+LEASE_ID="$(python3 -c 'import json; print(json.load(open("/tmp/dn-h05-lease.json"))["lease_id"])')"
+echo "ticket=$TICKET_ID lease=$LEASE_ID"
+
+echo "==> sealed files on disk (AES-GCM magic, no plaintext secrets)"
+python3 - <<PY
+from pathlib import Path
+ticket=Path("$TICKET_PATH").read_text()
+vault=Path("$VAULT_PATH").read_text()
+assert ticket.startswith("DNTICKET1:"), ticket[:40]
+assert vault.startswith("DNVAULT1:"), vault[:40]
+assert "CREATE TABLE h05_t" not in ticket
+# After magic prefix the rest is ciphertext/base64 — no SQL sample or password JSON.
+body_v = vault.split(":", 1)[-1] if ":" in vault else vault
+assert "CREATE TABLE" not in body_v
+assert '"backend_password"' not in vault
+assert "password" not in vault  # field names sealed inside ciphertext
+print("sealed files ok", "ticket_len", len(ticket), "vault_len", len(vault))
+PY
+
+echo "==> restart gateway; state reloads from encrypted files"
+stop_proxy
+start_proxy
+
+echo "==> tickets/leases still present after restart"
+curl -fsS "http://127.0.0.1:8082/admin/tickets?limit=50" | tee /tmp/dn-h05-tickets-after.json >/dev/null
+curl -fsS "http://127.0.0.1:8082/admin/vault/leases" | tee /tmp/dn-h05-leases-after.json >/dev/null
+python3 - <<PY
+import json
+tickets=json.load(open("/tmp/dn-h05-tickets-after.json"))
+# response may be {tickets:[...]} or list
+if isinstance(tickets, dict):
+    tickets=tickets.get("tickets") or tickets.get("items") or []
+ids=[t.get("id") for t in tickets]
+assert "$TICKET_ID" in ids, (ids, open("/tmp/dn-h05-tickets-after.json").read()[:500])
+leases=json.load(open("/tmp/dn-h05-leases-after.json"))
+if isinstance(leases, dict):
+    leases=leases.get("leases") or leases.get("items") or []
+elif not isinstance(leases, list):
+    raise SystemExit(f"unexpected leases shape: {type(leases)}")
+lids=[l.get("lease_id") for l in leases]
+assert "$LEASE_ID" in lids, lids
+# lease JSON still must not expose password
+assert all("password" not in json.dumps(l).lower() or l.get("password") is None for l in leases)
+print("reload ok ticket", "$TICKET_ID", "lease", "$LEASE_ID")
+PY
+
+echo "smoke-security-state-file: OK"

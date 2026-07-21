@@ -36,7 +36,7 @@ list_groups() {
   cat <<'EOF'
 Groups:
   l0                  L0 / security-off path (admin-auth, dual-listener, cross-protocol x2)
-  security-core       deny, column, mask, audit, audit-sample, ticket, portal, vault
+  security-core       deny, column, mask, audit, audit-sample, ticket, portal, vault, state-file
   security-extended   stream, passthrough, watermark, dual-control, time, xproto-stream, portal-xproto×2
   cedar               cedar + cedar-reload (build with --features security-cedar)
   default             l0 + security-core
@@ -66,6 +66,7 @@ security_core_smokes=(
   smoke-security-ticket.sh
   smoke-security-portal.sh
   smoke-security-vault.sh
+  smoke-security-state-file.sh
 )
 
 security_extended_smokes=(
