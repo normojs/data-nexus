@@ -249,3 +249,5 @@ examples/        smoke + gateway config 样例
 | UI27 | Policies section/effect chips + click-to-filter | feat(ui27) |
 | UI28 | Overview security/ops summary cards + quick links | feat(ui28) |
 | UI29 | Cedar health banner + security-policies PDP context | feat(ui29) |
+| UI30 | Topology section/protocol filters + click-to-filter | feat(ui30) |
+| UI31 | Settings gateway probe (health/version/security/audit) | feat(ui31) |
