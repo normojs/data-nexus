@@ -177,6 +177,7 @@ examples/        smoke + gateway config 样例
 | UI11 | Tickets disable self-approve; Portal stream path hint | feat(ui11) |
 | UI12 | Audit CSV export includes B08 sample_* columns | feat(ui12) |
 | UI13 | Portal truncated explains client vs policy max_rows | feat(ui13) |
+| UI14 | Audit table Level column (audit_level) | feat(ui14) |
 | chore | streaming rule INSERT chunked honesty; tickets dual-control hint | chore |
 | UI03 | Audit table Sample column for B08 sample_* | feat(ui03) |
 | UI05 | Portal query status shows stream + window_rows | feat(ui05) |

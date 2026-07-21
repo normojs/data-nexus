@@ -450,6 +450,7 @@ onMounted(() => {
           <tr>
             <th>Time</th>
             <th>Decision</th>
+            <th>Level</th>
             <th>Subject</th>
             <th>Service</th>
             <th>Outcome</th>
@@ -476,6 +477,9 @@ onMounted(() => {
                   ticket: e.decision === 'require_ticket',
                 }"
               >{{ e.decision || '—' }}</span>
+            </td>
+            <td class="mono">
+              {{ e.audit_level || '—' }}
             </td>
             <td>{{ e.subject_id || '—' }}</td>
             <td>{{ e.service || '—' }}</td>
@@ -518,7 +522,7 @@ onMounted(() => {
           </tr>
           <tr v-if="!events.length">
             <td
-              colspan="9"
+              colspan="10"
               class="empty"
             >
               No events.
@@ -546,6 +550,7 @@ onMounted(() => {
       </div>
       <p class="hint mono">
         event={{ selectedEvent.event_id || '—' }}
+        · level={{ selectedEvent.audit_level || '—' }}
         · rows={{ selectedEvent.sample_row_count ?? '—' }}
         · bytes={{ selectedEvent.sample_bytes ?? '—' }}
         · truncated={{ selectedEvent.sample_truncated ? 'yes' : 'no' }}
