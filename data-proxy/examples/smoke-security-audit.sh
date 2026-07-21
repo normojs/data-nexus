@@ -86,7 +86,13 @@ assert "pruned" in s, s
 assert s.get("index_enabled") is True, s
 assert s.get("index_inserted", 0) >= 1, s
 assert "index_rows" in s and "index_errors" in s, s
+# B07: deny traffic must hit priority queue (priority_queue_capacity>0 in deny config)
+assert int(s.get("priority_queue_capacity") or 0) > 0, s
+assert int(s.get("priority_accepted") or 0) >= 1, (
+    f"B07 expected priority_accepted>=1 after deny, got {s.get('priority_accepted')}"
+)
 print("stats ok", s)
+print("B07 priority_accepted", s.get("priority_accepted"), "cap", s.get("priority_queue_capacity"))
 PY
 
 echo "==> GET /admin/audit/events?decision=deny"
@@ -128,7 +134,8 @@ if [[ -f "$AUDIT_FILE" ]]; then
   echo "jsonl lines=$lines"
   [[ "$lines" -ge 1 ]]
 else
-  echo "warn: jsonl not found yet (worker lag); recent API is source of truth"
+  echo "error: expected JSONL file sink at $AUDIT_FILE after deny traffic" >&2
+  exit 1
 fi
 
 if [[ -f "$AUDIT_INDEX" ]]; then

@@ -76,7 +76,9 @@ sum(rate(unisql_proxy_gateway_execute_path_total[5m]))
 | `unisql_proxy_gateway_audit_queue_len` | gauge | `queue=main` / `priority` | In-memory queue depth snapshot |
 | `unisql_proxy_gateway_audit_process_duration_seconds` | histogram | `sink` | Worker per-event process latency |
 
-Audit must not block queries (bounded queue + async worker). See B07 priority queue for deny / require_approval.
+Audit must not block queries (bounded queue + async worker).
+
+**B07 priority queue**: decisions `deny` / `require_ticket` / `require_approval` enter a separate queue (`security.audit.priority_queue_capacity`) drained before the main allow/execute queue. Admin `/admin/audit/stats` exposes `priority_accepted` / `priority_dropped` / `priority_queue_len`. Smoke: `smoke-security-audit.sh` asserts `priority_accepted>=1` after a deny.
 
 ## OpenTelemetry / OTLP (optional feature)
 
