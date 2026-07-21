@@ -450,6 +450,8 @@ export function useAdminApi() {
       audit_level?: string
       /** UI17: outcome column filter (security_deny / ok / portal_* …). */
       outcome?: string
+      /** UI19: frontend listener name filter. */
+      listener?: string
       from_ms?: number
       to_ms?: number
       limit?: number
@@ -461,6 +463,7 @@ export function useAdminApi() {
       if (params?.event_id) q.set('event_id', params.event_id)
       if (params?.audit_level) q.set('audit_level', params.audit_level)
       if (params?.outcome) q.set('outcome', params.outcome)
+      if (params?.listener) q.set('listener', params.listener)
       if (params?.from_ms != null) q.set('from_ms', String(params.from_ms))
       if (params?.to_ms != null) q.set('to_ms', String(params.to_ms))
       if (params?.limit) q.set('limit', String(params.limit))

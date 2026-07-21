@@ -38,6 +38,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_decision_ts ON audit_events(decision, ts_un
 CREATE INDEX IF NOT EXISTS idx_audit_subject_ts ON audit_events(subject_id, ts_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_service_ts ON audit_events(service, ts_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_outcome_ts ON audit_events(outcome, ts_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_listener_ts ON audit_events(listener, ts_unix_ms DESC);
 "#;
 
 /// Filter for Admin / index queries (B06).
@@ -51,6 +52,8 @@ pub struct AuditQueryFilter {
     pub audit_level: Option<String>,
     /// UI17: filter by outcome column (`security_deny`, `ok`, portal_*, …).
     pub outcome: Option<String>,
+    /// UI19: filter by frontend listener name (index column).
+    pub listener: Option<String>,
     /// Inclusive lower bound on `ts_unix_ms`.
     pub from_ms: Option<u64>,
     /// Inclusive upper bound on `ts_unix_ms`.
@@ -229,6 +232,10 @@ impl AuditIndex {
         if let Some(ref o) = filter.outcome {
             sql.push_str(" AND outcome = ?");
             binds.push(Box::new(o.clone()));
+        }
+        if let Some(ref l) = filter.listener {
+            sql.push_str(" AND listener = ?");
+            binds.push(Box::new(l.clone()));
         }
         if let Some(from) = filter.from_ms {
             sql.push_str(" AND ts_unix_ms >= ?");
@@ -604,6 +611,48 @@ mod tests {
             .unwrap();
         assert_eq!(only_portal.len(), 1);
         assert_eq!(only_portal[0].event_id.as_deref(), Some("ae-out-portal"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn filter_by_listener_column() {
+        let path = tmp_path("listener");
+        let idx = AuditIndex::open(&path).unwrap();
+        let mut a = sample("deny", "u", "orders", 1000);
+        a.listener = Some("orders-mysql".into());
+        a.event_id = Some("ae-lsn-a".into());
+        idx.insert(&a).unwrap();
+        let mut b = sample("execute", "u", "orders", 1001);
+        b.listener = Some("orders-pg".into());
+        b.event_id = Some("ae-lsn-b".into());
+        idx.insert(&b).unwrap();
+        let mut c = sample("deny", "u", "billing", 1002);
+        c.listener = Some("orders-mysql".into());
+        c.event_id = Some("ae-lsn-c".into());
+        idx.insert(&c).unwrap();
+
+        let only_mysql = idx
+            .query(&AuditQueryFilter {
+                listener: Some("orders-mysql".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(only_mysql.len(), 2, "{only_mysql:?}");
+        assert!(only_mysql.iter().all(|e| e.listener.as_deref() == Some("orders-mysql")));
+
+        let only_pg = idx
+            .query(&AuditQueryFilter {
+                listener: Some("orders-pg".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(only_pg.len(), 1);
+        assert_eq!(only_pg[0].event_id.as_deref(), Some("ae-lsn-b"));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

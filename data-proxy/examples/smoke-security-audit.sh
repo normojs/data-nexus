@@ -189,6 +189,25 @@ for e in ev:
     assert e.get("outcome") == "security_deny", e
 assert data.get("source") == "index", data
 print("outcome=security_deny filter ok", "events", len(ev))
+# pick a listener for UI19 filter
+lsn = next((e.get("listener") for e in ev if e.get("listener")), None)
+assert lsn, f"expected deny event with listener, got {ev[0] if ev else None}"
+open("/tmp/dn-audit-deny-listener.txt","w").write(lsn)
+print("deny listener", lsn)
+PY
+
+DENY_LSN=$(cat /tmp/dn-audit-deny-listener.txt)
+echo "==> GET /admin/audit/events?listener=$DENY_LSN"
+curl -fsS "http://127.0.0.1:8082/admin/audit/events?listener=${DENY_LSN}&limit=20" | tee /tmp/dn-audit-listener.json >/dev/null
+python3 - <<PY
+import json
+data=json.load(open("/tmp/dn-audit-listener.json"))
+ev=data.get("events") or []
+assert ev, data
+for e in ev:
+    assert e.get("listener") == "$DENY_LSN", e
+assert data.get("source") == "index", data
+print("listener filter ok", "listener=$DENY_LSN", "events", len(ev))
 PY
 
 echo "smoke-security-audit: OK"

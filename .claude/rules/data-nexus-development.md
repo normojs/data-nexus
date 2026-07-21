@@ -105,7 +105,7 @@ docs/            架构与路线图（权威细节）
 
 - 只使用 `useAdminApi`。
 - 401 → 登录；403 → 友好页。
-- 后端已有过滤字段时 UI 必须吃到（审计 `event_id` / 时间窗 / `source` / `audit_level` / `outcome` / B08 `sample_*`；portal `stream` / `window_rows`）。
+- 后端已有过滤字段时 UI 必须吃到（审计 `event_id` / 时间窗 / `source` / `audit_level` / `outcome` / `listener` / B08 `sample_*`；portal `stream` / `window_rows`）。
 
 ## 9. Git 与发布
 
