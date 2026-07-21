@@ -245,3 +245,4 @@ examples/        smoke + gateway config 样例
 | UI23 | Tickets client-side status/subject/type filter + chips | feat(ui23) |
 | UI24 | Vault lease status/project/env/service client filter | feat(ui24) |
 | UI25 | Sessions listener/protocol/database/peer client filter | feat(ui25) |
+| UI26 | Portal project/lease picker client filters | feat(ui26) |
