@@ -101,7 +101,7 @@ meta=json.loads(lines[0])
 assert meta.get("_meta") is True
 assert meta.get("stream") == "backend_window", meta
 assert meta.get("service") == "orders-via-pg", meta
-assert int(meta.get("window_rows") or 0) >= 1, meta
+assert int(meta.get("window_rows") or 0) == 2, meta
 rows=[]
 for ln in lines[1:]:
     obj=json.loads(ln)
@@ -136,6 +136,7 @@ assert "x-data-nexus-stream: backend_window" in hdr, hdr
 body=json.load(open("/tmp/dn-portal-xproto-rev.json"))
 assert body.get("decision")=="allow", body
 assert body.get("stream")=="backend_window", body
+assert int(body.get("window_rows") or 0) == 2, body
 assert body.get("row_count", 0) >= 2, body
 assert isinstance(body.get("rows"), list) and len(body["rows"]) >= 2, body
 print("portal reverse xproto json backend_window ok", "rows", body.get("row_count"), "window", body.get("window_rows"))

@@ -173,6 +173,7 @@ examples/        smoke + gateway config 样例
 | chore | smoke matrix inventory + portal export stream header UI | chore(smoke/ui) |
 | A06 | OBSERVABILITY O01/A06 metrics + stream smoke hard-fail peak | docs(a06)/test |
 | H05 | backend_identity returns Zeroizing password | feat(h05) |
+| A09 | xproto portal smokes hard-assert window_rows==2 | test(a09) |
 
 ---
 

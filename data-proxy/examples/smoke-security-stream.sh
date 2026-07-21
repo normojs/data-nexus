@@ -765,7 +765,8 @@ if echo "$metrics" | grep -q 'gateway_execute_path_total'; then
     exit 1
   fi
 else
-  echo "note: gateway_execute_path_total metric missing; continuing"
+  echo "FAIL: gateway_execute_path_total missing after Streaming traffic" >&2
+  exit 1
 fi
 
 # A06 honesty: encode windows written and logical peak window rows ≤ configured window_rows=2.
