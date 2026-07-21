@@ -68,7 +68,8 @@ done
     echo "using binary: $PROXY_BIN" >>"$PROXY_LOG"
     # Rebuild if sources newer than binary (stale binary misses S1 routes).
     if [[ "$ROOT/gateway/core/src/pdp.rs" -nt "$PROXY_BIN" ]] 2>/dev/null \
-      || [[ "$ROOT/runtime/gateway/src/core_engine.rs" -nt "$PROXY_BIN" ]] 2>/dev/null; then
+      || [[ "$ROOT/runtime/gateway/src/core_engine.rs" -nt "$PROXY_BIN" ]] 2>/dev/null \
+      || [[ "$ROOT/http/src/http/mod.rs" -nt "$PROXY_BIN" ]] 2>/dev/null; then
       cargo build -p data-proxy --bin proxy
       PROXY_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/proxy"
       if [[ ! -x "$PROXY_BIN" ]]; then
@@ -121,11 +122,24 @@ assert data["audit_sample"]["sample_max_rows"] >= 1, data["audit_sample"]
 # watermark static token value must never leak
 assert "token" not in data["watermark"], data["watermark"]
 assert "has_static_token" in data["watermark"], data["watermark"]
+# UI18 / F31: nested pdp summary (no remote_url / remote_token values)
+assert "pdp" in data, sorted(data.keys())
+pdp = data["pdp"]
+assert pdp.get("backend") in ("local", "cedar", "remote"), pdp
+assert "remote_configured" in pdp and "remote_timeout_ms" in pdp, pdp
+assert "remote_fail_closed" in pdp and "remote_token_configured" in pdp, pdp
+assert int(pdp.get("remote_timeout_ms") or 0) >= 1, pdp
+# secrets must never appear
+blob = json.dumps(data)
+assert "remote_url" not in data["pdp"], data["pdp"]
+assert "remote_token" not in data["pdp"], data["pdp"]
+assert "remote_token" not in blob or '"remote_token_configured"' in blob
 print("security-policies:", data["rule_count"], "rules", names,
       "masks", len(data["mask_rules"]),
       "tags", len(data["column_tags"]),
       "high_risk", len(data["high_risk_rules"]),
-      "sample", data["audit_sample"]["sample_enabled"])
+      "sample", data["audit_sample"]["sample_enabled"],
+      "pdp", pdp.get("backend"), "remote_cfg", pdp.get("remote_configured"))
 PY
 
 mysql_via_gateway() {

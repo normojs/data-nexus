@@ -76,7 +76,7 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-echo "==> security-policies exposes B07 audit_queue"
+echo "==> security-policies exposes B07 audit_queue + UI18 pdp"
 curl -fsS "http://127.0.0.1:8082/admin/security-policies" | tee /tmp/dn-audit-policies.json >/dev/null
 python3 - <<'PY'
 import json
@@ -86,7 +86,11 @@ assert int(q.get("queue_capacity") or 0) >= 1, q
 assert int(q.get("priority_queue_capacity") or 0) >= 1, q
 assert q.get("overflow"), q
 assert isinstance(q.get("sinks"), list) and q["sinks"], q
-print("policies audit_queue", q)
+pdp=data.get("pdp") or {}
+assert pdp.get("backend") in ("local","cedar","remote"), pdp
+assert "remote_configured" in pdp and "remote_fail_closed" in pdp, pdp
+assert "remote_url" not in pdp and "remote_token" not in pdp, pdp
+print("policies audit_queue", q, "pdp", pdp)
 PY
 
 echo "==> GET /admin/audit/stats"

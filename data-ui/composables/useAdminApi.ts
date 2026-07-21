@@ -254,6 +254,15 @@ export type AdminSecurityPolicies = {
   sql_text_max_chars?: number
   pdp_backend: string
   pdp_policy_dir?: string | null
+  /** F31/UI18: nested PDP summary (no remote_url / token values). */
+  pdp?: {
+    backend: string
+    policy_dir?: string
+    remote_configured: boolean
+    remote_timeout_ms: number
+    remote_fail_closed: boolean
+    remote_token_configured: boolean
+  }
   rule_count: number
   rules: AdminSecurityRule[]
   mask_rules?: AdminSecurityMaskRule[]

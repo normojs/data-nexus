@@ -482,6 +482,8 @@ struct AdminSecurityPoliciesResponse {
     /// Present when `security.pdp.policy_dir` is set (Cedar / file PDP).
     #[serde(skip_serializing_if = "Option::is_none")]
     pdp_policy_dir: Option<String>,
+    /// F31/UI18: nested PDP summary (remote knobs; no URL/token values).
+    pdp: AdminSecurityPdpSummary,
     rule_count: usize,
     rules: Vec<AdminSecurityRuleSummary>,
     /// UI04: mask algorithms (name + algorithm only; no secrets).
@@ -616,6 +618,22 @@ struct AdminSecurityStateSummary {
     ticket_encrypt_configured: bool,
     /// True when `vault_encrypt_key` is non-empty (value never returned).
     vault_encrypt_configured: bool,
+}
+
+/// F31/UI18: PDP backend snapshot (read-only; never returns remote_token / URL secrets).
+#[derive(Debug, Serialize)]
+struct AdminSecurityPdpSummary {
+    /// `local` | `cedar` | `remote`.
+    backend: String,
+    /// Cedar / file policy dir when set (empty string omitted by skip).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    policy_dir: String,
+    /// True when `remote_url` is non-empty (value never returned).
+    remote_configured: bool,
+    remote_timeout_ms: u64,
+    remote_fail_closed: bool,
+    /// True when Bearer token is configured (value never returned).
+    remote_token_configured: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1114,6 +1132,14 @@ impl AxumServer {
                         sql_text_max_chars: security.audit.sql_text_max_chars,
                         pdp_backend: security.pdp.backend.clone(),
                         pdp_policy_dir,
+                        pdp: AdminSecurityPdpSummary {
+                            backend: security.pdp.backend.clone(),
+                            policy_dir: security.pdp.policy_dir.clone(),
+                            remote_configured: !security.pdp.remote_url.trim().is_empty(),
+                            remote_timeout_ms: security.pdp.remote_timeout_ms,
+                            remote_fail_closed: security.pdp.remote_fail_closed,
+                            remote_token_configured: !security.pdp.remote_token.trim().is_empty(),
+                        },
                         rule_count: security.rules.len(),
                         rules: security
                             .rules

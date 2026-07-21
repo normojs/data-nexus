@@ -169,6 +169,16 @@ onMounted(() => {
             {{ policy.pdp_policy_dir }}
           </dd>
         </div>
+        <div v-if="policy.pdp">
+          <dt>pdp (F31)</dt>
+          <dd class="mono">
+            backend={{ policy.pdp.backend }}
+            · remote_configured={{ policy.pdp.remote_configured }}
+            · timeout_ms={{ policy.pdp.remote_timeout_ms }}
+            · fail_closed={{ policy.pdp.remote_fail_closed }}
+            · token={{ policy.pdp.remote_token_configured ? 'yes' : 'no' }}
+          </dd>
+        </div>
         <div v-if="policy.streaming">
           <dt>streaming.window_rows</dt>
           <dd class="mono">
