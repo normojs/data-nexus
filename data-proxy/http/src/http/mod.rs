@@ -492,6 +492,8 @@ struct AdminSecurityPoliciesResponse {
     time_rules: Vec<AdminSecurityTimeRuleSummary>,
     watermark: AdminSecurityWatermarkSummary,
     streaming: AdminSecurityStreamingSummary,
+    /// B08 sample attach policy (requires default_audit_level=L2 when enabled).
+    audit_sample: AdminSecurityAuditSampleSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -568,6 +570,17 @@ struct AdminSecurityStreamingSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_bytes: Option<u64>,
     passthrough: bool,
+}
+
+/// B08: audit sample knobs (read-only; no secrets).
+#[derive(Debug, Serialize)]
+struct AdminSecurityAuditSampleSummary {
+    sample_enabled: bool,
+    sample_max_rows: u32,
+    sample_max_bytes: u32,
+    sample_inline: bool,
+    /// Empty uses default prefix `samples`.
+    sample_prefix: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1136,6 +1149,13 @@ impl AxumServer {
                             max_rows: security.streaming.max_rows,
                             max_bytes: security.streaming.max_bytes,
                             passthrough: security.streaming.passthrough,
+                        },
+                        audit_sample: AdminSecurityAuditSampleSummary {
+                            sample_enabled: security.audit.sample_enabled,
+                            sample_max_rows: security.audit.sample_max_rows,
+                            sample_max_bytes: security.audit.sample_max_bytes,
+                            sample_inline: security.audit.sample_inline,
+                            sample_prefix: security.audit.sample_prefix.clone(),
                         },
                     })
                 }

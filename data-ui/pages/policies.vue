@@ -184,6 +184,17 @@ onMounted(() => {
             {{ policy.streaming.max_rows }}
           </dd>
         </div>
+        <div v-if="policy.audit_sample">
+          <dt>audit.sample</dt>
+          <dd class="mono">
+            {{ policy.audit_sample.sample_enabled ? 'on' : 'off' }}
+            · max_rows={{ policy.audit_sample.sample_max_rows }}
+            · max_bytes={{ policy.audit_sample.sample_max_bytes }}
+            · inline={{ policy.audit_sample.sample_inline }}
+            · prefix={{ policy.audit_sample.sample_prefix || 'samples' }}
+            · needs L2
+          </dd>
+        </div>
         <div v-if="policy.watermark">
           <dt>watermark</dt>
           <dd class="mono">

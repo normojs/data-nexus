@@ -268,6 +268,14 @@ export type AdminSecurityPolicies = {
     max_bytes?: number | null
     passthrough: boolean
   }
+  /** B08: L2 result sample knobs (requires default_audit_level=L2 when enabled). */
+  audit_sample?: {
+    sample_enabled: boolean
+    sample_max_rows: number
+    sample_max_bytes: number
+    sample_inline: boolean
+    sample_prefix: string
+  }
 }
 
 export type AdminCedarReloadInfo = {
