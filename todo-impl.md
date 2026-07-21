@@ -28,11 +28,11 @@
 | 组 | 脚本数 | 内容 |
 |----|:------:|------|
 | `l0` | 4 | admin-auth / dual-listener / cross-protocol ×2 |
-| `security-core` | 9 | deny / column / mask / audit / **audit-sample** / ticket / portal / vault / **state-file** |
+| `security-core` | 10 | deny / column / mask / audit / **audit-sample** / ticket / portal / vault / **state-file** / **config-validate** |
 | `security-extended` | 8 | stream / passthrough / watermark / dual-control / time / xproto-stream / **portal-xproto×2** |
 | `cedar` | 2 | cedar + cedar-reload（需 `--features security-cedar`） |
-| **default** | **13** | l0 + security-core |
-| **all** | **21** | default + security-extended（不含 cedar） |
+| **default** | **14** | l0 + security-core |
+| **all** | **22** | default + security-extended（不含 cedar） |
 
 ### 可选 Cargo features
 
@@ -255,3 +255,4 @@ examples/        smoke + gateway config 样例
 | A09 | portal `x-data-nexus-window-rows` header + CSV/xproto smoke pin | feat(a09) |
 | T01 | qualified/alias star deny smoke + extract unit (no * expansion) | test(t01) |
 | B08/H05 | sample truncated hard-assert + UI non-L3/non-CRDT honesty | test(b08)/feat(ui) |
+| A08/B08 | config-validate smoke: sample L2 gate + require TLS needs CA | test(config) |

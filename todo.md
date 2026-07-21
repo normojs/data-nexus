@@ -58,9 +58,9 @@ cd data-proxy
   - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`、`OBSERVABILITY.md`
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
-  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 配置下 extended 降级 Streaming**（PG `QUERY_PARAMS` + **MySQL COM_STMT EXECUTE** demote；smoke **同时**断言 passthrough+streaming 计数共存）  
+  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 配置下 extended 降级 Streaming**（PG `QUERY_PARAMS` + **MySQL COM_STMT EXECUTE** demote；smoke **同时**断言 passthrough+streaming 计数共存）；**`smoke-security-config-validate` 拒绝 require+verify 无 CA**  
   - 仍欠：**extended 仍非 TCP 帧中继**（无 bind 原包透传）；Streaming 仍用 pool  
-  - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`smoke-security-passthrough.sh`、`OBSERVABILITY.md`
+  - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`smoke-security-passthrough.sh`、`smoke-security-config-validate.sh`、`OBSERVABILITY.md`
 
 - [ ] **A09** Portal 端到端流式  
   - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`（smoke：INSERT NDJSON/JSON/CSV **强制** `x-data-nexus-stream: chunked`）；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**；**跨协议 portal 双向** smoke 同窗；**响应头 `x-data-nexus-window-rows`**（CSV 无 body meta 时仍可钉窗）；**OBSERVABILITY** 标明 chunked ≠ backend_window  
@@ -77,9 +77,9 @@ cd data-proxy
 ## 2. P1 — 策略 / 合规 / 运维
 
 - [ ] **B08** L2 样本 / 大 payload  
-  - 已有：物化 ResultSet + Streaming 首窗（脱敏后）；`sample_enabled` 默认关；OpenDAL 可选；**validate：`sample_enabled` 必须 `default_audit_level=L2`**（防静默 no-op）；`OBSERVABILITY.md` + prod 模板诚实说明；smoke `smoke-security-audit-sample.sh` 断言 `sample_body` 有界且 **truncated 当 seed>max_rows**；UI 标明 **非 L3**  
+  - 已有：物化 ResultSet + Streaming 首窗（脱敏后）；`sample_enabled` 默认关；OpenDAL 可选；**validate：`sample_enabled` 必须 `default_audit_level=L2`**（防静默 no-op）；`OBSERVABILITY.md` + prod 模板诚实说明；smoke `smoke-security-audit-sample.sh` 断言 `sample_body` 有界且 **truncated 当 seed>max_rows**；UI 标明 **非 L3**；**`smoke-security-config-validate` 拒绝 L0+sample_enabled**  
   - 仍欠：勿宣传「全量 L2 / L3 合规样本」；OpenDAL 上传仍需 feature；高 QPS 默认仍应关  
-  - 路径：`security.rs` validate、`audit` sample attach、`OBSERVABILITY.md`、`smoke-security-audit-sample.sh`
+  - 路径：`security.rs` validate、`audit` sample attach、`OBSERVABILITY.md`、`smoke-security-audit-sample.sh`、`smoke-security-config-validate.sh`
 
 - [ ] **H05** 多实例状态外置（含 H08 vault 文件加密）  
   - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板；**vault `backend_password` ZeroizeOnDrop + revoke zeroize**；**`backend_identity` → `Zeroizing<String>`**；**Admin `security-policies.state` 只读摘要**；**smoke `smoke-security-state-file`**：file backend + encrypt flags + 密文落盘 + **重启后 ticket/lease 仍在** + **`policy_path` mtime 热更 deny E2E**；UI Overview/Settings/Vault/Tickets 标明 **last-writer-wins / 非 CRDT / 非 mlock**  
