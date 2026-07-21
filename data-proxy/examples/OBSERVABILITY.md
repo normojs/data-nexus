@@ -49,6 +49,21 @@ Command metrics labels include listener, service, frontend protocol, backend pro
 
 `execute_path` values match B03: `passthrough` / `streaming` / `materialized` / `xproto_stream` / `n/a`.
 
+### A-track honesty (A06 / A08 / A09 / A10)
+
+Do **not** treat path counters as proof of end-to-end zero-copy or process RSS bounds.
+
+| Claim you might want | What the product actually guarantees today |
+|----------------------|--------------------------------------------|
+| Peak memory ≈ window | **Logical** encode peak only: `gateway_encode_peak_window_rows` high-water of rows held in one encode window. Smoke forces peak ≤ `window_rows`. **No process RSS CI.** |
+| Passthrough always wire | **Simple Query** same-protocol + no result obligations can be `passthrough` (PG TCP frame relay / MySQL wire). **Extended** (PG Bind/Execute, MySQL COM_STMT) under `passthrough=true` **demotes to `streaming`** (re-encode window path). **Not** TCP bind-frame relay. |
+| Portal export is streaming | Multi-row SELECT Streaming → HTTP `x-data-nexus-stream: backend_window` (NDJSON/CSV/JSON). **Complete** (INSERT/DDL/no RowStream) → `chunked` (HTTP windows; backend ResultSet may already be materialized). |
+| PG PortalSuspended = cursor | Client Execute `max_rows` page → `s` footer; multi-Execute resume uses **`pg_portal_skip_rows` logical skip** (SQL is re-run; rows already returned are skipped). **Not** a backend `HOLD` cursor. Policy `max_rows` still ends with `C`. |
+| All traffic is Streaming | Control / empty Complete paths may label `n/a` or `materialized` depending on response shape. Row-returning Query* under obligations/max_rows should hit `streaming`. |
+| Sample / L2 = full result | B08 samples are bounded rows/bytes and require `default_audit_level=L2`. **Not** L3 full-result archive. |
+
+Related smokes: `smoke-security-stream.sh` (streaming + peak≤window + PortalSuspended resume), `smoke-security-passthrough.sh` (simple passthrough + extended demote streaming), `smoke-security-portal*.sh` (backend_window vs chunked).
+
 ### Secure encode metrics (O01 / A06, always on)
 
 | Metric | Type | Labels | Notes |
@@ -60,13 +75,23 @@ Command metrics labels include listener, service, frontend protocol, backend pro
 
 SQL base labels: `listener`, `service`, `frontend_protocol`, `backend_protocol`, `command_type`, `endpoint` (same as other gateway SQL series; metric names may be prefixed by the process exporter, e.g. `unisql_proxy_`).
 
+Interpreting `execute_path` for dashboards:
+
+- **`passthrough`**: wire/TCP relay path — count as “fast path hits”, not as “no security”.
+- **`streaming`**: windowed encode path (includes A08 demoted extended under passthrough config, and A06/A10 row streams with obligations).
+- **`materialized` / `n/a`**: control packets, empty Complete, or responses without a row stream — **expected**, not a regression by itself.
+- **`xproto_stream`**: cross-protocol translation Streaming.
+
 Example PromQL:
 
 ```text
-# passthrough hit rate (5m)
+# passthrough hit rate (5m) — simple Query only in practice when obligations are empty
 sum(rate(unisql_proxy_gateway_execute_path_total{execute_path="passthrough"}[5m]))
 /
 sum(rate(unisql_proxy_gateway_execute_path_total[5m]))
+
+# logical peak should stay near configured window_rows (not RSS)
+max_over_time(unisql_proxy_gateway_encode_peak_window_rows[5m])
 ```
 
 ### Audit pipeline metrics (always on)

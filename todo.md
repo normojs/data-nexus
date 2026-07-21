@@ -53,22 +53,22 @@ cd data-proxy
 > A1–A4 / A07 骨架与 socket writer 已交付（见归档）。
 
 - [ ] **A06** Backend→PEP 真行流  
-  - 已有：MySQL/PG `RowStream` + channel（含事务 producer 还 lease）；smoke 双协议 max_rows（含 txn）；**Materialized Query* 升 Streaming**；encode 峰值单测；**`StreamingEncodeStats.peak_window_rows` + Prometheus `gateway_encode_peak_window_rows`**（逻辑峰值高水位，非 RSS）；smoke **强制** `execute_path=streaming` + `encode_windows>0` + **peak≤window_rows**  
+  - 已有：MySQL/PG `RowStream` + channel（含事务 producer 还 lease）；smoke 双协议 max_rows（含 txn）；**Materialized Query* 升 Streaming**；encode 峰值单测；**`StreamingEncodeStats.peak_window_rows` + Prometheus `gateway_encode_peak_window_rows`**（逻辑峰值高水位，非 RSS）；smoke **强制** `execute_path=streaming` + `encode_windows>0` + **peak≤window_rows**；**control INSERT 后仍可 SELECT**；`OBSERVABILITY` A-track 诚实表  
   - 仍欠：控制语句/空结果 Complete 仍可小物化；**无进程 RSS 峰值 CI**（仅逻辑窗口峰值；smoke 已强制 peak 指标存在且 ≤window）；portal Complete 见 A09  
-  - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`
+  - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`、`OBSERVABILITY.md`
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
-  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 配置下 extended 降级 Streaming**（PG `QUERY_PARAMS` + **MySQL COM_STMT EXECUTE** demote；smoke 双边 streaming）  
+  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 配置下 extended 降级 Streaming**（PG `QUERY_PARAMS` + **MySQL COM_STMT EXECUTE** demote；smoke **同时**断言 passthrough+streaming 计数共存）  
   - 仍欠：**extended 仍非 TCP 帧中继**（无 bind 原包透传）；Streaming 仍用 pool  
-  - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`smoke-security-passthrough.sh`
+  - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`smoke-security-passthrough.sh`、`OBSERVABILITY.md`
 
 - [ ] **A09** Portal 端到端流式  
-  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`（smoke：INSERT NDJSON/JSON/CSV **强制** `x-data-nexus-stream: chunked`）；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**；**跨协议 portal 双向** smoke 同窗  
+  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`（smoke：INSERT NDJSON/JSON/CSV **强制** `x-data-nexus-stream: chunked`）；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**；**跨协议 portal 双向** smoke 同窗；**OBSERVABILITY** 标明 chunked ≠ backend_window  
   - 仍欠：Complete 路径 ResultSet 在 backend 侧仍可能先物化（无 RowStream 时不可避免）；无进程 RSS 峰值 CI（逻辑 window 已钉）  
   - 路径：`http` portal_execute_*_streaming；`security-portal-gateway-config.toml`；`security-portal-xproto{,-pg-mysql}-gateway-config.toml`；`smoke-security-portal{,-xproto,-xproto-pg-mysql}.sh`
 
 - [ ] **A10** 预处理 / 事务透传矩阵  
-  - 已有：MySQL COM_STMT + Streaming + PREPARE 列定义；PG Parse/Bind/Execute + Streaming；Describe 显式 SELECT + `SELECT *` catalog；扩展协议 Execute 不发 Z；**客户端 Execute max_rows → PortalSuspended（s）**；**同 portal 二次/三次 Execute 逻辑续读**（`pg_portal_skip_rows` 跳过已发行；仍重跑 SQL，非 backend 真游标 hold）；策略 max_rows 仍 C；协议 smoke（policy C + page 网关 `s` + multi-Execute resume）  
+  - 已有：MySQL COM_STMT + Streaming + PREPARE 列定义；PG Parse/Bind/Execute + Streaming；Describe 显式 SELECT + `SELECT *` catalog；扩展协议 Execute 不发 Z；**客户端 Execute max_rows → PortalSuspended（s）**；**同 portal 二次/三次 Execute 逻辑续读**（`pg_portal_skip_rows` 跳过已发行；仍重跑 SQL，非 backend 真游标 hold）；策略 max_rows 仍 C；协议 smoke（policy C + page 网关 `s` + multi-Execute resume）；**smoke/文档明确 logical skip ≠ HOLD cursor**  
   - 仍欠：非 TCP passthrough；**真 backend 游标/hold portal**（当前 skip 为逻辑重跑）；复杂 JOIN `*` 依赖 backend prepare  
   - 路径：frontend/backend mysql+pg、`SessionState.pg_portal_skip_rows`、`encode_portal_suspended`、`security-stream-page-gateway-config.toml`、`smoke-security-stream.sh`
 
@@ -117,8 +117,8 @@ cd data-proxy
 | 主题 | 限制 |
 |------|------|
 | Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`（**双向跨协议 portal** MySQL↔PG）；**Complete → `chunked`**；backend 无 RowStream 时仍可能先物化；无进程峰值 CI |
-| 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；控制语句/Complete 小结果仍可物化；**非进程 RSS CI** |
-| PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；simple Query 透传；**extended 在 passthrough 配置下降级 Streaming（非 TCP bind 中继）** |
+| 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；控制语句/Complete 小结果仍可物化；**非进程 RSS CI**；见 `OBSERVABILITY` A-track 表 |
+| PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；simple Query 透传；**extended 在 passthrough 配置下降级 Streaming（非 TCP bind 中继）**；smoke 要求 passthrough+streaming 计数共存 |
 | 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended + 逻辑 multi-Execute 续读（skip 重跑）**；策略截断仍 C；**非 backend 真游标**；非 TCP passthrough |
 | 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；活跃 vault 密码在 RAM；revoke/prune/Drop zeroize；`backend_identity` 返回 Zeroizing（非 mlock） |
 | L2 样本 | B08：默认关；有界 rows/bytes；**sample_enabled 强制 L2**；OpenDAL 需 feature；**非全量 L3** |

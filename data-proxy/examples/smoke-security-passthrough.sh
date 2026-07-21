@@ -257,7 +257,20 @@ assert (
     'execute_path="streaming"' in text
     or "execute_path=\"streaming\"" in text
 ), "expected streaming path for extended under passthrough config"
-print("A08 extended under passthrough uses streaming path")
+# Honesty: demote ≠ TCP bind-frame relay. We only prove path labels coexist:
+# simple Query can be passthrough while extended is streaming under the same config.
+pt_lines = [
+    ln for ln in text.splitlines()
+    if "gateway_execute_path_total" in ln and "passthrough" in ln and not ln.startswith("#")
+]
+st_lines = [
+    ln for ln in text.splitlines()
+    if "gateway_execute_path_total" in ln and "streaming" in ln and not ln.startswith("#")
+]
+assert pt_lines, "expected passthrough counter samples"
+assert st_lines, "expected streaming counter samples after demoted extended"
+print("A08 honesty: passthrough (simple) + streaming (extended demote) both present")
+print("A08 extended under passthrough uses streaming path (not TCP bind relay)")
 print("A05 metrics ok")
 for line in text.splitlines():
     if "gateway_execute_path_total" in line or "gateway_passthrough_bytes_total" in line:
