@@ -92,9 +92,9 @@ cd data-proxy
   - 路径：部署 runbook / 运维侧
 
 - [ ] **T01** 列 ACL / 复杂 SQL 用例矩阵  
-  - 已有：extract/PDP 单测；WHERE/HAVING/EXISTS/IN/标量子查询表提取；column smoke WHERE IN deny；**嵌套 SELECT 列表列 strip**（`rewrite_nested_select_lists`，含多层 derived table 单测）  
+  - 已有：extract/PDP 单测；WHERE/HAVING/EXISTS/IN/标量子查询表提取；column smoke WHERE IN deny；**嵌套 SELECT 列表列 strip**（多层 derived table 单测 + `smoke-security-column` multi-level E2E）  
   - 仍欠：**`*` / `t.*` 仍不展开**；相关子查询表达式/极端方言仍 heuristic  
-  - 路径：`object_extract`、`pdp::rewrite_select_strip_columns`、smoke
+  - 路径：`object_extract`、`pdp::rewrite_select_strip_columns`、`smoke-security-column.sh`
 
 - [ ] **F30** 敏感识别增强 — **延后**  
   - 现状：仅 `column_tags` + mask 规则  

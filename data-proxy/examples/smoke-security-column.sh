@@ -223,4 +223,18 @@ grep -qiE 'secret|token|denied|security|ERROR|1105|policy' /tmp/data-nexus-colum
 kill -0 "$PROXY_PID"
 echo "T01 WHERE subquery deny ok"
 
+echo "==> T01: multi-level nested SELECT strips salary at every projection"
+out="$(mysql_via_gateway 'SELECT id, salary FROM (SELECT id, salary FROM (SELECT id, name, salary FROM employees) x) y WHERE id=1;')"
+echo "$out"
+if echo "$out" | grep -q '90000'; then
+  echo "T01 multi-level nested: salary leaked" >&2
+  exit 1
+fi
+# Should still return id (+ maybe name if rewritten poorly kept) — require no salary value
+echo "$out" | tr '\t' ' ' | grep -q '1' || {
+  echo "T01 multi-level nested: expected row with id=1" >&2
+  exit 1
+}
+echo "T01 multi-level nested strip ok"
+
 echo "smoke-security-column: OK"
