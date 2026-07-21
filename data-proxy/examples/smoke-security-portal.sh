@@ -10,7 +10,7 @@ export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.1}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE_FILE="$ROOT/examples/docker-compose.dev.yml"
-CONFIG_FILE="$ROOT/examples/security-deny-gateway-config.toml"
+CONFIG_FILE="$ROOT/examples/security-portal-gateway-config.toml"
 PROXY_LOG="${TMPDIR:-/tmp}/data-nexus-portal-smoke.log"
 COMPOSE=(docker compose -f "$COMPOSE_FILE")
 
@@ -48,7 +48,7 @@ echo "==> gateway"
 PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
 (
   cd "$ROOT"
-  if [[ ! -x "$PROXY_BIN" ]] || [[ "$ROOT/http/src/http/mod.rs" -nt "$PROXY_BIN" ]]; then
+  if [[ ! -x "$PROXY_BIN" ]]     || [[ "$ROOT/http/src/http/mod.rs" -nt "$PROXY_BIN" ]]     || [[ "$CONFIG_FILE" -nt "$PROXY_BIN" ]]; then
     cargo build -p data-proxy --bin proxy
   fi
   "$PROXY_BIN" daemon -c "$CONFIG_FILE"
@@ -195,7 +195,8 @@ assert len(lines) >= 2, lines
 meta=json.loads(lines[0])
 assert meta.get("_meta") is True
 assert meta.get("stream") == "backend_window", meta
-assert meta.get("window_rows", 0) >= 1, meta
+# A09: portal smoke config pins window_rows=2 for honest windowed export.
+assert int(meta.get("window_rows") or 0) == 2, meta
 rows=[]
 for ln in lines[1:]:
     obj=json.loads(ln)
@@ -222,6 +223,7 @@ assert "x-data-nexus-stream: backend_window" in hdr, hdr
 body=json.load(open("/tmp/dn-portal-multi.json"))
 assert body.get("decision")=="allow", body
 assert body.get("stream")=="backend_window", body
+assert int(body.get("window_rows") or 0) == 2, body
 assert body.get("row_count", 0) >= 2, body
 assert isinstance(body.get("rows"), list) and len(body["rows"]) >= 2, body
 # rows remain array-of-arrays (AdminPortalQueryResponse shape for data-ui).

@@ -164,6 +164,7 @@ examples/        smoke + gateway config 样例
 | B08 | sample_enabled requires L2 + audit sample smoke + docs | feat(b08) |
 | T01 | nested SELECT list column strip rewrite | feat(t01) |
 | T01 | multi-level nested SELECT column strip E2E smoke | feat(t01) |
+| A09 | portal same-protocol smoke pins window_rows=2 | feat(a09) |
 
 ---
 

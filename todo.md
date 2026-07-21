@@ -63,9 +63,9 @@ cd data-proxy
   - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`smoke-security-passthrough.sh`
 
 - [ ] **A09** Portal 端到端流式  
-  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`；JSON 分片文档 UI 可 parse；**跨协议 portal 双向** smoke：MySQL→PG（`smoke-security-portal-xproto.sh`）与 **PG→MySQL**（`smoke-security-portal-xproto-pg-mysql.sh`），均 `window_rows=2` 强制三格式 `backend_window` + dialect rewrite + DDL 拒绝  
-  - 仍欠：Complete 路径 ResultSet 在 backend 侧仍可能先物化（无 RowStream 时不可避免）；无进程峰值 CI  
-  - 路径：`http` portal_execute_*_streaming + `portal_prepare` translation；`security-portal-xproto{,-pg-mysql}-gateway-config.toml`；`smoke-security-portal{,-xproto,-xproto-pg-mysql}.sh`
+  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**（`security-portal-gateway-config.toml` 强制 meta/body `window_rows==2`）；**跨协议 portal 双向** smoke 同窗  
+  - 仍欠：Complete 路径 ResultSet 在 backend 侧仍可能先物化（无 RowStream 时不可避免）；无进程 RSS 峰值 CI  
+  - 路径：`http` portal_execute_*_streaming；`security-portal-gateway-config.toml`；`security-portal-xproto{,-pg-mysql}-gateway-config.toml`；`smoke-security-portal{,-xproto,-xproto-pg-mysql}.sh`
 
 - [ ] **A10** 预处理 / 事务透传矩阵  
   - 已有：MySQL COM_STMT + Streaming + PREPARE 列定义；PG Parse/Bind/Execute + Streaming；Describe 显式 SELECT + `SELECT *` catalog；扩展协议 Execute 不发 Z；**客户端 Execute max_rows → PortalSuspended（s）**；**同 portal 二次/三次 Execute 逻辑续读**（`pg_portal_skip_rows` 跳过已发行；仍重跑 SQL，非 backend 真游标 hold）；策略 max_rows 仍 C；协议 smoke（policy C + page 网关 `s` + multi-Execute resume）  
@@ -134,7 +134,7 @@ cd data-proxy
 
 建议优先级：
 
-1. **A06/A09** 进程峰值 CI（可选）  
+1. **A06** 进程 RSS 峰值 CI（可选；逻辑 peak 已有）  
 2. **A10** backend 真游标 hold（可选；逻辑 skip 已交付）  
 3. **A08** extended TCP bind 帧中继（可选）  
 4. **H05** CRDT / mlock（可选）  
