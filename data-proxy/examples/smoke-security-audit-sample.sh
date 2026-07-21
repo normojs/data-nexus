@@ -148,6 +148,13 @@ print(
 )
 # Sanity: no multi-MB body
 assert len(json.dumps(body_ev)) < 100_000
+# F32: L2 keeps truncated sql_text (never full multi-MB dump).
+assert str(body_ev.get("audit_level") or "").upper() == "L2", body_ev.get("audit_level")
+sql = body_ev.get("sql_text")
+assert sql, f"L2 sample event should retain sql_text, keys={list(body_ev.keys())}"
+assert "audit_sample_t" in sql.lower() or "select" in sql.lower(), sql
+assert len(sql) < 10_000, f"sql_text unexpectedly huge: {len(sql)}"
+print("F32 L2 keeps sql_text ok", "chars", len(sql))
 PY
 
 echo "smoke-security-audit-sample: OK"

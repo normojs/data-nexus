@@ -230,3 +230,4 @@ examples/        smoke + gateway config 样例
 修订：从原 `todo.md` §1–§2 拆出；主看板仅保留未完成。
 | UI15 | Audit event detail shows F32 sql_text + sample | feat(ui15) |
 | F32 | smoke L0 strips sql_text on deny audit events | test(f32) |
+| F32 | smoke L2 keeps truncated sql_text on sample events | test(f32) |
