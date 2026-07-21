@@ -276,6 +276,16 @@ export type AdminSecurityPolicies = {
     sample_inline: boolean
     sample_prefix: string
   }
+  /** H05: multi-instance state (paths only; encrypt keys never returned). */
+  state?: {
+    backend: string
+    ticket_path: string
+    vault_path: string
+    policy_path: string
+    policy_poll_ms: number
+    ticket_encrypt_configured: boolean
+    vault_encrypt_configured: boolean
+  }
 }
 
 export type AdminCedarReloadInfo = {

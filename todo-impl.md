@@ -175,6 +175,7 @@ examples/        smoke + gateway config 样例
 | H05 | backend_identity returns Zeroizing password | feat(h05) |
 | A09 | xproto portal smokes hard-assert window_rows==2 | test(a09) |
 | A08 | MySQL prepared under passthrough demotes Streaming smoke | test(a08) |
+| H05 | security-policies exposes state summary (no keys) | feat(h05/ui04) |
 
 ---
 

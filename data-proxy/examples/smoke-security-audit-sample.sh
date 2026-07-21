@@ -86,6 +86,20 @@ assert int(s.get("sample_max_rows") or 0) == 2, s
 print("policies audit_sample", s)
 PY2
 
+echo "==> security-policies exposes H05 state summary"
+curl -fsS "http://127.0.0.1:8082/admin/security-policies" | tee /tmp/dn-audit-sample-policies.json >/dev/null
+python3 - <<'PY2'
+import json
+data=json.load(open("/tmp/dn-audit-sample-policies.json"))
+assert data.get("default_audit_level","").upper()=="L2", data.get("default_audit_level")
+s=data.get("state") or {}
+assert s.get("backend") in ("memory","file"), s
+# keys must never appear
+assert "ticket_encrypt_key" not in data and "vault_encrypt_key" not in json.dumps(data)
+assert "ticket_encrypt_configured" in s and "vault_encrypt_configured" in s
+print("policies state", s.get("backend"), "ticket_enc", s.get("ticket_encrypt_configured"), "vault_enc", s.get("vault_encrypt_configured"))
+PY2
+
 echo "==> generate multi-row SELECT traffic"
 mysql_via_gateway 'SELECT id, name FROM audit_sample_t ORDER BY id;'
 

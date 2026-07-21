@@ -195,6 +195,23 @@ onMounted(() => {
             · needs L2
           </dd>
         </div>
+        <div v-if="policy.state">
+          <dt>state (H05)</dt>
+          <dd class="mono">
+            backend={{ policy.state.backend }}
+            · ticket_enc={{ policy.state.ticket_encrypt_configured ? 'yes' : 'no' }}
+            · vault_enc={{ policy.state.vault_encrypt_configured ? 'yes' : 'no' }}
+            · poll_ms={{ policy.state.policy_poll_ms }}
+          </dd>
+        </div>
+        <div v-if="policy.state && policy.state.backend === 'file'">
+          <dt>state.paths</dt>
+          <dd class="mono small">
+            ticket={{ policy.state.ticket_path || '—' }}
+            · vault={{ policy.state.vault_path || '—' }}
+            · policy={{ policy.state.policy_path || '—' }}
+          </dd>
+        </div>
         <div v-if="policy.watermark">
           <dt>watermark</dt>
           <dd class="mono">
@@ -532,4 +549,5 @@ onMounted(() => {
   .kv { grid-template-columns: 1fr; }
   .input { min-width: 0; width: 100%; }
 }
+.small { font-size: .85em; word-break: break-all; }
 </style>

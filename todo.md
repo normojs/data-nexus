@@ -82,7 +82,7 @@ cd data-proxy
   - 路径：`security.rs` validate、`audit` sample attach、`OBSERVABILITY.md`、`smoke-security-audit-sample.sh`
 
 - [ ] **H05** 多实例状态外置（含 H08 vault 文件加密）  
-  - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板；**vault `backend_password` ZeroizeOnDrop + revoke zeroize**；**`backend_identity` → `Zeroizing<String>`**（调用方 drop 擦除）  
+  - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板；**vault `backend_password` ZeroizeOnDrop + revoke zeroize**；**`backend_identity` → `Zeroizing<String>`**；**Admin `security-policies.state` 只读摘要**（backend/paths/encrypt flags，无密钥）  
   - 仍欠：**全文件替换非 CRDT**；活跃 lease 密码仍在进程 RAM（非 mlock）；轮询默认 1s  
   - 路径：ticket/vault file backend、`vault.rs` zeroize、prod 模板、runbook
 

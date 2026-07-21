@@ -494,6 +494,8 @@ struct AdminSecurityPoliciesResponse {
     streaming: AdminSecurityStreamingSummary,
     /// B08 sample attach policy (requires default_audit_level=L2 when enabled).
     audit_sample: AdminSecurityAuditSampleSummary,
+    /// H05 multi-instance ticket/vault/policy file backend (no secrets).
+    state: AdminSecurityStateSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -581,6 +583,25 @@ struct AdminSecurityAuditSampleSummary {
     sample_inline: bool,
     /// Empty uses default prefix `samples`.
     sample_prefix: String,
+}
+
+/// H05: multi-instance state backend (read-only; no encrypt keys).
+#[derive(Debug, Serialize)]
+struct AdminSecurityStateSummary {
+    /// `memory` | `file`.
+    backend: String,
+    /// Ticket JSON path when backend=file (empty for memory).
+    ticket_path: String,
+    /// Vault JSON path when backend=file (empty for memory).
+    vault_path: String,
+    /// Local PDP snapshot path (optional shared file).
+    policy_path: String,
+    /// mtime poll interval ms (`0` = off).
+    policy_poll_ms: u64,
+    /// True when `ticket_encrypt_key` is non-empty (value never returned).
+    ticket_encrypt_configured: bool,
+    /// True when `vault_encrypt_key` is non-empty (value never returned).
+    vault_encrypt_configured: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1156,6 +1177,23 @@ impl AxumServer {
                             sample_max_bytes: security.audit.sample_max_bytes,
                             sample_inline: security.audit.sample_inline,
                             sample_prefix: security.audit.sample_prefix.clone(),
+                        },
+                        state: AdminSecurityStateSummary {
+                            backend: security.state.backend.clone(),
+                            ticket_path: security.state.ticket_path.clone(),
+                            vault_path: security.state.vault_path.clone(),
+                            policy_path: security.state.policy_path.clone(),
+                            policy_poll_ms: security.state.policy_poll_ms,
+                            ticket_encrypt_configured: !security
+                                .state
+                                .ticket_encrypt_key
+                                .trim()
+                                .is_empty(),
+                            vault_encrypt_configured: !security
+                                .state
+                                .vault_encrypt_key
+                                .trim()
+                                .is_empty(),
                         },
                     })
                 }
