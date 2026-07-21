@@ -28,11 +28,11 @@
 | 组 | 脚本数 | 内容 |
 |----|:------:|------|
 | `l0` | 4 | admin-auth / dual-listener / cross-protocol ×2 |
-| `security-core` | 10 | deny / column / mask / audit / **audit-sample** / ticket / portal / vault / **state-file** / **config-validate** |
+| `security-core` | 11 | deny / column / mask / audit / **audit-sample** / ticket / portal / vault / **state-file** / **config-validate** / **remote-pdp** |
 | `security-extended` | 8 | stream / passthrough / watermark / dual-control / time / xproto-stream / **portal-xproto×2** |
 | `cedar` | 2 | cedar + cedar-reload（需 `--features security-cedar`） |
-| **default** | **14** | l0 + security-core |
-| **all** | **22** | default + security-extended（不含 cedar） |
+| **default** | **15** | l0 + security-core |
+| **all** | **23** | default + security-extended（不含 cedar） |
 
 ### 可选 Cargo features
 
@@ -257,3 +257,4 @@ examples/        smoke + gateway config 样例
 | B08/H05 | sample truncated hard-assert + UI non-L3/non-CRDT honesty | test(b08)/feat(ui) |
 | A08/B08 | config-validate smoke: sample L2 gate + require TLS needs CA | test(config) |
 | F18/A09 | dual-control issuer self-reject + portal metrics honesty (not CoreEngine) | test(f18/a09) |
+| F31 | remote PDP mock E2E allow/deny + fail_closed smoke | test(f31) |

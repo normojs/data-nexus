@@ -175,28 +175,42 @@ impl RemotePdpClient {
     }
 
     fn post_authorize_http(&self, req: &RemotePdpRequest) -> Result<RemotePdpResponse, String> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(self.timeout)
-            .build()
-            .map_err(|e| format!("remote PDP client build: {e}"))?;
-        let mut builder = client.post(&self.url).json(req);
-        if let Some(token) = &self.token {
-            builder = builder.bearer_auth(token);
-        }
-        let response = builder
-            .send()
-            .map_err(|e| format!("remote PDP transport: {e}"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().unwrap_or_default();
-            return Err(format!(
-                "remote PDP HTTP {status}: {}",
-                body.chars().take(200).collect::<String>()
-            ));
-        }
-        response
-            .json::<RemotePdpResponse>()
-            .map_err(|e| format!("remote PDP response JSON: {e}"))
+        // PEP authorize runs on the async runtime worker. `reqwest::blocking`
+        // must not run there (drops/creates a runtime → panic / lost connection).
+        // Offload the entire blocking client to a short-lived OS thread.
+        let url = self.url.clone();
+        let timeout = self.timeout;
+        let token = self.token.clone();
+        let body = req.clone();
+        std::thread::Builder::new()
+            .name("dn-remote-pdp".into())
+            .spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(timeout)
+                    .build()
+                    .map_err(|e| format!("remote PDP client build: {e}"))?;
+                let mut builder = client.post(&url).json(&body);
+                if let Some(token) = &token {
+                    builder = builder.bearer_auth(token);
+                }
+                let response = builder
+                    .send()
+                    .map_err(|e| format!("remote PDP transport: {e}"))?;
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().unwrap_or_default();
+                    return Err(format!(
+                        "remote PDP HTTP {status}: {}",
+                        body.chars().take(200).collect::<String>()
+                    ));
+                }
+                response
+                    .json::<RemotePdpResponse>()
+                    .map_err(|e| format!("remote PDP response JSON: {e}"))
+            })
+            .map_err(|e| format!("remote PDP thread spawn: {e}"))?
+            .join()
+            .map_err(|_| "remote PDP worker thread panicked".to_string())?
     }
 }
 
