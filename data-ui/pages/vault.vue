@@ -18,6 +18,11 @@ const project = ref('')
 const environment = ref('dev')
 const ttlSecs = ref(900)
 const policyState = ref<AdminSecurityPolicies['state'] | null>(null)
+/** UI24: client-side lease list filters (API returns full page). */
+const statusFilter = ref('')
+const projectFilter = ref('')
+const envFilter = ref('')
+const serviceFilter = ref('')
 
 function setStatus(msg: string, kind: 'ok' | 'error' | '' = '') {
   status.value = msg
@@ -36,6 +41,59 @@ function fmtMs(ms?: number | null) {
 
 function isExpired(l: AdminVaultLease) {
   return Date.now() > (l.expires_at_unix_ms || 0)
+}
+
+/** active | expired | revoked — revoked wins over expired. */
+function leaseStatus(l: AdminVaultLease): 'active' | 'expired' | 'revoked' {
+  if (l.revoked)
+    return 'revoked'
+  if (isExpired(l))
+    return 'expired'
+  return 'active'
+}
+
+const filteredLeases = computed(() => {
+  const st = statusFilter.value.trim().toLowerCase()
+  const proj = projectFilter.value.trim().toLowerCase()
+  const env = envFilter.value.trim().toLowerCase()
+  const svc = serviceFilter.value.trim().toLowerCase()
+  return leases.value.filter((l) => {
+    if (st && leaseStatus(l) !== st)
+      return false
+    if (proj && !(l.project || '').toLowerCase().includes(proj))
+      return false
+    if (env && !(l.environment || '').toLowerCase().includes(env))
+      return false
+    if (svc && !(l.service || '').toLowerCase().includes(svc)
+      && !(l.endpoint || '').toLowerCase().includes(svc))
+      return false
+    return true
+  })
+})
+
+const statusCounts = computed(() => {
+  const c = { active: 0, expired: 0, revoked: 0 }
+  for (const l of leases.value) {
+    const s = leaseStatus(l)
+    c[s]++
+  }
+  return c
+})
+
+function clearListFilters() {
+  statusFilter.value = ''
+  projectFilter.value = ''
+  envFilter.value = ''
+  serviceFilter.value = ''
+}
+
+function setStatusFilter(s: string) {
+  statusFilter.value = statusFilter.value === s ? '' : s
+}
+
+function setProjectEnvFromLease(l: AdminVaultLease) {
+  projectFilter.value = l.project || ''
+  envFilter.value = l.environment || ''
 }
 
 async function load() {
@@ -61,8 +119,10 @@ async function load() {
     const stateBit = st
       ? ` · state=${st.backend}${st.vault_encrypt_configured ? '+enc' : ''}`
       : ''
+    const counts = statusCounts.value
+    const countBit = ` · active=${counts.active} expired=${counts.expired} revoked=${counts.revoked}`
     setStatus(
-      `${ls.length} leases · ${projs.length || svcs.length} projects/services${stateBit}`,
+      `${ls.length} leases${countBit} · ${projs.length || svcs.length} projects/services${stateBit}`,
       'ok',
     )
   }
@@ -111,7 +171,10 @@ async function renew(id: string) {
 }
 
 async function revoke(id: string) {
-  const reason = window.prompt('Revoke reason (optional)') ?? undefined
+  const raw = window.prompt('Revoke reason (optional)')
+  if (raw === null)
+    return
+  const reason = raw.trim() || undefined
   busy.value = true
   try {
     const lease = await api.revokeVaultLease(id, { reason }, apiBase.value)
@@ -294,11 +357,106 @@ onMounted(() => {
     </div>
 
     <div class="card">
-      <h3>Active leases</h3>
+      <h3>Leases</h3>
+      <div class="row list-filters">
+        <label>
+          <span class="sr">Status</span>
+          <select
+            v-model="statusFilter"
+            class="input"
+            aria-label="Filter by lease status"
+          >
+            <option value="">
+              All statuses
+            </option>
+            <option value="active">
+              active ({{ statusCounts.active }})
+            </option>
+            <option value="expired">
+              expired ({{ statusCounts.expired }})
+            </option>
+            <option value="revoked">
+              revoked ({{ statusCounts.revoked }})
+            </option>
+          </select>
+        </label>
+        <label>
+          <span class="sr">Project</span>
+          <input
+            v-model="projectFilter"
+            class="input"
+            placeholder="Filter project…"
+            aria-label="Filter by project"
+          >
+        </label>
+        <label>
+          <span class="sr">Environment</span>
+          <input
+            v-model="envFilter"
+            class="input"
+            placeholder="Filter env…"
+            aria-label="Filter by environment"
+          >
+        </label>
+        <label>
+          <span class="sr">Service</span>
+          <input
+            v-model="serviceFilter"
+            class="input"
+            placeholder="Filter service/endpoint…"
+            aria-label="Filter by service"
+          >
+        </label>
+        <button
+          type="button"
+          class="btn"
+          :disabled="!statusFilter && !projectFilter && !envFilter && !serviceFilter"
+          @click="clearListFilters"
+        >
+          Clear filters
+        </button>
+        <span class="hint-inline">
+          showing {{ filteredLeases.length }} / {{ leases.length }}
+          <template v-if="statusFilter || projectFilter || envFilter || serviceFilter">
+            (client-side)
+          </template>
+        </span>
+      </div>
+      <p class="hint">
+        UI24: status / project / env / service filters are client-side over the loaded
+        page. Backend password is never returned; Copy token is the portal access token only.
+      </p>
+      <div class="row status-chips">
+        <button
+          type="button"
+          class="chip"
+          :class="{ on: statusFilter === 'active' }"
+          @click="setStatusFilter('active')"
+        >
+          active {{ statusCounts.active }}
+        </button>
+        <button
+          type="button"
+          class="chip"
+          :class="{ on: statusFilter === 'expired' }"
+          @click="setStatusFilter('expired')"
+        >
+          expired {{ statusCounts.expired }}
+        </button>
+        <button
+          type="button"
+          class="chip"
+          :class="{ on: statusFilter === 'revoked' }"
+          @click="setStatusFilter('revoked')"
+        >
+          revoked {{ statusCounts.revoked }}
+        </button>
+      </div>
       <table class="table">
         <thead>
           <tr>
             <th>Lease id</th>
+            <th>Status</th>
             <th>Project / Env</th>
             <th>Service · Endpoint</th>
             <th>User</th>
@@ -309,21 +467,33 @@ onMounted(() => {
         </thead>
         <tbody>
           <tr
-            v-for="l in leases"
+            v-for="l in filteredLeases"
             :key="l.lease_id"
           >
             <td class="mono">
               {{ l.lease_id }}
-              <span
-                v-if="l.revoked"
-                class="badge rejected"
-              >revoked</span>
-              <span
-                v-else-if="isExpired(l)"
-                class="badge pending"
-              >expired</span>
             </td>
-            <td>{{ l.project }} / {{ l.environment }}</td>
+            <td>
+              <button
+                type="button"
+                class="badge linkish-badge"
+                :class="leaseStatus(l)"
+                :title="`Filter status=${leaseStatus(l)}`"
+                @click="setStatusFilter(leaseStatus(l))"
+              >
+                {{ leaseStatus(l) }}
+              </button>
+            </td>
+            <td>
+              <button
+                type="button"
+                class="linkish"
+                :title="`Filter project=${l.project} env=${l.environment}`"
+                @click="setProjectEnvFromLease(l)"
+              >
+                {{ l.project }} / {{ l.environment }}
+              </button>
+            </td>
             <td>
               <div class="mono">
                 {{ l.service }}
@@ -342,6 +512,7 @@ onMounted(() => {
               <button
                 type="button"
                 class="btn"
+                :disabled="!!l.revoked"
                 @click="copyToken(l.access_token)"
               >
                 Copy token
@@ -366,12 +537,12 @@ onMounted(() => {
               </button>
             </td>
           </tr>
-          <tr v-if="!leases.length">
+          <tr v-if="!filteredLeases.length">
             <td
-              colspan="7"
+              colspan="8"
               class="empty"
             >
-              No vault leases.
+              {{ leases.length ? 'No leases match filters.' : 'No vault leases.' }}
             </td>
           </tr>
         </tbody>
@@ -433,5 +604,39 @@ onMounted(() => {
   color: #6b7280;
   font-family: inherit;
   font-size: .8rem;
+}
+.list-filters { margin-bottom: .5rem; gap: .55rem; }
+.list-filters label { display: flex; flex-direction: column; gap: .15rem; min-width: 8rem; }
+.list-filters .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.status-chips { margin: 0 0 .65rem; gap: .4rem; }
+.chip {
+  border: 1px solid #d0d7de;
+  background: #f6f8fa;
+  border-radius: 999px;
+  padding: .2rem .55rem;
+  font-size: .8rem;
+  cursor: pointer;
+  font: inherit;
+  color: #444;
+}
+.chip.on { border-color: #0969da; background: #ddf4ff; color: #0969da; font-weight: 600; }
+.badge.active { background: #dafbe1; color: #1a7f37; }
+.badge.expired { background: #fff8c5; color: #9a6700; }
+.badge.revoked { background: #ffebe9; color: #cf222e; }
+button.badge {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  margin-left: 0;
+}
+button.badge:hover { filter: brightness(0.97); text-decoration: underline; }
+.linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #0969da;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
 }
 </style>
