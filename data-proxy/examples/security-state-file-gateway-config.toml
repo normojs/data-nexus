@@ -27,7 +27,7 @@ backend = "file"
 ticket_path = "/tmp/data-nexus-h05-tickets.json"
 vault_path = "/tmp/data-nexus-h05-vault.json"
 policy_path = "/tmp/data-nexus-h05-local-pdp.json"
-policy_poll_ms = 0
+policy_poll_ms = 200
 # 32-byte AES keys as 64 hex (fixture only — never use in production).
 ticket_encrypt_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 vault_encrypt_key = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"

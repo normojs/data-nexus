@@ -41,6 +41,8 @@ start_proxy() {
     if [[ ! -x "$PROXY_BIN" ]] \
       || [[ "$ROOT/gateway/core/src/vault.rs" -nt "$PROXY_BIN" ]] \
       || [[ "$ROOT/gateway/core/src/ticket.rs" -nt "$PROXY_BIN" ]] \
+      || [[ "$ROOT/gateway/core/src/pdp.rs" -nt "$PROXY_BIN" ]] \
+      || [[ "$ROOT/gateway/core/src/policy_file.rs" -nt "$PROXY_BIN" ]] \
       || [[ "$ROOT/http/src/http/mod.rs" -nt "$PROXY_BIN" ]]; then
       cargo build -p data-proxy --bin proxy
     fi
@@ -149,5 +151,74 @@ assert "$LEASE_ID" in lids, lids
 assert all("password" not in json.dumps(l).lower() or l.get("password") is None for l in leases)
 print("reload ok ticket", "$TICKET_ID", "lease", "$LEASE_ID")
 PY
+
+
+echo "==> H05 Local PDP policy_path mtime hot-reload"
+# Seed table for SELECT
+"${COMPOSE[@]}" exec -T mysql-primary mysql -uroot -proot -e "
+CREATE DATABASE IF NOT EXISTS orders;
+USE orders;
+CREATE TABLE IF NOT EXISTS h05_poll_t (id INT PRIMARY KEY, name VARCHAR(16));
+INSERT INTO h05_poll_t VALUES (1,'a') ON DUPLICATE KEY UPDATE name=VALUES(name);
+" >/dev/null
+
+mysql_via_gateway() {
+  docker run --rm --add-host=host.docker.internal:host-gateway mysql:8.0 \
+    mysql --ssl-mode=DISABLED -h host.docker.internal -P 9088 -uroot -proot -N -e "$1"
+}
+
+echo "  baseline SELECT should allow (no deny rules)"
+out="$(mysql_via_gateway 'SELECT id, name FROM h05_poll_t WHERE id=1;')"
+echo "$out"
+echo "$out" | grep -q 'a'
+
+# policy file should exist after start (seeded)
+if [[ ! -f "$POLICY_PATH" ]]; then
+  echo "expected policy file seeded at $POLICY_PATH" >&2
+  ls -la /tmp/data-nexus-h05* >&2 || true
+  exit 1
+fi
+
+echo "  write deny-all SELECT into shared policy_path"
+python3 - <<'PY'
+import json, time
+from pathlib import Path
+path = Path("/tmp/data-nexus-h05-local-pdp.json")
+try:
+    snap = json.loads(path.read_text())
+except Exception:
+    snap = {}
+snap.setdefault("fail_closed", False)
+snap.setdefault("star_policy", "allow")
+snap["rules"] = [{
+    "name": "h05-deny-poll",
+    "effect": "deny",
+    "actions": ["select"],
+    "tables": ["h05_poll_t", "*.h05_poll_t"],
+    "columns": [],
+    "subjects": [],
+}]
+# ensure mtime advances on 1s FS
+time.sleep(1.1)
+path.write_text(json.dumps(snap, indent=2))
+print("policy written", path, "rules", len(snap["rules"]))
+PY
+
+echo "  wait for poll (>= policy_poll_ms) then SELECT must deny"
+sleep 1
+set +e
+mysql_via_gateway 'SELECT id FROM h05_poll_t WHERE id=1;' >/tmp/dn-h05-poll-deny.txt 2>&1
+rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  if ! grep -qiE 'denied|security|policy|ERROR|1105' /tmp/dn-h05-poll-deny.txt; then
+    echo "expected deny after policy poll, got success" >&2
+    cat /tmp/dn-h05-poll-deny.txt >&2
+    exit 1
+  fi
+fi
+grep -qiE 'denied|security|policy|ERROR|1105|h05-deny' /tmp/dn-h05-poll-deny.txt \
+  || { echo "deny message missing"; cat /tmp/dn-h05-poll-deny.txt; exit 1; }
+echo "policy mtime poll deny ok"
 
 echo "smoke-security-state-file: OK"

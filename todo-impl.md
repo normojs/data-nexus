@@ -177,6 +177,7 @@ examples/        smoke + gateway config 样例
 | A08 | MySQL prepared under passthrough demotes Streaming smoke | test(a08) |
 | H05 | security-policies exposes state summary (no keys) | feat(h05/ui04) |
 | H05 | file state + AES-GCM restart smoke (state-file) | feat(h05) |
+| H05 | policy_path mtime poll E2E in state-file smoke | feat(h05) |
 
 ---
 
