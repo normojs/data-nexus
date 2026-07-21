@@ -169,6 +169,7 @@ examples/        smoke + gateway config 样例
 | A09 | portal same-protocol smoke pins window_rows=2 | feat(a09) |
 | A09 | portal Complete INSERT forces stream=chunked smoke | feat(a09) |
 | A09 | portal Complete INSERT CSV stream=chunked smoke | feat(a09) |
+| UI06 | Vault/Tickets pages show H05 state summary | feat(ui06) |
 | UI03 | Audit table Sample column for B08 sample_* | feat(ui03) |
 | UI05 | Portal query status shows stream + window_rows | feat(ui05) |
 | UI04 | security-policies exposes B08 audit_sample knobs | feat(ui04) |

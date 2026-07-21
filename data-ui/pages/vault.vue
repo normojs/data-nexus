@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { AdminProject, AdminService, AdminVaultLease } from '~/composables/useAdminApi'
+import type { AdminProject, AdminSecurityPolicies, AdminService, AdminVaultLease } from '~/composables/useAdminApi'
 
 definePageMeta({ layout: 'admin' })
 useHead({ title: 'Vault · Data Nexus Admin' })
@@ -17,6 +17,7 @@ const busy = ref(false)
 const project = ref('')
 const environment = ref('dev')
 const ttlSecs = ref(900)
+const policyState = ref<AdminSecurityPolicies['state'] | null>(null)
 
 function setStatus(msg: string, kind: 'ok' | 'error' | '' = '') {
   status.value = msg
@@ -41,20 +42,29 @@ async function load() {
   setStatus('Loading vault…')
   const base = apiBase.value
   try {
-    const [ls, projs, svcs] = await Promise.all([
+    const [ls, projs, svcs, policies] = await Promise.all([
       api.vaultLeases(base).catch(() => [] as AdminVaultLease[]),
       api.projects(base).catch(() => [] as AdminProject[]),
       api.services(base).catch(() => [] as AdminService[]),
+      api.securityPolicies(base).catch(() => null),
     ])
     leases.value = ls
     projects.value = projs
     services.value = svcs
+    policyState.value = policies?.state ?? null
     if (!project.value) {
       project.value = projs[0]?.name || svcs[0]?.name || ''
       if (projs[0]?.environment)
         environment.value = projs[0].environment
     }
-    setStatus(`${ls.length} leases · ${projs.length || svcs.length} projects/services`, 'ok')
+    const st = policyState.value
+    const stateBit = st
+      ? ` · state=${st.backend}${st.vault_encrypt_configured ? '+enc' : ''}`
+      : ''
+    setStatus(
+      `${ls.length} leases · ${projs.length || svcs.length} projects/services${stateBit}`,
+      'ok',
+    )
   }
   catch (e: any) {
     setStatus(e?.data?.message || e?.message || String(e), 'error')
@@ -177,11 +187,25 @@ onMounted(() => {
       </div>
     </div>
 
+    <div
+      v-if="policyState"
+      class="card state-banner mono"
+    >
+      H05 state: backend={{ policyState.backend }}
+      · vault_enc={{ policyState.vault_encrypt_configured ? 'yes' : 'no' }}
+      · ticket_enc={{ policyState.ticket_encrypt_configured ? 'yes' : 'no' }}
+      · poll_ms={{ policyState.policy_poll_ms }}
+      <template v-if="policyState.backend === 'file'">
+        · vault={{ policyState.vault_path || '—' }}
+      </template>
+      <span class="hint-inline"> (keys never returned; file backend last-writer-wins, not CRDT)</span>
+    </div>
+
     <div class="card form-card">
       <h3>Issue lease</h3>
       <p class="hint">
-        Short-lived portal credentials. Backend passwords stay in process memory and are
-        <strong>never</strong> returned to the browser (H03).
+        Short-lived portal credentials. Backend passwords stay in process memory (revoke/Drop zeroize; not mlock) and are
+        <strong>never</strong> returned to the browser (H03/H05).
       </p>
       <div class="form-grid">
         <label>
@@ -398,5 +422,16 @@ onMounted(() => {
 .card { background: #fff; border: 1px solid #e6ebf0; border-radius: 10px; padding: .75rem; overflow: auto; margin-bottom: .75rem; }
 @media (max-width: 720px) {
   .form-grid { grid-template-columns: 1fr; }
+}
+.state-banner {
+  margin-bottom: .75rem;
+  font-size: .85rem;
+  color: #374151;
+  line-height: 1.45;
+}
+.hint-inline {
+  color: #6b7280;
+  font-family: inherit;
+  font-size: .8rem;
 }
 </style>

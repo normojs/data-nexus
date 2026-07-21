@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { AdminTicket } from '~/composables/useAdminApi'
+import type { AdminSecurityPolicies, AdminTicket } from '~/composables/useAdminApi'
 
 definePageMeta({ layout: 'admin' })
 useHead({ title: 'Tickets · Data Nexus Admin' })
@@ -8,6 +8,7 @@ const api = useAdminApi()
 const { apiBase, hydrate } = useAdminSettings()
 
 const tickets = ref<AdminTicket[]>([])
+const policyState = ref<AdminSecurityPolicies['state'] | null>(null)
 const status = ref('')
 const statusKind = ref<'ok' | 'error' | ''>('')
 const busy = ref(false)
@@ -43,8 +44,17 @@ function remaining(t: AdminTicket) {
 async function load() {
   setStatus('Loading tickets…')
   try {
-    tickets.value = await api.tickets(100, apiBase.value)
-    setStatus(`${tickets.value.length} tickets`, 'ok')
+    const [list, policies] = await Promise.all([
+      api.tickets(100, apiBase.value),
+      api.securityPolicies(apiBase.value).catch(() => null),
+    ])
+    tickets.value = list
+    policyState.value = policies?.state ?? null
+    const st = policyState.value
+    const stateBit = st
+      ? ` · state=${st.backend}${st.ticket_encrypt_configured ? '+enc' : ''}`
+      : ''
+    setStatus(`${tickets.value.length} tickets${stateBit}`, 'ok')
   }
   catch (e: any) {
     setStatus(e?.data?.message || e?.message || String(e), 'error')
@@ -192,6 +202,19 @@ onMounted(() => {
           Prune expired
         </button>
       </div>
+    </div>
+
+    <div
+      v-if="policyState"
+      class="card state-banner mono"
+    >
+      H05 state: backend={{ policyState.backend }}
+      · ticket_enc={{ policyState.ticket_encrypt_configured ? 'yes' : 'no' }}
+      · poll_ms={{ policyState.policy_poll_ms }}
+      <template v-if="policyState.backend === 'file'">
+        · ticket={{ policyState.ticket_path || '—' }}
+      </template>
+      <span class="hint-inline"> (file backend last-writer-wins, not CRDT)</span>
     </div>
 
     <div class="card form-card">
@@ -445,4 +468,6 @@ onMounted(() => {
 @media (max-width: 720px) {
   .form-grid { grid-template-columns: 1fr; }
 }
+.state-banner { font-size: .85rem; color: #374151; line-height: 1.45; margin-bottom: .75rem; }
+.hint-inline { color: #6b7280; font-family: inherit; font-size: .8rem; }
 </style>
