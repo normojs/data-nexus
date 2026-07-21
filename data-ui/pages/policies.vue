@@ -11,6 +11,9 @@ const policy = ref<AdminSecurityPolicies | null>(null)
 const message = ref('')
 const messageKind = ref<'ok' | 'error' | ''>('')
 const filter = ref('')
+/** UI27: section focus + ACL effect chip (client-side). */
+const section = ref<'all' | 'rules' | 'masks' | 'tags' | 'high_risk' | 'time'>('all')
+const effectFilter = ref('')
 
 function setMessage(msg: string, kind: 'ok' | 'error' | '' = '') {
   message.value = msg
@@ -29,9 +32,11 @@ function matchesFilter(parts: Array<string | undefined | null>) {
 }
 
 const filteredRules = computed(() =>
-  (policy.value?.rules || []).filter(r =>
-    matchesFilter([r.name, r.effect, joinList(r.actions), joinList(r.tables), joinList(r.columns), joinList(r.subjects), r.row_filter]),
-  ),
+  (policy.value?.rules || []).filter((r) => {
+    if (effectFilter.value && (r.effect || '').toLowerCase() !== effectFilter.value.toLowerCase())
+      return false
+    return matchesFilter([r.name, r.effect, joinList(r.actions), joinList(r.tables), joinList(r.columns), joinList(r.subjects), r.row_filter])
+  }),
 )
 
 const filteredMasks = computed(() =>
@@ -58,6 +63,45 @@ const filteredTime = computed(() =>
   ),
 )
 
+const effectCounts = computed(() => {
+  const c = { allow: 0, deny: 0, other: 0 }
+  for (const r of policy.value?.rules || []) {
+    const e = (r.effect || '').toLowerCase()
+    if (e === 'allow')
+      c.allow++
+    else if (e === 'deny')
+      c.deny++
+    else c.other++
+  }
+  return c
+})
+
+function setEffectFilter(e: string) {
+  effectFilter.value = effectFilter.value === e ? '' : e
+  if (e)
+    section.value = 'rules'
+}
+
+function setSection(s: typeof section.value) {
+  section.value = section.value === s ? 'all' : s
+}
+
+function setFilterFrom(text: string) {
+  filter.value = text
+}
+
+function clearFilters() {
+  filter.value = ''
+  effectFilter.value = ''
+  section.value = 'all'
+}
+
+const showRules = computed(() => section.value === 'all' || section.value === 'rules')
+const showMasks = computed(() => section.value === 'all' || section.value === 'masks')
+const showTags = computed(() => section.value === 'all' || section.value === 'tags')
+const showHighRisk = computed(() => section.value === 'all' || section.value === 'high_risk')
+const showTime = computed(() => section.value === 'all' || section.value === 'time')
+
 async function load() {
   setMessage('Loading security policies…')
   try {
@@ -70,7 +114,8 @@ async function load() {
       `${(p.column_tags || []).length} tags`,
       `${(p.high_risk_rules || []).length} high-risk`,
       `${(p.time_rules || []).length} time`,
-    ]
+      p.pdp_backend ? `pdp=${p.pdp_backend}` : '',
+    ].filter(Boolean)
     setMessage(bits.join(' · '), 'ok')
   }
   catch (e: any) {
@@ -109,6 +154,14 @@ onMounted(() => {
         <button
           type="button"
           class="btn"
+          :disabled="!filter && !effectFilter && section === 'all'"
+          @click="clearFilters"
+        >
+          Clear
+        </button>
+        <button
+          type="button"
+          class="btn"
           @click="load"
         >
           Refresh
@@ -117,9 +170,81 @@ onMounted(() => {
     </div>
 
     <p class="hint">
-      UI04 read-only view of <code class="mono">GET /admin/security-policies</code>.
+      UI04/UI27 read-only view of <code class="mono">GET /admin/security-policies</code>.
       Edits stay in gateway config / Local PDP file / Cedar — this page never mutates policy.
+      Section chips and ACL effect chips are client-side only.
     </p>
+
+    <div
+      v-if="policy"
+      class="row section-chips"
+    >
+      <button
+        type="button"
+        class="chip"
+        :class="{ on: section === 'all' }"
+        @click="section = 'all'"
+      >
+        all
+      </button>
+      <button
+        type="button"
+        class="chip"
+        :class="{ on: section === 'rules' }"
+        @click="setSection('rules')"
+      >
+        rules {{ policy.rule_count }}
+      </button>
+      <button
+        type="button"
+        class="chip"
+        :class="{ on: section === 'masks' }"
+        @click="setSection('masks')"
+      >
+        masks {{ (policy.mask_rules || []).length }}
+      </button>
+      <button
+        type="button"
+        class="chip"
+        :class="{ on: section === 'tags' }"
+        @click="setSection('tags')"
+      >
+        tags {{ (policy.column_tags || []).length }}
+      </button>
+      <button
+        type="button"
+        class="chip"
+        :class="{ on: section === 'high_risk' }"
+        @click="setSection('high_risk')"
+      >
+        high-risk {{ (policy.high_risk_rules || []).length }}
+      </button>
+      <button
+        type="button"
+        class="chip"
+        :class="{ on: section === 'time' }"
+        @click="setSection('time')"
+      >
+        time {{ (policy.time_rules || []).length }}
+      </button>
+      <span class="chip-sep" />
+      <button
+        type="button"
+        class="chip"
+        :class="{ on: effectFilter === 'allow' }"
+        @click="setEffectFilter('allow')"
+      >
+        allow {{ effectCounts.allow }}
+      </button>
+      <button
+        type="button"
+        class="chip"
+        :class="{ on: effectFilter === 'deny' }"
+        @click="setEffectFilter('deny')"
+      >
+        deny {{ effectCounts.deny }}
+      </button>
+    </div>
 
     <div
       v-if="policy"
@@ -246,7 +371,10 @@ onMounted(() => {
       </dl>
     </div>
 
-    <div class="card">
+    <div
+      v-if="showRules"
+      class="card"
+    >
       <h3>ACL rules ({{ filteredRules.length }})</h3>
       <div
         v-if="filteredRules.length"
@@ -270,13 +398,25 @@ onMounted(() => {
               :key="r.name"
             >
               <td class="mono">
-                {{ r.name }}
+                <button
+                  type="button"
+                  class="linkish"
+                  :title="`Filter name=${r.name}`"
+                  @click="setFilterFrom(r.name)"
+                >
+                  {{ r.name }}
+                </button>
               </td>
               <td>
-                <span
-                  class="badge"
+                <button
+                  type="button"
+                  class="badge linkish-badge"
                   :class="r.effect === 'allow' ? 'on' : 'off'"
-                >{{ r.effect }}</span>
+                  :title="`Filter effect=${r.effect}`"
+                  @click="setEffectFilter(r.effect)"
+                >
+                  {{ r.effect }}
+                </button>
               </td>
               <td class="mono">
                 {{ joinList(r.actions) }}
@@ -305,7 +445,10 @@ onMounted(() => {
       </div>
     </div>
 
-    <div class="card">
+    <div
+      v-if="showMasks"
+      class="card"
+    >
       <h3>Mask rules ({{ filteredMasks.length }})</h3>
       <div
         v-if="filteredMasks.length"
@@ -353,7 +496,10 @@ onMounted(() => {
       </div>
     </div>
 
-    <div class="card">
+    <div
+      v-if="showTags"
+      class="card"
+    >
       <h3>Column tags ({{ filteredTags.length }})</h3>
       <div
         v-if="filteredTags.length"
@@ -401,7 +547,10 @@ onMounted(() => {
       </div>
     </div>
 
-    <div class="card">
+    <div
+      v-if="showHighRisk"
+      class="card"
+    >
       <h3>High-risk rules ({{ filteredHighRisk.length }})</h3>
       <div
         v-if="filteredHighRisk.length"
@@ -451,7 +600,10 @@ onMounted(() => {
       </div>
     </div>
 
-    <div class="card">
+    <div
+      v-if="showTime"
+      class="card"
+    >
       <h3>Time rules ({{ filteredTime.length }})</h3>
       <div
         v-if="filteredTime.length"
@@ -511,6 +663,34 @@ onMounted(() => {
 
 <style scoped>
 .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+.section-chips { margin: 0 0 .75rem; gap: .4rem; }
+.chip {
+  border: 1px solid #d0d7de;
+  background: #f6f8fa;
+  border-radius: 999px;
+  padding: .2rem .55rem;
+  font-size: .8rem;
+  cursor: pointer;
+  font: inherit;
+  color: #444;
+}
+.chip.on { border-color: #0969da; background: #ddf4ff; color: #0969da; font-weight: 600; }
+.chip-sep { width: 1px; height: 1.1rem; background: #d0d7de; margin: 0 .15rem; }
+.linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #0969da;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+button.badge {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+button.badge:hover { filter: brightness(0.97); text-decoration: underline; }
 .hint { color: #57606a; font-size: .88rem; margin: 0 0 .75rem; }
 .input {
   min-width: 14rem;
