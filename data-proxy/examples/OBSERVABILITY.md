@@ -162,6 +162,11 @@ file_path = "/tmp/data-nexus-audit-events.jsonl"
 
 Smoke: `./examples/smoke-security-audit-sample.sh`.
 
+Read-only config snapshot: `GET /admin/security-policies` includes `audit_sample`
+(`sample_enabled`, `sample_max_rows`, `sample_max_bytes`, `sample_inline`, `sample_prefix`).
+Admin Policies page surfaces the same knobs (UI04).
+
+
 ## Admin API auth (management plane)
 
 Optional. Default `admin_auth.enabled = false` keeps open Admin API (local dev).

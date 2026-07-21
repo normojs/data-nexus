@@ -80,13 +80,13 @@ docs/            架构与路线图（权威细节）
 | Secure / 流式 | 有 mask 等义务 | 窗口内处理；禁止「全量再改」唯一实现 |
 | 跨协议 | 翻译开启 | Streaming 窗口 encode |
 
-**已知债务（改动时优先还）**：事务内/PG Streaming 物化、Portal 逻辑物化、PG 非 TCP 帧中继、prepared 不完整。
+**已知债务（改动时优先还）**：Complete/控制语句小物化；Portal Complete 无 RowStream 时 backend 仍可能物化；PG/MySQL extended **非** TCP bind 帧中继（passthrough 下 demote Streaming）；A10 逻辑 skip 续读 **非** backend 真游标；进程 RSS 峰值 CI 未做（仅逻辑 peak_window_rows）。
 
 ## 5. 安全与审计
 
 - 审计队列有界；**deny / require_approval** 高优队列（B07）。
 - 索引（B06）在 worker 写；stats **禁止**热路径 `COUNT(*)`。
-- L2 样本（B08）未实现前不要宣传。
+- L2 样本（B08）：默认关；`sample_enabled` 须 `default_audit_level=L2`；有界 rows/bytes；**勿宣传全量 L3**。
 - Vault：永不回传后端密码；revoke 擦除内存。
 - Ticket：双人审批 approver ≠ issuer。
 
@@ -105,7 +105,7 @@ docs/            架构与路线图（权威细节）
 
 - 只使用 `useAdminApi`。
 - 401 → 登录；403 → 友好页。
-- 后端已有过滤字段时 UI 必须吃到（审计 `event_id` / 时间窗 / `source`）。
+- 后端已有过滤字段时 UI 必须吃到（审计 `event_id` / 时间窗 / `source` / B08 `sample_*`；portal `stream` / `window_rows`）。
 
 ## 9. Git 与发布
 
@@ -119,7 +119,7 @@ docs/            架构与路线图（权威细节）
 |------|------|
 | 中小流量可上线 | 文档、CI、误配修复、UI |
 | 大数据脱敏 | **dn-stream**（A06 续 / A09 / A08） |
-| 企业 ABAC/合规 | F29 → B08 → F31 |
+| 企业 ABAC/合规 | F29 / B08 / F31 已有切片；深化见 `todo.md` |
 
 ---
 
