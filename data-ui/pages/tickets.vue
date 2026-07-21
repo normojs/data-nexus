@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { AdminSecurityPolicies, AdminTicket } from '~/composables/useAdminApi'
+import type { AdminMe, AdminSecurityPolicies, AdminTicket } from '~/composables/useAdminApi'
 
 definePageMeta({ layout: 'admin' })
 useHead({ title: 'Tickets · Data Nexus Admin' })
@@ -9,6 +9,7 @@ const { apiBase, hydrate } = useAdminSettings()
 
 const tickets = ref<AdminTicket[]>([])
 const policyState = ref<AdminSecurityPolicies['state'] | null>(null)
+const adminMe = ref<AdminMe | null>(null)
 const status = ref('')
 const statusKind = ref<'ok' | 'error' | ''>('')
 const busy = ref(false)
@@ -44,17 +45,20 @@ function remaining(t: AdminTicket) {
 async function load() {
   setStatus('Loading tickets…')
   try {
-    const [list, policies] = await Promise.all([
+    const [list, policies, me] = await Promise.all([
       api.tickets(100, apiBase.value),
       api.securityPolicies(apiBase.value).catch(() => null),
+      api.me(apiBase.value).catch(() => null),
     ])
     tickets.value = list
     policyState.value = policies?.state ?? null
+    adminMe.value = me
     const st = policyState.value
     const stateBit = st
       ? ` · state=${st.backend}${st.ticket_encrypt_configured ? '+enc' : ''}`
       : ''
-    setStatus(`${tickets.value.length} tickets${stateBit}`, 'ok')
+    const meBit = adminMe.value?.subject ? ` · as ${adminMe.value.subject}` : ''
+    setStatus(`${tickets.value.length} tickets${stateBit}${meBit}`, 'ok')
   }
   catch (e: any) {
     setStatus(e?.data?.message || e?.message || String(e), 'error')
@@ -95,14 +99,29 @@ async function issue() {
 }
 
 async function approve(id: string) {
+  const ticket = tickets.value.find(x => x.id === id)
+  const me = adminMe.value?.subject?.trim()
+  if (
+    ticket?.dual_control
+    && me
+    && ticket.issued_by
+    && ticket.issued_by.trim().toLowerCase() === me.toLowerCase()
+  ) {
+    setStatus(
+      `Cannot self-approve dual-control ticket ${id}: approver must differ from issuer (${ticket.issued_by})`,
+      'error',
+    )
+    return
+  }
   busy.value = true
   try {
     const t = await api.approveTicket(id, {}, apiBase.value)
-    setStatus(`Approved ${t.id}`, 'ok')
+    setStatus(`Approved ${t.id} as ${me || t.approved_by || 'admin'}`, 'ok')
     await load()
   }
   catch (e: any) {
-    setStatus(e?.data?.message || e?.message || String(e), 'error')
+    const msg = e?.data?.message || e?.message || String(e)
+    setStatus(msg, 'error')
   }
   finally {
     busy.value = false
@@ -281,7 +300,7 @@ onMounted(() => {
             v-model="dualControl"
             type="checkbox"
           >
-          Dual-control (second approver required; approver ≠ issuer)
+          Dual-control (second approver required; approver ≠ issuer; uses logged-in admin subject)
         </label>
       </div>
       <div class="row">
