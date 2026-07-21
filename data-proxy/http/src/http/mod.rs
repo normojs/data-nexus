@@ -476,6 +476,8 @@ struct AdminSecurityPoliciesResponse {
     fail_closed: bool,
     star_policy: String,
     default_audit_level: String,
+    /// F32: max SQL chars stored at L1/L2 (`sql_text`); L0 always strips.
+    sql_text_max_chars: u32,
     pdp_backend: String,
     /// Present when `security.pdp.policy_dir` is set (Cedar / file PDP).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1093,6 +1095,7 @@ impl AxumServer {
                         fail_closed: security.fail_closed,
                         star_policy: security.star_policy.clone(),
                         default_audit_level: security.default_audit_level.clone(),
+                        sql_text_max_chars: security.audit.sql_text_max_chars,
                         pdp_backend: security.pdp.backend.clone(),
                         pdp_policy_dir,
                         rule_count: security.rules.len(),

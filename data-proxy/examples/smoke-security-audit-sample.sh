@@ -80,10 +80,12 @@ python3 - <<'PY2'
 import json
 data=json.load(open("/tmp/dn-audit-sample-policies.json"))
 assert data.get("default_audit_level","").upper()=="L2", data.get("default_audit_level")
+# F32: sql_text_max_chars exposed for L1/L2 truncation policy
+assert int(data.get("sql_text_max_chars") or 0) >= 1, data.get("sql_text_max_chars")
 s=data.get("audit_sample") or {}
 assert s.get("sample_enabled") is True, s
 assert int(s.get("sample_max_rows") or 0) == 2, s
-print("policies audit_sample", s)
+print("policies audit_sample", s, "sql_text_max_chars", data.get("sql_text_max_chars"))
 PY2
 
 echo "==> security-policies exposes H05 state summary"

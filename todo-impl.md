@@ -232,3 +232,4 @@ examples/        smoke + gateway config 样例
 | F32 | smoke L0 strips sql_text on deny audit events | test(f32) |
 | F32 | smoke L2 keeps truncated sql_text on sample events | test(f32) |
 | F32 | OBSERVABILITY audit level payload table + UI tables | docs(f32)/feat(ui) |
+| F32 | expose sql_text_max_chars on security-policies API/UI | feat(f32/ui) |

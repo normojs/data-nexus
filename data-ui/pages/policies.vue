@@ -152,6 +152,9 @@ onMounted(() => {
           <dt>default_audit_level</dt>
           <dd class="mono">
             {{ policy.default_audit_level }}
+            <template v-if="policy.sql_text_max_chars != null">
+              · sql_text_max_chars={{ policy.sql_text_max_chars }}
+            </template>
           </dd>
         </div>
         <div>

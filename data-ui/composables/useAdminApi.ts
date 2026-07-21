@@ -250,6 +250,8 @@ export type AdminSecurityPolicies = {
   fail_closed: boolean
   star_policy: string
   default_audit_level: string
+  /** F32: max chars of sql_text at L1/L2. */
+  sql_text_max_chars?: number
   pdp_backend: string
   pdp_policy_dir?: string | null
   rule_count: number
