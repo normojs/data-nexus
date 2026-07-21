@@ -99,6 +99,10 @@ assert any((e.get("decision")=="deny") for e in ev), data
 assert any((e.get("outcome")=="security_deny" or e.get("code")=="security_deny") for e in ev), data
 assert data.get("source") == "index", data
 print("deny events:", len(ev), "source=", data.get("source"))
+# F32: L0 must not keep sql_text on events (deny config default_audit_level=L0).
+for e in ev:
+    assert not e.get("sql_text"), f"L0 must strip sql_text, got {e.get('sql_text')!r} on {e.get('event_id')}"
+print("F32 L0 strips sql_text ok")
 # B06 event_id round-trip via index
 eid = next(e.get("event_id") for e in ev if e.get("decision")=="deny" and e.get("event_id"))
 open("/tmp/dn-audit-deny-eid.txt","w").write(eid)
