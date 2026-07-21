@@ -58,7 +58,7 @@ cd data-proxy
   - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
-  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 配置下 extended Bind/Execute 降级 Streaming**（双协议 demote，禁止 Complete 物化；smoke 断言 `QUERY_PARAMS`→`execute_path=streaming`）  
+  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 配置下 extended 降级 Streaming**（PG `QUERY_PARAMS` + **MySQL COM_STMT EXECUTE** demote；smoke 双边 streaming）  
   - 仍欠：**extended 仍非 TCP 帧中继**（无 bind 原包透传）；Streaming 仍用 pool  
   - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`smoke-security-passthrough.sh`
 

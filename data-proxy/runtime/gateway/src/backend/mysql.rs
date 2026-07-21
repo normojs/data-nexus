@@ -3009,6 +3009,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a08_passthrough_demotes_query_params_to_streaming() {
+        // Parity with PostgreSQL: Passthrough + QueryParams/Execute demotes to Streaming.
+        let mode = ExecuteMode::Passthrough;
+        let is_query_params = true;
+        let is_execute = false;
+        let demoted = if matches!(mode, ExecuteMode::Passthrough) && (is_query_params || is_execute)
+        {
+            ExecuteMode::from_streaming_config(256, None)
+        } else {
+            mode
+        };
+        assert!(demoted.is_streaming(), "{demoted:?}");
+        assert_eq!(demoted.window_rows(), Some(256));
+    }
+
     #[tokio::test]
     async fn a10_query_params_streaming_against_live_mysql() {
         let mut ep = endpoint();

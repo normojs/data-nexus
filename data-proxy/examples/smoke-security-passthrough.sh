@@ -201,6 +201,41 @@ PY
 echo "$pg_ext_out"
 echo "$pg_ext_out" | grep -q 'pg_extended_under_passthrough_ok'
 
+echo "==> A08 MySQL COM_STMT under passthrough config (not WireRelay)"
+# Prepared Execute must demote to Streaming (COM_STMT path), not Complete materialize.
+mysql_prep_out="$(docker run --rm --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
+  bash -lc 'pip install -q --disable-pip-version-check mysql-connector-python >/tmp/pip.log 2>&1 || { cat /tmp/pip.log; exit 1; }
+python - <<"PY"
+import mysql.connector
+cnx = mysql.connector.connect(
+    host="host.docker.internal",
+    port=9088,
+    user="root",
+    password="root",
+    database="orders",
+    ssl_disabled=True,
+    connection_timeout=10,
+)
+try:
+    cur = cnx.cursor(prepared=True)
+    cur.execute(
+        "SELECT id, name FROM pass_smoke WHERE id = %s ORDER BY id",
+        (1,),
+    )
+    rows = cur.fetchall()
+    print("mysql_prep_rows", rows)
+    assert len(rows) >= 1, rows
+    assert rows[0][0] == 1 or str(rows[0][0]) == "1", rows
+    assert "alice" in str(rows[0][1]), rows
+    print("mysql_prepared_under_passthrough_ok")
+    cur.close()
+finally:
+    cnx.close()
+PY
+')"
+echo "$mysql_prep_out"
+echo "$mysql_prep_out" | grep -q 'mysql_prepared_under_passthrough_ok'
+
 echo "==> A05 Prometheus execute_path + passthrough_bytes"
 curl -fsS "http://127.0.0.1:8082/metrics" | tee /tmp/dn-pt-metrics.txt >/dev/null
 python3 - <<'PY'
@@ -209,14 +244,20 @@ assert "gateway_execute_path_total" in text, "missing gateway_execute_path_total
 assert 'execute_path="passthrough"' in text or "execute_path=\"passthrough\"" in text, text[:2000]
 # bytes counter present after wire traffic
 assert "gateway_passthrough_bytes_total" in text, "missing gateway_passthrough_bytes_total"
-# A08: extended Bind/Execute under passthrough config must use streaming re-encode
-# (not wire passthrough for QUERY_PARAMS).
-if 'type="QUERY_PARAMS"' in text or "type=\"QUERY_PARAMS\"" in text:
-    assert (
-        'execute_path="streaming"' in text
-        or "execute_path=\"streaming\"" in text
-    ), "expected streaming path for extended under passthrough config"
-    print("A08 extended under passthrough uses streaming path")
+# A08: extended under passthrough config must use streaming re-encode
+# (PG QUERY_PARAMS and/or MySQL EXECUTE — not wire passthrough).
+has_ext = (
+    'type="QUERY_PARAMS"' in text
+    or 'type="EXECUTE"' in text
+    or "type=\"QUERY_PARAMS\"" in text
+    or "type=\"EXECUTE\"" in text
+)
+assert has_ext, "expected QUERY_PARAMS or EXECUTE after extended traffic"
+assert (
+    'execute_path="streaming"' in text
+    or "execute_path=\"streaming\"" in text
+), "expected streaming path for extended under passthrough config"
+print("A08 extended under passthrough uses streaming path")
 print("A05 metrics ok")
 for line in text.splitlines():
     if "gateway_execute_path_total" in line or "gateway_passthrough_bytes_total" in line:
