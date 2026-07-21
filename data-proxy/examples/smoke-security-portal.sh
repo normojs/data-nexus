@@ -306,6 +306,34 @@ assert body.get("stream")=="chunked", body
 print("portal complete insert json chunked ok", "rows", body.get("row_count"), "stream", body.get("stream"))
 PY
 
+
+echo "==> portal Complete path INSERT CSV also chunked"
+curl -fsS -D /tmp/dn-portal-insert-csv.hdr -o /tmp/dn-portal-insert.csv \
+  -X POST "http://127.0.0.1:8082/admin/portal/query" \
+  -H 'content-type: application/json' \
+  -d "$(python3 - <<'PY'
+import json
+print(json.dumps({
+  "service": "orders",
+  "sql": "INSERT INTO portal_t (id, name) VALUES (101, 'chunked-csv') ON DUPLICATE KEY UPDATE name=VALUES(name)",
+  "subject_id": "portal-user",
+  "format": "csv",
+  "max_rows": 10,
+  "download": True,
+}))
+PY
+)"
+python3 - <<'PY'
+hdr=open("/tmp/dn-portal-insert-csv.hdr").read().lower()
+body=open("/tmp/dn-portal-insert.csv").read()
+assert "text/csv" in hdr, hdr
+assert "x-data-nexus-stream: chunked" in hdr, hdr
+assert "backend_window" not in hdr, hdr
+lines=[ln for ln in body.splitlines() if ln.strip() and not ln.startswith("#")]
+assert len(lines) >= 1, lines
+print("portal complete insert csv chunked ok", "lines", len(lines), "head", lines[0][:40])
+PY
+
 echo "==> portal invalid format rejected"
 set +e
 curl -sS -o /tmp/dn-portal-badfmt.json -w "%{http_code}" \
