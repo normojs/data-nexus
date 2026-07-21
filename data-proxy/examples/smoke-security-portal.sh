@@ -250,6 +250,62 @@ assert lines[0].lower().startswith("id"), lines[0]
 print("csv multi-row backend_window ok", "lines", len(lines))
 PY
 
+
+echo "==> portal Complete path INSERT → chunked (not backend_window)"
+# Non-SELECT yields ExecuteOutcome::Complete; export must still stream HTTP windows
+# with x-data-nexus-stream: chunked (honest: no RowStream).
+curl -fsS -D /tmp/dn-portal-insert.hdr -o /tmp/dn-portal-insert.ndjson \
+  -X POST "http://127.0.0.1:8082/admin/portal/query" \
+  -H 'content-type: application/json' \
+  -d "$(python3 - <<'PY'
+import json
+print(json.dumps({
+  "service": "orders",
+  "sql": "INSERT INTO portal_t (id, name) VALUES (99, 'chunked') ON DUPLICATE KEY UPDATE name=VALUES(name)",
+  "subject_id": "portal-user",
+  "format": "ndjson",
+  "max_rows": 10,
+}))
+PY
+)"
+python3 - <<'PY'
+import json
+hdr=open("/tmp/dn-portal-insert.hdr").read().lower()
+assert "x-data-nexus-stream: chunked" in hdr, hdr
+lines=[ln for ln in open("/tmp/dn-portal-insert.ndjson") if ln.strip()]
+assert len(lines) >= 1, lines
+meta=json.loads(lines[0])
+assert meta.get("_meta") is True, meta
+assert meta.get("stream") == "chunked", meta
+assert meta.get("decision") == "allow", meta
+print("portal complete insert chunked ok", "stream", meta.get("stream"), "lines", len(lines))
+PY
+
+echo "==> portal Complete path INSERT JSON also chunked"
+curl -fsS -D /tmp/dn-portal-insert-json.hdr -o /tmp/dn-portal-insert.json \
+  -X POST "http://127.0.0.1:8082/admin/portal/query" \
+  -H 'content-type: application/json' \
+  -d "$(python3 - <<'PY'
+import json
+print(json.dumps({
+  "service": "orders",
+  "sql": "INSERT INTO portal_t (id, name) VALUES (100, 'chunked-json') ON DUPLICATE KEY UPDATE name=VALUES(name)",
+  "subject_id": "portal-user",
+  "format": "json",
+  "max_rows": 10,
+}))
+PY
+)"
+python3 - <<'PY'
+import json
+hdr=open("/tmp/dn-portal-insert-json.hdr").read().lower()
+assert "x-data-nexus-stream: chunked" in hdr, hdr
+body=json.load(open("/tmp/dn-portal-insert.json"))
+assert body.get("decision")=="allow", body
+assert body.get("stream")=="chunked", body
+print("portal complete insert json chunked ok", "rows", body.get("row_count"), "stream", body.get("stream"))
+PY
+
 echo "==> portal invalid format rejected"
 set +e
 curl -sS -o /tmp/dn-portal-badfmt.json -w "%{http_code}" \

@@ -63,7 +63,7 @@ cd data-proxy
   - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`smoke-security-passthrough.sh`
 
 - [ ] **A09** Portal 端到端流式  
-  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**（`security-portal-gateway-config.toml` 强制 meta/body `window_rows==2`）；**跨协议 portal 双向** smoke 同窗  
+  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`（smoke：INSERT NDJSON/JSON **强制** `x-data-nexus-stream: chunked`）；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**；**跨协议 portal 双向** smoke 同窗  
   - 仍欠：Complete 路径 ResultSet 在 backend 侧仍可能先物化（无 RowStream 时不可避免）；无进程 RSS 峰值 CI（逻辑 window 已钉）  
   - 路径：`http` portal_execute_*_streaming；`security-portal-gateway-config.toml`；`security-portal-xproto{,-pg-mysql}-gateway-config.toml`；`smoke-security-portal{,-xproto,-xproto-pg-mysql}.sh`
 
