@@ -281,7 +281,7 @@ onMounted(() => {
             v-model="dualControl"
             type="checkbox"
           >
-          Dual-control (second approver required)
+          Dual-control (second approver required; approver ≠ issuer)
         </label>
       </div>
       <div class="row">
