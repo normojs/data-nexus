@@ -2,6 +2,7 @@
 import type {
   AdminPortalQueryResult,
   AdminProject,
+  AdminSecurityPolicies,
   AdminService,
   AdminVaultLease,
 } from '~/composables/useAdminApi'
@@ -19,6 +20,7 @@ const service = ref('')
 const sql = ref('SELECT 1 AS ok')
 const maxRows = ref(100)
 const leaseId = ref('')
+const streamingCfg = ref<AdminSecurityPolicies['streaming'] | null>(null)
 const result = ref<AdminPortalQueryResult | null>(null)
 const status = ref('')
 const statusKind = ref<'ok' | 'error' | ''>('')
@@ -30,14 +32,16 @@ function setStatus(msg: string, kind: 'ok' | 'error' | '' = '') {
 
 async function loadMeta() {
   const base = apiBase.value
-  const [svcs, projs, ls] = await Promise.all([
+  const [svcs, projs, ls, policies] = await Promise.all([
     api.services(base),
     api.projects(base).catch(() => [] as AdminProject[]),
     api.vaultLeases(base).catch(() => [] as AdminVaultLease[]),
+    api.securityPolicies(base).catch(() => null),
   ])
   services.value = svcs
   projects.value = projs
   leases.value = ls
+  streamingCfg.value = policies?.streaming ?? null
   if (!service.value && svcs[0])
     service.value = svcs[0].name
 }
@@ -167,6 +171,16 @@ onMounted(async () => {
             type="number"
             min="1"
           >
+          <span
+            v-if="streamingCfg"
+            class="field-hint mono"
+          >
+            gateway window_rows={{ streamingCfg.window_rows }}
+            · passthrough={{ streamingCfg.passthrough }}
+            <template v-if="streamingCfg.max_rows != null">
+              · policy max_rows={{ streamingCfg.max_rows }}
+            </template>
+          </span>
         </label>
         <label class="field">
           <span>Vault lease id (optional)</span>
@@ -314,4 +328,5 @@ onMounted(async () => {
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .meta.ok { color: #1a7f37; }
 .meta.error { color: #cf222e; }
+.field-hint { display: block; margin-top: .25rem; font-size: .75rem; color: #6b7280; }
 </style>
