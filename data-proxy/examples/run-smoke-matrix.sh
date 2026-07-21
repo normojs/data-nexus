@@ -36,8 +36,8 @@ list_groups() {
   cat <<'EOF'
 Groups:
   l0                  L0 / security-off path (admin-auth, dual-listener, cross-protocol x2)
-  security-core       deny, column, mask, audit, ticket, portal
-  security-extended   stream, passthrough, watermark, dual-control, time, cross-protocol-stream
+  security-core       deny, column, mask, audit, audit-sample, ticket, portal, vault
+  security-extended   stream, passthrough, watermark, dual-control, time, xproto-stream, portal-xproto×2
   cedar               cedar + cedar-reload (build with --features security-cedar)
   default             l0 + security-core
   all                 default + security-extended (not cedar)

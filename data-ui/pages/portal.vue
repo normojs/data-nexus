@@ -91,7 +91,7 @@ async function exportResult(format: 'csv' | 'ndjson' | 'json') {
   }
   setStatus(`Exporting ${format} via PEP…`)
   try {
-    const blob = await api.portalExport({
+    const { blob, stream } = await api.portalExport({
       service: service.value,
       sql: sql.value,
       lease_id: leaseId.value || undefined,
@@ -106,7 +106,11 @@ async function exportResult(format: 'csv' | 'ndjson' | 'json') {
     a.click()
     a.remove()
     URL.revokeObjectURL(url)
-    setStatus(`Exported ${format} (still enforced by PEP + max_rows)`, 'ok')
+    const streamBit = stream ? ` · stream=${stream}` : ''
+    setStatus(
+      `Exported ${format}${streamBit} (PEP + max_rows; not full-result dump)`,
+      'ok',
+    )
   }
   catch (e: any) {
     setStatus(e?.data?.message || e?.message || String(e), 'error')

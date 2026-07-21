@@ -513,7 +513,11 @@ export function useAdminApi() {
         headers: { 'Content-Type': 'application/json' },
         body,
       }, base),
-    /** Download portal result as CSV/NDJSON/JSON blob (B05). */
+    /**
+     * Download portal result as CSV/NDJSON/JSON (B05/A09).
+     * Returns blob plus optional `x-data-nexus-stream` header
+     * (`backend_window` | `chunked`).
+     */
     portalExport: async (body: {
       service: string
       sql: string
@@ -521,10 +525,10 @@ export function useAdminApi() {
       subject_id?: string
       max_rows?: number
       format: 'csv' | 'ndjson' | 'json'
-    }, base?: string) => {
+    }, base?: string): Promise<{ blob: Blob, stream: string | null, contentType: string | null }> => {
       const path = '/admin/portal/query'
       try {
-        return await $fetch<Blob>(`${normalizeBase(base)}${path}`, {
+        const res = await $fetch.raw(`${normalizeBase(base)}${path}`, {
           method: 'POST',
           headers: {
             ...authHeaders(),
@@ -534,6 +538,13 @@ export function useAdminApi() {
           body: { ...body, download: true },
           responseType: 'blob',
         })
+        const stream =
+          res.headers.get('x-data-nexus-stream') ||
+          res.headers.get('X-Data-Nexus-Stream') ||
+          null
+        const contentType = res.headers.get('content-type')
+        const blob = res._data as Blob
+        return { blob, stream, contentType }
       }
       catch (err) {
         handleAdminApiAuthError(err, path)

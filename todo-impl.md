@@ -23,14 +23,16 @@
 - [x] **P2**：双人金库 F18、时间窗 F27、Cedar F26/F26b、OTel B03、审计轮转+OpenDAL B04、portal 导出 B05  
 - [x] **P3 主线**：H01–H04、B04c/B05b/B06/B07、F28、A05、UI01/UI02、smoke 硬化  
 
-### 关键 smoke（交付时本机 19/19 绿）
+### 关键 smoke（矩阵规模；发版前 `all`+`cedar`）
 
 | 组 | 脚本数 | 内容 |
 |----|:------:|------|
 | `l0` | 4 | admin-auth / dual-listener / cross-protocol ×2 |
-| `security-core` | 7 | deny / column / mask / audit / ticket / portal / vault |
-| `security-extended` | 6 | stream / passthrough / watermark / dual-control / time / xproto-stream |
+| `security-core` | 8 | deny / column / mask / audit / **audit-sample** / ticket / portal / vault |
+| `security-extended` | 8 | stream / passthrough / watermark / dual-control / time / xproto-stream / **portal-xproto×2** |
 | `cedar` | 2 | cedar + cedar-reload（需 `--features security-cedar`） |
+| **default** | **12** | l0 + security-core |
+| **all** | **20** | default + security-extended（不含 cedar） |
 
 ### 可选 Cargo features
 
@@ -168,6 +170,7 @@ examples/        smoke + gateway config 样例
 | UI03 | Audit table Sample column for B08 sample_* | feat(ui03) |
 | UI05 | Portal query status shows stream + window_rows | feat(ui05) |
 | UI04 | security-policies exposes B08 audit_sample knobs | feat(ui04) |
+| chore | smoke matrix inventory + portal export stream header UI | chore(smoke/ui) |
 
 ---
 
