@@ -772,6 +772,7 @@ onMounted(() => {
           · bytes={{ selectedEvent.sample_bytes ?? '—' }}
           · truncated={{ selectedEvent.sample_truncated ? 'yes' : 'no' }}
           · ref={{ selectedEvent.sample_ref || '—' }}
+          · B08 bounded L2 only (full_result_l3=false; not full archive)
         </p>
         <pre
           v-if="selectedEvent.sample_body"
@@ -781,9 +782,15 @@ onMounted(() => {
           v-else-if="selectedEvent.sample_ref"
           class="hint"
         >
-          No inline sample_body (OpenDAL ref only or stripped).
+          No inline sample_body (OpenDAL ref only or stripped). Still not L3 full-result archive.
         </p>
       </template>
+      <p
+        v-else
+        class="hint"
+      >
+        No B08 sample on this event (needs sample_enabled + default_audit_level=L2; not L3 full-result archive).
+      </p>
     </div>
   </div>
 </template>

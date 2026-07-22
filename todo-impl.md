@@ -293,3 +293,4 @@ examples/        smoke + gateway config 样例
 | B08 | security-policies full_result_l3=false + requires_audit_level=L2 | feat(b08) |
 | A08 | watermark+passthrough=true still streaming smoke pin | test(a08) |
 | T01 | unit: star_policy=allow does not expand/strip SELECT * | test(t01) |
+| UI37 | Audit sample detail B08 full_result_l3=false honesty | feat(ui) |

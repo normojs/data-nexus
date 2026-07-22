@@ -173,6 +173,7 @@ grep -qiE 'security|denied|deny|policy|wildcard' /tmp/data-nexus-security-column
   || grep -qi 'ERROR' /tmp/data-nexus-security-column-astar-err.txt
 kill -0 "$PROXY_PID"
 echo "T01 qualified/alias star deny ok (no * expansion; star_policy=deny)"
+echo "T01 honesty: wildcards are never expanded to strip denied columns (allow also no expand — unit star_policy_allow_does_not_expand_or_strip_wildcard)"
 
 echo "==> deny: secret table still blocked"
 set +e
