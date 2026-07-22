@@ -1,5 +1,10 @@
 <script setup lang="ts">
-import type { AdminAuditStats, AdminMe, AdminSecurityPolicies } from '~/composables/useAdminApi'
+import type {
+  AdminAuditStats,
+  AdminMe,
+  AdminSecurityPolicies,
+  SqlCursorMetricModes,
+} from '~/composables/useAdminApi'
 
 definePageMeta({ layout: 'admin' })
 useHead({ title: 'Settings · Data Nexus Admin' })
@@ -19,6 +24,7 @@ const version = ref('')
 const me = ref<AdminMe | null>(null)
 const policies = ref<AdminSecurityPolicies | null>(null)
 const auditStats = ref<AdminAuditStats | null>(null)
+const sqlCursors = ref<SqlCursorMetricModes | null>(null)
 const probeAt = ref('')
 
 function setStatus(msg: string, kind: 'ok' | 'error' | '' = '') {
@@ -30,7 +36,7 @@ async function probeGateway() {
   busyProbe.value = true
   const base = apiBase.value
   try {
-    const [hz, ver, who, pol, astats] = await Promise.all([
+    const [hz, ver, who, pol, astats, metricsTxt] = await Promise.all([
       $fetch<string | { status?: string }>(`${base.replace(/\/$/, '')}/healthz`, {
         responseType: 'text' as any,
       }).catch(async () => {
@@ -45,6 +51,7 @@ async function probeGateway() {
       api.me(base).catch(() => null),
       api.securityPolicies(base).catch(() => null),
       api.auditStats(base).catch(() => null),
+      api.metricsText(base).catch(() => null as string | null),
     ])
     if (typeof hz === 'string')
       healthz.value = hz.trim() || 'ok'
@@ -56,6 +63,7 @@ async function probeGateway() {
     me.value = who
     policies.value = pol
     auditStats.value = astats
+    sqlCursors.value = metricsTxt ? api.parseSqlCursorMetrics(metricsTxt) : null
     probeAt.value = new Date().toLocaleTimeString()
     setStatus(
       healthz.value === 'unreachable'
@@ -225,6 +233,26 @@ async function doReload() {
             </template>
             <template v-else>
               —
+            </template>
+          </dd>
+        </div>
+        <div>
+          <dt>SQL cursors (A10)</dt>
+          <dd class="mono">
+            <template v-if="sqlCursors">
+              declare={{ sqlCursors.declare }}
+              · fetch={{ sqlCursors.fetch }}
+              · close={{ sqlCursors.close }}
+              · session_end={{ sqlCursors.session_end }}
+              <template v-if="sqlCursors.unsupported">
+                · unsupported={{ sqlCursors.unsupported }}
+              </template>
+              <span class="hint-inline">
+                process-local only (not backend WITH HOLD)
+              </span>
+            </template>
+            <template v-else>
+              — <span class="hint-inline">(/metrics unavailable or empty)</span>
             </template>
           </dd>
         </div>

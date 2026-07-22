@@ -284,6 +284,7 @@ examples/        smoke + gateway config 样例
 | H05 | state API vault_password_zeroize + smoke pin (not mlock) | feat(h05) |
 | UI32 | Portal/Sessions process-local SQL cursor honesty hints | feat(ui) |
 | UI33 | Overview SQL cursor process-local metrics card | feat(ui) |
+| UI34 | Settings probe SQL cursor metrics + A10 honesty | feat(ui) |
 | A10 | MOVE/FETCH ABSOLUTE fail-closed + runbook H05 honesty fields | feat(a10)/docs(h05) |
 | A10 | sql_cursor_unsupported metric + OBSERVABILITY MOVE/ABSOLUTE | feat(a10) |
 | A08 | mask+passthrough=true still execute_path=streaming smoke pin | test(a08) |
