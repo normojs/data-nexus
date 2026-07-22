@@ -23,7 +23,7 @@ export PATH="/Volumes/fushilu/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin
 | `l0` | security off | 协议/路由改动 |
 | `security-core` | deny/column/mask/audit/**audit-sample**/ticket/portal/vault/**state-file**/`config-validate`/**remote-pdp** | **安全默认门禁** |
 | `default` | l0 + security-core | **PR / commit 默认** |
-| `security-extended` | stream/passthrough/watermark/dual-control/time/xproto/**portal-xproto×2** | 流式/透传/时间窗/跨协议 portal |
+| `security-extended` | stream/**stream-rss**/passthrough/watermark/dual-control/time/xproto/**portal-xproto×2** | 流式/透传/时间窗/跨协议 portal |
 | `cedar` | cedar + reload | 需 `--features security-cedar` |
 | `all` | default + extended | 发版前 |
 

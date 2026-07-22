@@ -29,10 +29,10 @@
 |----|:------:|------|
 | `l0` | 4 | admin-auth / dual-listener / cross-protocol ×2 |
 | `security-core` | 11 | deny / column / mask / audit / **audit-sample** / ticket / portal / vault / **state-file** / **config-validate** / **remote-pdp** |
-| `security-extended` | 8 | stream / passthrough / watermark / dual-control / time / xproto-stream / **portal-xproto×2** |
+| `security-extended` | 9 | stream / **stream-rss** / passthrough / watermark / dual-control / time / xproto-stream / **portal-xproto×2** |
 | `cedar` | 2 | cedar + cedar-reload（需 `--features security-cedar`） |
 | **default** | **15** | l0 + security-core |
-| **all** | **23** | default + security-extended（不含 cedar） |
+| **all** | **24** | default + security-extended（不含 cedar） |
 
 ### 可选 Cargo features
 
@@ -260,3 +260,4 @@ examples/        smoke + gateway config 样例
 | F31 | remote PDP mock E2E allow/deny + fail_closed smoke | test(f31) |
 | A09 | portal HTTP Prometheus PORTAL_STREAM/CHUNKED + peak smoke | feat(a09) |
 | A09 | xproto portal PORTAL_STREAM xproto_stream + peak≤window smoke | test(a09) |
+| A06 | coarse process-RSS Streaming smoke (anti full-result materialize) | test(a06) |

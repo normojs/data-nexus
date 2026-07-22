@@ -37,7 +37,7 @@ list_groups() {
 Groups:
   l0                  L0 / security-off path (admin-auth, dual-listener, cross-protocol x2)
   security-core       deny, column, mask, audit, audit-sample, ticket, portal, vault, state-file, config-validate, remote-pdp
-  security-extended   stream, passthrough, watermark, dual-control, time, xproto-stream, portal-xproto×2
+  security-extended   stream, stream-rss, passthrough, watermark, dual-control, time, xproto-stream, portal-xproto×2
   cedar               cedar + cedar-reload (build with --features security-cedar)
   default             l0 + security-core
   all                 default + security-extended (not cedar)
@@ -73,6 +73,7 @@ security_core_smokes=(
 
 security_extended_smokes=(
   smoke-security-stream.sh
+  smoke-security-stream-rss.sh
   smoke-security-passthrough.sh
   smoke-security-watermark.sh
   smoke-security-dual-control.sh
