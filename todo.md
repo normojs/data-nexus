@@ -118,7 +118,7 @@ cd data-proxy
 |------|------|
 | Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`（**双向跨协议 portal** MySQL↔PG）；**Complete → `chunked`**；**`x-data-nexus-window-rows` 头**（CSV 可钉窗）；backend 无 RowStream 时仍可能先物化；无进程峰值 CI |
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；**粗粒度进程 RSS smoke**（防全量物化；非精确 window 字节）；控制语句/Complete 小结果仍可物化；见 `OBSERVABILITY` A-track 表 |
-| PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；simple Query 透传；**extended 在 passthrough 下降级 Streaming 并标 `streaming_demote`（非 TCP bind 中继）**；smoke 要求 passthrough + demote/streaming 共存 |
+| PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；simple Query 透传；**PG text-bind extended 可 rewrite→simple Query TCP（`QUERY_PARAMS` 标 passthrough + wire bytes）**；不可改写（MySQL COM_STMT）标 **`streaming_demote`**；smoke 强制两者；**仍非** Parse/Bind 原包中继 |
 | 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended + multi-Execute 续读（优先 RowStream hold；logical skip 回落）**；策略截断仍 C；**非** SQL `WITH HOLD` 命名游标；非 TCP passthrough |
 | 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；活跃 vault 密码在 RAM；revoke/prune/Drop zeroize；`backend_identity` 返回 Zeroizing（非 mlock） |
 | L2 样本 | B08：默认关；有界 rows/bytes；**sample_enabled 强制 L2**；OpenDAL 需 feature；**非全量 L3** |

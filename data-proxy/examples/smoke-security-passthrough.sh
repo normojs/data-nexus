@@ -250,28 +250,33 @@ has_ext = (
     or "type=\"EXECUTE\"" in text
 )
 assert has_ext, "expected QUERY_PARAMS or EXECUTE after extended traffic"
-# A08 honesty for extended under passthrough:
-# - Prefer text-inline rewrite → simple Query TCP/wire (passthrough) when possible.
-# - Otherwise demote Streaming (streaming_demote preferred; bare streaming accepted).
-# Still NOT Parse/Bind/Execute original frame relay.
-has_demote = 'execute_path="streaming_demote"' in text or "execute_path=\"streaming_demote\"" in text
-has_streaming = 'execute_path="streaming"' in text or "execute_path=\"streaming\"" in text
-has_pt = 'execute_path="passthrough"' in text or "execute_path=\"passthrough\"" in text
-assert has_demote or has_streaming or has_pt
-if has_demote:
-    print("A08 honesty: execute_path=streaming_demote observed (extended demote, not TCP bind relay)")
-elif has_streaming:
-    print("A08 note: streaming present without streaming_demote label")
-else:
-    print("A08 honesty: extended text-bind rewritten to simple Query wire (passthrough)")
-pt_lines = [ln for ln in text.splitlines() if "gateway_execute_path_total" in ln and "passthrough" in ln and not ln.startswith("#")]
-st_lines = [ln for ln in text.splitlines() if "gateway_execute_path_total" in ln and ("streaming" in ln) and not ln.startswith("#")]
-assert pt_lines, "expected passthrough counter samples"
-if st_lines:
-    print("A08 honesty: passthrough (simple/rewrite) + streaming_demote/streaming both present")
-else:
-    print("A08 honesty: passthrough present; extended text-bind used rewrite→simple Query wire")
-print("A08 extended under passthrough: rewrite→simple Query wire preferred; demote Streaming fallback (not Parse/Bind frame relay)")
+# A08: PG extended text-bind should rewrite → simple Query TCP (passthrough on QUERY_PARAMS).
+# MySQL COM_STMT remains streaming_demote. Still NOT Parse/Bind/Execute frame relay.
+has_pg_qp_pt = (
+    'type="QUERY_PARAMS"' in text and 'execute_path="passthrough"' in text
+) or (
+    'type="QUERY_PARAMS"' in text and 'passthrough' in text
+)
+# Stronger: a single metric line with both labels
+pg_qp_pt_line = any(
+    ('QUERY_PARAMS' in ln) and ('passthrough' in ln) and ('gateway_execute_path_total' in ln)
+    for ln in text.splitlines() if not ln.startswith('#')
+)
+pg_qp_bytes = any(
+    ('QUERY_PARAMS' in ln) and ('gateway_passthrough_bytes_total' in ln) and not ln.startswith('#')
+    for ln in text.splitlines()
+)
+assert pg_qp_pt_line, "expected QUERY_PARAMS execute_path=passthrough after PG text-bind rewrite"
+assert pg_qp_bytes, "expected passthrough_bytes for QUERY_PARAMS after PG text-bind rewrite"
+print("A08 honesty: PG QUERY_PARAMS text-bind rewrite → passthrough + wire bytes")
+# MySQL COM_STMT should still demote (binary bind unsafe as text rewrite)
+mysql_demote = any(
+    ('EXECUTE' in ln) and ('streaming_demote' in ln or 'streaming' in ln) and ('mysql' in ln)
+    for ln in text.splitlines() if 'gateway_execute_path_total' in ln and not ln.startswith('#')
+)
+assert mysql_demote, "expected MySQL EXECUTE streaming_demote under passthrough"
+print("A08 honesty: MySQL COM_STMT remains streaming_demote (not text rewrite)")
+print("A08 still NOT Parse/Bind/Execute original frame relay")
 print("A05 metrics ok")
 for line in text.splitlines():
     if "gateway_execute_path_total" in line or "gateway_passthrough_bytes_total" in line:

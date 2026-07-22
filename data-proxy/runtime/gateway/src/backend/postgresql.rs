@@ -2471,6 +2471,78 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn a08_passthrough_query_params_wire_relay_against_live_pg() {
+        // Text-bind $1 under Passthrough should TCP-relay as simple Query (WireRelay),
+        // not demote Streaming. Skips if postgres is not reachable.
+        let connector = PostgreSqlBackendConnector::with_endpoints(vec![EndpointConfig {
+            name: "analytics-primary".into(),
+            protocol: ProtocolKind::PostgreSql,
+            address: "127.0.0.1:15433".into(),
+            database: Some("analytics".into()),
+            role: EndpointRole::ReadWrite,
+            username: "postgres".into(),
+            password: "postgres".into(),
+            weight: 1,
+            ssl_mode: Default::default(),
+            ssl_ca_file: None,
+            ssl_accept_invalid_certs: true,
+        }]);
+        let mut session = SessionState::default();
+        let outcome = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connector.execute_outcome(
+                GatewayCommand::QueryParams {
+                    sql: "SELECT 1 AS ok WHERE $1::int = 1".into(),
+                    parameters: vec![GatewayValue::String("1".into())],
+                },
+                &mut session,
+                ExecuteMode::Passthrough,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if msg.contains("connect")
+                    || msg.contains("Connection refused")
+                    || msg.contains("timeout")
+                    || msg.contains("os error")
+                {
+                    eprintln!("skip live pg a08 query_params wire relay: {msg}");
+                    return;
+                }
+                panic!("unexpected error: {msg}");
+            }
+            Err(_) => {
+                eprintln!("skip live pg a08 query_params wire relay: timeout");
+                return;
+            }
+        };
+        match outcome {
+            ExecuteOutcome::WireRelay(mut relay) => {
+                let mut n = 0usize;
+                while let Some(batch) = relay.stream.poll_packets(32).await.unwrap() {
+                    n += batch.len();
+                }
+                assert!(n >= 1, "expected at least one wire packet from TCP relay");
+            }
+            ExecuteOutcome::Streaming(_) => {
+                panic!("text-bind QueryParams under Passthrough must WireRelay, not Streaming demote")
+            }
+            ExecuteOutcome::Complete(other) => {
+                // Accept Complete(Wire) as alternate collect path
+                match other {
+                    GatewayResponse::Wire { packets } => {
+                        assert!(!packets.is_empty());
+                    }
+                    other => panic!("unexpected complete {other:?}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn a08_passthrough_text_bind_rewrites_to_simple_query_sql() {
         // Text-bindable $n under passthrough should rewrite for simple Query TCP relay
@@ -2484,13 +2556,15 @@ mod tests {
         assert!(!sql.contains("$1"), "{sql}");
     }
 
-        fn a08_passthrough_demotes_query_params_to_streaming() {
-        // Passthrough mode is only for simple Query TCP relay; extended binds demote.
+    #[test]
+    fn a08_passthrough_demotes_unrewritable_query_params_to_streaming() {
+        // When rewrite cannot apply (e.g. placeholder count mismatch path is separate),
+        // demotion formula used in execute_outcome must stay Streaming (not Complete).
         let mode = ExecuteMode::Passthrough;
         assert!(!mode.is_streaming());
-        // Demotion formula used in execute_outcome (must stay in sync).
         let is_query_params = true;
         let is_execute = false;
+        // Simulate rewrite failure → demote branch (must stay in sync with execute_outcome).
         let demoted = if matches!(mode, ExecuteMode::Passthrough) && (is_query_params || is_execute)
         {
             ExecuteMode::from_streaming_config(256, None)
@@ -2499,6 +2573,17 @@ mod tests {
         };
         assert!(demoted.is_streaming(), "{demoted:?}");
         assert_eq!(demoted.window_rows(), Some(256));
+    }
+
+    #[test]
+    fn a08_passthrough_rewrite_rejects_param_count_mismatch() {
+        let err = bind_pg_placeholders(
+            "SELECT $1, $2",
+            &[GatewayValue::Integer(1)],
+        )
+        .expect_err("count mismatch");
+        let msg = err.to_string();
+        assert!(msg.contains("expects 2") || msg.contains("parameters"), "{msg}");
     }
 
     #[tokio::test]

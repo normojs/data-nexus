@@ -265,3 +265,4 @@ examples/        smoke + gateway config 样例
 | A08 | execute_path=streaming_demote for extended under passthrough | feat(a08) |
 | H05 | state API last_writer_wins/mlock honesty + smoke pin | feat(h05) |
 | A08 | PG extended text-bind rewrite → simple Query TCP under passthrough | feat(a08) |
+| A08 | live unit WireRelay + smoke pin QUERY_PARAMS passthrough / MySQL demote | test(a08) |
