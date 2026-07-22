@@ -58,7 +58,7 @@ cd data-proxy
   - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`、`smoke-security-stream-rss.sh`、`OBSERVABILITY.md`
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
-  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 下 extended text-bind：backend 重编码 Parse/Bind/Execute/Sync TCP**并标 **`passthrough_extended`**（剥离 backend `1`/`2`/`Z`；仍非客户端原包）；否则 **`streaming_demote`**（MySQL COM_STMT 默认 demote）；**`smoke-security-config-validate` 拒绝 require+verify 无 CA**  
+  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 下 extended text-bind：backend 重编码 Parse/Bind/Describe/Execute/Sync TCP**并标 **`passthrough_extended`**（空 result_formats=全 text；Describe 出 `T`；剥离 backend `1`/`2`/`Z`；仍非客户端原包）；否则 **`streaming_demote`**（MySQL COM_STMT 默认 demote）；**`smoke-security-config-validate` 拒绝 require+verify 无 CA**  
   - 仍欠：**非客户端原包 Parse/Bind/Execute 帧中继**（gateway 重编码 text bind）；Streaming 仍用 pool  
   - 路径：`backend/postgresql` + `pg_tcp_relay` extended_text_bind、`write_wire_relay_opts` strip 1/2/Z、`core_engine` path labels、`smoke-security-passthrough.sh`、`OBSERVABILITY.md`
 

@@ -474,12 +474,14 @@ impl PgTcpSession {
         })
     }
 
-    /// A08: re-encode extended text-bind unit on backend TCP (Parse/Bind/Execute/Sync).
+    /// A08: re-encode extended text-bind unit on backend TCP (Parse/Bind/Describe/Execute/Sync).
     ///
     /// Uses **unnamed** statement/portal so idle pool reuse stays safe. Params are
-    /// already text-serializable (`None` = SQL NULL). This is **not** original client
-    /// frame relay — gateway rebuilds P/B/E/S. Callers serving a client extended unit
-    /// should strip backend ParseComplete/BindComplete/ReadyForQuery (`1`/`2`/`Z`).
+    /// already text-serializable (`None` = SQL NULL). Empty result_formats ⇒ all text
+    /// columns. Describe(portal) is included so RowDescription is available without a
+    /// separate client Describe. This is **not** original client frame relay — gateway
+    /// rebuilds P/B/D/E/S. Callers serving a client extended unit should strip backend
+    /// ParseComplete/BindComplete/ReadyForQuery (`1`/`2`/`Z`).
     pub async fn extended_text_bind_relay_into(
         mut self,
         sql: &str,
@@ -506,13 +508,17 @@ impl PgTcpSession {
                     }
                 }
             },
-            // result formats: all text (0)
-            std::iter::once(0i16),
+            // Empty ⇒ all result columns use text format (not "only first column").
+            std::iter::empty::<i16>(),
             &mut out,
         )
         .map_err(|_e| {
             GatewayError::Backend("pg extended bind encode failed".into())
         })?;
+        // Describe portal so Execute path yields RowDescription for multi-column SELECTs
+        // even when the client skipped Describe (common in raw-frame smokes).
+        frontend::describe(b'P', "", &mut out)
+            .map_err(|e| GatewayError::Backend(format!("pg extended describe encode: {e}")))?;
         frontend::execute("", 0, &mut out)
             .map_err(|e| GatewayError::Backend(format!("pg extended execute encode: {e}")))?;
         frontend::sync(&mut out);

@@ -199,25 +199,28 @@ assert "2" in tags_pb, tags_pb
 
 sock.sendall(msg(b"E", cstr("pext") + i32(0)))
 # Drain Execute result WITHOUT Sync: must end at CommandComplete/PortalSuspended, no Z.
+# Backend re-encode includes Describe(portal) → expect RowDescription (T) before DataRow.
 tags_ex, rows, end = drain_until(sock, frozenset({b"C", b"s", b"E"}))
 print("after_execute", tags_ex, "rows", rows, "end", end)
 assert rows >= 1, rows
 assert end in (b"C", b"s"), tags_ex
 assert "Z" not in tags_ex, f"backend ReadyForQuery leaked before Sync: {tags_ex}"
-assert "T" in tags_ex or "D" in tags_ex, tags_ex
+assert "1" not in tags_ex and "2" not in tags_ex, f"backend Parse/BindComplete leaked: {tags_ex}"
+assert "T" in tags_ex, f"expected RowDescription from backend Describe(portal): {tags_ex}"
+assert "D" in tags_ex, tags_ex
 
 sock.sendall(msg(b"S", b""))
 tags_sync, _, endz = drain_until(sock, frozenset({b"Z", b"E"}))
 print("after_sync", tags_sync, "end", endz)
 assert endz == b"Z", tags_sync
 print("pg_extended_under_passthrough_ok")
-print("a08_rewrite_wire_no_premature_ready_ok")
+print("a08_extended_wire_rowdesc_no_premature_ready_ok")
 sock.close()
 PY
 )"
 echo "$pg_ext_out"
 echo "$pg_ext_out" | grep -q 'pg_extended_under_passthrough_ok'
-echo "$pg_ext_out" | grep -q 'a08_rewrite_wire_no_premature_ready_ok'
+echo "$pg_ext_out" | grep -q 'a08_extended_wire_rowdesc_no_premature_ready_ok'
 
 echo "==> A08 MySQL COM_STMT under passthrough config (not WireRelay)"
 # Prepared Execute must demote to Streaming (COM_STMT path), not Complete materialize.
