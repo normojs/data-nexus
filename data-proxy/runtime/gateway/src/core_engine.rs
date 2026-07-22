@@ -74,6 +74,19 @@ pub struct CoreGatewayConnection {
     /// When set, the next Execute for the same portal reuses this stream instead of
     /// re-running SQL (logical skip). Dropped on Close / Sync / portal name change.
     held_portal_stream: Option<gateway_core::StreamingQuery>,
+    /// A10: process-local named cursors for simple-query `DECLARE name CURSOR …`
+    /// / `FETCH` / `CLOSE`. Holds a gateway `RowStream` after opening SELECT —
+    /// **not** SQL `DECLARE … WITH HOLD` on the backend (no server-side cursor).
+    /// Without WITH HOLD, cursors are dropped on COMMIT/ROLLBACK; WITH HOLD keeps
+    /// them until CLOSE or session end (still process-local).
+    named_cursors: std::collections::HashMap<String, NamedCursorHeld>,
+}
+
+/// Process-local held cursor (A10). `with_hold` only affects COMMIT/ROLLBACK
+/// cleanup — never promotes to a backend server cursor.
+struct NamedCursorHeld {
+    with_hold: bool,
+    query: gateway_core::StreamingQuery,
 }
 
 impl CoreGatewayConnection {
@@ -103,6 +116,7 @@ impl CoreGatewayConnection {
             metrics: MySQLServerMetricsCollector,
             pending_encode_obligations: None,
             held_portal_stream: None,
+            named_cursors: std::collections::HashMap::new(),
         }
     }
 
@@ -143,6 +157,7 @@ impl CoreGatewayConnection {
             metrics: MySQLServerMetricsCollector,
             pending_encode_obligations: None,
             held_portal_stream: None,
+            named_cursors: std::collections::HashMap::new(),
         }
     }
 
@@ -388,7 +403,27 @@ impl CoreGatewayConnection {
             ];
             self.metrics.set_sql_under_processing_inc(&labels);
 
+            // A10: process-local named cursor surface for simple-query
+            // DECLARE / FETCH / CLOSE (not backend SQL WITH HOLD).
+            if let GatewayCommand::Query { ref sql } = command {
+                if let Some(kind) = parse_named_cursor_sql(sql) {
+                    let outcome = self
+                        .handle_named_cursor_sql(kind, writer, &labels, started_at, &command_span)
+                        .await;
+                    self.metrics.set_sql_under_processing_dec(&labels);
+                    outcome?;
+                    continue;
+                }
+            }
+
             let mut concurrency_rule_idx = None;
+            // A10: non-WITH-HOLD process-local cursors drop at txn end (honest).
+            // Quit drops all process-local cursors (WITH HOLD included — session ends).
+            let drop_non_hold_cursors_after = matches!(
+                command,
+                GatewayCommand::Commit | GatewayCommand::Rollback
+            );
+            let drop_all_cursors_after = matches!(command, GatewayCommand::Quit);
             if let Some(plugins) = self.plugins.as_mut() {
                 let ctx = PluginContext {
                     service: self.service_name.clone(),
@@ -1259,6 +1294,15 @@ impl CoreGatewayConnection {
             }
 
             self.encode_response_to_writer(response, writer).await?;
+            if drop_all_cursors_after {
+                // Session end: all process-local cursors die (including WITH HOLD).
+                self.drop_all_named_cursors();
+            } else if drop_non_hold_cursors_after {
+                // COMMIT/ROLLBACK: drop process-local cursors without WITH HOLD.
+                // WITH HOLD keeps process-local stream until CLOSE/session end
+                // (still not a backend server cursor).
+                self.drop_non_hold_named_cursors();
+            }
             record_otel_command(
                 &self.listener_name,
                 &self.service_name,
@@ -1283,6 +1327,345 @@ impl CoreGatewayConnection {
 
         Ok(())
     }
+
+    /// A10: process-local named cursor for simple-query DECLARE/FETCH/CLOSE.
+    ///
+    /// Opens SELECT via normal Streaming path and holds [`StreamingQuery`] in
+    /// `named_cursors`. **Not** backend `DECLARE … WITH HOLD` — cursor dies with
+    /// the gateway session; metrics use `sql_cursor_*` modes.
+    async fn handle_named_cursor_sql(
+        &mut self,
+        kind: NamedCursorSql,
+        writer: &mut dyn ResponseWriter,
+        labels: &[&str],
+        started_at: Instant,
+        command_span: &tracing::Span,
+    ) -> GatewayResult<()> {
+        use gateway_core::{StreamingQuery, VecRowStream};
+
+        match kind {
+            NamedCursorSql::Declare {
+                name,
+                select_sql,
+                with_hold,
+            } => {
+                if self.named_cursors.contains_key(&name) {
+                    let msg = format!(
+                        "cursor \"{name}\" already exists (process-local; not SQL WITH HOLD)"
+                    );
+                    let response = GatewayResponse::Error {
+                        code: "34000".into(),
+                        message: msg,
+                    };
+                    self.encode_response_to_writer(response, writer).await?;
+                    command_span.record("outcome", "error");
+                    command_span.record("execute_path", "sql_cursor_declare");
+                    finish_command_metrics(&self.metrics, labels, started_at, "sql_cursor_declare", 0);
+                    return Ok(());
+                }
+                // Open cursor without backend max_rows cap so multi-FETCH can page the
+                // full result. Policy max_rows still applies to ordinary Query*;
+                // process-local cursor lifetime is session-scoped (not backend WITH HOLD).
+                let window = self.stream_mode.window_rows().unwrap_or(256).max(1) as u32;
+                let exec_mode = ExecuteMode::from_streaming_config(window, None);
+                let outcome = self
+                    .backend
+                    .execute_outcome(
+                        GatewayCommand::Query {
+                            sql: select_sql.clone(),
+                        },
+                        &mut self.session,
+                        exec_mode,
+                    )
+                    .await?;
+                match outcome {
+                    ExecuteOutcome::Streaming(query) => {
+                        self.named_cursors.insert(
+                            name.clone(),
+                            NamedCursorHeld { with_hold, query },
+                        );
+                        self.metrics.record_portal_resume("sql_cursor_declare");
+                        let response = GatewayResponse::Ok {
+                            affected_rows: 0,
+                            last_insert_id: None,
+                        };
+                        self.encode_response_to_writer(response, writer).await?;
+                        command_span.record("outcome", "sql_cursor_declare");
+                        command_span.record("execute_path", "sql_cursor_declare");
+                        finish_command_metrics(
+                            &self.metrics,
+                            labels,
+                            started_at,
+                            "sql_cursor_declare",
+                            0,
+                        );
+                        Ok(())
+                    }
+                    ExecuteOutcome::Complete(GatewayResponse::ResultSet { columns, rows }) => {
+                        // Fallback: materialize into VecRowStream so FETCH still works.
+                        let query = StreamingQuery {
+                            columns,
+                            stream: Box::new(VecRowStream::new(rows)),
+                        };
+                        self.named_cursors.insert(
+                            name.clone(),
+                            NamedCursorHeld { with_hold, query },
+                        );
+                        self.metrics.record_portal_resume("sql_cursor_declare");
+                        let response = GatewayResponse::Ok {
+                            affected_rows: 0,
+                            last_insert_id: None,
+                        };
+                        self.encode_response_to_writer(response, writer).await?;
+                        command_span.record("outcome", "sql_cursor_declare");
+                        command_span.record("execute_path", "sql_cursor_declare");
+                        finish_command_metrics(
+                            &self.metrics,
+                            labels,
+                            started_at,
+                            "sql_cursor_declare",
+                            0,
+                        );
+                        Ok(())
+                    }
+                    ExecuteOutcome::Complete(other) => {
+                        self.encode_response_to_writer(other, writer).await?;
+                        command_span.record("outcome", "error");
+                        finish_command_metrics(&self.metrics, labels, started_at, "n/a", 0);
+                        Ok(())
+                    }
+                    ExecuteOutcome::WireRelay(_) => {
+                        let response = GatewayResponse::Error {
+                            code: "0A000".into(),
+                            message: "DECLARE cursor cannot use wire passthrough (process-local hold only)"
+                                .into(),
+                        };
+                        self.encode_response_to_writer(response, writer).await?;
+                        finish_command_metrics(&self.metrics, labels, started_at, "n/a", 0);
+                        Ok(())
+                    }
+                }
+            }
+            NamedCursorSql::Fetch { name, count } => {
+                let Some(mut held) = self.named_cursors.remove(&name) else {
+                    let response = GatewayResponse::Error {
+                        code: "34000".into(),
+                        message: format!(
+                            "cursor \"{name}\" does not exist (process-local; not SQL WITH HOLD)"
+                        ),
+                    };
+                    self.encode_response_to_writer(response, writer).await?;
+                    finish_command_metrics(&self.metrics, labels, started_at, "n/a", 0);
+                    return Ok(());
+                };
+                use gateway_core::PrefixedRowStream;
+                let mut rows = Vec::new();
+                let columns = held.query.columns.clone();
+                let mut remaining = count;
+                let mut stream_ended = false;
+                while remaining > 0 {
+                    let want = remaining.min(256);
+                    match held.query.stream.poll_window(want).await? {
+                        Some(chunk) if !chunk.is_empty() => {
+                            if chunk.len() > remaining {
+                                let mut it = chunk.into_iter();
+                                for _ in 0..remaining {
+                                    if let Some(r) = it.next() {
+                                        rows.push(r);
+                                    }
+                                }
+                                let leftover: Vec<_> = it.collect();
+                                held.query.stream =
+                                    Box::new(PrefixedRowStream::new(leftover, held.query.stream));
+                                remaining = 0;
+                            } else {
+                                remaining -= chunk.len();
+                                rows.extend(chunk);
+                            }
+                        }
+                        _ => {
+                            stream_ended = true;
+                            break;
+                        }
+                    }
+                }
+                if !stream_ended {
+                    self.named_cursors.insert(name.clone(), held);
+                }
+                self.metrics.record_portal_resume("sql_cursor_fetch");
+                let response = GatewayResponse::ResultSet { columns, rows };
+                self.encode_response_to_writer(response, writer).await?;
+                command_span.record("outcome", "sql_cursor_fetch");
+                command_span.record("execute_path", "sql_cursor_fetch");
+                finish_command_metrics(
+                    &self.metrics,
+                    labels,
+                    started_at,
+                    "sql_cursor_fetch",
+                    0,
+                );
+                Ok(())
+            }
+            NamedCursorSql::Close { name } => {
+                let existed = self.named_cursors.remove(&name).is_some();
+                if !existed {
+                    let response = GatewayResponse::Error {
+                        code: "34000".into(),
+                        message: format!(
+                            "cursor \"{name}\" does not exist (process-local; not SQL WITH HOLD)"
+                        ),
+                    };
+                    self.encode_response_to_writer(response, writer).await?;
+                    finish_command_metrics(&self.metrics, labels, started_at, "n/a", 0);
+                    return Ok(());
+                }
+                self.metrics.record_portal_resume("sql_cursor_close");
+                let response = GatewayResponse::Ok {
+                    affected_rows: 0,
+                    last_insert_id: None,
+                };
+                self.encode_response_to_writer(response, writer).await?;
+                command_span.record("outcome", "sql_cursor_close");
+                command_span.record("execute_path", "sql_cursor_close");
+                finish_command_metrics(
+                    &self.metrics,
+                    labels,
+                    started_at,
+                    "sql_cursor_close",
+                    0,
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Drop process-local cursors that did not declare WITH HOLD (honest txn end).
+    fn drop_non_hold_named_cursors(&mut self) {
+        self.named_cursors.retain(|_, c| c.with_hold);
+    }
+
+    /// Drop all process-local cursors (session end / Quit). WITH HOLD is still
+    /// process-local — never survives gateway disconnect.
+    fn drop_all_named_cursors(&mut self) {
+        if !self.named_cursors.is_empty() {
+            self.metrics.record_portal_resume("sql_cursor_session_end");
+        }
+        self.named_cursors.clear();
+    }
+}
+
+impl Drop for CoreGatewayConnection {
+    fn drop(&mut self) {
+        // Connection close without explicit Quit still ends process-local cursors.
+        if !self.named_cursors.is_empty() {
+            self.metrics.record_portal_resume("sql_cursor_session_end");
+            self.named_cursors.clear();
+        }
+        self.held_portal_stream = None;
+    }
+}
+
+/// A10: simple-query named cursor surface (process-local RowStream hold).
+#[derive(Debug, Clone)]
+enum NamedCursorSql {
+    Declare {
+        name: String,
+        select_sql: String,
+        /// Text contained `WITH HOLD` — process-local only; survives COMMIT/ROLLBACK
+        /// until CLOSE/session end. **Not** backend server-side WITH HOLD.
+        with_hold: bool,
+    },
+    Fetch { name: String, count: usize },
+    Close { name: String },
+}
+
+/// Parse `DECLARE name [BINARY] [INSENSITIVE] [NO] SCROLL CURSOR [WITH HOLD] FOR <select>`
+/// / `FETCH [FORWARD] [count|ALL] FROM name` / `CLOSE name`.
+///
+/// Returns `None` for unrelated SQL. `WITH HOLD` is accepted in text but the
+/// implementation is still process-local (honest: not backend WITH HOLD).
+fn parse_named_cursor_sql(sql: &str) -> Option<NamedCursorSql> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("DECLARE ") {
+        // Find CURSOR … FOR
+        let cursor_pos = upper.find(" CURSOR ")?;
+        let for_pos = upper.find(" FOR ")?;
+        if for_pos < cursor_pos {
+            return None;
+        }
+        let name_part = trimmed[8..cursor_pos].trim();
+        // Drop optional BINARY / INSENSITIVE / [NO] SCROLL before name or after.
+        let name = name_part
+            .split_whitespace()
+            .find(|t| {
+                let u = t.to_ascii_uppercase();
+                !matches!(
+                    u.as_str(),
+                    "BINARY" | "INSENSITIVE" | "NO" | "SCROLL" | "ASENSITIVE"
+                )
+            })?
+            .trim_matches('"')
+            .to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let select_sql = trimmed[for_pos + 5..].trim().to_string();
+        if select_sql.is_empty() {
+            return None;
+        }
+        // BETWEEN cursor keyword and FOR: optional WITH HOLD / WITHOUT HOLD.
+        let mid = &upper[cursor_pos..for_pos];
+        let with_hold = mid.contains(" WITH HOLD");
+        return Some(NamedCursorSql::Declare {
+            name,
+            select_sql,
+            with_hold,
+        });
+    }
+    if upper.starts_with("FETCH ") {
+        // FETCH [FORWARD] [n|ALL] [FROM|IN] name
+        let rest = trimmed[6..].trim();
+        let mut tokens: Vec<&str> = rest.split_whitespace().collect();
+        if tokens.is_empty() {
+            return None;
+        }
+        // strip FORWARD
+        if tokens[0].eq_ignore_ascii_case("FORWARD") {
+            tokens.remove(0);
+        }
+        if tokens.is_empty() {
+            return None;
+        }
+        let mut count: usize = 1;
+        let mut idx = 0;
+        if tokens[0].eq_ignore_ascii_case("ALL") {
+            count = usize::MAX / 4;
+            idx = 1;
+        } else if let Ok(n) = tokens[0].parse::<usize>() {
+            count = n.max(1);
+            idx = 1;
+        }
+        if idx < tokens.len()
+            && (tokens[idx].eq_ignore_ascii_case("FROM")
+                || tokens[idx].eq_ignore_ascii_case("IN"))
+        {
+            idx += 1;
+        }
+        let name = tokens.get(idx)?.trim_matches('"').to_string();
+        if name.is_empty() {
+            return None;
+        }
+        return Some(NamedCursorSql::Fetch { name, count });
+    }
+    if upper.starts_with("CLOSE ") {
+        let name = trimmed[6..].trim().trim_matches('"').to_string();
+        if name.is_empty() {
+            return None;
+        }
+        return Some(NamedCursorSql::Close { name });
+    }
+    None
 }
 
 fn finish_command_metrics(
@@ -2813,5 +3196,63 @@ mod tests {
         frame.extend_from_slice(b"DROP TABLE users");
         let packets = connection.handle_frame(&frame).await.unwrap();
         assert_eq!(packets[0].first(), Some(&0xff));
+    }
+
+    #[test]
+    fn a10_parse_named_cursor_declare_fetch_close() {
+        match parse_named_cursor_sql(
+            "DECLARE c1 CURSOR WITH HOLD FOR SELECT id, name FROM stream_smoke ORDER BY id",
+        ) {
+            Some(NamedCursorSql::Declare {
+                name,
+                select_sql,
+                with_hold,
+            }) => {
+                assert_eq!(name, "c1");
+                assert!(select_sql.to_ascii_uppercase().starts_with("SELECT"));
+                assert!(with_hold);
+            }
+            other => panic!("declare: {other:?}"),
+        }
+        match parse_named_cursor_sql("DECLARE c2 CURSOR FOR SELECT 1") {
+            Some(NamedCursorSql::Declare {
+                name,
+                with_hold,
+                ..
+            }) => {
+                assert_eq!(name, "c2");
+                assert!(!with_hold);
+            }
+            other => panic!("declare no hold: {other:?}"),
+        }
+        match parse_named_cursor_sql("FETCH 1 FROM c1") {
+            Some(NamedCursorSql::Fetch { name, count }) => {
+                assert_eq!(name, "c1");
+                assert_eq!(count, 1);
+            }
+            other => panic!("fetch: {other:?}"),
+        }
+        match parse_named_cursor_sql("FETCH FORWARD 2 IN c1") {
+            Some(NamedCursorSql::Fetch { name, count }) => {
+                assert_eq!(name, "c1");
+                assert_eq!(count, 2);
+            }
+            other => panic!("fetch forward: {other:?}"),
+        }
+        match parse_named_cursor_sql("CLOSE c1") {
+            Some(NamedCursorSql::Close { name }) => assert_eq!(name, "c1"),
+            other => panic!("close: {other:?}"),
+        }
+        assert!(parse_named_cursor_sql("SELECT 1").is_none());
+        // WITH HOLD is accepted in text but still process-local implementation.
+        match parse_named_cursor_sql("DECLARE x NO SCROLL CURSOR WITH HOLD FOR SELECT 1") {
+            Some(NamedCursorSql::Declare {
+                name, with_hold, ..
+            }) => {
+                assert_eq!(name, "x");
+                assert!(with_hold);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -702,7 +702,13 @@ fn decode_query_command(sql: String, session: &mut SessionState) -> GatewayComma
         session.charset = Some(client_encoding);
     }
 
-    match sql.trim().to_ascii_lowercase().as_str() {
+    // Strip trailing semicolons so "COMMIT;" / "BEGIN;" match control keywords.
+    let keyword = sql
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_ascii_lowercase();
+    match keyword.as_str() {
         "begin" | "start transaction" => {
             session.transaction_state = TransactionState::Active;
             GatewayCommand::Begin

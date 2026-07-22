@@ -165,11 +165,12 @@ pub static GATEWAY_ENCODE_PEAK_WINDOW_BYTES: Lazy<GaugeVec> = Lazy::new(|| {
 /// mode=hold — remainder kept as process-local RowStream (not SQL WITH HOLD).
 /// mode=logical_skip — re-run SQL and skip prior rows (fallback).
 /// mode=resume_hold — next Execute consumed the held RowStream without re-SQL.
+/// mode=sql_cursor_* — simple-query DECLARE/FETCH/CLOSE process-local named cursor.
 pub static GATEWAY_PORTAL_RESUME_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         opts!(
             "gateway_portal_resume_total",
-            "PG PortalSuspended multi-Execute resume events (hold|logical_skip|resume_hold; not SQL WITH HOLD)"
+            "PG portal/cursor resume events (hold|logical_skip|resume_hold|sql_cursor_*; not backend WITH HOLD)"
         ),
         &["mode"],
     )
@@ -323,6 +324,12 @@ pub fn normalize_portal_resume_mode(mode: &str) -> &'static str {
         "hold" | "hold_remainder" | "rowstream_hold" => "hold",
         "logical_skip" | "skip" | "logical" => "logical_skip",
         "resume_hold" | "resume" | "held_resume" => "resume_hold",
+        "sql_cursor_declare" | "declare" | "cursor_declare" => "sql_cursor_declare",
+        "sql_cursor_fetch" | "fetch" | "cursor_fetch" => "sql_cursor_fetch",
+        "sql_cursor_close" | "close" | "cursor_close" => "sql_cursor_close",
+        "sql_cursor_session_end" | "session_end" | "cursor_session_end" => {
+            "sql_cursor_session_end"
+        }
         _ => "n/a",
     }
 }
@@ -349,6 +356,8 @@ pub fn normalize_execute_path(path: &str) -> &'static str {
         "streaming" | "stream" => "streaming",
         "materialized" | "materialise" | "full" => "materialized",
         "xproto_stream" | "xproto" | "cross_protocol" => "xproto_stream",
+        // A10 process-local SQL cursor surface (not backend WITH HOLD).
+        "sql_cursor_declare" | "sql_cursor_fetch" | "sql_cursor_close" => "streaming",
         _ => "n/a",
     }
 }
@@ -416,6 +425,18 @@ mod tests {
         assert_eq!(normalize_portal_resume_mode("hold_remainder"), "hold");
         assert_eq!(normalize_portal_resume_mode("logical_skip"), "logical_skip");
         assert_eq!(normalize_portal_resume_mode("resume_hold"), "resume_hold");
+        assert_eq!(
+            normalize_portal_resume_mode("sql_cursor_declare"),
+            "sql_cursor_declare"
+        );
+        assert_eq!(
+            normalize_portal_resume_mode("sql_cursor_fetch"),
+            "sql_cursor_fetch"
+        );
+        assert_eq!(
+            normalize_portal_resume_mode("sql_cursor_close"),
+            "sql_cursor_close"
+        );
         assert_eq!(normalize_portal_resume_mode("weird"), "n/a");
     }
 

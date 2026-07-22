@@ -276,3 +276,6 @@ examples/        smoke + gateway config 样例
 | A08 | client original-frame extended TCP + passthrough_client label | feat(a08) |
 | A08 | multi-Execute continuous client-frame TCP hold + PgBackendSync | feat(a08) |
 | A06 | peak_window_bytes logical gauge + multi-window smoke pin | feat(a06) |
+| A10 | process-local SQL DECLARE/FETCH/CLOSE cursor (not backend WITH HOLD) | feat(a10) |
+| A10 | session end Drop/Quit clears named_cursors + smoke reconnect dies | feat(a10) |
+| A10 | dual concurrent process-local cursors smoke (ASC+DESC interleave) | test(a10) |

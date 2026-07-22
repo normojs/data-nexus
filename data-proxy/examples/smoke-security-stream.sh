@@ -887,4 +887,133 @@ for ln in text.splitlines():
         print(ln)
 PYA10
 
+echo "==> A10 process-local SQL cursor DECLARE/FETCH/CLOSE (not backend WITH HOLD)"
+# Gateway holds a RowStream under a name; WITH HOLD in text is accepted but still
+# process-local (dies with session). Metrics: sql_cursor_declare/fetch/close.
+# Use main gateway: DECLARE opens without max_rows cap so multi-FETCH can page.
+pg_cur_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+  env PGPASSWORD=postgres \
+  psql -h host.docker.internal -p 9089 -U postgres -d analytics -v ON_ERROR_STOP=1 -A -t <<'SQL'
+BEGIN;
+DECLARE c_smoke CURSOR WITH HOLD FOR SELECT id, name FROM stream_smoke ORDER BY id;
+FETCH 1 FROM c_smoke;
+FETCH 1 FROM c_smoke;
+CLOSE c_smoke;
+COMMIT;
+SQL
+)"
+echo "$pg_cur_out"
+# Two FETCH 1 pages should yield two distinct rows (id 1 then 2) if stream held.
+echo "$pg_cur_out" | grep -qE '1\|a' || { echo "FAIL: expected first fetch id=1: $pg_cur_out" >&2; exit 1; }
+echo "$pg_cur_out" | grep -qE '2\|b' || { echo "FAIL: expected second fetch id=2 (multi-FETCH hold): $pg_cur_out" >&2; exit 1; }
+echo "a10_sql_cursor_declare_fetch_close_ok"
+echo "a10_sql_cursor_multi_fetch_ok"
+
+# Non-WITH-HOLD cursor is dropped on COMMIT (honest txn end; still not backend cursor).
+# Capture stderr: psql prints ERROR there.
+pg_cur_nohold="$(docker run --rm -i --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+  env PGPASSWORD=postgres \
+  psql -h host.docker.internal -p 9089 -U postgres -d analytics -v ON_ERROR_STOP=0 -A -t <<'SQL' 2>&1
+BEGIN;
+DECLARE c_nohold CURSOR FOR SELECT id, name FROM stream_smoke ORDER BY id;
+FETCH 1 FROM c_nohold;
+COMMIT;
+FETCH 1 FROM c_nohold;
+SQL
+)"
+echo "$pg_cur_nohold"
+# After COMMIT, FETCH on non-hold cursor should error (does not exist).
+echo "$pg_cur_nohold" | grep -qiE 'does not exist|34000|ERROR' \
+  || { echo "FAIL: expected non-WITH-HOLD cursor dropped on COMMIT: $pg_cur_nohold" >&2; exit 1; }
+echo "a10_sql_cursor_nohold_drop_on_commit_ok"
+
+# WITH HOLD (process-local) survives COMMIT until CLOSE — still not backend server cursor.
+pg_cur_hold="$(docker run --rm -i --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+  env PGPASSWORD=postgres \
+  psql -h host.docker.internal -p 9089 -U postgres -d analytics -v ON_ERROR_STOP=1 -A -t <<'SQL' 2>&1
+BEGIN;
+DECLARE c_hold CURSOR WITH HOLD FOR SELECT id, name FROM stream_smoke ORDER BY id;
+FETCH 1 FROM c_hold;
+COMMIT;
+FETCH 1 FROM c_hold;
+CLOSE c_hold;
+SQL
+)"
+echo "$pg_cur_hold"
+echo "$pg_cur_hold" | grep -qE '1\|a' || { echo "FAIL: WITH HOLD first fetch: $pg_cur_hold" >&2; exit 1; }
+echo "$pg_cur_hold" | grep -qE '2\|b' || { echo "FAIL: WITH HOLD should survive COMMIT for second fetch: $pg_cur_hold" >&2; exit 1; }
+echo "$pg_cur_hold" | grep -qiE 'does not exist' \
+  && { echo "FAIL: WITH HOLD process-local cursor must not drop on COMMIT: $pg_cur_hold" >&2; exit 1; }
+echo "a10_sql_cursor_with_hold_survives_commit_ok"
+
+# Session end: WITH HOLD process-local cursor dies with disconnect (not backend).
+# Open cursor, disconnect, reconnect and FETCH must fail.
+docker run --rm -i --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+  env PGPASSWORD=postgres \
+  psql -h host.docker.internal -p 9089 -U postgres -d analytics -v ON_ERROR_STOP=1 -A -t <<'SQL' >/tmp/dn-cursor-session1.out 2>&1
+BEGIN;
+DECLARE c_sess CURSOR WITH HOLD FOR SELECT id, name FROM stream_smoke ORDER BY id;
+FETCH 1 FROM c_sess;
+COMMIT;
+SQL
+echo "session1:"
+cat /tmp/dn-cursor-session1.out
+grep -qE '1\|a' /tmp/dn-cursor-session1.out || { echo "FAIL: session1 open cursor" >&2; exit 1; }
+
+pg_cur_sess2="$(docker run --rm -i --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+  env PGPASSWORD=postgres \
+  psql -h host.docker.internal -p 9089 -U postgres -d analytics -v ON_ERROR_STOP=0 -A -t <<'SQL' 2>&1
+FETCH 1 FROM c_sess;
+SQL
+)"
+echo "session2:"
+echo "$pg_cur_sess2"
+echo "$pg_cur_sess2" | grep -qiE 'does not exist|34000|ERROR' \
+  || { echo "FAIL: WITH HOLD process-local cursor must die with session: $pg_cur_sess2" >&2; exit 1; }
+echo "a10_sql_cursor_dies_with_session_ok"
+
+# Two concurrent process-local cursors in one session must not clobber each other.
+pg_dual="$(docker run --rm -i --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+  env PGPASSWORD=postgres \
+  psql -h host.docker.internal -p 9089 -U postgres -d analytics -v ON_ERROR_STOP=1 -A -t <<'SQL' 2>&1
+BEGIN;
+DECLARE c_a CURSOR WITH HOLD FOR SELECT id, name FROM stream_smoke ORDER BY id;
+DECLARE c_b CURSOR WITH HOLD FOR SELECT id, name FROM stream_smoke ORDER BY id DESC;
+FETCH 1 FROM c_a;
+FETCH 1 FROM c_b;
+FETCH 1 FROM c_a;
+CLOSE c_a;
+CLOSE c_b;
+COMMIT;
+SQL
+)"
+echo "$pg_dual"
+# ASC first row id=1, DESC first row id=3 (seed has 1,2,3), then ASC second id=2.
+echo "$pg_dual" | grep -qE '1\|a' || { echo "FAIL: dual cursor c_a first: $pg_dual" >&2; exit 1; }
+echo "$pg_dual" | grep -qE '3\|c' || { echo "FAIL: dual cursor c_b first (DESC): $pg_dual" >&2; exit 1; }
+echo "$pg_dual" | grep -qE '2\|b' || { echo "FAIL: dual cursor c_a second: $pg_dual" >&2; exit 1; }
+echo "a10_sql_cursor_dual_concurrent_ok"
+
+curl -fsS "http://127.0.0.1:8082/metrics" | tee /tmp/dn-stream-cursor-metrics.txt >/dev/null
+python3 - <<'PYCUR'
+import re
+text=open("/tmp/dn-stream-cursor-metrics.txt").read()
+modes={}
+for ln in text.splitlines():
+    if "gateway_portal_resume_total" not in ln or ln.startswith("#"):
+        continue
+    m=re.search(r'mode="([^"]+)".*?\s([0-9]+(?:\.[0-9]+)?)\s*$', ln)
+    if m:
+        modes[m.group(1)] = modes.get(m.group(1),0)+float(m.group(2))
+print("portal_resume modes after cursor:", modes)
+assert modes.get("sql_cursor_declare",0) >= 6, modes  # prior 4 + dual 2
+assert modes.get("sql_cursor_fetch",0) >= 8, modes  # prior 6 + dual 3
+assert modes.get("sql_cursor_close",0) >= 4, modes  # prior 2 + dual 2
+assert modes.get("sql_cursor_session_end",0) >= 1, modes
+print("A10 honesty: dual concurrent process-local cursors; multi-FETCH; txn/session lifecycle (not backend WITH HOLD)")
+for ln in text.splitlines():
+    if "gateway_portal_resume_total" in ln and not ln.startswith("#") and "sql_cursor" in ln:
+        print(ln)
+PYCUR
+
 echo "smoke-security-stream: OK"
