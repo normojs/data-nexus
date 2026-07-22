@@ -143,6 +143,45 @@ fn gateway_value_sql_literal(v: &GatewayValue) -> String {
     }
 }
 
+/// A08: serialize bind values as PostgreSQL **text** parameter bytes for backend
+/// re-encoded Bind (format code 0). `None` = SQL NULL. Rejects values that cannot
+/// be safely text-bound without a typed OID (none today for GatewayValue set).
+fn gateway_values_to_pg_text_params(
+    parameters: &[GatewayValue],
+) -> GatewayResult<Vec<Option<Vec<u8>>>> {
+    let mut out = Vec::with_capacity(parameters.len());
+    for v in parameters {
+        let bytes = match v {
+            GatewayValue::Null => None,
+            GatewayValue::Boolean(b) => {
+                Some(if *b { b"t".to_vec() } else { b"f".to_vec() })
+            }
+            GatewayValue::Integer(i) => Some(i.to_string().into_bytes()),
+            GatewayValue::UnsignedInteger(u) => Some(u.to_string().into_bytes()),
+            GatewayValue::Float(f) => {
+                if f.is_finite() {
+                    Some(f.to_string().into_bytes())
+                } else {
+                    None
+                }
+            }
+            GatewayValue::Decimal(s) => Some(s.as_bytes().to_vec()),
+            GatewayValue::String(s) => Some(s.as_bytes().to_vec()),
+            GatewayValue::Bytes(b) => {
+                // Text-format bytea as \xHEX (PG accepts this for text binds).
+                let mut hex = String::with_capacity(2 + b.len() * 2);
+                hex.push_str("\\x");
+                for byte in b {
+                    hex.push_str(&format!("{byte:02x}"));
+                }
+                Some(hex.into_bytes())
+            }
+        };
+        out.push(bytes);
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug)]
 pub struct PostgreSqlBackendConnector {
     endpoints: Arc<Mutex<Vec<EndpointConfig>>>,
@@ -345,6 +384,62 @@ impl PostgreSqlBackendConnector {
         let stream = session_tcp
             .simple_query_relay_into(
                 sql,
+                SessionReturn::Idle {
+                    pool: self.tcp_idle.clone(),
+                    key,
+                },
+            )
+            .await?;
+        Ok(ExecuteOutcome::WireRelay(WireRelay {
+            stream: Box::new(stream),
+        }))
+    }
+
+    /// A08: re-encoded extended text-bind on backend TCP (not original client frames).
+    ///
+    /// Builds backend Parse/Bind/Execute/Sync with text params. Caller (core_engine)
+    /// strips backend ParseComplete/BindComplete/ReadyForQuery when serving a client
+    /// extended unit. Falls through to demote if params cannot be text-serialized.
+    async fn execute_extended_text_bind_tcp_relay(
+        &self,
+        endpoint: EndpointConfig,
+        sql: &str,
+        parameters: &[GatewayValue],
+        session: &SessionState,
+        in_txn: bool,
+    ) -> GatewayResult<ExecuteOutcome> {
+        let text_params = gateway_values_to_pg_text_params(parameters)?;
+        let database = effective_database(&endpoint, session)?;
+        if in_txn {
+            let (sess, is_new) = self.take_or_open_tcp_txn(&endpoint, session).await?;
+            let sess = if is_new {
+                let (sess, begin_packets) = sess.simple_query_collect_reuse("BEGIN").await?;
+                if begin_packets.iter().any(|p| p.first() == Some(&b'E')) {
+                    return Ok(ExecuteOutcome::Complete(GatewayResponse::Wire {
+                        packets: begin_packets,
+                    }));
+                }
+                sess
+            } else {
+                sess
+            };
+            let stream = sess
+                .extended_text_bind_relay_into(
+                    sql,
+                    &text_params,
+                    SessionReturn::Txn(self.tcp_txn.clone()),
+                )
+                .await?;
+            return Ok(ExecuteOutcome::WireRelay(WireRelay {
+                stream: Box::new(stream),
+            }));
+        }
+        let key = PgTcpIdlePool::pool_key(&endpoint, &database);
+        let session_tcp = self.tcp_idle.take_or_connect(&endpoint, &database).await?;
+        let stream = session_tcp
+            .extended_text_bind_relay_into(
+                sql,
+                &text_params,
                 SessionReturn::Idle {
                     pool: self.tcp_idle.clone(),
                     key,
@@ -1112,9 +1207,10 @@ impl BackendConnector for PostgreSqlBackendConnector {
             || self.tcp_txn.lock().is_some();
 
         // A08: progressive TCP frame relay for passthrough (txn + non-txn).
-        // QueryParams / prepared Execute with text-bindable params can be rewritten
-        // into a simple Query and still use TCP frame relay. Binary-only or rewrite
-        // failures demote to Streaming (no Parse/Bind/Execute wire passthrough).
+        // Simple Query → simple Query TCP. Extended text-bindable QueryParams /
+        // prepared Execute → re-encoded backend Parse/Bind/Execute/Sync TCP.
+        // Still not original client Parse/Bind frames. Binary-only / serialize
+        // failures demote to Streaming.
         if matches!(mode, ExecuteMode::Passthrough) && is_query {
             if let GatewayCommand::Query { sql } = command {
                 let endpoint = self.select_endpoint(session)?;
@@ -1129,14 +1225,11 @@ impl BackendConnector for PostgreSqlBackendConnector {
             }
         }
 
-        // A08: extended → simple Query TCP relay when placeholders can be text-inlined.
-        // This is still not Parse/Bind/Execute frame relay; it is honest "simple Query
-        // wire after rewrite" and avoids demoting every parameterized SELECT under
-        // passthrough=true. Binary-only binds / rewrite errors fall through to demote.
+        // A08: extended text-bind → backend re-encoded Parse/Bind/Execute/Sync TCP.
         if matches!(mode, ExecuteMode::Passthrough) && (is_query_params || is_execute) {
-            let rewritten = match &command {
+            let try_relay = match &command {
                 GatewayCommand::QueryParams { sql, parameters } => {
-                    Some(bind_pg_placeholders(sql, parameters))
+                    Some((sql.clone(), parameters.clone()))
                 }
                 GatewayCommand::Execute {
                     statement_id,
@@ -1144,27 +1237,36 @@ impl BackendConnector for PostgreSqlBackendConnector {
                 } => self
                     .prepared
                     .take_sql(statement_id)
-                    .map(|sql| bind_pg_placeholders(&sql, parameters)),
+                    .map(|sql| (sql, parameters.clone())),
                 _ => None,
             };
-            if let Some(Ok(sql)) = rewritten {
+            if let Some((sql, parameters)) = try_relay {
                 let endpoint = self.select_endpoint(session)?;
-                if in_txn {
-                    return self
-                        .execute_simple_query_tcp_relay_txn(endpoint, &sql, session)
-                        .await;
+                match self
+                    .execute_extended_text_bind_tcp_relay(
+                        endpoint,
+                        &sql,
+                        &parameters,
+                        session,
+                        in_txn,
+                    )
+                    .await
+                {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "data_nexus::gateway",
+                            error = %e,
+                            "a08 extended text-bind TCP relay failed; demote Streaming"
+                        );
+                    }
                 }
-                return self
-                    .execute_simple_query_tcp_relay(endpoint, &sql, session)
-                    .await;
             }
-            // rewrite failed or unknown statement id → demote below
         }
 
-        // A08 honesty: Passthrough + extended that could not TCP-relay as simple Query
-        // must not fall through to Complete materialization. Demote to Streaming
-        // so bound params still use the windowed prepare path (no TCP frame relay).
-        // Preserve max_rows if the caller already merged stream_mode caps.
+        // A08 honesty: Passthrough + extended that could not TCP-relay as extended
+        // text-bind must not fall through to Complete materialization. Demote to
+        // Streaming so bound params still use the windowed prepare path.
         let (mode, streaming) = if matches!(mode, ExecuteMode::Passthrough)
             && (is_query_params || is_execute)
         {

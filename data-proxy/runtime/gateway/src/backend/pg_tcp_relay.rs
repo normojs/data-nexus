@@ -1,19 +1,20 @@
 //! A08: PostgreSQL same-protocol TCP frame relay.
 //!
 //! Opens a dedicated backend TCP session (startup + auth), sends simple Query
-//! frames, and yields raw backend messages (tag + length + body) until
-//! ReadyForQuery. Peak retained bytes ≈ one read buffer / batch.
+//! **or re-encoded extended** (Parse/Bind/Execute/Sync) frames, and yields raw
+//! backend messages (tag + length + body) until ReadyForQuery. Peak retained
+//! bytes ≈ one read buffer / batch.
 //!
 //! Scope (honest):
-//! - simple Query only (not extended protocol)
+//! - simple Query TCP relay
+//! - **extended text-bind re-encode** on backend TCP (not original client Parse/Bind
+//!   frames; gateway rebuilds P/B/E/S with text params)
 //! - reusable session for in-transaction multi-statement passthrough
 //! - **non-txn idle pool** (per address|db|user, capped + **idle TTL**) to avoid
 //!   connect/auth every passthrough query
 //! - cleartext / MD5 / SCRAM-SHA-256 auth; TLS via ssl_mode + optional CA pin
 //! - not shared with the tokio-postgres pool (parallel lease)
 //! - idle TTL + **optional active health probe** (SELECT 1) on take
-//! - cleartext / MD5 / SCRAM-SHA-256 auth; TLS via ssl_mode + optional CA pin
-//! - not shared with the tokio-postgres pool (parallel lease)
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use postgres_protocol::authentication::md5_hash;
 use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256, SCRAM_SHA_256};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
+use postgres_protocol::IsNull;
 use postgresql_protocol::encode_ssl_request;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -465,6 +467,59 @@ impl PgTcpSession {
             .write_all(&out)
             .await
             .map_err(|e| GatewayError::Backend(format!("pg query write: {e}")))?;
+        Ok(PgTcpWireStream {
+            session: Some(self),
+            return_to,
+            done: false,
+        })
+    }
+
+    /// A08: re-encode extended text-bind unit on backend TCP (Parse/Bind/Execute/Sync).
+    ///
+    /// Uses **unnamed** statement/portal so idle pool reuse stays safe. Params are
+    /// already text-serializable (`None` = SQL NULL). This is **not** original client
+    /// frame relay — gateway rebuilds P/B/E/S. Callers serving a client extended unit
+    /// should strip backend ParseComplete/BindComplete/ReadyForQuery (`1`/`2`/`Z`).
+    pub async fn extended_text_bind_relay_into(
+        mut self,
+        sql: &str,
+        text_params: &[Option<Vec<u8>>],
+        return_to: SessionReturn,
+    ) -> GatewayResult<PgTcpWireStream> {
+        let mut out = BytesMut::with_capacity(64 + sql.len() + text_params.len() * 16);
+        // Unnamed statement; no forced param OIDs (backend infers / text).
+        frontend::parse("", sql, std::iter::empty::<u32>(), &mut out)
+            .map_err(|e| GatewayError::Backend(format!("pg extended parse encode: {e}")))?;
+        let formats = std::iter::repeat(0i16).take(text_params.len());
+        let values = text_params.iter().map(|p| p.as_ref());
+        frontend::bind(
+            "",
+            "",
+            formats,
+            values,
+            |v, buf| {
+                match v {
+                    None => Ok(IsNull::Yes),
+                    Some(bytes) => {
+                        buf.extend_from_slice(bytes);
+                        Ok(IsNull::No)
+                    }
+                }
+            },
+            // result formats: all text (0)
+            std::iter::once(0i16),
+            &mut out,
+        )
+        .map_err(|_e| {
+            GatewayError::Backend("pg extended bind encode failed".into())
+        })?;
+        frontend::execute("", 0, &mut out)
+            .map_err(|e| GatewayError::Backend(format!("pg extended execute encode: {e}")))?;
+        frontend::sync(&mut out);
+        self.stream
+            .write_all(&out)
+            .await
+            .map_err(|e| GatewayError::Backend(format!("pg extended write: {e}")))?;
         Ok(PgTcpWireStream {
             session: Some(self),
             return_to,

@@ -126,10 +126,9 @@ elif grep -q 'passthrough' "$PROXY_LOG" 2>/dev/null; then
   echo "log contains passthrough outcome"
 fi
 
-echo "==> A08 PostgreSQL extended text-bind under passthrough (rewrite→simple Query wire)"
-# Text-bindable $1 rewrites to simple Query TCP (passthrough + wire bytes).
-# Still NOT original Parse/Bind/Execute frame relay. Backend ReadyForQuery from
-# the rewritten simple Query must be stripped until client Sync (pg_extended_query).
+echo "==> A08 PostgreSQL extended text-bind under passthrough (backend re-encoded P/B/E TCP)"
+# Text-bindable $1 re-encodes as backend Parse/Bind/Execute/Sync (passthrough_extended).
+# Still NOT original client Parse/Bind frame relay. Backend 1/2/Z stripped until Sync.
 pg_ext_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
   python - <<'PY'
 import socket, struct
@@ -269,24 +268,22 @@ has_ext = (
     or "type=\"EXECUTE\"" in text
 )
 assert has_ext, "expected QUERY_PARAMS or EXECUTE after extended traffic"
-# A08: PG extended text-bind should rewrite → simple Query TCP.
-# Honesty label: execute_path=passthrough_rewrite (not plain passthrough, not demote).
-# MySQL COM_STMT remains streaming_demote. Still NOT Parse/Bind/Execute frame relay.
-pg_qp_rewrite = any(
+# A08: PG extended text-bind → backend re-encoded Parse/Bind/Execute TCP.
+# Honesty label: execute_path=passthrough_extended (aliases passthrough_rewrite).
+# MySQL COM_STMT remains streaming_demote. Still NOT original client frame relay.
+pg_qp_ext = any(
     ('QUERY_PARAMS' in ln)
-    and ('passthrough_rewrite' in ln)
+    and ('passthrough_extended' in ln or 'passthrough_rewrite' in ln)
     and ('gateway_execute_path_total' in ln)
     for ln in text.splitlines() if not ln.startswith('#')
 )
-# Accept legacy passthrough on QUERY_PARAMS only if rewrite label missing in older builds —
-# this smoke builds current binary, so require passthrough_rewrite.
-assert pg_qp_rewrite, "expected QUERY_PARAMS execute_path=passthrough_rewrite after PG text-bind rewrite"
+assert pg_qp_ext, "expected QUERY_PARAMS execute_path=passthrough_extended after PG text-bind"
 pg_qp_bytes = any(
     ('QUERY_PARAMS' in ln) and ('gateway_passthrough_bytes_total' in ln) and not ln.startswith('#')
     for ln in text.splitlines()
 )
-assert pg_qp_bytes, "expected passthrough_bytes for QUERY_PARAMS after PG text-bind rewrite"
-print("A08 honesty: PG QUERY_PARAMS text-bind rewrite → passthrough_rewrite + wire bytes")
+assert pg_qp_bytes, "expected passthrough_bytes for QUERY_PARAMS after PG text-bind"
+print("A08 honesty: PG QUERY_PARAMS text-bind → passthrough_extended + wire bytes")
 # MySQL COM_STMT should still demote (binary bind unsafe as text rewrite)
 mysql_demote = any(
     ('EXECUTE' in ln) and ('streaming_demote' in ln or 'streaming' in ln) and ('mysql' in ln)
@@ -294,7 +291,7 @@ mysql_demote = any(
 )
 assert mysql_demote, "expected MySQL EXECUTE streaming_demote under passthrough"
 print("A08 honesty: MySQL COM_STMT remains streaming_demote (not text rewrite)")
-print("A08 still NOT Parse/Bind/Execute original frame relay")
+print("A08 still NOT original client Parse/Bind/Execute frame relay")
 print("A05 metrics ok")
 for line in text.splitlines():
     if "gateway_execute_path_total" in line or "gateway_passthrough_bytes_total" in line:

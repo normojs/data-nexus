@@ -830,17 +830,18 @@ impl CoreGatewayConnection {
                     let skip_z = self.session.pg_extended_query;
                     let wire_bytes = write_wire_relay_opts(relay, writer, skip_z).await?;
                     // Honesty: simple Query wire = passthrough; QueryParams/Execute that
-                    // text-rewrote to simple Query TCP = passthrough_rewrite (still not
-                    // original Parse/Bind frame relay).
+                    // re-encoded extended text-bind (or legacy rewrite) to TCP wire =
+                    // passthrough_extended (still not original client Parse/Bind frames).
+                    // Keep passthrough_rewrite as alias for metrics continuity.
                     let execute_path = if command_type == "QUERY_PARAMS"
                         || command_type == "EXECUTE"
                     {
-                        "passthrough_rewrite"
+                        "passthrough_extended"
                     } else {
                         "passthrough"
                     };
-                    let outcome = if execute_path == "passthrough_rewrite" {
-                        "passthrough_rewrite"
+                    let outcome = if execute_path == "passthrough_extended" {
+                        "passthrough_extended"
                     } else {
                         "passthrough"
                     };

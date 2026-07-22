@@ -220,11 +220,12 @@ pub async fn write_wire_relay<W: ResponseWriter + ?Sized>(
 
 /// A08: drain WireRelay, optionally suppressing backend ReadyForQuery (`Z`).
 ///
-/// When PG extended QueryParams/Execute is rewritten to simple Query TCP, the
-/// backend still ends the simple-query unit with ReadyForQuery. Clients in an
-/// extended-query unit must **not** see that `Z` until Sync — strip it here so
-/// rewrite→wire stays protocol-correct without claiming original Parse/Bind
-/// frame relay.
+/// When PG extended QueryParams/Execute is served via backend simple Query or
+/// re-encoded extended TCP, the backend unit may emit ReadyForQuery and (for
+/// re-encoded P/B/E/S) ParseComplete/BindComplete. Clients that already received
+/// local `1`/`2` from the frontend adapter must not see a second pair, and must
+/// not see `Z` until Sync — strip those tags when `skip_ready_for_query` is set.
+/// Still not original client Parse/Bind frame relay.
 pub async fn write_wire_relay_opts<W: ResponseWriter + ?Sized>(
     mut relay: WireRelay,
     writer: &mut W,
@@ -239,7 +240,10 @@ pub async fn write_wire_relay_opts<W: ResponseWriter + ?Sized>(
                 let batch = if skip_ready_for_query {
                     batch
                         .into_iter()
-                        .filter(|p| p.first() != Some(&b'Z'))
+                        .filter(|p| {
+                            // Z = ReadyForQuery; 1 = ParseComplete; 2 = BindComplete
+                            !matches!(p.first(), Some(&b'Z' | &b'1' | &b'2'))
+                        })
                         .collect::<Vec<_>>()
                 } else {
                     batch
@@ -824,6 +828,8 @@ mod tests {
             stream: Box::new(FakeWire {
                 batches: vec![
                     vec![
+                        vec![b'1', 0, 0, 0, 4], // ParseComplete from backend re-encode
+                        vec![b'2', 0, 0, 0, 4], // BindComplete
                         vec![b'T', 0, 0, 0, 4],
                         vec![b'D', 0, 0, 0, 4],
                         vec![b'C', 0, 0, 0, 4],
@@ -837,7 +843,10 @@ mod tests {
         let bytes = write_wire_relay_opts(relay, &mut writer, true).await.unwrap();
         assert_eq!(bytes, 5 + 5 + 5);
         assert_eq!(writer.packets.len(), 3);
-        assert!(writer.packets.iter().all(|p| p.first() != Some(&b'Z')));
+        assert!(writer
+            .packets
+            .iter()
+            .all(|p| !matches!(p.first(), Some(&b'Z' | &b'1' | &b'2'))));
         assert_eq!(writer.packets[0][0], b'T');
         assert_eq!(writer.packets[2][0], b'C');
     }
