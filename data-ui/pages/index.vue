@@ -84,6 +84,7 @@ const pdpBackend = computed(() => policies.value?.pdp_backend || policies.value?
 const auditLevel = computed(() => policies.value?.default_audit_level || '—')
 const windowRows = computed(() => policies.value?.streaming?.window_rows)
 const stateBackend = computed(() => policies.value?.state?.backend || '—')
+const auditSample = computed(() => policies.value?.audit_sample || null)
 
 async function loadAll() {
   setStatus('Loading…')
@@ -282,6 +283,32 @@ onUnmounted(() => {
           written={{ auditStats?.written ?? '—' }}
           · dropped={{ auditStats?.dropped ?? '—' }}
           · prio_acc={{ auditStats?.priority_accepted ?? '—' }}
+        </div>
+      </NuxtLink>
+      <NuxtLink
+        class="stat-card link-card"
+        to="/policies"
+      >
+        <div class="label">
+          Audit sample (B08)
+        </div>
+        <div class="value mono">
+          <template v-if="auditSample">
+            {{ auditSample.sample_enabled ? 'on' : 'off' }}
+          </template>
+          <template v-else>
+            —
+          </template>
+        </div>
+        <div
+          v-if="auditSample"
+          class="sub mono"
+        >
+          max_rows={{ auditSample.sample_max_rows }}
+          · max_bytes={{ auditSample.sample_max_bytes }}
+          · needs {{ auditSample.requires_audit_level || 'L2' }}
+          · full_result_l3={{ auditSample.full_result_l3 ?? false }}
+          · not L3 full archive
         </div>
       </NuxtLink>
       <NuxtLink

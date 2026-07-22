@@ -286,6 +286,7 @@ examples/        smoke + gateway config 样例
 | UI33 | Overview SQL cursor process-local metrics card | feat(ui) |
 | UI34 | Settings probe SQL cursor metrics + A10 honesty | feat(ui) |
 | UI35 | Policies streaming.passthrough honesty (mask forces Streaming) | feat(ui) |
+| UI36 | Overview B08 audit_sample honesty card (not L3) | feat(ui) |
 | A10 | MOVE/FETCH ABSOLUTE fail-closed + runbook H05 honesty fields | feat(a10)/docs(h05) |
 | A10 | sql_cursor_unsupported metric + OBSERVABILITY MOVE/ABSOLUTE | feat(a10) |
 | A08 | mask+passthrough=true still execute_path=streaming smoke pin | test(a08) |
