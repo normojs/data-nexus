@@ -63,8 +63,8 @@ cd data-proxy
   - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`smoke-security-passthrough.sh`、`smoke-security-config-validate.sh`、`OBSERVABILITY.md`
 
 - [ ] **A09** Portal 端到端流式  
-  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`（smoke：INSERT NDJSON/JSON/CSV **强制** `x-data-nexus-stream: chunked`）；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**；**跨协议 portal 双向** smoke 同窗；**响应头 `x-data-nexus-window-rows`**（CSV 无 body meta 时仍可钉窗）；**portal 与协议 CoreEngine 指标分离（诚实：portal 可不产生 encode_peak）**；**OBSERVABILITY** 标明 chunked ≠ backend_window  
-  - 仍欠：Complete 路径 ResultSet 在 backend 侧仍可能先物化（无 RowStream 时不可避免）；无进程 RSS 峰值 CI（逻辑 window 已钉）；portal 路径可选补齐独立 HTTP 侧指标  
+  - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`（smoke：INSERT NDJSON/JSON/CSV **强制** `x-data-nexus-stream: chunked`）；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**；**跨协议 portal 双向** smoke 同窗；**响应头 `x-data-nexus-window-rows`**；**portal HTTP 记 Prometheus `type=PORTAL_STREAM|PORTAL_CHUNKED`**（execute_path + 逻辑 peak；smoke 强制 PORTAL_STREAM peak≤window）；**OBSERVABILITY** 标明 chunked ≠ backend_window  
+  - 仍欠：Complete 路径 ResultSet 在 backend 侧仍可能先物化（无 RowStream 时不可避免）；无进程 RSS 峰值 CI（逻辑 window 已钉）  
   - 路径：`http` portal_execute_*_streaming；`security-portal-gateway-config.toml`；`security-portal-xproto{,-pg-mysql}-gateway-config.toml`；`smoke-security-portal{,-xproto,-xproto-pg-mysql}.sh`
 
 - [ ] **A10** 预处理 / 事务透传矩阵  

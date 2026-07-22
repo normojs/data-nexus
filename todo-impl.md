@@ -258,3 +258,4 @@ examples/        smoke + gateway config 样例
 | A08/B08 | config-validate smoke: sample L2 gate + require TLS needs CA | test(config) |
 | F18/A09 | dual-control issuer self-reject + portal metrics honesty (not CoreEngine) | test(f18/a09) |
 | F31 | remote PDP mock E2E allow/deny + fail_closed smoke | test(f31) |
+| A09 | portal HTTP Prometheus PORTAL_STREAM/CHUNKED + peak smoke | feat(a09) |

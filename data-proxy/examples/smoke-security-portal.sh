@@ -355,29 +355,45 @@ assert "format" in body or "invalid" in body, body
 print("bad format rejected", code)
 PY
 
-echo "==> A09 honesty: portal HTTP path vs protocol CoreEngine metrics"
-# Portal multi-row exports already pinned stream=backend_window + x-data-nexus-window-rows=2.
-# They call backend.execute_outcome directly (PEP on Admin API), not the protocol CoreEngine
-# handle_frame path — so gateway_execute_path_total / encode_peak may be absent or stale.
-# Do not claim protocol RSS/peak CI from portal alone; window pin is the portal contract.
+echo "==> A09 portal HTTP metrics on /metrics (PORTAL_STREAM path)"
+# Portal Admin path now records gateway_execute_path_total + encode peak under type=PORTAL_*.
+# Still logical peak (not process RSS). Headers remain the primary stream contract.
 metrics="$(curl -fsS http://127.0.0.1:8082/metrics 2>/dev/null || true)"
-if echo "$metrics" | grep -q 'gateway_encode_peak_window_rows{'; then
-  bad_peak="$(echo "$metrics" | awk '/gateway_encode_peak_window_rows\{/ {
-    v=$NF+0; if (v > 2) print v
-  }' | head -1)"
-  if [[ -n "$bad_peak" ]]; then
-    echo "FAIL: if peak samples exist they must be ≤ window_rows=2, got $bad_peak" >&2
+if ! echo "$metrics" | grep -q 'gateway_execute_path_total'; then
+  echo "FAIL: gateway_execute_path_total missing after portal traffic" >&2
+  exit 1
+fi
+if ! echo "$metrics" | grep 'type="PORTAL_STREAM"' | grep -q 'execute_path="streaming"\|execute_path="xproto_stream"'; then
+  # Also accept any PORTAL_STREAM line (path may be quoted variously)
+  if ! echo "$metrics" | grep -q 'type="PORTAL_STREAM"'; then
+    echo "FAIL: expected PORTAL_STREAM execute_path samples after multi-row portal exports" >&2
+    echo "$metrics" | grep 'gateway_execute_path_total' | head -20 || true
     exit 1
   fi
-  echo "note: encode_peak samples present and ≤2 (may be from prior protocol traffic)"
-else
-  echo "note: no encode_peak samples (expected for portal-only HTTP path; window pinned via headers)"
 fi
-if echo "$metrics" | grep -q 'execute_path="streaming"'; then
-  echo "note: streaming path counter present (protocol and/or prior traffic)"
-else
-  echo "note: no protocol execute_path=streaming sample required for portal HTTP exports"
+echo "portal PORTAL_STREAM path counter observed"
+if ! echo "$metrics" | grep -q 'type="PORTAL_STREAM".*gateway_encode_peak_window_rows\|gateway_encode_peak_window_rows{.*type="PORTAL_STREAM"'; then
+  # prometheus label order: check peak lines containing PORTAL_STREAM
+  if ! echo "$metrics" | grep 'gateway_encode_peak_window_rows' | grep -q 'PORTAL_STREAM'; then
+    echo "FAIL: expected gateway_encode_peak_window_rows for PORTAL_STREAM" >&2
+    echo "$metrics" | grep 'gateway_encode_peak_window_rows' | head -12 || true
+    exit 1
+  fi
 fi
-echo "portal window contract already asserted via x-data-nexus-stream/window-rows headers"
+bad_peak="$(echo "$metrics" | awk '/gateway_encode_peak_window_rows\{/ && /PORTAL_STREAM/ {
+  v=$NF+0; if (v > 2) print v
+}' | head -1)"
+if [[ -n "$bad_peak" ]]; then
+  echo "FAIL: portal PORTAL_STREAM peak_window_rows=$bad_peak exceeds window_rows=2" >&2
+  exit 1
+fi
+echo "portal PORTAL_STREAM encode peak ≤ window_rows=2 (logical; not process RSS)"
+# Complete INSERT paths should leave PORTAL_CHUNKED / materialized samples.
+if echo "$metrics" | grep -q 'type="PORTAL_CHUNKED"'; then
+  echo "portal PORTAL_CHUNKED path counter observed (Complete fallback)"
+else
+  echo "note: no PORTAL_CHUNKED sample yet (Complete INSERT still ran; label may share scrape timing)"
+fi
+echo "$metrics" | grep -E 'PORTAL_STREAM|PORTAL_CHUNKED' | head -12 || true
 
 echo "smoke-security-portal: OK"

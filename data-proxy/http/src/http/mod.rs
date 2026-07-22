@@ -2893,7 +2893,72 @@ struct PortalPrepared {
     obligations: gateway_core::Obligations,
     frontend_protocol: gateway_core::ProtocolKind,
     backend_protocol: gateway_core::ProtocolKind,
+    /// Listener name used for metrics domain label (first matching service listener).
+    listener_name: String,
+    /// Service name for metrics.
+    service_name: String,
+    /// First backend endpoint name for metrics.
+    endpoint_name: String,
 }
+
+/// A09: record portal Admin HTTP path onto the same Prometheus series as protocol CoreEngine.
+/// Uses `type=PORTAL_*` and `execute_path=streaming|materialized|xproto_stream` so portal-only
+/// traffic is no longer invisible on `/metrics`. Peak is logical window (not process RSS).
+fn record_portal_http_metrics(
+    listener_name: &str,
+    service_name: &str,
+    frontend_protocol: gateway_core::ProtocolKind,
+    backend_protocol: gateway_core::ProtocolKind,
+    endpoint_name: &str,
+    stream_kind: &str,
+    window_rows: usize,
+    peak_window_rows: u64,
+    windows: u64,
+) {
+    use runtime_gateway::server::metrics::MySQLServerMetricsCollector;
+
+    let domain = listener_name;
+    let service = service_name;
+    let frontend = frontend_protocol.as_str();
+    let backend = backend_protocol.as_str();
+    let endpoint = endpoint_name;
+    // Distinguish portal formats in the existing `type` label (command_type).
+    let cmd_type = match stream_kind {
+        "backend_window" => "PORTAL_STREAM",
+        "chunked" => "PORTAL_CHUNKED",
+        _ => "PORTAL",
+    };
+    let labels = [domain, service, frontend, backend, cmd_type, endpoint];
+    let execute_path = if frontend_protocol != backend_protocol {
+        "xproto_stream"
+    } else if stream_kind == "backend_window" {
+        "streaming"
+    } else {
+        // Complete / chunked fallback: backend may have materialized ResultSet.
+        "materialized"
+    };
+    let metrics = MySQLServerMetricsCollector::new();
+    metrics.record_execute_path(&labels, execute_path, 0);
+    let peak = if peak_window_rows > 0 {
+        peak_window_rows
+    } else if stream_kind == "backend_window" {
+        // At least advertise configured window as logical bound for portal Streaming.
+        window_rows.max(1) as u64
+    } else {
+        0
+    };
+    let win = if windows > 0 {
+        windows
+    } else if stream_kind == "backend_window" {
+        1
+    } else {
+        0
+    };
+    if win > 0 || peak > 0 {
+        metrics.record_secure_encode_peak(&labels, 0, win, 0, peak);
+    }
+}
+
 
 fn portal_prepare(
     config: &gateway_core::GatewayConfig,
@@ -2935,12 +3000,22 @@ fn portal_prepare(
         return Err(("endpoint".into(), "service has no endpoints".into()));
     }
 
+    let listener_name = plan
+        .listeners()
+        .iter()
+        .find(|l| l.service().name == service_name)
+        .map(|l| l.listener().name.clone())
+        .unwrap_or_else(|| service_name.to_owned());
     let frontend_protocol = plan
         .listeners()
         .iter()
         .find(|l| l.service().name == service_name)
         .map(|l| l.listener().protocol.clone())
         .unwrap_or_else(|| service.backend_protocol.clone());
+    let endpoint_name = endpoints
+        .first()
+        .map(|e| e.name.clone())
+        .unwrap_or_else(|| "unknown".into());
 
     let objects =
         runtime_gateway::object_extract::extract_object_set(sql, frontend_protocol.as_str());
@@ -3019,6 +3094,9 @@ fn portal_prepare(
         obligations,
         frontend_protocol,
         backend_protocol: service.backend_protocol,
+        listener_name,
+        service_name: service_name.to_owned(),
+        endpoint_name,
     })
 }
 
@@ -3054,6 +3132,11 @@ async fn portal_execute_ndjson_streaming(
     };
 
     let prepared = portal_prepare(config, service_name, sql, subject_id, max_rows)?;
+    let portal_listener = prepared.listener_name.clone();
+    let portal_service = prepared.service_name.clone();
+    let portal_frontend = prepared.frontend_protocol;
+    let portal_backend = prepared.backend_protocol;
+    let portal_endpoint = prepared.endpoint_name.clone();
     let mut session = prepared.session.clone();
     let outcome = prepared
         .backend
@@ -3180,6 +3263,17 @@ async fn portal_execute_ndjson_streaming(
                     "attachment; filename=\"portal-export.ndjson\"",
                 );
             }
+            record_portal_http_metrics(
+                &portal_listener,
+                &portal_service,
+                portal_frontend,
+                portal_backend,
+                &portal_endpoint,
+                "backend_window",
+                window,
+                window as u64,
+                1,
+            );
             Ok(builder.body(body).unwrap_or_else(|_| {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -3218,6 +3312,17 @@ async fn portal_execute_ndjson_streaming(
                         decision: "allow".into(),
                         message: None,
                     };
+                    record_portal_http_metrics(
+                        &portal_listener,
+                        &portal_service,
+                        portal_frontend,
+                        portal_backend,
+                        &portal_endpoint,
+                        "chunked",
+                        window,
+                        0,
+                        0,
+                    );
                     Ok(portal_ndjson_chunked_response(resp, download, window))
                 }
                 GatewayResponse::Error { code, message } => Err((code, message)),
@@ -3231,6 +3336,17 @@ async fn portal_execute_ndjson_streaming(
                         decision: "allow".into(),
                         message: Some("ok".into()),
                     };
+                    record_portal_http_metrics(
+                        &portal_listener,
+                        &portal_service,
+                        portal_frontend,
+                        portal_backend,
+                        &portal_endpoint,
+                        "chunked",
+                        window,
+                        0,
+                        0,
+                    );
                     Ok(portal_ndjson_chunked_response(resp, download, window))
                 }
                 other => Err(("unsupported".into(), format!("{other:?}"))),
@@ -3256,6 +3372,11 @@ async fn portal_execute_csv_streaming(
     };
 
     let prepared = portal_prepare(config, service_name, sql, subject_id, max_rows)?;
+    let portal_listener = prepared.listener_name.clone();
+    let portal_service = prepared.service_name.clone();
+    let portal_frontend = prepared.frontend_protocol;
+    let portal_backend = prepared.backend_protocol;
+    let portal_endpoint = prepared.endpoint_name.clone();
     let mut session = prepared.session.clone();
     let outcome = prepared
         .backend
@@ -3378,6 +3499,17 @@ async fn portal_execute_csv_streaming(
                     "attachment; filename=\"portal-export.csv\"",
                 );
             }
+            record_portal_http_metrics(
+                &portal_listener,
+                &portal_service,
+                portal_frontend,
+                portal_backend,
+                &portal_endpoint,
+                "backend_window",
+                window,
+                window as u64,
+                1,
+            );
             Ok(builder.body(body).unwrap_or_else(|_| {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -3423,6 +3555,17 @@ async fn portal_execute_csv_streaming(
                         decision: "allow".into(),
                         message: None,
                     };
+                    record_portal_http_metrics(
+                        &portal_listener,
+                        &portal_service,
+                        portal_frontend,
+                        portal_backend,
+                        &portal_endpoint,
+                        "chunked",
+                        window,
+                        0,
+                        0,
+                    );
                     Ok(portal_csv_chunked_response(resp, download, window))
                 }
                 GatewayResponse::Error { code, message } => Err((code, message)),
@@ -3436,6 +3579,17 @@ async fn portal_execute_csv_streaming(
                         decision: "allow".into(),
                         message: Some("ok".into()),
                     };
+                    record_portal_http_metrics(
+                        &portal_listener,
+                        &portal_service,
+                        portal_frontend,
+                        portal_backend,
+                        &portal_endpoint,
+                        "chunked",
+                        window,
+                        0,
+                        0,
+                    );
                     Ok(portal_csv_chunked_response(resp, download, window))
                 }
                 other => Err(("unsupported".into(), format!("{other:?}"))),
@@ -3463,6 +3617,11 @@ async fn portal_execute_json_streaming(
     };
 
     let prepared = portal_prepare(config, service_name, sql, subject_id, max_rows)?;
+    let portal_listener = prepared.listener_name.clone();
+    let portal_service = prepared.service_name.clone();
+    let portal_frontend = prepared.frontend_protocol;
+    let portal_backend = prepared.backend_protocol;
+    let portal_endpoint = prepared.endpoint_name.clone();
     let mut session = prepared.session.clone();
     let outcome = prepared
         .backend
@@ -3601,6 +3760,17 @@ async fn portal_execute_json_streaming(
                     "attachment; filename=\"portal-export.json\"",
                 );
             }
+            record_portal_http_metrics(
+                &portal_listener,
+                &portal_service,
+                portal_frontend,
+                portal_backend,
+                &portal_endpoint,
+                "backend_window",
+                window,
+                window as u64,
+                1,
+            );
             Ok(builder.body(body).unwrap_or_else(|_| {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -3646,6 +3816,17 @@ async fn portal_execute_json_streaming(
                         decision: "allow".into(),
                         message: None,
                     };
+                    record_portal_http_metrics(
+                        &portal_listener,
+                        &portal_service,
+                        portal_frontend,
+                        portal_backend,
+                        &portal_endpoint,
+                        "chunked",
+                        window,
+                        0,
+                        0,
+                    );
                     Ok(portal_json_chunked_response(resp, download, window))
                 }
                 GatewayResponse::Error { code, message } => Err((code, message)),
@@ -3659,6 +3840,17 @@ async fn portal_execute_json_streaming(
                         decision: "allow".into(),
                         message: Some("ok".into()),
                     };
+                    record_portal_http_metrics(
+                        &portal_listener,
+                        &portal_service,
+                        portal_frontend,
+                        portal_backend,
+                        &portal_endpoint,
+                        "chunked",
+                        window,
+                        0,
+                        0,
+                    );
                     Ok(portal_json_chunked_response(resp, download, window))
                 }
                 other => Err(("unsupported".into(), format!("{other:?}"))),

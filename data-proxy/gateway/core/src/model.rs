@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///
 /// Canonical config strings are `mysql` and `postgresql`.
 /// Deserialization also accepts common aliases (`my_sql`, `postgres`, `postgre_sql`, `pg`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolKind {
     MySql,
     PostgreSql,
