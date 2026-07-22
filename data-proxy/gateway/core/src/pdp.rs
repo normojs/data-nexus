@@ -2380,6 +2380,74 @@ mod tests {
     }
 
     #[test]
+    fn star_policy_allow_does_not_expand_or_strip_wildcard() {
+        // T01 honesty: even with star_policy=allow and a column deny on salary,
+        // `SELECT *` is not rewritten into an explicit list with salary stripped.
+        // Wildcard is skipped; only explicit columns participate in strip/deny.
+        let pdp = LocalPdp::from_inner(LocalPdpInner {
+            fail_closed: true,
+            star_policy: StarPolicy::Allow,
+            rules: vec![SecurityRuleConfig {
+                name: "deny-salary".into(),
+                effect: "deny".into(),
+                actions: vec!["select".into()],
+                tables: vec!["employees".into()],
+                columns: vec!["salary".into()],
+                subjects: vec![],
+                row_filter: None,
+            }],
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
+            default_max_rows: None,
+            watermark: SecurityWatermarkConfig::default(),
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
+            remote: None,
+        });
+        let mut set = ObjectSet::empty();
+        let mut obj = ObjectAccess::new("employees", StatementAction::Select);
+        obj.has_wildcard = true;
+        // No bare columns — pure star projection.
+        set.objects.push(obj);
+        let sub = subject("app");
+        let dialect = HeuristicDialectParser::mysql();
+        let sql = "SELECT * FROM employees";
+        let cmd = GatewayCommand::Query {
+            sql: sql.into(),
+        };
+        let dec = pdp.authorize_command_with_objects(&sub, "hr", &cmd, &dialect, Some(&set));
+        match dec {
+            SecurityDecision::Allow { .. } => {}
+            SecurityDecision::AllowRewrite { sql: rewritten, .. } => {
+                panic!(
+                    "star_policy=allow must not rewrite SELECT * to strip columns, got {rewritten}"
+                );
+            }
+            other => panic!("expected Allow (no expansion/strip) for SELECT *, got {other:?}"),
+        }
+        // Explicit salary still denied/rewritten path exists for non-star.
+        let mut set2 = ObjectSet::empty();
+        let mut obj2 = ObjectAccess::new("employees", StatementAction::Select);
+        obj2.columns = vec!["id".into(), "salary".into()];
+        set2.objects.push(obj2);
+        let cmd2 = GatewayCommand::Query {
+            sql: "SELECT id, salary FROM employees".into(),
+        };
+        let dec2 = pdp.authorize_command_with_objects(&sub, "hr", &cmd2, &dialect, Some(&set2));
+        assert!(
+            matches!(
+                dec2,
+                SecurityDecision::AllowRewrite { .. } | SecurityDecision::Deny { .. }
+            ),
+            "explicit salary must still be rewritten or denied, got {dec2:?}"
+        );
+    }
+
+    #[test]
     fn parse_failed_fail_closed() {
         let pdp = pdp_with(vec![SecurityRuleConfig {
             name: "deny-secret".into(),

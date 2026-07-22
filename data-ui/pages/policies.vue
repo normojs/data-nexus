@@ -272,7 +272,7 @@ onMounted(() => {
           <dd class="mono">
             {{ policy.star_policy }}
             <span class="hint-inline">
-              (deny blocks * / t.*; never expands wildcards to strip columns)
+              (deny blocks * / t.*; allow also never expands * to strip denied columns — list columns explicitly)
             </span>
           </dd>
         </div>
