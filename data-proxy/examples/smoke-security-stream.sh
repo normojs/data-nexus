@@ -73,6 +73,8 @@ PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
     || [[ "$ROOT/runtime/gateway/src/server/metrics.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/gateway/core/src/transport.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/gateway/core/src/model.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/gateway/core/src/pdp.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/app/metrics/src/metrics.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/protocol/postgresql/src/lib.rs" -nt "$PROXY_BIN" ]]; then
     cargo build -p data-proxy --bin proxy
   fi
@@ -823,5 +825,39 @@ echo "==> A10 PortalSuspended multi-Execute resume (backend stream hold when pos
 # Hold keeps the live RowStream across Execute pages; if hold cannot apply,
 # logical skip still yields the same client-visible page tags.
 echo "pg multi-Execute resume verified earlier (s,s,C); prefer hold_remainder over SQL re-run"
+
+echo "==> A10 portal resume honesty metrics (hold | resume_hold | logical_skip)"
+# PortalSuspended multi-Execute ran on the page gateway (8083/9090), not main 8082.
+# Not SQL DECLARE … WITH HOLD — process-local RowStream hold + optional logical skip.
+curl -fsS "http://127.0.0.1:8083/metrics" | tee /tmp/dn-stream-a10-metrics.txt >/dev/null
+if ! grep -q 'gateway_portal_resume_total' /tmp/dn-stream-a10-metrics.txt; then
+  echo "FAIL: gateway_portal_resume_total missing on page gateway after multi-Execute" >&2
+  exit 1
+fi
+python3 - <<'PYA10'
+import re, sys
+text = open("/tmp/dn-stream-a10-metrics.txt").read()
+modes = {}
+for ln in text.splitlines():
+    if "gateway_portal_resume_total" not in ln or ln.startswith("#"):
+        continue
+    m = re.search(r'mode="([^"]+)".*?\s([0-9]+(?:\.[0-9]+)?)\s*$', ln)
+    if m:
+        modes[m.group(1)] = modes.get(m.group(1), 0) + float(m.group(2))
+print("portal_resume modes:", modes)
+hold = modes.get("hold", 0)
+resume = modes.get("resume_hold", 0)
+skip = modes.get("logical_skip", 0)
+assert hold >= 1 or skip >= 1, f"expected hold or logical_skip after multi-Execute, got {modes}"
+if hold >= 1:
+    assert resume >= 1, f"hold observed but no resume_hold: {modes}"
+    print("A10 honesty: process-local RowStream hold + resume_hold (not SQL WITH HOLD)")
+else:
+    print("A10 honesty: logical_skip fallback only (hold unavailable; not SQL WITH HOLD)")
+print("A10 portal resume metrics ok")
+for ln in text.splitlines():
+    if "gateway_portal_resume_total" in ln and not ln.startswith("#"):
+        print(ln)
+PYA10
 
 echo "smoke-security-stream: OK"

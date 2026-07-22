@@ -149,6 +149,21 @@ pub static GATEWAY_ENCODE_PEAK_WINDOW_ROWS: Lazy<GaugeVec> = Lazy::new(|| {
     .expect("Could not create GATEWAY_ENCODE_PEAK_WINDOW_ROWS")
 });
 
+/// A10 honesty: PortalSuspended multi-Execute resume strategy.
+/// mode=hold — remainder kept as process-local RowStream (not SQL WITH HOLD).
+/// mode=logical_skip — re-run SQL and skip prior rows (fallback).
+/// mode=resume_hold — next Execute consumed the held RowStream without re-SQL.
+pub static GATEWAY_PORTAL_RESUME_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "gateway_portal_resume_total",
+            "PG PortalSuspended multi-Execute resume events (hold|logical_skip|resume_hold; not SQL WITH HOLD)"
+        ),
+        &["mode"],
+    )
+    .expect("Could not create GATEWAY_PORTAL_RESUME_TOTAL")
+});
+
 /// Audit pipeline queue depth snapshot (main + priority), refreshed on /metrics gather.
 pub static GATEWAY_AUDIT_QUEUE_LEN: Lazy<GaugeVec> = Lazy::new(|| {
     GaugeVec::new(
@@ -267,6 +282,23 @@ impl MySQLServerMetricsCollector {
             }
         }
     }
+
+    /// A10: PortalSuspended multi-Execute resume honesty counter.
+    /// `mode` is collapsed to hold | logical_skip | resume_hold | n/a.
+    pub fn record_portal_resume(&self, mode: &str) {
+        let mode = normalize_portal_resume_mode(mode);
+        GATEWAY_PORTAL_RESUME_TOTAL.with_label_values(&[mode]).inc();
+    }
+}
+
+/// Collapse free-form portal resume mode strings.
+pub fn normalize_portal_resume_mode(mode: &str) -> &'static str {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "hold" | "hold_remainder" | "rowstream_hold" => "hold",
+        "logical_skip" | "skip" | "logical" => "logical_skip",
+        "resume_hold" | "resume" | "held_resume" => "resume_hold",
+        _ => "n/a",
+    }
 }
 
 /// Collapse free-form path strings to the B03/A05 controlled set.
@@ -324,6 +356,35 @@ mod tests {
         assert_eq!(normalize_execute_path("materialized"), "materialized");
         assert_eq!(normalize_execute_path("xproto_stream"), "xproto_stream");
         assert_eq!(normalize_execute_path("other"), "n/a");
+    }
+
+    #[test]
+    fn normalize_portal_resume_mode_values() {
+        assert_eq!(normalize_portal_resume_mode("hold"), "hold");
+        assert_eq!(normalize_portal_resume_mode("hold_remainder"), "hold");
+        assert_eq!(normalize_portal_resume_mode("logical_skip"), "logical_skip");
+        assert_eq!(normalize_portal_resume_mode("resume_hold"), "resume_hold");
+        assert_eq!(normalize_portal_resume_mode("weird"), "n/a");
+    }
+
+    #[test]
+    fn record_portal_resume_increments_counter() {
+        let m = MySQLServerMetricsCollector::new();
+        m.record_portal_resume("hold");
+        m.record_portal_resume("resume_hold");
+        m.record_portal_resume("logical_skip");
+        let hold = GATEWAY_PORTAL_RESUME_TOTAL
+            .with_label_values(&["hold"])
+            .get();
+        let resume = GATEWAY_PORTAL_RESUME_TOTAL
+            .with_label_values(&["resume_hold"])
+            .get();
+        let skip = GATEWAY_PORTAL_RESUME_TOTAL
+            .with_label_values(&["logical_skip"])
+            .get();
+        assert!(hold >= 1, "hold={hold}");
+        assert!(resume >= 1, "resume_hold={resume}");
+        assert!(skip >= 1, "logical_skip={skip}");
     }
 
     #[test]

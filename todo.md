@@ -68,9 +68,9 @@ cd data-proxy
   - 路径：`http` portal_execute_*_streaming；`security-portal-gateway-config.toml`；`security-portal-xproto{,-pg-mysql}-gateway-config.toml`；`smoke-security-portal{,-xproto,-xproto-pg-mysql}.sh`
 
 - [ ] **A10** 预处理 / 事务透传矩阵  
-  - 已有：MySQL COM_STMT + Streaming + PREPARE 列定义；PG Parse/Bind/Execute + Streaming；Describe 显式 SELECT + `SELECT *` catalog；扩展协议 Execute 不发 Z；**客户端 Execute max_rows → PortalSuspended（s）**；**同 portal multi-Execute 续读**：**优先 backend `RowStream` hold**（`hold_remainder`，不重跑 SQL）；hold 不可用时 **logical skip** 回落；策略 max_rows 仍 C；Bind/Close/Sync 丢弃 hold；unit `a10_hold_remainder_keeps_stream_for_resume` + stream smoke multi-Execute  
+  - 已有：MySQL COM_STMT + Streaming + PREPARE 列定义；PG Parse/Bind/Execute + Streaming；Describe 显式 SELECT + `SELECT *` catalog；扩展协议 Execute 不发 Z；**客户端 Execute max_rows → PortalSuspended（s）**；**同 portal multi-Execute 续读**：**优先 backend `RowStream` hold**（`hold_remainder`，不重跑 SQL）；hold 不可用时 **logical skip** 回落；策略 max_rows 仍 C；Bind/Close/Sync 丢弃 hold；unit `a10_hold_remainder_keeps_stream_for_resume` + stream smoke multi-Execute；**Prometheus `gateway_portal_resume_total{mode=hold\|resume_hold\|logical_skip}`**（smoke 强制 hold+resume_hold 或 skip）；**PDP prepared Execute 继承 `streaming.max_rows`**（防 passthrough demote 绕过 cap）  
   - 仍欠：非 TCP passthrough；**非** SQL `DECLARE … WITH HOLD` 服务端命名游标（hold 为 gateway 进程内 `RowStream`）；复杂 JOIN `*` 依赖 backend prepare  
-  - 路径：`transport` hold/`PrefixedRowStream`、`CoreGatewayConnection.held_portal_stream`、frontend Bind/Close/Sync drop flag、`smoke-security-stream.sh`
+  - 路径：`transport` hold/`PrefixedRowStream`、`CoreGatewayConnection.held_portal_stream`、`pdp` Execute obligations、`server/metrics` portal_resume、frontend Bind/Close/Sync drop flag、`smoke-security-stream.sh`
 
 ---
 
@@ -119,7 +119,7 @@ cd data-proxy
 | Portal「流式」 | A09 NDJSON+CSV+JSON：Streaming → `backend_window`（**双向跨协议 portal** MySQL↔PG）；**Complete → `chunked`**；**`x-data-nexus-window-rows` 头**（CSV 可钉窗）；backend 无 RowStream 时仍可能先物化；无进程峰值 CI |
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows 指标+smoke≤window**；**粗粒度进程 RSS smoke**（防全量物化；非精确 window 字节）；控制语句/Complete 小结果仍可物化；见 `OBSERVABILITY` A-track 表 |
 | PG/MySQL backend TLS | A08：默认 accept_invalid=**false**（verify）；simple Query 透传；**PG text-bind extended 可 rewrite→simple Query TCP（`QUERY_PARAMS` 标 passthrough + wire bytes）**；不可改写（MySQL COM_STMT）标 **`streaming_demote`**；smoke 强制两者；**仍非** Parse/Bind 原包中继 |
-| 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended + multi-Execute 续读（优先 RowStream hold；logical skip 回落）**；策略截断仍 C；**非** SQL `WITH HOLD` 命名游标；非 TCP passthrough |
+| 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended + multi-Execute 续读（优先 RowStream hold；logical skip 回落；`gateway_portal_resume_total` 诚实指标）**；策略截断仍 C；**非** SQL `WITH HOLD` 命名游标；非 TCP passthrough |
 | 多副本 | H05：file+lock+可选 AES-GCM；全文件替换非 CRDT；活跃 vault 密码在 RAM；revoke/prune/Drop zeroize；`backend_identity` 返回 Zeroizing（非 mlock） |
 | L2 样本 | B08：默认关；有界 rows/bytes；**sample_enabled 强制 L2**；OpenDAL 需 feature；**非全量 L3** |
 | Remote PDP | F31 已交付：表/动作 gate；超时 fail_closed；**非**热路径逐行 mask |

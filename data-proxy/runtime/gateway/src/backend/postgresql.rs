@@ -1164,10 +1164,12 @@ impl BackendConnector for PostgreSqlBackendConnector {
         // A08 honesty: Passthrough + extended that could not TCP-relay as simple Query
         // must not fall through to Complete materialization. Demote to Streaming
         // so bound params still use the windowed prepare path (no TCP frame relay).
+        // Preserve max_rows if the caller already merged stream_mode caps.
         let (mode, streaming) = if matches!(mode, ExecuteMode::Passthrough)
             && (is_query_params || is_execute)
         {
-            let m = ExecuteMode::from_streaming_config(256, None);
+            let max = mode.effective_max_rows();
+            let m = ExecuteMode::from_streaming_config(256, max);
             (m, true)
         } else {
             (mode, streaming)

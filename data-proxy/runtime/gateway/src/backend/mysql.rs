@@ -1345,10 +1345,13 @@ impl BackendConnector for MySqlBackendConnector {
         // text rewrite). Demote to Streaming window path (parity with PG demote
         // when rewrite cannot apply). PG may text-inline $n → simple Query TCP;
         // MySQL stays demote-only for COM_STMT.
+        // Preserve any max_rows already on the mode (from stream_mode merge); do
+        // not open an uncapped demote window under passthrough=true.
         let (mode, streaming) = if matches!(mode, ExecuteMode::Passthrough)
             && (is_query_params || is_execute)
         {
-            let m = ExecuteMode::from_streaming_config(256, None);
+            let max = mode.effective_max_rows();
+            let m = ExecuteMode::from_streaming_config(256, max);
             (m, true)
         } else {
             (mode, streaming)

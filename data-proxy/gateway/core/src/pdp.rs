@@ -689,6 +689,10 @@ impl LocalPdp {
                 self.evaluate(&request)
             }
             GatewayCommand::Execute { .. } => {
+                // A10: prepared Execute has no SQL text at the command layer (id + binds).
+                // fail_closed still denies unclassified Execute; otherwise allow with the
+                // streaming default max_rows so COM_STMT_EXECUTE / PG Execute cannot
+                // silently bypass security.streaming.max_rows (smoke pins max_rows=1).
                 if __p.fail_closed {
                     SecurityDecision::Deny {
                         rule: "fail_closed".into(),
@@ -697,7 +701,11 @@ impl LocalPdp {
                                 .into(),
                     }
                 } else {
-                    SecurityDecision::allow_empty()
+                    let mut obligations = Obligations::default();
+                    if let Some(max) = __p.default_max_rows {
+                        obligations.max_rows = Some(max);
+                    }
+                    SecurityDecision::Allow { obligations }
                 }
             }
             GatewayCommand::Query { sql }
@@ -3083,5 +3091,48 @@ mod tests {
         };
         let dec = pdp.authorize_command(&sub, "orders", &cmd, &dialect);
         assert!(!dec.is_deny(), "fail_closed=false should allow: {dec:?}");
+    }
+
+    #[test]
+    fn a10_execute_carries_default_max_rows_obligation() {
+        // Prepared Execute has no SQL text; must still inherit streaming.max_rows
+        // so COM_STMT_EXECUTE / PG Execute cannot bypass the cap under passthrough demote.
+        let pdp = LocalPdp::from_inner(LocalPdpInner {
+            fail_closed: false,
+            star_policy: StarPolicy::Allow,
+            rules: vec![SecurityRuleConfig {
+                name: "allow-all".into(),
+                effect: "allow".into(),
+                actions: vec!["select".into()],
+                tables: vec!["*".into()],
+                columns: vec![],
+                subjects: vec![],
+                row_filter: None,
+            }],
+            mask_rules: Vec::new(),
+            column_tags: Vec::new(),
+            high_risk_rules: Vec::new(),
+            time_rules: Vec::new(),
+            default_max_rows: Some(1),
+            watermark: SecurityWatermarkConfig::default(),
+            #[cfg(feature = "security-cedar")]
+            cedar: None,
+            #[cfg(feature = "security-cedar")]
+            cedar_required: false,
+            remote: None,
+        });
+        let sub = subject("alice");
+        let dialect = HeuristicDialectParser::mysql();
+        let cmd = GatewayCommand::Execute {
+            statement_id: "1".into(),
+            parameters: vec![],
+        };
+        let dec = pdp.authorize_command(&sub, "orders", &cmd, &dialect);
+        match dec {
+            SecurityDecision::Allow { obligations } => {
+                assert_eq!(obligations.max_rows, Some(1));
+            }
+            other => panic!("expected Allow with max_rows, got {other:?}"),
+        }
     }
 }

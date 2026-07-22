@@ -266,3 +266,5 @@ examples/        smoke + gateway config 样例
 | H05 | state API last_writer_wins/mlock honesty + smoke pin | feat(h05) |
 | A08 | PG extended text-bind rewrite → simple Query TCP under passthrough | feat(a08) |
 | A08 | live unit WireRelay + smoke pin QUERY_PARAMS passthrough / MySQL demote | test(a08) |
+| A10 | portal resume metrics hold/resume_hold/logical_skip + stream smoke | feat(a10) |
+| A10 | PDP Execute inherits streaming.max_rows (COM_STMT cap under demote) | fix(a10) |

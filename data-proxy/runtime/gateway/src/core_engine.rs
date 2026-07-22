@@ -807,6 +807,8 @@ impl CoreGatewayConnection {
                     )
                 {
                     let held = self.held_portal_stream.take().expect("checked is_some");
+                    // A10 honesty: process-local RowStream resume (not SQL WITH HOLD).
+                    self.metrics.record_portal_resume("resume_hold");
                     Ok(ExecuteOutcome::Streaming(held))
                 } else {
                     if self.held_portal_stream.is_some() {
@@ -977,6 +979,8 @@ impl CoreGatewayConnection {
                     if encode_stats.hold_remainder {
                         self.held_portal_stream = held;
                         self.session.pg_portal_skip_rows = 0;
+                        // Process-local RowStream hold (not SQL DECLARE … WITH HOLD).
+                        self.metrics.record_portal_resume("hold");
                     } else if encode_stats.truncated
                         && self.session.pg_execute_max_rows.is_some()
                         && self.session.pg_portal_name.is_some()
@@ -987,6 +991,7 @@ impl CoreGatewayConnection {
                             .session
                             .pg_portal_skip_rows
                             .saturating_add(encode_stats.total_rows);
+                        self.metrics.record_portal_resume("logical_skip");
                     } else if self.session.pg_portal_name.is_some() {
                         // Finished portal (no more rows or unlimited fetch).
                         self.held_portal_stream = None;
