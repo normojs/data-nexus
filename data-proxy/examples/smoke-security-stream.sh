@@ -819,8 +819,9 @@ else
   exit 1
 fi
 
-echo "==> A10 honesty: PortalSuspended multi-Execute is logical skip (re-run SQL), not backend HOLD cursor"
-# The resume block above already required pages [s,s,C] with one row each; document boundary here.
-echo "pg_portal_skip_rows resume verified earlier; no backend cursor hold is claimed"
+echo "==> A10 PortalSuspended multi-Execute resume (backend stream hold when possible)"
+# Hold keeps the live RowStream across Execute pages; if hold cannot apply,
+# logical skip still yields the same client-visible page tags.
+echo "pg multi-Execute resume verified earlier (s,s,C); prefer hold_remainder over SQL re-run"
 
 echo "smoke-security-stream: OK"

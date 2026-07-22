@@ -251,6 +251,55 @@ pub struct StreamingEncodeStats {
     pub sample_row_count: Option<u32>,
     pub sample_bytes: Option<u32>,
     pub sample_truncated: bool,
+    /// A10: when true, encode stopped for a client page and the backend stream was
+    /// **not** drained — caller may hold [`StreamingQuery`] for true multi-Execute resume.
+    /// When false with `truncated`, remaining rows were drained (logical skip path).
+    pub hold_remainder: bool,
+}
+
+/// A10: prepend one already-polled chunk before an inner [`RowStream`].
+///
+/// Used when page truncation peeks one window to learn whether more rows exist,
+/// without losing that window on hold resume.
+pub struct PrefixedRowStream {
+    prefix: Option<Vec<Vec<GatewayValue>>>,
+    inner: Box<dyn RowStream>,
+}
+
+impl PrefixedRowStream {
+    pub fn new(prefix: Vec<Vec<GatewayValue>>, inner: Box<dyn RowStream>) -> Self {
+        Self {
+            prefix: if prefix.is_empty() { None } else { Some(prefix) },
+            inner,
+        }
+    }
+}
+
+#[async_trait]
+impl RowStream for PrefixedRowStream {
+    async fn poll_window(
+        &mut self,
+        max_rows: usize,
+    ) -> GatewayResult<Option<Vec<Vec<GatewayValue>>>> {
+        let max_rows = max_rows.max(1);
+        if let Some(mut prefix) = self.prefix.take() {
+            if prefix.len() > max_rows {
+                let rest = prefix.split_off(max_rows);
+                self.prefix = Some(rest);
+                return Ok(Some(prefix));
+            }
+            if prefix.len() == max_rows {
+                return Ok(Some(prefix));
+            }
+            // Need more from inner to fill window.
+            let need = max_rows - prefix.len();
+            if let Some(mut more) = self.inner.poll_window(need).await? {
+                prefix.append(&mut more);
+            }
+            return Ok(Some(prefix));
+        }
+        self.inner.poll_window(max_rows).await
+    }
 }
 
 /// Optional B08 sample capture during streaming encode (first window only).
@@ -275,7 +324,7 @@ pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
     obligations: Option<&Obligations>,
     writer: &mut W,
 ) -> GatewayResult<StreamingEncodeStats> {
-    write_streaming_query_with_obligations_sample(
+    let (stats, _hold) = write_streaming_query_with_obligations_sample(
         frontend,
         session,
         query,
@@ -283,12 +332,19 @@ pub async fn write_streaming_query_with_obligations<W: ResponseWriter + ?Sized>(
         obligations,
         writer,
         StreamingSampleOpts::default(),
+        false,
     )
-    .await
+    .await?;
+    Ok(stats)
 }
 
 /// Like [`write_streaming_query_with_obligations`], optionally capturing a B08
 /// first-window sample **after** mask/watermark and **before** drop(chunk).
+///
+/// When `hold_remainder` is true and the encode stops at a row cap with more
+/// backend rows available, the remaining [`StreamingQuery`] is returned (not drained)
+/// so the connection can resume a true portal page (A10 hold). Otherwise remaining
+/// rows are drained so the backend connection can return to the pool.
 pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?Sized>(
     frontend: &mut dyn FrontendProtocolAdapter,
     session: &SessionState,
@@ -297,7 +353,8 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
     obligations: Option<&Obligations>,
     writer: &mut W,
     sample_opts: StreamingSampleOpts,
-) -> GatewayResult<StreamingEncodeStats> {
+    hold_remainder: bool,
+) -> GatewayResult<(StreamingEncodeStats, Option<StreamingQuery>)> {
     let window = window_rows.max(1);
     let mut columns = query.columns;
 
@@ -332,20 +389,47 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
     } else {
         Vec::new()
     };
+    // A10 hold: leftover rows from a mid-window truncate, plus live stream.
+    let mut hold_prefix: Option<Vec<Vec<GatewayValue>>> = None;
+    let mut should_hold = false;
 
     loop {
         if let Some(max) = max_total {
             if stats.total_rows >= max {
-                // Hit row cap: drain remaining backend windows so the connection
-                // can be reused, and mark truncated when more rows were available.
-                let mut saw_more = false;
-                while let Some(chunk) = query.stream.poll_window(window).await? {
-                    if !chunk.is_empty() {
-                        saw_more = true;
+                // Hit row cap. Prefer true hold (keep stream) when requested and more
+                // rows remain; otherwise drain so the backend connection is reusable.
+                if hold_remainder {
+                    if let Some(prefix) = hold_prefix.take() {
+                        // Already know there are more rows (mid-window truncate leftover).
+                        stats.truncated = true;
+                        stats.hold_remainder = true;
+                        should_hold = true;
+                        hold_prefix = Some(prefix);
+                        break;
                     }
+                    match query.stream.poll_window(window).await? {
+                        Some(chunk) if !chunk.is_empty() => {
+                            stats.truncated = true;
+                            stats.hold_remainder = true;
+                            should_hold = true;
+                            hold_prefix = Some(chunk);
+                            break;
+                        }
+                        _ => {
+                            // No more rows — not truncated.
+                            break;
+                        }
+                    }
+                } else {
+                    let mut saw_more = false;
+                    while let Some(chunk) = query.stream.poll_window(window).await? {
+                        if !chunk.is_empty() {
+                            saw_more = true;
+                        }
+                    }
+                    stats.truncated = saw_more || stats.truncated;
+                    break;
                 }
-                stats.truncated = saw_more || stats.truncated;
-                break;
             }
         }
         // Prefer filling the page window; when still skipping prior portal rows,
@@ -373,8 +457,11 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
         if let Some(max) = max_total {
             let remain = max.saturating_sub(stats.total_rows) as usize;
             if chunk.len() > remain {
-                chunk.truncate(remain);
+                let leftover = chunk.split_off(remain);
                 stats.truncated = true;
+                if hold_remainder && !leftover.is_empty() {
+                    hold_prefix = Some(leftover);
+                }
             }
         }
         if has_masks {
@@ -451,7 +538,21 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
             stats.truncated,
         )?)
         .await?;
-    Ok(stats)
+
+    let held = if should_hold {
+        let stream: Box<dyn RowStream> = if let Some(prefix) = hold_prefix {
+            Box::new(PrefixedRowStream::new(prefix, query.stream))
+        } else {
+            query.stream
+        };
+        Some(StreamingQuery {
+            columns: columns.clone(),
+            stream,
+        })
+    } else {
+        None
+    };
+    Ok((stats, held))
 }
 
 /// Encode a result set in windows, writing each phase through `writer` (A2).
@@ -902,7 +1003,7 @@ mod tests {
         };
         let session = SessionState::default();
         let mut writer = CollectingWriter::new();
-        let stats = write_streaming_query_with_obligations_sample(
+        let (stats, held) = write_streaming_query_with_obligations_sample(
             &mut fe,
             &session,
             query,
@@ -914,9 +1015,11 @@ mod tests {
                 max_rows: 3,
                 max_bytes: 4096,
             },
+            false,
         )
         .await
         .unwrap();
+        assert!(held.is_none());
         assert_eq!(stats.total_rows, 5);
         let body = stats.sample_body.expect("sample");
         assert!(body.contains("\"rows\""));
@@ -925,6 +1028,97 @@ mod tests {
         assert!(!body.contains("s1"));
         assert_eq!(stats.sample_row_count, Some(3));
         assert!(stats.sample_truncated); // 5 total > 3 sampled
+    }
+
+    #[tokio::test]
+    async fn a10_hold_remainder_keeps_stream_for_resume() {
+        // 5 rows, page max_rows=2, window=2 → hold after first page without drain.
+        let columns = vec![Column {
+            name: "id".into(),
+            data_type: "int".into(),
+        }];
+        let rows = (1..=5)
+            .map(|i| vec![GatewayValue::Integer(i)])
+            .collect::<Vec<_>>();
+        let mut obl = Obligations::default();
+        obl.max_rows = Some(2);
+        let query = StreamingQuery {
+            columns: columns.clone(),
+            stream: Box::new(VecRowStream::new(rows)),
+        };
+        let mut fe = FakeFrontend {
+            header_calls: 0,
+            row_calls: 0,
+            footer_calls: 0,
+        };
+        let session = SessionState::default();
+        let mut writer = CollectingWriter::new();
+        let (stats, held) = write_streaming_query_with_obligations_sample(
+            &mut fe,
+            &session,
+            query,
+            2,
+            Some(&obl),
+            &mut writer,
+            StreamingSampleOpts::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.total_rows, 2);
+        assert!(stats.truncated);
+        assert!(stats.hold_remainder);
+        let held = held.expect("held stream");
+        // Resume second page of 2.
+        let mut obl2 = Obligations::default();
+        obl2.max_rows = Some(2);
+        let mut fe2 = FakeFrontend {
+            header_calls: 0,
+            row_calls: 0,
+            footer_calls: 0,
+        };
+        let mut writer2 = CollectingWriter::new();
+        let (stats2, held2) = write_streaming_query_with_obligations_sample(
+            &mut fe2,
+            &session,
+            held,
+            2,
+            Some(&obl2),
+            &mut writer2,
+            StreamingSampleOpts::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats2.total_rows, 2);
+        assert!(stats2.truncated);
+        assert!(stats2.hold_remainder);
+        let held2 = held2.expect("still held");
+        // Final page: 1 remaining → not truncated, no hold.
+        let mut obl3 = Obligations::default();
+        obl3.max_rows = Some(2);
+        let mut fe3 = FakeFrontend {
+            header_calls: 0,
+            row_calls: 0,
+            footer_calls: 0,
+        };
+        let mut writer3 = CollectingWriter::new();
+        let (stats3, held3) = write_streaming_query_with_obligations_sample(
+            &mut fe3,
+            &session,
+            held2,
+            2,
+            Some(&obl3),
+            &mut writer3,
+            StreamingSampleOpts::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats3.total_rows, 1);
+        assert!(!stats3.truncated);
+        assert!(!stats3.hold_remainder);
+        assert!(held3.is_none());
     }
 
     #[tokio::test]

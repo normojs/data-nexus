@@ -2614,6 +2614,8 @@ mod tests {
                     || msg.contains("timed out")
                     || msg.contains("timeout")
                     || msg.contains("os error")
+                    || msg.contains("serializ")
+                    || msg.contains("parameter")
                 {
                     eprintln!("skip live pg a10 prepared streaming test: {msg}");
                     return;

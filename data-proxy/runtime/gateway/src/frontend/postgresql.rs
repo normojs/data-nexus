@@ -175,6 +175,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 session.result_truncated = false;
                 session.pg_portal_name = None;
                 session.pg_portal_skip_rows = 0;
+                session.pg_drop_portal_hold = true;
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_ready_for_query(transaction_status(session))],
                 }])
@@ -238,6 +239,8 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 // Clear any leftover one-shot suppress from a previous unit.
                 self.suppress_next_row_description = false;
                 // A10: re-Bind resets logical portal page offset for this portal name.
+                // Re-Bind invalidates any held backend stream for true portal resume.
+                session.pg_drop_portal_hold = true;
                 if session.pg_portal_name.as_deref() == Some(portal.as_str()) {
                     session.pg_portal_skip_rows = 0;
                 }
@@ -415,6 +418,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                     if session.pg_portal_name.as_deref() == Some(name.as_str()) {
                         session.pg_portal_name = None;
                         session.pg_portal_skip_rows = 0;
+                        session.pg_drop_portal_hold = true;
                     }
                 }
                 Ok(vec![GatewayCommand::ClientWire {

@@ -261,3 +261,4 @@ examples/        smoke + gateway config 样例
 | A09 | portal HTTP Prometheus PORTAL_STREAM/CHUNKED + peak smoke | feat(a09) |
 | A09 | xproto portal PORTAL_STREAM xproto_stream + peak≤window smoke | test(a09) |
 | A06 | coarse process-RSS Streaming smoke (anti full-result materialize) | test(a06) |
+| A10 | multi-Execute RowStream hold (PrefixedRowStream + held_portal_stream) | feat(a10) |

@@ -138,6 +138,9 @@ pub struct SessionState {
     /// A10: rows already returned for `pg_portal_name` (re-Execute skips these).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub pg_portal_skip_rows: u64,
+    /// A10: set by frontend on Bind/Close/Sync so CoreEngine drops any held stream.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pg_drop_portal_hold: bool,
 }
 
 fn is_zero_u64(v: &u64) -> bool {

@@ -69,6 +69,10 @@ pub struct CoreGatewayConnection {
     metrics: MySQLServerMetricsCollector,
     /// Result-path obligations deferred to encode so mask can run per window (A06/A07).
     pending_encode_obligations: Option<Obligations>,
+    /// A10: held backend row stream for true multi-Execute portal resume.
+    /// When set, the next Execute for the same portal reuses this stream instead of
+    /// re-running SQL (logical skip). Dropped on Close / Sync / portal name change.
+    held_portal_stream: Option<gateway_core::StreamingQuery>,
 }
 
 impl CoreGatewayConnection {
@@ -97,6 +101,7 @@ impl CoreGatewayConnection {
             passthrough_enabled: false,
             metrics: MySQLServerMetricsCollector,
             pending_encode_obligations: None,
+            held_portal_stream: None,
         }
     }
 
@@ -136,6 +141,7 @@ impl CoreGatewayConnection {
             passthrough_enabled,
             metrics: MySQLServerMetricsCollector,
             pending_encode_obligations: None,
+            held_portal_stream: None,
         }
     }
 
@@ -775,12 +781,36 @@ impl CoreGatewayConnection {
                 }
             };
 
-            let response = match self
-                .backend
-                .execute_outcome(command, &mut self.session, exec_mode)
-                .instrument(command_span.clone())
-                .await
-            {
+            let response = match {
+                // A10 true hold: resume held stream without re-running backend SQL.
+                if self.session.pg_drop_portal_hold {
+                    self.held_portal_stream = None;
+                    self.session.pg_drop_portal_hold = false;
+                }
+                if self.held_portal_stream.is_some()
+                    && self.session.pg_portal_name.is_some()
+                    && self.session.pg_execute_max_rows.is_some()
+                    && self.session.pg_extended_query
+                    && matches!(
+                        command,
+                        GatewayCommand::Query { .. }
+                            | GatewayCommand::QueryParams { .. }
+                            | GatewayCommand::Execute { .. }
+                    )
+                {
+                    let held = self.held_portal_stream.take().expect("checked is_some");
+                    Ok(ExecuteOutcome::Streaming(held))
+                } else {
+                    if self.held_portal_stream.is_some() {
+                        // Different command / portal — drop held stream (best-effort).
+                        self.held_portal_stream = None;
+                    }
+                    self.backend
+                        .execute_outcome(command, &mut self.session, exec_mode)
+                        .instrument(command_span.clone())
+                        .await
+                }
+            } {
                 Ok(ExecuteOutcome::WireRelay(relay)) => {
                     // A08: progressive wire frames → socket (no logical ResultSet).
                     // Only selected when passthrough is allowed (no result obligations).
@@ -860,6 +890,7 @@ impl CoreGatewayConnection {
                 Ok(ExecuteOutcome::Streaming(mut query)) => {
                     // A06: progressive rows — type-map column metadata, then encode
                     // window-by-window with optional obligations (no full ResultSet).
+                    // (Hold resume reuses columns already mapped on first Execute.)
                     if self.translation_policy.is_some() {
                         let backend = self.backend.protocol();
                         let frontend = self.frontend.protocol();
@@ -896,6 +927,9 @@ impl CoreGatewayConnection {
                             None => page,
                         });
                     }
+                    // Hold resume: only the client page size applies (no cumulative skip).
+                    // Detect resume by empty skip + held stream was just consumed above —
+                    // we set skip_rows=0 when hold_remainder is active.
                     let obl = if encode_obl.has_result_obligations() {
                         Some(&encode_obl)
                     } else {
@@ -912,7 +946,15 @@ impl CoreGatewayConnection {
                     } else {
                         StreamingSampleOpts::default()
                     };
-                    let encode_stats = write_streaming_query_with_obligations_sample(
+                    // Hold remainder for PG client-paged Execute (PortalSuspended path).
+                    let want_hold = self.session.pg_execute_max_rows.is_some()
+                        && self.session.pg_portal_name.is_some()
+                        && self.session.pg_extended_query;
+                    // When resuming a held stream, disable logical skip (already at offset).
+                    if want_hold {
+                        self.session.pg_portal_skip_rows = 0;
+                    }
+                    let (encode_stats, held) = write_streaming_query_with_obligations_sample(
                         self.frontend.as_mut(),
                         &self.session,
                         query,
@@ -920,21 +962,26 @@ impl CoreGatewayConnection {
                         obl,
                         writer,
                         sample_opts,
+                        want_hold,
                     )
                     .await?;
-                    // A10: advance logical portal offset after this page.
-                    // On PortalSuspended (truncated + client page), keep skip so the
-                    // next Execute resumes; on CommandComplete clear the portal page.
-                    if encode_stats.truncated
+                    // A10: portal paging state after this page.
+                    if encode_stats.hold_remainder {
+                        self.held_portal_stream = held;
+                        self.session.pg_portal_skip_rows = 0;
+                    } else if encode_stats.truncated
                         && self.session.pg_execute_max_rows.is_some()
                         && self.session.pg_portal_name.is_some()
                     {
+                        // Fallback logical skip (no hold / drain path).
+                        self.held_portal_stream = None;
                         self.session.pg_portal_skip_rows = self
                             .session
                             .pg_portal_skip_rows
                             .saturating_add(encode_stats.total_rows);
                     } else if self.session.pg_portal_name.is_some() {
                         // Finished portal (no more rows or unlimited fetch).
+                        self.held_portal_stream = None;
                         self.session.pg_portal_skip_rows = 0;
                         self.session.pg_portal_name = None;
                     }
