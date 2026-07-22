@@ -621,6 +621,10 @@ struct AdminSecurityStateSummary {
     /// H05 honesty: file backend uses full-file replace under advisory lock
     /// (last writer wins). Not a CRDT / merge store.
     last_writer_wins: bool,
+    /// Explicit merge strategy name for operators (`last_writer_wins` only today).
+    merge_strategy: String,
+    /// Always false — no CRDT / vector-clock merge.
+    crdt: bool,
     /// H05 honesty: vault passwords use ZeroizeOnDrop / Zeroizing copies only.
     /// Never mlock / secure heap.
     mlock: bool,
@@ -1260,6 +1264,8 @@ impl AxumServer {
                             // File backend: advisory lock + full-file replace.
                             // Memory backend is single-process only (still not CRDT).
                             last_writer_wins: true,
+                            merge_strategy: "last_writer_wins".into(),
+                            crdt: false,
                             mlock: false,
                         },
                     })

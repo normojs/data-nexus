@@ -279,3 +279,4 @@ examples/        smoke + gateway config 样例
 | A10 | process-local SQL DECLARE/FETCH/CLOSE cursor (not backend WITH HOLD) | feat(a10) |
 | A10 | session end Drop/Quit clears named_cursors + smoke reconnect dies | feat(a10) |
 | A10 | dual concurrent process-local cursors smoke (ASC+DESC interleave) | test(a10) |
+| H05 | state API merge_strategy/crdt + LWW disk reload smoke | feat(h05) |

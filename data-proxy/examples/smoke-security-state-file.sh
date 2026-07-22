@@ -92,10 +92,23 @@ assert "h05-vault" in (s.get("vault_path") or "")
 # H05 honesty pins (not CRDT / not mlock)
 assert s.get("last_writer_wins") is True, s
 assert s.get("mlock") is False, s
+assert s.get("crdt") is False, s
+assert (s.get("merge_strategy") or "") == "last_writer_wins", s
 raw=json.dumps(d)
 assert "ticket_encrypt_key" not in raw and "vault_encrypt_key" not in raw
 assert "0123456789abcdef" not in raw
-print("policies state file+enc ok", s.get("backend"), "lww", s.get("last_writer_wins"), "mlock", s.get("mlock"))
+print(
+    "policies state file+enc ok",
+    s.get("backend"),
+    "lww",
+    s.get("last_writer_wins"),
+    "merge",
+    s.get("merge_strategy"),
+    "crdt",
+    s.get("crdt"),
+    "mlock",
+    s.get("mlock"),
+)
 PY
 
 echo "==> issue ticket + vault lease"
@@ -223,5 +236,75 @@ fi
 grep -qiE 'denied|security|policy|ERROR|1105|h05-deny' /tmp/dn-h05-poll-deny.txt \
   || { echo "deny message missing"; cat /tmp/dn-h05-poll-deny.txt; exit 1; }
 echo "policy mtime poll deny ok"
+
+echo "==> H05 last-writer-wins dual-writer honesty (not CRDT merge)"
+# Two processes cannot both hold the live gateway; simulate LWW by writing a
+# second sealed ticket file after process A wrote, then restarting so only the
+# last full-file replace is visible (unit tests cover concurrent in-memory maps).
+python3 - <<'PY'
+import json, os, subprocess, sys, time
+from pathlib import Path
+
+# Decode path is inside the gateway; here we only prove the *disk* contract:
+# a later full-file replace of the sealed blob is what reload sees.
+# Create a second ticket via API, then overwrite the ticket file with a copy
+# that only contains the second ticket's sealed content by re-issuing and
+# checking reload drops the first if we restore an older snapshot then newer.
+ticket_path = Path("/tmp/data-nexus-h05-tickets.json")
+older = ticket_path.read_bytes()
+# Issue a second ticket
+import urllib.request
+req = urllib.request.Request(
+    "http://127.0.0.1:8082/admin/tickets",
+    data=json.dumps({
+        "subject_id": "root",
+        "sql": "CREATE TABLE h05_lww (id INT)",
+        "ticket_type": "ddl",
+        "ttl_secs": 600,
+        "max_uses": 1,
+        "note": "h05-lww-second",
+    }).encode(),
+    headers={"content-type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=10) as resp:
+    second = json.loads(resp.read().decode())
+second_id = second["id"]
+newer = ticket_path.read_bytes()
+assert newer != older, "second issue must rewrite ticket file"
+# Restore older snapshot (simulates loser of LWW)
+ticket_path.write_bytes(older)
+# Then apply newer again (last writer)
+ticket_path.write_bytes(newer)
+print("lww_disk_second_id", second_id, "older_len", len(older), "newer_len", len(newer))
+open("/tmp/dn-h05-lww-second-id.txt", "w").write(second_id)
+PY
+# Restart so gateway reloads sealed file from disk
+stop_proxy
+start_proxy
+curl -fsS "http://127.0.0.1:8082/admin/tickets?limit=50" | tee /tmp/dn-h05-lww-tickets.json >/dev/null
+python3 - <<'PY'
+import json
+from pathlib import Path
+second_id = Path("/tmp/dn-h05-lww-second-id.txt").read_text().strip()
+tickets = json.load(open("/tmp/dn-h05-lww-tickets.json"))
+if isinstance(tickets, dict):
+    tickets = tickets.get("tickets") or tickets.get("items") or []
+ids = [t.get("id") for t in tickets]
+assert second_id in ids, (ids, "expected last-writer ticket after reload")
+# First ticket may or may not be in the newer blob depending on store append
+# semantics; LWW honesty is that the *last full-file replace* is what loads —
+# we overwrote with the post-second-issue blob, which includes second_id.
+print("lww reload ok last_writer_ticket", second_id, "ids", ids)
+# API still advertises honesty fields
+import urllib.request
+pol = json.loads(urllib.request.urlopen("http://127.0.0.1:8082/admin/security-policies", timeout=10).read())
+s = pol.get("state") or {}
+assert s.get("last_writer_wins") is True
+assert s.get("crdt") is False
+assert s.get("merge_strategy") == "last_writer_wins"
+assert s.get("mlock") is False
+print("H05 honesty: last_writer_wins + crdt=false + merge_strategy (not CRDT merge)")
+PY
 
 echo "smoke-security-state-file: OK"

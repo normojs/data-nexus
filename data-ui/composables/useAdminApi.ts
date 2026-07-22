@@ -307,6 +307,10 @@ export type AdminSecurityPolicies = {
     vault_encrypt_configured: boolean
     /** Full-file replace under advisory lock (not CRDT). */
     last_writer_wins?: boolean
+    /** Explicit strategy name (`last_writer_wins` only today). */
+    merge_strategy?: string
+    /** Always false — no CRDT / vector-clock merge. */
+    crdt?: boolean
     /** Always false today — Zeroize only, never mlock. */
     mlock?: boolean
   }
