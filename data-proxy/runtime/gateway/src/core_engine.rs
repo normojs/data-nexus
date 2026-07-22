@@ -733,12 +733,20 @@ impl CoreGatewayConnection {
             // A06: result obligations force Streaming so backend applies max_rows/window
             // and we never take the wire Passthrough path with masks.
             let has_result_obl = pending_obligations.has_result_obligations();
+            // A08: same-protocol + no result obligations + passthrough enabled.
+            // Simple Query always eligible. Extended (QueryParams / Execute) is also
+            // marked Passthrough so backends can rewrite text binds into simple Query
+            // TCP/wire; if rewrite cannot apply they demote to Streaming internally.
             let want_passthrough = self.passthrough_enabled
                 && same_protocol
                 && !has_result_obl
-                && matches!(command, GatewayCommand::Query { .. })
+                && matches!(
+                    command,
+                    GatewayCommand::Query { .. }
+                        | GatewayCommand::QueryParams { .. }
+                        | GatewayCommand::Execute { .. }
+                )
                 && self.translation_policy.is_none();
-            // QueryParams uses bound prepare path (not TCP wire passthrough).
             // A4: cross-protocol never uses wire passthrough; force Streaming so
             // backend max_rows/window apply and encode path is windowed.
             // A06: Materialized is never the production default for row-returning
@@ -1002,8 +1010,9 @@ impl CoreGatewayConnection {
                     } else if self.passthrough_enabled
                         && (command_type == "QUERY_PARAMS" || command_type == "EXECUTE")
                     {
-                        // A08: extended under passthrough demotes to Streaming encode
-                        // (not TCP bind-frame relay). Distinct path label for honesty.
+                        // A08: extended under passthrough that could not be rewritten
+                        // into simple Query TCP/wire still demotes to Streaming encode
+                        // (not Parse/Bind/Execute frame relay). Distinct path label.
                         "streaming_demote"
                     } else {
                         "streaming"

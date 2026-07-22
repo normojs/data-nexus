@@ -1341,7 +1341,10 @@ impl BackendConnector for MySqlBackendConnector {
             || self.txn_lease.lock().is_some();
 
         // A08 honesty: Passthrough + extended (QueryParams / prepared Execute)
-        // cannot wire-relay binds; demote to Streaming window path (parity with PG).
+        // cannot safely wire-relay COM_STMT binary binds (client `?` / binary vs
+        // text rewrite). Demote to Streaming window path (parity with PG demote
+        // when rewrite cannot apply). PG may text-inline $n → simple Query TCP;
+        // MySQL stays demote-only for COM_STMT.
         let (mode, streaming) = if matches!(mode, ExecuteMode::Passthrough)
             && (is_query_params || is_execute)
         {

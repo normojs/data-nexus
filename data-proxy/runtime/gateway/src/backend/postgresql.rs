@@ -1112,8 +1112,9 @@ impl BackendConnector for PostgreSqlBackendConnector {
             || self.tcp_txn.lock().is_some();
 
         // A08: progressive TCP frame relay for passthrough (txn + non-txn).
-        // QueryParams / prepared Execute cannot TCP-relay bound params — never
-        // wire-passthrough those (see demotion to Streaming below).
+        // QueryParams / prepared Execute with text-bindable params can be rewritten
+        // into a simple Query and still use TCP frame relay. Binary-only or rewrite
+        // failures demote to Streaming (no Parse/Bind/Execute wire passthrough).
         if matches!(mode, ExecuteMode::Passthrough) && is_query {
             if let GatewayCommand::Query { sql } = command {
                 let endpoint = self.select_endpoint(session)?;
@@ -1128,7 +1129,39 @@ impl BackendConnector for PostgreSqlBackendConnector {
             }
         }
 
-        // A08 honesty: Passthrough + extended (QueryParams / prepared Execute)
+        // A08: extended → simple Query TCP relay when placeholders can be text-inlined.
+        // This is still not Parse/Bind/Execute frame relay; it is honest "simple Query
+        // wire after rewrite" and avoids demoting every parameterized SELECT under
+        // passthrough=true. Binary-only binds / rewrite errors fall through to demote.
+        if matches!(mode, ExecuteMode::Passthrough) && (is_query_params || is_execute) {
+            let rewritten = match &command {
+                GatewayCommand::QueryParams { sql, parameters } => {
+                    Some(bind_pg_placeholders(sql, parameters))
+                }
+                GatewayCommand::Execute {
+                    statement_id,
+                    parameters,
+                } => self
+                    .prepared
+                    .take_sql(statement_id)
+                    .map(|sql| bind_pg_placeholders(&sql, parameters)),
+                _ => None,
+            };
+            if let Some(Ok(sql)) = rewritten {
+                let endpoint = self.select_endpoint(session)?;
+                if in_txn {
+                    return self
+                        .execute_simple_query_tcp_relay_txn(endpoint, &sql, session)
+                        .await;
+                }
+                return self
+                    .execute_simple_query_tcp_relay(endpoint, &sql, session)
+                    .await;
+            }
+            // rewrite failed or unknown statement id → demote below
+        }
+
+        // A08 honesty: Passthrough + extended that could not TCP-relay as simple Query
         // must not fall through to Complete materialization. Demote to Streaming
         // so bound params still use the windowed prepare path (no TCP frame relay).
         let (mode, streaming) = if matches!(mode, ExecuteMode::Passthrough)
@@ -2439,7 +2472,19 @@ mod tests {
     }
 
     #[test]
-    fn a08_passthrough_demotes_query_params_to_streaming() {
+    fn a08_passthrough_text_bind_rewrites_to_simple_query_sql() {
+        // Text-bindable $n under passthrough should rewrite for simple Query TCP relay
+        // (not remain demoted Streaming). This is still not Parse/Bind frame relay.
+        let sql = bind_pg_placeholders(
+            "SELECT id, name FROM pass_smoke WHERE id = $1",
+            &[GatewayValue::String("1".into())],
+        )
+        .expect("rewrite");
+        assert!(sql.contains("'1'"), "{sql}");
+        assert!(!sql.contains("$1"), "{sql}");
+    }
+
+        fn a08_passthrough_demotes_query_params_to_streaming() {
         // Passthrough mode is only for simple Query TCP relay; extended binds demote.
         let mode = ExecuteMode::Passthrough;
         assert!(!mode.is_streaming());

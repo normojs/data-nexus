@@ -58,7 +58,7 @@ cd data-proxy
   - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`、`smoke-security-stream-rss.sh`、`OBSERVABILITY.md`
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
-  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 下 extended demote Streaming**；**Prometheus `execute_path=streaming_demote`**（与 bare `streaming` 区分；smoke 优先断言 demote）；**`smoke-security-config-validate` 拒绝 require+verify 无 CA**  
+  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 `ssl_mode` + `ssl_ca_file` / `ssl_accept_invalid_certs`；**默认 `ssl_accept_invalid_certs=false`（verify）**；prod 模板 require+CA+verify；validate 拒绝 require+verify 无 CA；MySQL prefer 可明文回落；**PG simple Query 透传 smoke**；**passthrough 下 extended：可文本改写则 simple Query TCP/wire**（`QUERY_PARAMS` 可走 `passthrough` + wire bytes）；否则 **`streaming_demote`**（MySQL COM_STMT 默认 demote）；**仍非** Parse/Bind/Execute 原包中继；**`smoke-security-config-validate` 拒绝 require+verify 无 CA**  
   - 仍欠：**extended 仍非 TCP 帧中继**（无 Parse/Bind/Execute 原包透传）；Streaming 仍用 pool  
   - 路径：`backend/postgresql` + `backend/mysql` demote、`pg_tcp_relay`、`core_engine` demote label、`smoke-security-passthrough.sh`、`smoke-security-config-validate.sh`、`OBSERVABILITY.md`
 
