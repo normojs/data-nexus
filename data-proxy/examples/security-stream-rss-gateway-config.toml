@@ -1,5 +1,6 @@
-# A06: coarse process-RSS sanity for Streaming path (not a precise window-size CI).
+# A06: coarse process-memory sanity for Streaming path (not a precise window-size CI).
 # window_rows=8, high max_rows so multi-window SELECT can run; no mask (pure stream).
+# Dual listeners (MySQL + PG). Smoke samples cgroup/proc/ps and pins multi-window encode.
 # Pair with: docker compose -f examples/docker-compose.dev.yml up -d
 # Run: ./examples/smoke-security-stream-rss.sh
 
