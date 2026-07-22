@@ -285,3 +285,4 @@ examples/        smoke + gateway config 样例
 | UI32 | Portal/Sessions process-local SQL cursor honesty hints | feat(ui) |
 | UI33 | Overview SQL cursor process-local metrics card | feat(ui) |
 | A10 | MOVE/FETCH ABSOLUTE fail-closed + runbook H05 honesty fields | feat(a10)/docs(h05) |
+| A10 | sql_cursor_unsupported metric + OBSERVABILITY MOVE/ABSOLUTE | feat(a10) |

@@ -330,6 +330,9 @@ pub fn normalize_portal_resume_mode(mode: &str) -> &'static str {
         "sql_cursor_session_end" | "session_end" | "cursor_session_end" => {
             "sql_cursor_session_end"
         }
+        "sql_cursor_unsupported" | "cursor_unsupported" | "unsupported" => {
+            "sql_cursor_unsupported"
+        }
         _ => "n/a",
     }
 }

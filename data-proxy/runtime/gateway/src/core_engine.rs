@@ -1544,6 +1544,7 @@ impl CoreGatewayConnection {
                     ),
                 };
                 self.encode_response_to_writer(response, writer).await?;
+                self.metrics.record_portal_resume("sql_cursor_unsupported");
                 command_span.record("outcome", "error");
                 command_span.record("execute_path", "sql_cursor_unsupported");
                 finish_command_metrics(

@@ -430,6 +430,7 @@ export type SqlCursorMetricModes = {
   fetch: number
   close: number
   session_end: number
+  unsupported: number
 }
 
 /** Parse Prometheus text for A10 process-local SQL cursor modes (best-effort). */
@@ -439,6 +440,7 @@ export function parseSqlCursorMetrics(text: string): SqlCursorMetricModes {
     fetch: 0,
     close: 0,
     session_end: 0,
+    unsupported: 0,
   }
   for (const ln of text.split('\n')) {
     if (!ln.includes('gateway_portal_resume_total') || ln.startsWith('#'))
@@ -456,6 +458,8 @@ export function parseSqlCursorMetrics(text: string): SqlCursorMetricModes {
       out.close += n
     else if (mode === 'sql_cursor_session_end')
       out.session_end += n
+    else if (mode === 'sql_cursor_unsupported')
+      out.unsupported += n
   }
   return out
 }

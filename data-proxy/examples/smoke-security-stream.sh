@@ -1046,11 +1046,12 @@ for ln in text.splitlines():
     if m:
         modes[m.group(1)] = modes.get(m.group(1),0)+float(m.group(2))
 print("portal_resume modes after cursor:", modes)
-assert modes.get("sql_cursor_declare",0) >= 7, modes  # prior 6 + c_all
+assert modes.get("sql_cursor_declare",0) >= 7, modes  # prior 6 + c_all (+ c_mv)
 assert modes.get("sql_cursor_fetch",0) >= 10, modes  # prior + FETCH1 + FETCH ALL
 assert modes.get("sql_cursor_close",0) >= 4, modes  # dual+multi+hold-survive; ALL auto-drops without CLOSE
 assert modes.get("sql_cursor_session_end",0) >= 1, modes
-print("A10 honesty: dual cursors; dup DECLARE reject; FETCH ALL drain; lifecycle (not backend WITH HOLD)")
+assert modes.get("sql_cursor_unsupported",0) >= 2, modes  # MOVE + FETCH ABSOLUTE
+print("A10 honesty: dual cursors; dup DECLARE; FETCH ALL; MOVE/ABSOLUTE unsupported; lifecycle (not backend WITH HOLD)")
 for ln in text.splitlines():
     if "gateway_portal_resume_total" in ln and not ln.startswith("#") and "sql_cursor" in ln:
         print(ln)

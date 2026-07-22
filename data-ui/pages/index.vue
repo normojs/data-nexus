@@ -256,6 +256,9 @@ onUnmounted(() => {
         </div>
         <div class="sub mono">
           session_end={{ sqlCursors.session_end }}
+          <template v-if="sqlCursors.unsupported">
+            · unsupported={{ sqlCursors.unsupported }}
+          </template>
           · not backend WITH HOLD
           · <a
             class="inline-link"
