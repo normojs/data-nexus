@@ -117,6 +117,8 @@ pub enum SessionReturn {
         pool: Arc<PgTcpIdlePool>,
         key: String,
     },
+    /// A08: multi-Execute client-frame unit held open (no Sync sent yet).
+    Hold(PgTcpTxnSlot),
 }
 
 /// Small process-local idle pool for non-transaction TCP relay sessions.
@@ -471,6 +473,7 @@ impl PgTcpSession {
             session: Some(self),
             return_to,
             done: false,
+            stop_before_ready: false,
         })
     }
 
@@ -535,6 +538,119 @@ impl PgTcpSession {
             session: Some(self),
             return_to,
             done: false,
+            stop_before_ready: false,
+        })
+    }
+
+    /// A08: client-frame unit without Sync — for multi-Execute pages (PortalSuspended).
+    ///
+    /// Streams until CommandComplete / PortalSuspended / ErrorResponse, then holds
+    /// the TCP session (use [`SessionReturn::Hold`]). Caller must later send more
+    /// Execute frames or Sync via the held session.
+    pub async fn client_frames_relay_hold_into(
+        mut self,
+        client_frames: &[Vec<u8>],
+        return_to: SessionReturn,
+    ) -> GatewayResult<PgTcpWireStream> {
+        if client_frames.is_empty() {
+            return Err(GatewayError::Backend(
+                "pg client frame hold relay: empty frame list".into(),
+            ));
+        }
+        let mut out = BytesMut::with_capacity(
+            client_frames.iter().map(|f| f.len()).sum::<usize>() + 32,
+        );
+        let mut saw_describe = false;
+        let mut bound_portal: Option<String> = None;
+        for f in client_frames {
+            let tag = f.first().copied();
+            if tag == Some(b'D') {
+                saw_describe = true;
+            }
+            if tag == Some(b'B') && f.len() > 5 {
+                if let Some(end) = f[5..].iter().position(|&b| b == 0) {
+                    let name = String::from_utf8_lossy(&f[5..5 + end]).into_owned();
+                    bound_portal = Some(name);
+                }
+            }
+            if bound_portal.is_some() && !saw_describe && tag == Some(b'E') {
+                let portal = bound_portal.as_deref().unwrap_or("");
+                frontend::describe(b'P', portal, &mut out).map_err(|e| {
+                    GatewayError::Backend(format!("pg client-frame describe inject: {e}"))
+                })?;
+                saw_describe = true;
+            }
+            out.extend_from_slice(f);
+        }
+        if bound_portal.is_some() && !saw_describe {
+            let portal = bound_portal.as_deref().unwrap_or("");
+            frontend::describe(b'P', portal, &mut out).map_err(|e| {
+                GatewayError::Backend(format!("pg client-frame describe inject: {e}"))
+            })?;
+        }
+        self.stream
+            .write_all(&out)
+            .await
+            .map_err(|e| GatewayError::Backend(format!("pg client frame hold write: {e}")))?;
+        // Flush so PortalSuspended / CommandComplete is delivered without Sync.
+        let mut flush_buf = BytesMut::with_capacity(5);
+        frontend::flush(&mut flush_buf);
+        self.stream
+            .write_all(&flush_buf)
+            .await
+            .map_err(|e| GatewayError::Backend(format!("pg client frame hold flush: {e}")))?;
+        Ok(PgTcpWireStream {
+            session: Some(self),
+            return_to,
+            done: false,
+            stop_before_ready: true,
+        })
+    }
+
+    /// A08: send only client Execute frame(s) on a held session (multi-Execute page).
+    pub async fn client_execute_relay_hold_into(
+        mut self,
+        execute_frames: &[Vec<u8>],
+        return_to: SessionReturn,
+    ) -> GatewayResult<PgTcpWireStream> {
+        if execute_frames.is_empty() {
+            return Err(GatewayError::Backend(
+                "pg client execute hold relay: empty".into(),
+            ));
+        }
+        let mut out = BytesMut::with_capacity(execute_frames.iter().map(|f| f.len()).sum::<usize>() + 5);
+        for f in execute_frames {
+            out.extend_from_slice(f);
+        }
+        frontend::flush(&mut out);
+        self.stream
+            .write_all(&out)
+            .await
+            .map_err(|e| GatewayError::Backend(format!("pg client execute write: {e}")))?;
+        Ok(PgTcpWireStream {
+            session: Some(self),
+            return_to,
+            done: false,
+            stop_before_ready: true,
+        })
+    }
+
+    /// A08: Sync on held client-frame session → stream until ReadyForQuery.
+    pub async fn client_sync_relay_into(
+        mut self,
+        return_to: SessionReturn,
+    ) -> GatewayResult<PgTcpWireStream> {
+        let mut out = BytesMut::with_capacity(5);
+        frontend::sync(&mut out);
+        self.stream
+            .write_all(&out)
+            .await
+            .map_err(|e| GatewayError::Backend(format!("pg client sync write: {e}")))?;
+        Ok(PgTcpWireStream {
+            session: Some(self),
+            return_to,
+            done: false,
+            stop_before_ready: false,
         })
     }
 
@@ -594,6 +710,7 @@ impl PgTcpSession {
             session: Some(self),
             return_to,
             done: false,
+            stop_before_ready: false,
         })
     }
 
@@ -722,11 +839,17 @@ impl PgTcpSession {
     }
 }
 
-/// Progressive wire frames for one simple-query response (ends at ReadyForQuery).
+/// Progressive wire frames for one backend response unit.
+///
+/// Default: ends at ReadyForQuery. With `stop_before_ready`, ends after
+/// CommandComplete / PortalSuspended / ErrorResponse without consuming Z
+/// (multi-Execute client-frame hold — session returned via Hold slot).
 pub struct PgTcpWireStream {
     session: Option<PgTcpSession>,
     return_to: SessionReturn,
     done: bool,
+    /// When true, do not wait for / include ReadyForQuery; stop after C/s/E.
+    stop_before_ready: bool,
 }
 
 impl PgTcpWireStream {
@@ -736,7 +859,7 @@ impl PgTcpWireStream {
                 SessionReturn::Drop => {
                     // drop → TCP close
                 }
-                SessionReturn::Txn(slot) => {
+                SessionReturn::Txn(slot) | SessionReturn::Hold(slot) => {
                     *slot.lock() = Some(sess);
                 }
                 SessionReturn::Idle { pool, key } => {
@@ -780,9 +903,26 @@ impl WireStream for PgTcpWireStream {
                     break;
                 }
             };
-            let is_ready = frame.first() == Some(&b'Z');
+            let tag = frame.first().copied();
+            let is_ready = tag == Some(b'Z');
+            if self.stop_before_ready && is_ready {
+                // Should not normally arrive (no Sync); leave Z for next Sync drain.
+                // Put frame back by not supporting unread — Sync path expects clean.
+                // If Z appears early, treat as unit end and include it.
+                batch.push(frame);
+                self.done = true;
+                self.finish_session();
+                break;
+            }
             batch.push(frame);
-            if is_ready {
+            if self.stop_before_ready {
+                // End page at CommandComplete / PortalSuspended / ErrorResponse.
+                if matches!(tag, Some(b'C' | b's' | b'E')) {
+                    self.done = true;
+                    self.finish_session();
+                    break;
+                }
+            } else if is_ready {
                 self.done = true;
                 self.finish_session();
                 break;

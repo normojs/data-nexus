@@ -147,6 +147,10 @@ pub struct SessionState {
     /// Cleared on Sync / successful client-frame relay / demote.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pg_client_extended_frames: Vec<Vec<u8>>,
+    /// A08: backend TCP session is held open for multi-Execute client-frame pages
+    /// (no Sync sent yet). Frontend Sync must flush backend via [`GatewayCommand::PgBackendSync`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pg_ext_tcp_hold: bool,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -191,6 +195,9 @@ pub enum GatewayCommand {
     /// Frontend-only wire packets (A10 extended protocol acks: ParseComplete, BindComplete, Sync…).
     /// Backend must return these unchanged as [`GatewayResponse::Wire`].
     ClientWire { packets: Vec<Vec<u8>> },
+    /// A08: client Sync while a multi-Execute client-frame TCP unit is held open.
+    /// Backend sends Sync on the held socket and streams until ReadyForQuery.
+    PgBackendSync,
     UseDatabase { database: String },
     Begin,
     Commit,

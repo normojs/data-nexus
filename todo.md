@@ -58,9 +58,9 @@ cd data-proxy
   - 路径：`transport`、`server/metrics`、`core_engine`、`model::ExecuteMode`、`smoke-security-stream.sh`、`smoke-security-stream-rss.sh`、`OBSERVABILITY.md`
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
-  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 TLS；**PG simple Query 透传**；**passthrough 下 extended：优先客户端原包 Parse/Bind/Execute TCP**（`passthrough_client`；单元级 + backend Sync；剥离 Z）；回落 **backend 重编码**（`passthrough_extended` + Describe）；否则 **`streaming_demote`**（MySQL COM_STMT）；**`smoke-security-config-validate` TLS pin**  
-  - 仍欠：multi-Execute / hold 页仍非 client-frame 连续中继；Streaming 仍用 pool；非自由代理  
-  - 路径：`session.pg_client_extended_frames`、`pg_tcp_relay.client_frames_relay_into`、`write_wire_relay_opts` strip Z、`smoke-security-passthrough.sh`
+  - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 TLS；**PG simple Query 透传**；**passthrough 下 extended：优先客户端原包 P/B/E TCP**（`passthrough_client`）；**multi-Execute 连续 client-frame**（首页 hold 无 Sync；续页只中继 Execute；Sync→`PgBackendSync` 刷 Z）；回落 **backend 重编码**（`passthrough_extended`）；否则 **`streaming_demote`**（MySQL COM_STMT）  
+  - 仍欠：义务路径仍 Streaming；Streaming 仍用 pool；非自由代理  
+  - 路径：`pg_client_extended_frames` + `pg_ext_tcp_hold`、`client_frames_relay_hold_into`、`PgBackendSync`、`smoke-security-passthrough.sh`
 
 - [ ] **A09** Portal 端到端流式  
   - 已有：NDJSON + CSV + **JSON** Streaming → `backend_window`；**Complete 回退** 三格式 `chunked`（smoke：INSERT NDJSON/JSON/CSV **强制** `x-data-nexus-stream: chunked`）；JSON 分片文档 UI 可 parse；**同协议 portal smoke 钉 `window_rows=2`**；**跨协议 portal 双向** smoke 同窗；**响应头 `x-data-nexus-window-rows`**；**portal HTTP 记 Prometheus `type=PORTAL_STREAM|PORTAL_CHUNKED`**（同协议 streaming / 跨协议 **xproto_stream** + 逻辑 peak；smoke 强制 PORTAL_STREAM peak≤window，含 xproto 双向）；**OBSERVABILITY** 标明 chunked ≠ backend_window  
@@ -134,11 +134,10 @@ cd data-proxy
 
 建议优先级：
 
-1. **A08** multi-Execute client-frame 连续中继（可选；单单元 `passthrough_client` 已有）  
-2. **A06** 精密 window 字节级 CI（可选；stream-rss 已双协议 + cgroup/proc/ps 采样源）  
-3. **A10** SQL `DECLARE … WITH HOLD` 命名游标（可选；进程内 RowStream hold 已有）  
-4. **H05** CRDT merge / mlock（可选；LWW + Zeroize 诚实字段已有）  
-5. 体验小刀；**F30/P0x 延后项未点名勿做**
+1. **A06** 精密 window 字节级 CI（可选；stream-rss 已双协议 + cgroup/proc/ps 采样源）  
+2. **A10** SQL `DECLARE … WITH HOLD` 命名游标（可选；进程内 RowStream hold 已有）  
+3. **H05** CRDT merge / mlock（可选；LWW + Zeroize 诚实字段已有）  
+4. 体验小刀；**F30/P0x 延后项未点名勿做**
 
 ```bash
 # A 轨相关回归入口

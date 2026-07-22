@@ -13,6 +13,7 @@ pub enum CommandSummary {
     CloseStatement { statement_id: String },
     DescribeSql { sql: String },
     ClientWire,
+    PgBackendSync,
     UseDatabase { database: String },
     Begin,
     Commit,
@@ -35,6 +36,7 @@ impl CommandSummary {
             }
             GatewayCommand::DescribeSql { sql } => Self::DescribeSql { sql: sql.clone() },
             GatewayCommand::ClientWire { .. } => Self::ClientWire,
+            GatewayCommand::PgBackendSync => Self::PgBackendSync,
             GatewayCommand::UseDatabase { database } => {
                 Self::UseDatabase { database: database.clone() }
             }
@@ -58,6 +60,7 @@ impl CommandSummary {
             }
             Self::UseDatabase { database } => database.as_str(),
             Self::ClientWire => "CLIENT_WIRE",
+            Self::PgBackendSync => "PG_BACKEND_SYNC",
             Self::Begin => "BEGIN",
             Self::Commit => "COMMIT",
             Self::Rollback => "ROLLBACK",

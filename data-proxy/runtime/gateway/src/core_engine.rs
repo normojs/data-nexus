@@ -746,6 +746,7 @@ impl CoreGatewayConnection {
                     GatewayCommand::Query { .. }
                         | GatewayCommand::QueryParams { .. }
                         | GatewayCommand::Execute { .. }
+                        | GatewayCommand::PgBackendSync
                 )
                 && self.translation_policy.is_none();
             // A4: cross-protocol never uses wire passthrough; force Streaming so
@@ -827,21 +828,23 @@ impl CoreGatewayConnection {
                     // Only selected when passthrough is allowed (no result obligations).
                     // Extended-query rewrite→simple Query TCP still ends with backend Z;
                     // strip it so only Sync emits ReadyForQuery (not original Parse/Bind relay).
-                    let skip_z = self.session.pg_extended_query;
+                    let skip_z = self.session.pg_extended_query
+                        && command_type != "PG_BACKEND_SYNC";
                     let wire_bytes = write_wire_relay_opts(relay, writer, skip_z).await?;
                     // Honesty labels for WireRelay under passthrough:
                     // - simple Query → passthrough
-                    // - QueryParams/Execute original client frames taken → passthrough_client
-                    // - QueryParams/Execute re-encoded text-bind (frames still buffered) →
-                    //   passthrough_extended (passthrough_rewrite aliases in metrics)
-                    let execute_path = if command_type == "QUERY_PARAMS"
+                    // - QueryParams/Execute original client frames → passthrough_client
+                    // - QueryParams/Execute re-encoded → passthrough_extended
+                    // - PgBackendSync flush of multi-Execute hold → passthrough_client
+                    let execute_path = if command_type == "PG_BACKEND_SYNC" {
+                        "passthrough_client"
+                    } else if command_type == "QUERY_PARAMS"
                         || command_type == "EXECUTE"
+                        || (command_type == "QUERY" && self.session.pg_extended_query)
                     {
                         if self.session.pg_client_extended_frames.is_empty() {
                             "passthrough_client"
                         } else {
-                            // Re-encode did not consume client frames; clear leftover so
-                            // the next unit starts clean.
                             self.session.pg_client_extended_frames.clear();
                             "passthrough_extended"
                         }
@@ -849,6 +852,10 @@ impl CoreGatewayConnection {
                         "passthrough"
                     };
                     let outcome = execute_path;
+                    if command_type == "PG_BACKEND_SYNC" {
+                        self.session.pg_extended_query = false;
+                        self.session.pg_ext_tcp_hold = false;
+                    }
                     command_span.record("outcome", outcome);
                     command_span.record("security_decision", "allow");
                     command_span.record("security_rule_class", "none");
@@ -1330,6 +1337,7 @@ fn command_metric_type(command: &GatewayCommand) -> &'static str {
         GatewayCommand::CloseStatement { .. } => "CLOSE",
         GatewayCommand::DescribeSql { .. } => "DESCRIBE_SQL",
         GatewayCommand::ClientWire { .. } => "CLIENT_WIRE",
+        GatewayCommand::PgBackendSync => "PG_BACKEND_SYNC",
         GatewayCommand::UseDatabase { .. } => "USE",
         GatewayCommand::Begin => "BEGIN",
         GatewayCommand::Commit => "COMMIT",

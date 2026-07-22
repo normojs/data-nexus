@@ -665,7 +665,8 @@ impl LocalPdp {
             GatewayCommand::Ping
             | GatewayCommand::Quit
             | GatewayCommand::CloseStatement { .. }
-            | GatewayCommand::ClientWire { .. } => SecurityDecision::allow_empty(),
+            | GatewayCommand::ClientWire { .. }
+            | GatewayCommand::PgBackendSync => SecurityDecision::allow_empty(),
             GatewayCommand::Begin | GatewayCommand::Commit | GatewayCommand::Rollback => {
                 let request = AccessRequest {
                     subject,

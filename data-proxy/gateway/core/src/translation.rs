@@ -119,7 +119,8 @@ pub fn prepare_cross_protocol_command(
         | GatewayCommand::Rollback
         | GatewayCommand::Ping
         | GatewayCommand::Quit
-        | GatewayCommand::ClientWire { .. } => Ok(command),
+        | GatewayCommand::ClientWire { .. }
+        | GatewayCommand::PgBackendSync => Ok(command),
     }
 }
 

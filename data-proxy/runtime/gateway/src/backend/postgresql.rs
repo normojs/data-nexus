@@ -193,6 +193,8 @@ pub struct PostgreSqlBackendConnector {
     tcp_txn: PgTcpTxnSlot,
     /// A08: idle non-txn TCP relay sessions (keyed by address|db|user).
     tcp_idle: Arc<PgTcpIdlePool>,
+    /// A08: held TCP session for multi-Execute client-frame unit (no Sync yet).
+    tcp_ext_hold: PgTcpTxnSlot,
     prepared: Arc<PreparedRegistry>,
 }
 
@@ -225,6 +227,7 @@ impl PostgreSqlBackendConnector {
             txn_lease: Arc::new(Mutex::new(None)),
             tcp_txn: new_tcp_txn_slot(),
             tcp_idle: PgTcpIdlePool::with_default_cap(),
+            tcp_ext_hold: new_tcp_txn_slot(),
             prepared: Arc::new(PreparedRegistry::default()),
         }
     }
@@ -397,9 +400,10 @@ impl PostgreSqlBackendConnector {
 
     /// A08: original client extended frames on backend TCP (not re-encoded).
     ///
-    /// Takes `session.pg_client_extended_frames` (Parse/Bind/Execute raw messages),
-    /// appends Sync on the backend, and streams until ReadyForQuery. Caller strips
-    /// backend Z for client extended units. Clears the frame buffer on success.
+    /// Takes `session.pg_client_extended_frames` (Parse/Bind/Execute raw messages).
+    /// - Unlimited Execute (max_rows none/0): append Sync, stream until Z.
+    /// - Paged Execute (max_rows > 0): no Sync; hold TCP for multi-Execute pages.
+    /// - Subsequent page with only Execute frames + hold open: relay Execute only.
     async fn execute_client_extended_frames_tcp_relay(
         &self,
         endpoint: EndpointConfig,
@@ -412,75 +416,118 @@ impl PostgreSqlBackendConnector {
             ));
         }
         let frames = std::mem::take(&mut session.pg_client_extended_frames);
+        let paged = session.pg_execute_max_rows.is_some();
+        let only_execute = frames.iter().all(|f| f.first() == Some(&b'E'));
+
+        // Multi-Execute resume: held TCP + only Execute frame(s).
+        if only_execute && session.pg_ext_tcp_hold {
+            let sess = self
+                .tcp_ext_hold
+                .lock()
+                .take()
+                .ok_or_else(|| GatewayError::Backend("pg ext hold session missing".into()))?;
+            let stream = sess
+                .client_execute_relay_hold_into(
+                    &frames,
+                    SessionReturn::Hold(self.tcp_ext_hold.clone()),
+                )
+                .await?;
+            session.pg_ext_tcp_hold = true;
+            return Ok(ExecuteOutcome::WireRelay(WireRelay {
+                stream: Box::new(stream),
+            }));
+        }
+
         let database = effective_database(&endpoint, session)?;
-        if in_txn {
-            let (sess, is_new) = match self.take_or_open_tcp_txn(&endpoint, session).await {
-                Ok(v) => v,
-                Err(e) => {
-                    session.pg_client_extended_frames = frames;
-                    return Err(e);
-                }
-            };
-            let sess = if is_new {
-                match sess.simple_query_collect_reuse("BEGIN").await {
-                    Ok((sess, begin_packets)) => {
-                        if begin_packets.iter().any(|p| p.first() == Some(&b'E')) {
-                            session.pg_client_extended_frames = frames;
-                            return Ok(ExecuteOutcome::Complete(GatewayResponse::Wire {
-                                packets: begin_packets,
-                            }));
-                        }
-                        sess
+        let open_sess = async {
+            if in_txn {
+                let (sess, is_new) = self.take_or_open_tcp_txn(&endpoint, session).await?;
+                if is_new {
+                    let (sess, begin_packets) = sess.simple_query_collect_reuse("BEGIN").await?;
+                    if begin_packets.iter().any(|p| p.first() == Some(&b'E')) {
+                        return Err(GatewayError::Backend(
+                            "pg client-frame relay: BEGIN failed".into(),
+                        ));
                     }
-                    Err(e) => {
-                        session.pg_client_extended_frames = frames;
-                        return Err(e);
-                    }
+                    Ok(sess)
+                } else {
+                    Ok(sess)
                 }
             } else {
-                sess
-            };
-            match sess
-                .client_frames_relay_into(&frames, SessionReturn::Txn(self.tcp_txn.clone()))
-                .await
-            {
-                Ok(stream) => {
-                    return Ok(ExecuteOutcome::WireRelay(WireRelay {
-                        stream: Box::new(stream),
-                    }));
-                }
-                Err(e) => {
-                    session.pg_client_extended_frames = frames;
-                    return Err(e);
-                }
+                self.tcp_idle.take_or_connect(&endpoint, &database).await
             }
-        }
-        let key = PgTcpIdlePool::pool_key(&endpoint, &database);
-        let session_tcp = match self.tcp_idle.take_or_connect(&endpoint, &database).await {
+        };
+
+        let sess = match open_sess.await {
             Ok(s) => s,
             Err(e) => {
                 session.pg_client_extended_frames = frames;
                 return Err(e);
             }
         };
-        match session_tcp
-            .client_frames_relay_into(
-                &frames,
+
+        if paged {
+            // Hold open for more Execute / client Sync.
+            let return_to = SessionReturn::Hold(self.tcp_ext_hold.clone());
+            match sess
+                .client_frames_relay_hold_into(&frames, return_to)
+                .await
+            {
+                Ok(stream) => {
+                    session.pg_ext_tcp_hold = true;
+                    Ok(ExecuteOutcome::WireRelay(WireRelay {
+                        stream: Box::new(stream),
+                    }))
+                }
+                Err(e) => {
+                    session.pg_client_extended_frames = frames;
+                    session.pg_ext_tcp_hold = false;
+                    Err(e)
+                }
+            }
+        } else {
+            // One-shot unit: Sync on backend.
+            let return_to = if in_txn {
+                SessionReturn::Txn(self.tcp_txn.clone())
+            } else {
+                let key = PgTcpIdlePool::pool_key(&endpoint, &database);
                 SessionReturn::Idle {
                     pool: self.tcp_idle.clone(),
                     key,
-                },
-            )
-            .await
-        {
-            Ok(stream) => Ok(ExecuteOutcome::WireRelay(WireRelay {
-                stream: Box::new(stream),
-            })),
-            Err(e) => {
-                session.pg_client_extended_frames = frames;
-                Err(e)
+                }
+            };
+            match sess.client_frames_relay_into(&frames, return_to).await {
+                Ok(stream) => {
+                    session.pg_ext_tcp_hold = false;
+                    Ok(ExecuteOutcome::WireRelay(WireRelay {
+                        stream: Box::new(stream),
+                    }))
+                }
+                Err(e) => {
+                    session.pg_client_extended_frames = frames;
+                    Err(e)
+                }
             }
         }
+    }
+
+    /// A08: client Sync while multi-Execute client-frame TCP unit is held.
+    async fn execute_pg_backend_sync(
+        &self,
+        session: &mut SessionState,
+    ) -> GatewayResult<ExecuteOutcome> {
+        let sess = self.tcp_ext_hold.lock().take().ok_or_else(|| {
+            GatewayError::Backend("pg backend sync: no held extended TCP session".into())
+        })?;
+        session.pg_ext_tcp_hold = false;
+        session.pg_client_extended_frames.clear();
+        // After Sync, return socket to idle pool when possible (unknown key → drop).
+        let stream = sess
+            .client_sync_relay_into(SessionReturn::Drop)
+            .await?;
+        Ok(ExecuteOutcome::WireRelay(WireRelay {
+            stream: Box::new(stream),
+        }))
     }
 
     /// A08: re-encoded extended text-bind on backend TCP (not original client frames).
@@ -1265,6 +1312,9 @@ impl BackendConnector for PostgreSqlBackendConnector {
                 result
             }
             GatewayCommand::ClientWire { packets } => Ok(GatewayResponse::Wire { packets }),
+            GatewayCommand::PgBackendSync => Err(GatewayError::Unsupported(
+                "use execute_outcome for PgBackendSync".into(),
+            )),
         }
     }
 
@@ -1274,6 +1324,10 @@ impl BackendConnector for PostgreSqlBackendConnector {
         session: &mut SessionState,
         mode: ExecuteMode,
     ) -> GatewayResult<ExecuteOutcome> {
+        // A08: client Sync flush for multi-Execute client-frame hold.
+        if matches!(command, GatewayCommand::PgBackendSync) {
+            return self.execute_pg_backend_sync(session).await;
+        }
         // A06: windowed yield for Streaming SELECT (txn and non-txn).
         // In-transaction: producer returns the leased connection to `txn_lease`
         // after draining so COMMIT/ROLLBACK still share the same backend conn.
@@ -1295,11 +1349,12 @@ impl BackendConnector for PostgreSqlBackendConnector {
             || self.tcp_txn.lock().is_some();
 
         // A08: progressive TCP frame relay for passthrough (txn + non-txn).
-        // Simple Query → simple Query TCP. Extended text-bindable QueryParams /
-        // prepared Execute → re-encoded backend Parse/Bind/Execute/Sync TCP.
-        // Still not original client Parse/Bind frames. Binary-only / serialize
-        // failures demote to Streaming.
-        if matches!(mode, ExecuteMode::Passthrough) && is_query {
+        // Simple Query → simple Query TCP only when no extended client frames buffered
+        // (empty-param Execute also decodes as Query but must use client-frame path).
+        if matches!(mode, ExecuteMode::Passthrough)
+            && is_query
+            && session.pg_client_extended_frames.is_empty()
+        {
             if let GatewayCommand::Query { sql } = command {
                 let endpoint = self.select_endpoint(session)?;
                 if in_txn {
@@ -1314,29 +1369,29 @@ impl BackendConnector for PostgreSqlBackendConnector {
         }
 
         // A08: prefer original client extended frames on TCP when frontend buffered them
-        // (Parse/Bind/Execute raw). Falls back to re-encoded text-bind, then demote.
-        if matches!(mode, ExecuteMode::Passthrough) && (is_query_params || is_execute) {
-            if !session.pg_client_extended_frames.is_empty() {
-                // Multi-Execute resume (logical skip / hold) may have leftover frames
-                // from a prior unit — only use when we have at least Parse+Bind+Execute
-                // tags or simply non-empty after frontend push (one unit).
-                let endpoint = self.select_endpoint(session)?;
-                match self
-                    .execute_client_extended_frames_tcp_relay(endpoint, session, in_txn)
-                    .await
-                {
-                    Ok(outcome) => return Ok(outcome),
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "data_nexus::gateway",
-                            error = %e,
-                            "a08 client-frame TCP relay failed; try re-encode / demote"
-                        );
-                        // frames already taken on success path; on failure restore empty
-                        // (execute_client_extended_frames takes them only after begin ok)
-                    }
+        // (Parse/Bind/Execute raw). Empty-param Execute decodes as Query { sql } but
+        // still carries frames — must not fall through to simple Query TCP.
+        // Falls back to re-encoded text-bind (params only), then demote.
+        if matches!(mode, ExecuteMode::Passthrough)
+            && (is_query || is_query_params || is_execute)
+            && !session.pg_client_extended_frames.is_empty()
+        {
+            let endpoint = self.select_endpoint(session)?;
+            match self
+                .execute_client_extended_frames_tcp_relay(endpoint, session, in_txn)
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "data_nexus::gateway",
+                        error = %e,
+                        "a08 client-frame TCP relay failed; try re-encode / demote"
+                    );
                 }
             }
+        }
+        if matches!(mode, ExecuteMode::Passthrough) && (is_query_params || is_execute) {
             let try_relay = match &command {
                 GatewayCommand::QueryParams { sql, parameters } => {
                     Some((sql.clone(), parameters.clone()))

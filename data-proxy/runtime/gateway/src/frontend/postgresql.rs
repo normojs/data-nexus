@@ -170,16 +170,22 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 self.pending_describe = None;
                 self.portal_row_described.clear();
                 session.prefer_binary_result = false;
-                session.pg_extended_query = false;
                 session.pg_execute_max_rows = None;
                 session.result_truncated = false;
                 session.pg_portal_name = None;
                 session.pg_portal_skip_rows = 0;
                 session.pg_drop_portal_hold = true;
                 session.pg_client_extended_frames.clear();
-                Ok(vec![GatewayCommand::ClientWire {
-                    packets: vec![encode_ready_for_query(transaction_status(session))],
-                }])
+                // A08: multi-Execute client-frame TCP unit still open → flush backend Sync.
+                if session.pg_ext_tcp_hold {
+                    session.pg_extended_query = true; // strip nothing critical; Z should pass
+                    Ok(vec![GatewayCommand::PgBackendSync])
+                } else {
+                    session.pg_extended_query = false;
+                    Ok(vec![GatewayCommand::ClientWire {
+                        packets: vec![encode_ready_for_query(transaction_status(session))],
+                    }])
+                }
             }
             FrontendMessage::Flush => Ok(vec![]),
             FrontendMessage::Parse {
@@ -364,7 +370,11 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             }
             FrontendMessage::Execute { portal, max_rows } => {
                 session.pg_extended_query = true;
-                // A08: include Execute frame for optional original-frame TCP relay.
+                // A08 multi-Execute: if TCP hold is open, only buffer this Execute frame
+                // (prior Parse/Bind already relayed).
+                if session.pg_ext_tcp_hold {
+                    session.pg_client_extended_frames.clear();
+                }
                 session.pg_client_extended_frames.push(frame.to_vec());
                 // Client Execute max_rows: 0 = unlimited. When > 0 and stream is
                 // truncated at this page, footer emits PortalSuspended.

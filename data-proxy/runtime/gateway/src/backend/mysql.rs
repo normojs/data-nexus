@@ -1312,6 +1312,9 @@ impl BackendConnector for MySqlBackendConnector {
                 Ok(GatewayResponse::RowDescription { columns })
             }
             GatewayCommand::ClientWire { packets } => Ok(GatewayResponse::Wire { packets }),
+            GatewayCommand::PgBackendSync => Err(GatewayError::Unsupported(
+                "mysql backend does not support PgBackendSync".into(),
+            )),
         }
     }
 

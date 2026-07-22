@@ -223,6 +223,96 @@ echo "$pg_ext_out"
 echo "$pg_ext_out" | grep -q 'pg_extended_under_passthrough_ok'
 echo "$pg_ext_out" | grep -q 'a08_client_frame_wire_no_premature_ready_ok'
 
+echo "==> A08 multi-Execute client-frame continuous TCP (PortalSuspended pages)"
+# First Execute max_rows=1 under passthrough holds backend TCP without Sync;
+# second Execute continues; Sync flushes ReadyForQuery. Label passthrough_client.
+pg_multi_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
+  python - <<'PY'
+import socket, struct
+
+def i32(n):
+    return struct.pack("!i", n)
+
+def i16(n):
+    return struct.pack("!h", n)
+
+def cstr(s: str) -> bytes:
+    return s.encode() + b"\x00"
+
+def msg(tag: bytes, body: bytes) -> bytes:
+    return tag + i32(len(body) + 4) + body
+
+def read_msg(sock):
+    hdr = b""
+    while len(hdr) < 5:
+        chunk = sock.recv(5 - len(hdr))
+        if not chunk:
+            raise RuntimeError("eof header")
+        hdr += chunk
+    tag = hdr[0:1]
+    (length,) = struct.unpack("!i", hdr[1:5])
+    body = b""
+    need = length - 4
+    while len(body) < need:
+        chunk = sock.recv(need - len(body))
+        if not chunk:
+            raise RuntimeError("eof body")
+        body += chunk
+    return tag, body
+
+def drain_until(sock, stop):
+    tags = []
+    rows = 0
+    while True:
+        tag, body = read_msg(sock)
+        tags.append(tag.decode("latin1"))
+        if tag == b"D":
+            rows += 1
+        if tag == b"E":
+            raise RuntimeError(body.decode("utf-8", "replace"))
+        if tag in stop:
+            return tags, rows, tag
+
+sock = socket.create_connection(("host.docker.internal", 9089), timeout=10)
+params = cstr("user") + cstr("postgres") + cstr("database") + cstr("analytics") + b"\x00"
+sock.sendall(i32(8 + len(params)) + i32(196608) + params)
+while True:
+    tag, body = read_msg(sock)
+    if tag == b"Z":
+        break
+    if tag == b"E":
+        raise RuntimeError(body)
+
+sql = "SELECT id, name FROM pass_smoke ORDER BY id"
+sock.sendall(msg(b"P", cstr("smulti") + cstr(sql) + i16(0)))
+body = cstr("pmulti") + cstr("smulti") + i16(0) + i16(0) + i16(0)
+sock.sendall(msg(b"B", body))
+tags_pb, _, _ = drain_until(sock, frozenset({b"2", b"E"}))
+assert "1" in tags_pb and "2" in tags_pb, tags_pb
+
+pages = []
+for i in range(2):
+    sock.sendall(msg(b"E", cstr("pmulti") + i32(1)))
+    tags, rows, end = drain_until(sock, frozenset({b"C", b"s", b"E"}))
+    pages.append((tags, rows, end.decode("latin1")))
+    print(f"page{i+1}", tags, "rows", rows, "end", end)
+    assert "Z" not in tags, tags
+    assert rows == 1, rows
+
+assert pages[0][2] == "s", pages[0]
+assert pages[1][2] in ("s", "C"), pages[1]
+
+sock.sendall(msg(b"S", b""))
+tags_sync, _, endz = drain_until(sock, frozenset({b"Z", b"E"}))
+print("after_sync", tags_sync, "end", endz)
+assert endz == b"Z", tags_sync
+print("a08_multi_execute_client_frame_ok")
+sock.close()
+PY
+)"
+echo "$pg_multi_out"
+echo "$pg_multi_out" | grep -q 'a08_multi_execute_client_frame_ok'
+
 echo "==> A08 MySQL COM_STMT under passthrough config (not WireRelay)"
 # Prepared Execute must demote to Streaming (COM_STMT path), not Complete materialize.
 mysql_prep_out="$(docker run --rm --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
@@ -288,6 +378,13 @@ pg_qp_bytes = any(
 )
 assert pg_qp_bytes, "expected passthrough_bytes for QUERY_PARAMS after PG extended"
 print("A08 honesty: PG QUERY_PARAMS → passthrough_client (or extended fallback) + wire bytes")
+# multi-Execute continuous client-frame should also record passthrough_client
+pg_multi = any(
+    ('passthrough_client' in ln) and ('gateway_execute_path_total' in ln)
+    for ln in text.splitlines() if not ln.startswith('#')
+)
+assert pg_multi, "expected passthrough_client after multi-Execute client-frame pages"
+print("A08 honesty: multi-Execute continuous client-frame TCP (passthrough_client)")
 # MySQL COM_STMT should still demote (binary bind unsafe as text rewrite)
 mysql_demote = any(
     ('EXECUTE' in ln) and ('streaming_demote' in ln or 'streaming' in ln) and ('mysql' in ln)
@@ -295,7 +392,7 @@ mysql_demote = any(
 )
 assert mysql_demote, "expected MySQL EXECUTE streaming_demote under passthrough"
 print("A08 honesty: MySQL COM_STMT remains streaming_demote (not text rewrite)")
-print("A08 client-frame relay is unit-scoped (not free-form proxy; multi-Execute hold separate)")
+print("A08 client-frame relay: unit + multi-Execute continuous hold (not free-form proxy)")
 print("A05 metrics ok")
 for line in text.splitlines():
     if "gateway_execute_path_total" in line or "gateway_passthrough_bytes_total" in line:
