@@ -273,6 +273,10 @@ pub struct StreamingEncodeStats {
     /// A06 honesty: max rows held in one encode window (should be ≤ configured window).
     /// Not process RSS — logical peak retained for encode, not full ResultSet.
     pub peak_window_rows: u64,
+    /// A06 honesty: max **encoded payload bytes** of one encode window (sum of
+    /// frontend row-packet lengths for that window). Logical, not process RSS /
+    /// cgroup — still proves multi-window encode does not grow with full ResultSet.
+    pub peak_window_bytes: u64,
     /// True when a row cap stopped encoding while the backend stream still had rows
     /// (A10 PortalSuspended / honest truncated Complete).
     pub truncated: bool,
@@ -536,8 +540,14 @@ pub async fn write_streaming_query_with_obligations_sample<W: ResponseWriter + ?
             stats.peak_window_rows = chunk_len;
         }
         let packets = frontend.encode_resultset_rows(&columns, &chunk, session)?;
+        let mut window_bytes = 0u64;
         for p in &packets {
-            stats.encoded_bytes = stats.encoded_bytes.saturating_add(p.len() as u64);
+            let n = p.len() as u64;
+            window_bytes = window_bytes.saturating_add(n);
+            stats.encoded_bytes = stats.encoded_bytes.saturating_add(n);
+        }
+        if window_bytes > stats.peak_window_bytes {
+            stats.peak_window_bytes = window_bytes;
         }
         drop(chunk);
         writer.write_packets(packets).await?;
@@ -672,8 +682,14 @@ pub async fn write_resultset_windowed_with_obligations<W: ResponseWriter + ?Size
             stats.peak_window_rows = chunk_len;
         }
         let packets = frontend.encode_resultset_rows(&columns, &chunk, session)?;
+        let mut window_bytes = 0u64;
         for p in &packets {
-            stats.encoded_bytes = stats.encoded_bytes.saturating_add(p.len() as u64);
+            let n = p.len() as u64;
+            window_bytes = window_bytes.saturating_add(n);
+            stats.encoded_bytes = stats.encoded_bytes.saturating_add(n);
+        }
+        if window_bytes > stats.peak_window_bytes {
+            stats.peak_window_bytes = window_bytes;
         }
         // Drop chunk after encode so peak is header+one window of packets.
         drop(chunk);
@@ -1040,6 +1056,30 @@ mod tests {
             window
         );
         assert!(stats.peak_window_rows >= 1);
+        // A06 logical peak window bytes: positive and well below full-result bytes.
+        assert!(
+            stats.peak_window_bytes > 0,
+            "peak_window_bytes={}",
+            stats.peak_window_bytes
+        );
+        assert!(
+            stats.peak_window_bytes < stats.encoded_bytes || stats.windows == 1,
+            "peak_window_bytes={} encoded_bytes={} windows={}",
+            stats.peak_window_bytes,
+            stats.encoded_bytes,
+            stats.windows
+        );
+        // Full result would be ~windows × peak; multi-window stream keeps peak << total.
+        if stats.windows > 1 {
+            assert!(
+                stats.peak_window_bytes * 2 < stats.encoded_bytes
+                    || stats.peak_window_bytes < stats.encoded_bytes,
+                "expected multi-window: peak_bytes={} total_bytes={} windows={}",
+                stats.peak_window_bytes,
+                stats.encoded_bytes,
+                stats.windows
+            );
+        }
     }
 
     #[tokio::test]

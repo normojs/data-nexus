@@ -2965,7 +2965,9 @@ fn record_portal_http_metrics(
         0
     };
     if win > 0 || peak > 0 {
-        metrics.record_secure_encode_peak(&labels, 0, win, 0, peak);
+        // Portal HTTP path has no per-window encode-byte high-water yet; pass 0
+        // so peak_window_bytes gauge is not falsely advanced.
+        metrics.record_secure_encode_peak(&labels, 0, win, 0, peak, 0);
     }
 }
 

@@ -261,6 +261,7 @@ impl CoreGatewayConnection {
                         stats.windows,
                         stats.encoded_bytes,
                         stats.peak_window_rows,
+                        stats.peak_window_bytes,
                     );
                     Ok(())
                 } else {
@@ -1039,6 +1040,7 @@ impl CoreGatewayConnection {
                         encode_stats.windows,
                         encode_stats.encoded_bytes,
                         encode_stats.peak_window_rows,
+                        encode_stats.peak_window_bytes,
                     );
                     let execute_path = if self.translation_policy.is_some() {
                         "xproto_stream"

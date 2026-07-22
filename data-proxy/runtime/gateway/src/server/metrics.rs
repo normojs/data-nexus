@@ -149,6 +149,18 @@ pub static GATEWAY_ENCODE_PEAK_WINDOW_ROWS: Lazy<GaugeVec> = Lazy::new(|| {
     .expect("Could not create GATEWAY_ENCODE_PEAK_WINDOW_ROWS")
 });
 
+/// A06 honesty: max encoded payload bytes of one encode window (logical, not process RSS).
+pub static GATEWAY_ENCODE_PEAK_WINDOW_BYTES: Lazy<GaugeVec> = Lazy::new(|| {
+    GaugeVec::new(
+        opts!(
+            "gateway_encode_peak_window_bytes",
+            "High-water mark of encoded payload bytes in a single encode window (A06 logical; not process RSS)"
+        ),
+        SQL_METRIC_LABELS,
+    )
+    .expect("Could not create GATEWAY_ENCODE_PEAK_WINDOW_BYTES")
+});
+
 /// A10 honesty: PortalSuspended multi-Execute resume strategy.
 /// mode=hold — remainder kept as process-local RowStream (not SQL WITH HOLD).
 /// mode=logical_skip — re-run SQL and skip prior rows (fallback).
@@ -250,10 +262,10 @@ impl MySQLServerMetricsCollector {
         windows: u64,
         encoded_bytes: u64,
     ) {
-        self.record_secure_encode_peak(labels, masked_rows, windows, encoded_bytes, 0);
+        self.record_secure_encode_peak(labels, masked_rows, windows, encoded_bytes, 0, 0);
     }
 
-    /// O01 + A06: Secure encode counters including peak window rows.
+    /// O01 + A06: Secure encode counters including peak window rows and bytes.
     pub fn record_secure_encode_peak(
         &self,
         labels: &[&str],
@@ -261,6 +273,7 @@ impl MySQLServerMetricsCollector {
         windows: u64,
         encoded_bytes: u64,
         peak_window_rows: u64,
+        peak_window_bytes: u64,
     ) {
         if labels.len() != 6 {
             return;
@@ -282,10 +295,16 @@ impl MySQLServerMetricsCollector {
         }
         if peak_window_rows > 0 {
             let g = GATEWAY_ENCODE_PEAK_WINDOW_ROWS.with_label_values(labels);
-            // High-water mark across queries for this label set.
             let cur = g.get();
             if peak_window_rows as f64 > cur {
                 g.set(peak_window_rows as f64);
+            }
+        }
+        if peak_window_bytes > 0 {
+            let g = GATEWAY_ENCODE_PEAK_WINDOW_BYTES.with_label_values(labels);
+            let cur = g.get();
+            if peak_window_bytes as f64 > cur {
+                g.set(peak_window_bytes as f64);
             }
         }
     }
@@ -463,7 +482,7 @@ mod tests {
             "query",
             "ep",
         ];
-        m.record_secure_encode_peak(&labels, 3, 2, 100, 7);
+        m.record_secure_encode_peak(&labels, 3, 2, 100, 7, 50);
         let masked = GATEWAY_MASK_ROWS_TOTAL.with_label_values(&labels).get();
         assert!(masked >= 3, "masked={masked}");
         let windows = GATEWAY_ENCODE_WINDOWS_TOTAL.with_label_values(&labels).get();
@@ -472,10 +491,14 @@ mod tests {
         assert!(bytes >= 100, "bytes={bytes}");
         let peak = GATEWAY_ENCODE_PEAK_WINDOW_ROWS.with_label_values(&labels).get();
         assert!(peak >= 7.0, "peak_window_rows={peak}");
+        let peak_b = GATEWAY_ENCODE_PEAK_WINDOW_BYTES.with_label_values(&labels).get();
+        assert!(peak_b >= 50.0, "peak_window_bytes={peak_b}");
         // High-water: lower peak must not decrease the gauge.
-        m.record_secure_encode_peak(&labels, 0, 1, 10, 3);
+        m.record_secure_encode_peak(&labels, 0, 1, 10, 3, 10);
         let peak2 = GATEWAY_ENCODE_PEAK_WINDOW_ROWS.with_label_values(&labels).get();
         assert!(peak2 >= 7.0, "peak should stay high-water, got {peak2}");
+        let peak_b2 = GATEWAY_ENCODE_PEAK_WINDOW_BYTES.with_label_values(&labels).get();
+        assert!(peak_b2 >= 50.0, "peak_window_bytes high-water, got {peak_b2}");
     }
 
     #[test]

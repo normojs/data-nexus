@@ -15,10 +15,10 @@
 use prometheus::{Encoder, Registry};
 use runtime_gateway::server::metrics::{
     install_audit_metrics_hooks, refresh_audit_queue_metrics, GATEWAY_AUDIT_PROCESS_DURATION,
-    GATEWAY_AUDIT_QUEUE_LEN, GATEWAY_ENCODE_BYTES_TOTAL, GATEWAY_ENCODE_PEAK_WINDOW_ROWS,
-    GATEWAY_ENCODE_WINDOWS_TOTAL, GATEWAY_EXECUTE_PATH_TOTAL, GATEWAY_MASK_ROWS_TOTAL,
-    GATEWAY_PASSTHROUGH_BYTES_TOTAL, GATEWAY_PORTAL_RESUME_TOTAL, SQL_PROCESSED_DURATION,
-    SQL_PROCESSED_TOTAL, SQL_UNDER_PROCESSING,
+    GATEWAY_AUDIT_QUEUE_LEN, GATEWAY_ENCODE_BYTES_TOTAL, GATEWAY_ENCODE_PEAK_WINDOW_BYTES,
+    GATEWAY_ENCODE_PEAK_WINDOW_ROWS, GATEWAY_ENCODE_WINDOWS_TOTAL, GATEWAY_EXECUTE_PATH_TOTAL,
+    GATEWAY_MASK_ROWS_TOTAL, GATEWAY_PASSTHROUGH_BYTES_TOTAL, GATEWAY_PORTAL_RESUME_TOTAL,
+    SQL_PROCESSED_DURATION, SQL_PROCESSED_TOTAL, SQL_UNDER_PROCESSING,
 };
 
 const METRICS_NAMESPACE: &str = "unisql_proxy";
@@ -64,6 +64,10 @@ impl MetricsManager {
         // A06: logical peak encode window rows (high-water gauge).
         registry
             .register(Box::new(GATEWAY_ENCODE_PEAK_WINDOW_ROWS.clone()))
+            .unwrap();
+        // A06: logical peak encode window bytes (high-water gauge; not process RSS).
+        registry
+            .register(Box::new(GATEWAY_ENCODE_PEAK_WINDOW_BYTES.clone()))
             .unwrap();
         // A10: PortalSuspended multi-Execute resume strategy (hold vs logical_skip).
         registry

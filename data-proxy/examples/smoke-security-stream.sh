@@ -821,6 +821,33 @@ else
   exit 1
 fi
 
+# A06 honesty: logical peak window *bytes* (encode payload of one window, not process RSS).
+if echo "$metrics" | grep -q 'gateway_encode_peak_window_bytes'; then
+  echo "$metrics" | grep 'gateway_encode_peak_window_bytes' | head -8 || true
+  if ! echo "$metrics" | awk '/gateway_encode_peak_window_bytes\{/ { if ($NF+0 > 0) found=1 } END { exit !found }'; then
+    echo "FAIL: expected gateway_encode_peak_window_bytes > 0 after Streaming traffic" >&2
+    exit 1
+  fi
+  # Multi-window SELECT: peak window bytes should stay well under total encode_bytes.
+  # (Single-window / tiny results may have peak ≈ total; only assert when total is large.)
+  peak_b_max="$(echo "$metrics" | awk '/gateway_encode_peak_window_bytes\{/ { v=$NF+0; if (v>m) m=v } END { print m+0 }')"
+  total_b_sum="$(echo "$metrics" | awk '/gateway_encode_bytes_total\{/ && !/^#/ { s+=$NF } END { print s+0 }')"
+  windows_sum="$(echo "$metrics" | awk '/gateway_encode_windows_total\{/ && !/^#/ { s+=$NF } END { print s+0 }')"
+  echo "peak_window_bytes_max=${peak_b_max} encode_bytes_sum=${total_b_sum} windows_sum=${windows_sum}"
+  if awk -v w="$windows_sum" -v p="$peak_b_max" -v t="$total_b_sum" 'BEGIN {
+    if (w >= 2 && t > 0 && p > 0 && p * 1.5 >= t) exit 1
+    exit 0
+  }'; then
+    echo "encode peak_window_bytes << total encode_bytes for multi-window stream (logical; not process RSS)"
+  else
+    echo "FAIL: multi-window peak_window_bytes=${peak_b_max} not clearly below encode_bytes_sum=${total_b_sum} (windows=${windows_sum})" >&2
+    exit 1
+  fi
+else
+  echo "FAIL: gateway_encode_peak_window_bytes missing after Streaming traffic (A06 logical peak bytes)" >&2
+  exit 1
+fi
+
 echo "==> A10 PortalSuspended multi-Execute resume (backend stream hold when possible)"
 # Hold keeps the live RowStream across Execute pages; if hold cannot apply,
 # logical skip still yields the same client-visible page tags.

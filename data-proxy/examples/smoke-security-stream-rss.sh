@@ -406,6 +406,33 @@ echo "$metrics" | grep 'gateway_encode_peak_window_rows' | head -8 || true
 echo "$metrics" | grep 'gateway_encode_windows_total' | head -8 || true
 echo "logical peak ≤ window_rows ok (authoritative; process/cgroup memory is coarse OS sanity only)"
 
+# A06: logical peak window *bytes* (encode payload high-water of one window).
+if ! echo "$metrics" | grep -q 'gateway_encode_peak_window_bytes'; then
+  echo "FAIL: missing gateway_encode_peak_window_bytes" >&2
+  exit 1
+fi
+peak_b_max="$(echo "$metrics" | awk '/gateway_encode_peak_window_bytes\{/ { v=$NF+0; if (v>m) m=v } END { print m+0 }')"
+total_b_sum="$(echo "$metrics" | awk '/gateway_encode_bytes_total\{/ && !/^#/ { s+=$NF } END { print s+0 }')"
+echo "peak_window_bytes_max=${peak_b_max} encode_bytes_sum=${total_b_sum}"
+if ! awk -v p="$peak_b_max" 'BEGIN { exit !(p > 0) }'; then
+  echo "FAIL: expected peak_window_bytes > 0" >&2
+  exit 1
+fi
+# 50k-row multi-window: peak window payload must be << total encoded bytes.
+if ! awk -v p="$peak_b_max" -v t="$total_b_sum" -v w="$windows_sum" 'BEGIN {
+  if (w < 2) exit 1
+  if (t <= 0 || p <= 0) exit 1
+  # peak of one window should be well under total (allow 2× noise margin vs full total)
+  if (p * 4 >= t) exit 1
+  exit 0
+}'; then
+  echo "FAIL: peak_window_bytes=${peak_b_max} not clearly below encode_bytes_sum=${total_b_sum} (windows=${windows_sum})" >&2
+  echo "  (logical window-byte peak; not process RSS / cgroup)" >&2
+  exit 1
+fi
+echo "$metrics" | grep 'gateway_encode_peak_window_bytes' | head -8 || true
+echo "A06 logical peak_window_bytes << total encode_bytes ok (not process RSS)"
+
 echo "smoke-security-stream-rss: OK"
 echo "NOTE: memory sample source=$MEM_SOURCE; catches full-result materialize regressions, not exact window bytes."
 echo "NOTE: set DN_RSS_MEM_SOURCE=cgroup|proc|ps to force a source; DN_RSS_VS_FULL_MULT>0 enables relative bound."

@@ -275,3 +275,4 @@ examples/        smoke + gateway config 样例
 | A08 | extended re-encode Describe+all-text formats; smoke pins RowDescription | fix(a08) |
 | A08 | client original-frame extended TCP + passthrough_client label | feat(a08) |
 | A08 | multi-Execute continuous client-frame TCP hold + PgBackendSync | feat(a08) |
+| A06 | peak_window_bytes logical gauge + multi-window smoke pin | feat(a06) |
