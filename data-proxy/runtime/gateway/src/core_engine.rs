@@ -999,6 +999,12 @@ impl CoreGatewayConnection {
                     );
                     let execute_path = if self.translation_policy.is_some() {
                         "xproto_stream"
+                    } else if self.passthrough_enabled
+                        && (command_type == "QUERY_PARAMS" || command_type == "EXECUTE")
+                    {
+                        // A08: extended under passthrough demotes to Streaming encode
+                        // (not TCP bind-frame relay). Distinct path label for honesty.
+                        "streaming_demote"
                     } else {
                         "streaming"
                     };

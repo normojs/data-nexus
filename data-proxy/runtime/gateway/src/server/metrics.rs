@@ -62,7 +62,8 @@ pub static SQL_UNDER_PROCESSING: Lazy<GaugeVec> = Lazy::new(|| {
 });
 
 // A05: execute path + passthrough bytes (Prometheus; always available).
-// Labels match B03 execute_path: passthrough | streaming | materialized | xproto_stream | n/a
+// Labels match B03 execute_path plus A08 honesty:
+// passthrough | streaming | streaming_demote | materialized | xproto_stream | n/a
 const LABEL_NAME_EXECUTE_PATH: &str = "execute_path";
 const EXECUTE_PATH_LABELS: &[&str] = &[
     LABEL_NAME_DOMAIN,
@@ -79,7 +80,7 @@ pub static GATEWAY_EXECUTE_PATH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         opts!(
             "gateway_execute_path_total",
-            "Gateway commands by execute_path (passthrough|streaming|materialized|xproto_stream|n/a)"
+            "Gateway commands by execute_path (passthrough|streaming|streaming_demote|materialized|xproto_stream|n/a)"
         ),
         EXECUTE_PATH_LABELS,
     )
@@ -272,6 +273,8 @@ impl MySQLServerMetricsCollector {
 pub fn normalize_execute_path(path: &str) -> &'static str {
     match path.trim().to_ascii_lowercase().as_str() {
         "passthrough" | "pass_through" | "wire" => "passthrough",
+        // A08: extended under passthrough demotes to Streaming (not TCP bind relay).
+        "streaming_demote" | "demote" | "demoted_streaming" => "streaming_demote",
         "streaming" | "stream" => "streaming",
         "materialized" | "materialise" | "full" => "materialized",
         "xproto_stream" | "xproto" | "cross_protocol" => "xproto_stream",
@@ -316,6 +319,8 @@ mod tests {
     fn normalize_execute_path_values() {
         assert_eq!(normalize_execute_path("passthrough"), "passthrough");
         assert_eq!(normalize_execute_path("STREAMING"), "streaming");
+        assert_eq!(normalize_execute_path("streaming_demote"), "streaming_demote");
+        assert_eq!(normalize_execute_path("demote"), "streaming_demote");
         assert_eq!(normalize_execute_path("materialized"), "materialized");
         assert_eq!(normalize_execute_path("xproto_stream"), "xproto_stream");
         assert_eq!(normalize_execute_path("other"), "n/a");

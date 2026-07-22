@@ -253,24 +253,38 @@ has_ext = (
     or "type=\"EXECUTE\"" in text
 )
 assert has_ext, "expected QUERY_PARAMS or EXECUTE after extended traffic"
-assert (
+# A08 honesty: demoted extended is labeled streaming_demote (not passthrough, not bare streaming).
+has_demote = (
+    'execute_path="streaming_demote"' in text
+    or "execute_path=\"streaming_demote\"" in text
+)
+has_streaming = (
     'execute_path="streaming"' in text
     or "execute_path=\"streaming\"" in text
-), "expected streaming path for extended under passthrough config"
+)
+assert has_demote or has_streaming, (
+    "expected streaming_demote (preferred) or streaming for extended under passthrough"
+)
+if has_demote:
+    print("A08 honesty: execute_path=streaming_demote observed (extended demote, not TCP bind relay)")
+else:
+    print("A08 note: streaming present without streaming_demote label (older binary?)")
 # Honesty: demote ≠ TCP bind-frame relay. We only prove path labels coexist:
-# simple Query can be passthrough while extended is streaming under the same config.
+# simple Query can be passthrough while extended is demoted streaming under the same config.
 pt_lines = [
     ln for ln in text.splitlines()
     if "gateway_execute_path_total" in ln and "passthrough" in ln and not ln.startswith("#")
 ]
 st_lines = [
     ln for ln in text.splitlines()
-    if "gateway_execute_path_total" in ln and "streaming" in ln and not ln.startswith("#")
+    if "gateway_execute_path_total" in ln
+    and ("streaming" in ln)
+    and not ln.startswith("#")
 ]
 assert pt_lines, "expected passthrough counter samples"
-assert st_lines, "expected streaming counter samples after demoted extended"
-print("A08 honesty: passthrough (simple) + streaming (extended demote) both present")
-print("A08 extended under passthrough uses streaming path (not TCP bind relay)")
+assert st_lines, "expected streaming/streaming_demote counter samples after demoted extended"
+print("A08 honesty: passthrough (simple) + streaming_demote/streaming (extended demote) both present")
+print("A08 extended under passthrough uses demoted streaming path (not TCP bind relay)")
 print("A05 metrics ok")
 for line in text.splitlines():
     if "gateway_execute_path_total" in line or "gateway_passthrough_bytes_total" in line:
