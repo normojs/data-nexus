@@ -221,4 +221,31 @@ assert code.startswith("4") or "error" in body or "denied" in body or "not suppo
 print("portal reverse xproto ddl rejected", code)
 PY
 
+echo "==> A09 reverse xproto portal metrics PORTAL_STREAM (logical peak ≤ window_rows=2)"
+metrics="$(curl -fsS http://127.0.0.1:8085/metrics 2>/dev/null || true)"
+if ! echo "$metrics" | grep -q 'type="PORTAL_STREAM"'; then
+  echo "FAIL: expected PORTAL_STREAM after reverse xproto multi-row portal exports" >&2
+  echo "$metrics" | grep 'gateway_execute_path_total' | head -20 || true
+  exit 1
+fi
+if ! echo "$metrics" | grep 'type="PORTAL_STREAM"' | grep -q 'execute_path="xproto_stream"'; then
+  echo "FAIL: expected execute_path=xproto_stream for reverse cross-protocol PORTAL_STREAM" >&2
+  echo "$metrics" | grep 'PORTAL_STREAM' | head -20 || true
+  exit 1
+fi
+echo "portal reverse xproto PORTAL_STREAM xproto_stream observed"
+if ! echo "$metrics" | grep 'gateway_encode_peak_window_rows' | grep -q 'PORTAL_STREAM'; then
+  echo "FAIL: expected gateway_encode_peak_window_rows for PORTAL_STREAM" >&2
+  exit 1
+fi
+bad_peak="$(echo "$metrics" | awk '/gateway_encode_peak_window_rows\{/ && /PORTAL_STREAM/ {
+  v=$NF+0; if (v > 2) print v
+}' | head -1)"
+if [[ -n "$bad_peak" ]]; then
+  echo "FAIL: reverse xproto PORTAL_STREAM peak_window_rows=$bad_peak exceeds window_rows=2" >&2
+  exit 1
+fi
+echo "portal reverse xproto PORTAL_STREAM peak ≤ window_rows=2 (logical; not process RSS)"
+echo "$metrics" | grep -E 'PORTAL_STREAM' | head -10 || true
+
 echo "smoke-security-portal-xproto-pg-mysql: OK"
