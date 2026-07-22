@@ -1015,6 +1015,25 @@ echo "$pg_dup_all" | grep -qE '2\|b' || { echo "FAIL: FETCH ALL should include i
 echo "$pg_dup_all" | grep -qE '3\|c' || { echo "FAIL: FETCH ALL should include id=3: $pg_dup_all" >&2; exit 1; }
 echo "a10_sql_cursor_dup_declare_and_fetch_all_ok"
 
+# MOVE / FETCH ABSOLUTE are fail-closed (process-local is forward-only).
+pg_move="$(docker run --rm -i --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+  env PGPASSWORD=postgres \
+  psql -h host.docker.internal -p 9089 -U postgres -d analytics -v ON_ERROR_STOP=0 -A -t <<'SQL' 2>&1
+BEGIN;
+DECLARE c_mv CURSOR WITH HOLD FOR SELECT id, name FROM stream_smoke ORDER BY id;
+MOVE FORWARD 1 FROM c_mv;
+FETCH ABSOLUTE 2 FROM c_mv;
+CLOSE c_mv;
+COMMIT;
+SQL
+)"
+echo "$pg_move"
+echo "$pg_move" | grep -qiE 'not supported|0A000|MOVE' \
+  || { echo "FAIL: expected MOVE unsupported: $pg_move" >&2; exit 1; }
+echo "$pg_move" | grep -qiE 'ABSOLUTE|not supported|0A000' \
+  || { echo "FAIL: expected FETCH ABSOLUTE unsupported: $pg_move" >&2; exit 1; }
+echo "a10_sql_cursor_move_absolute_unsupported_ok"
+
 curl -fsS "http://127.0.0.1:8082/metrics" | tee /tmp/dn-stream-cursor-metrics.txt >/dev/null
 python3 - <<'PYCUR'
 import re

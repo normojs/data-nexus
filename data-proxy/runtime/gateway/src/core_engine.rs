@@ -1536,6 +1536,25 @@ impl CoreGatewayConnection {
                 );
                 Ok(())
             }
+            NamedCursorSql::Unsupported { verb } => {
+                let response = GatewayResponse::Error {
+                    code: "0A000".into(),
+                    message: format!(
+                        "{verb} is not supported on process-local cursors (forward FETCH only; not backend SQL cursor)"
+                    ),
+                };
+                self.encode_response_to_writer(response, writer).await?;
+                command_span.record("outcome", "error");
+                command_span.record("execute_path", "sql_cursor_unsupported");
+                finish_command_metrics(
+                    &self.metrics,
+                    labels,
+                    started_at,
+                    "sql_cursor_unsupported",
+                    0,
+                );
+                Ok(())
+            }
         }
     }
 
@@ -1577,6 +1596,9 @@ enum NamedCursorSql {
     },
     Fetch { name: String, count: usize },
     Close { name: String },
+    /// MOVE / FETCH ABSOLUTE|RELATIVE|BACKWARD etc. — not supported on process-local
+    /// forward-only RowStream hold (honest fail-closed).
+    Unsupported { verb: String },
 }
 
 /// Parse `DECLARE name [BINARY] [INSENSITIVE] [NO] SCROLL CURSOR [WITH HOLD] FOR <select>`
@@ -1623,6 +1645,11 @@ fn parse_named_cursor_sql(sql: &str) -> Option<NamedCursorSql> {
             with_hold,
         });
     }
+    if upper.starts_with("MOVE ") {
+        return Some(NamedCursorSql::Unsupported {
+            verb: "MOVE".into(),
+        });
+    }
     if upper.starts_with("FETCH ") {
         // FETCH [FORWARD] [n|ALL] [FROM|IN] name
         let rest = trimmed[6..].trim();
@@ -1630,8 +1657,31 @@ fn parse_named_cursor_sql(sql: &str) -> Option<NamedCursorSql> {
         if tokens.is_empty() {
             return None;
         }
-        // strip FORWARD
-        if tokens[0].eq_ignore_ascii_case("FORWARD") {
+        // Fail-closed: absolute/relative/backward not supported on process-local hold.
+        let first = tokens[0].to_ascii_uppercase();
+        if matches!(
+            first.as_str(),
+            "ABSOLUTE" | "RELATIVE" | "BACKWARD" | "PRIOR" | "FIRST" | "LAST" | "NEXT"
+        ) {
+            // NEXT alone is sometimes used like FETCH NEXT FROM c — treat NEXT as 1 forward
+            // only when followed by FROM/IN name (no count). Otherwise unsupported.
+            if first == "NEXT"
+                && tokens.len() >= 2
+                && (tokens[1].eq_ignore_ascii_case("FROM") || tokens[1].eq_ignore_ascii_case("IN"))
+            {
+                // fall through as FORWARD 1
+            } else if first != "NEXT" {
+                return Some(NamedCursorSql::Unsupported {
+                    verb: format!("FETCH {first}"),
+                });
+            } else {
+                return Some(NamedCursorSql::Unsupported {
+                    verb: "FETCH NEXT (unsupported form)".into(),
+                });
+            }
+        }
+        // strip FORWARD / NEXT (forward 1)
+        if tokens[0].eq_ignore_ascii_case("FORWARD") || tokens[0].eq_ignore_ascii_case("NEXT") {
             tokens.remove(0);
         }
         if tokens.is_empty() {
@@ -3253,6 +3303,21 @@ mod tests {
                 assert!(with_hold);
             }
             other => panic!("{other:?}"),
+        }
+        match parse_named_cursor_sql("MOVE FORWARD 1 FROM c1") {
+            Some(NamedCursorSql::Unsupported { verb }) => assert!(verb.contains("MOVE")),
+            other => panic!("expected MOVE unsupported: {other:?}"),
+        }
+        match parse_named_cursor_sql("FETCH ABSOLUTE 2 FROM c1") {
+            Some(NamedCursorSql::Unsupported { verb }) => assert!(verb.contains("ABSOLUTE")),
+            other => panic!("expected ABSOLUTE unsupported: {other:?}"),
+        }
+        match parse_named_cursor_sql("FETCH NEXT FROM c1") {
+            Some(NamedCursorSql::Fetch { name, count }) => {
+                assert_eq!(name, "c1");
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected FETCH NEXT as forward 1: {other:?}"),
         }
     }
 }
