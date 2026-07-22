@@ -290,3 +290,4 @@ examples/        smoke + gateway config 样例
 | A10 | sql_cursor_unsupported metric + OBSERVABILITY MOVE/ABSOLUTE | feat(a10) |
 | A08 | mask+passthrough=true still execute_path=streaming smoke pin | test(a08) |
 | B08 | security-policies full_result_l3=false + requires_audit_level=L2 | feat(b08) |
+| A08 | watermark+passthrough=true still streaming smoke pin | test(a08) |

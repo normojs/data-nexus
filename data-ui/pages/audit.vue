@@ -81,7 +81,7 @@ function sampleTitle(e: AdminAuditEvent): string {
       e.sample_body.length > 240 ? `${e.sample_body.slice(0, 240)}…` : e.sample_body
     parts.push(preview)
   }
-  return parts.join(' · ') || 'no sample (need sample_enabled + default_audit_level=L2; not L3 full result)'
+  return parts.join(' · ') || 'no sample (need sample_enabled + default_audit_level=L2; not L3 full result; API full_result_l3=false)'
 }
 
 const sourceBadgeClass = computed(() => {
@@ -686,7 +686,7 @@ onMounted(() => {
               </button>
               <span
                 v-else
-                title="no sample (need sample_enabled + default_audit_level=L2)"
+                title="no sample (need sample_enabled + default_audit_level=L2; not L3 full-result archive)"
               >—</span>
             </td>
             <td class="mono eid">

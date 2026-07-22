@@ -49,7 +49,8 @@ PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
   cd "$ROOT"
   if [[ ! -x "$PROXY_BIN" ]] \
     || [[ "$ROOT/gateway/core/src/obligations.rs" -nt "$PROXY_BIN" ]] \
-    || [[ "$ROOT/gateway/core/src/pdp.rs" -nt "$PROXY_BIN" ]]; then
+    || [[ "$ROOT/gateway/core/src/pdp.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/runtime/gateway/src/core_engine.rs" -nt "$PROXY_BIN" ]]; then
     cargo build -p data-proxy --bin proxy
   fi
   "$PROXY_BIN" daemon -c "$CONFIG_FILE"
@@ -76,5 +77,29 @@ echo "$out" | grep -q 'wm-demo-token'
 # column mode should add third field
 fields=$(echo "$out" | head -1 | awk '{print NF}')
 [[ "$fields" -ge 3 ]] || { echo "expected >=3 fields (id,name,wm), got $fields" >&2; exit 1; }
+
+echo "==> A08 honesty: watermark is a result obligation → Streaming even if passthrough=true"
+curl -fsS "http://127.0.0.1:8082/metrics" | tee /tmp/dn-wm-metrics.txt >/dev/null
+python3 - <<'PY'
+import re
+text = open("/tmp/dn-wm-metrics.txt").read()
+paths = set()
+for ln in text.splitlines():
+    if "gateway_execute_path_total" not in ln or ln.startswith("#"):
+        continue
+    if "QUERY" not in ln:
+        continue
+    m = re.search(r'execute_path="([^"]+)"', ln)
+    if m:
+        paths.add(m.group(1))
+print("execute_path labels (QUERY-ish):", sorted(paths))
+assert "streaming" in paths, f"expected streaming under watermark+passthrough, got {paths}"
+if paths.issubset({"passthrough", "passthrough_client", "passthrough_extended", "n/a"}):
+    raise SystemExit(f"FAIL: watermark traffic only passthrough-ish paths: {paths}")
+print("A08 honesty: watermark obligation forces Streaming under passthrough=true")
+for ln in text.splitlines():
+    if "gateway_execute_path_total" in ln and not ln.startswith("#") and "QUERY" in ln:
+        print(ln)
+PY
 
 echo "smoke-security-watermark: OK"

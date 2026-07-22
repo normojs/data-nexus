@@ -62,7 +62,7 @@ Do **not** treat path counters as proof of end-to-end zero-copy or process RSS b
 | All traffic is Streaming | Control / empty Complete paths may label `n/a` or `materialized` depending on response shape. Row-returning Query* under obligations/max_rows should hit `streaming`. Extended under passthrough: text-bind rewrite → `passthrough_rewrite`; else `streaming_demote`. |
 | Sample / L2 = full result | B08 samples are bounded rows/bytes and require `default_audit_level=L2`. **Not** L3 full-result archive. |
 
-Related smokes: `smoke-security-stream.sh` (streaming + peak≤window + PortalSuspended resume), `smoke-security-passthrough.sh` (simple passthrough + PG client-frame / MySQL demote), `smoke-security-mask.sh` (mask+`passthrough=true` still `execute_path=streaming`), `smoke-security-portal*.sh` (backend_window vs chunked).
+Related smokes: `smoke-security-stream.sh` (streaming + peak≤window + PortalSuspended resume), `smoke-security-passthrough.sh` (simple passthrough + PG client-frame / MySQL demote), `smoke-security-mask.sh` / `smoke-security-watermark.sh` (mask|watermark + `passthrough=true` still `execute_path=streaming`), `smoke-security-portal*.sh` (backend_window vs chunked).
 
 ### Secure encode metrics (O01 / A06, always on)
 
