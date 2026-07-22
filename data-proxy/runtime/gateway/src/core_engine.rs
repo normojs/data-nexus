@@ -17,7 +17,8 @@ use std::{sync::Arc, time::Instant};
 use endpoint::endpoint::Endpoint;
 use gateway_core::{
         write_resultset_windowed, write_resultset_windowed_with_obligations,
-        write_streaming_query_with_obligations_sample, write_wire_relay, CollectingWriter, map_response_types,
+        write_streaming_query_with_obligations_sample, write_wire_relay_opts, CollectingWriter,
+        map_response_types,
         prepare_cross_protocol_command, BackendConnector, CommandSummary, DialectParser,
         EndpointConfig, EndpointRef, EndpointRole, ExecuteMode, ExecuteOutcome,
         FrontendProtocolAdapter, GatewayCommand, GatewayConfig, GatewayError, GatewayResponse,
@@ -824,7 +825,10 @@ impl CoreGatewayConnection {
                 Ok(ExecuteOutcome::WireRelay(relay)) => {
                     // A08: progressive wire frames → socket (no logical ResultSet).
                     // Only selected when passthrough is allowed (no result obligations).
-                    let wire_bytes = write_wire_relay(relay, writer).await?;
+                    // Extended-query rewrite→simple Query TCP still ends with backend Z;
+                    // strip it so only Sync emits ReadyForQuery (not original Parse/Bind relay).
+                    let skip_z = self.session.pg_extended_query;
+                    let wire_bytes = write_wire_relay_opts(relay, writer, skip_z).await?;
                     let execute_path = "passthrough";
                     command_span.record("outcome", "passthrough");
                     command_span.record("security_decision", "allow");

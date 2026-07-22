@@ -115,7 +115,8 @@ pub use translation::{
 pub use transport::{
     write_resultset_windowed, write_resultset_windowed_with_obligations,
     write_streaming_query_with_obligations, write_streaming_query_with_obligations_sample,
-    write_wire_relay, BackendConnector, CollectingWriter, ExecuteOutcome, FrontendProtocolAdapter,
+    write_wire_relay, write_wire_relay_opts, BackendConnector, CollectingWriter, ExecuteOutcome,
+    FrontendProtocolAdapter,
     PrefixedRowStream, ResponseWriter, RowStream, StreamingEncodeStats, StreamingQuery,
     StreamingSampleOpts, VecRowStream, WireRelay, WireStream,
 };

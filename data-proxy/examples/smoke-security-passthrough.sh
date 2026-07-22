@@ -64,6 +64,7 @@ PROXY_BIN="${CARGO_TARGET_DIR}/debug/proxy"
     || [[ "$ROOT/runtime/gateway/src/backend/postgresql.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/backend/pg_tcp_relay.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/gateway/core/src/config.rs" -nt "$PROXY_BIN" ]] \
+    || [[ "$ROOT/gateway/core/src/transport.rs" -nt "$PROXY_BIN" ]] \
     || [[ "$ROOT/runtime/gateway/src/core_engine.rs" -nt "$PROXY_BIN" ]]; then
     cargo build -p data-proxy --bin proxy
   fi
@@ -125,9 +126,10 @@ elif grep -q 'passthrough' "$PROXY_LOG" 2>/dev/null; then
   echo "log contains passthrough outcome"
 fi
 
-echo "==> A08 PostgreSQL extended Bind/Execute under passthrough config (not WireRelay)"
-# Passthrough only applies to simple Query. Extended QueryParams must still work
-# via Streaming re-encode (no TCP bind relay). Assert rows + metrics streaming.
+echo "==> A08 PostgreSQL extended text-bind under passthrough (rewrite→simple Query wire)"
+# Text-bindable $1 rewrites to simple Query TCP (passthrough + wire bytes).
+# Still NOT original Parse/Bind/Execute frame relay. Backend ReadyForQuery from
+# the rewritten simple Query must be stripped until client Sync (pg_extended_query).
 pg_ext_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
   python - <<'PY'
 import socket, struct
@@ -162,6 +164,19 @@ def read_msg(sock):
         body += chunk
     return tag, body
 
+def drain_until(sock, stop):
+    tags = []
+    rows = 0
+    while True:
+        tag, body = read_msg(sock)
+        tags.append(tag.decode("latin1"))
+        if tag == b"D":
+            rows += 1
+        if tag == b"E":
+            raise RuntimeError(body.decode("utf-8", "replace"))
+        if tag in stop:
+            return tags, rows, tag
+
 sock = socket.create_connection(("host.docker.internal", 9089), timeout=10)
 params = cstr("user") + cstr("postgres") + cstr("database") + cstr("analytics") + b"\x00"
 sock.sendall(i32(8 + len(params)) + i32(196608) + params)
@@ -177,29 +192,33 @@ sock.sendall(msg(b"P", cstr("sext") + cstr(sql) + i16(0)))
 param = b"1"
 body = cstr("pext") + cstr("sext") + i16(0) + i16(1) + i32(len(param)) + param + i16(0)
 sock.sendall(msg(b"B", body))
-sock.sendall(msg(b"E", cstr("pext") + i32(0)))
-sock.sendall(msg(b"S", b""))
+# Parse/Bind complete locally as ClientWire; drain those before Execute.
+tags_pb, _, _ = drain_until(sock, frozenset({b"2", b"E"}))  # BindComplete = '2'
+print("after_bind", tags_pb)
+assert "1" in tags_pb, tags_pb  # ParseComplete
+assert "2" in tags_pb, tags_pb
 
-tags = []
-rows = 0
-while True:
-    tag, body = read_msg(sock)
-    tags.append(tag.decode("latin1"))
-    if tag == b"D":
-        rows += 1
-    if tag == b"E":
-        raise RuntimeError(body.decode("utf-8", "replace"))
-    if tag == b"Z":
-        break
-print("pg_ext_tags", tags, "rows", rows)
+sock.sendall(msg(b"E", cstr("pext") + i32(0)))
+# Drain Execute result WITHOUT Sync: must end at CommandComplete/PortalSuspended, no Z.
+tags_ex, rows, end = drain_until(sock, frozenset({b"C", b"s", b"E"}))
+print("after_execute", tags_ex, "rows", rows, "end", end)
 assert rows >= 1, rows
-assert "C" in tags or "s" in tags, tags
+assert end in (b"C", b"s"), tags_ex
+assert "Z" not in tags_ex, f"backend ReadyForQuery leaked before Sync: {tags_ex}"
+assert "T" in tags_ex or "D" in tags_ex, tags_ex
+
+sock.sendall(msg(b"S", b""))
+tags_sync, _, endz = drain_until(sock, frozenset({b"Z", b"E"}))
+print("after_sync", tags_sync, "end", endz)
+assert endz == b"Z", tags_sync
 print("pg_extended_under_passthrough_ok")
+print("a08_rewrite_wire_no_premature_ready_ok")
 sock.close()
 PY
 )"
 echo "$pg_ext_out"
 echo "$pg_ext_out" | grep -q 'pg_extended_under_passthrough_ok'
+echo "$pg_ext_out" | grep -q 'a08_rewrite_wire_no_premature_ready_ok'
 
 echo "==> A08 MySQL COM_STMT under passthrough config (not WireRelay)"
 # Prepared Execute must demote to Streaming (COM_STMT path), not Complete materialize.

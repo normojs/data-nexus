@@ -268,3 +268,4 @@ examples/        smoke + gateway config 样例
 | A08 | live unit WireRelay + smoke pin QUERY_PARAMS passthrough / MySQL demote | test(a08) |
 | A10 | portal resume metrics hold/resume_hold/logical_skip + stream smoke | feat(a10) |
 | A10 | PDP Execute inherits streaming.max_rows (COM_STMT cap under demote) | fix(a10) |
+| A08 | rewrite→wire strip backend ReadyForQuery under extended + smoke | feat(a08) |

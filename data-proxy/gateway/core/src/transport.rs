@@ -212,8 +212,23 @@ impl RowStream for VecRowStream {
 ///
 /// Returns total payload bytes written (sum of packet lengths).
 pub async fn write_wire_relay<W: ResponseWriter + ?Sized>(
+    relay: WireRelay,
+    writer: &mut W,
+) -> GatewayResult<u64> {
+    write_wire_relay_opts(relay, writer, false).await
+}
+
+/// A08: drain WireRelay, optionally suppressing backend ReadyForQuery (`Z`).
+///
+/// When PG extended QueryParams/Execute is rewritten to simple Query TCP, the
+/// backend still ends the simple-query unit with ReadyForQuery. Clients in an
+/// extended-query unit must **not** see that `Z` until Sync — strip it here so
+/// rewrite→wire stays protocol-correct without claiming original Parse/Bind
+/// frame relay.
+pub async fn write_wire_relay_opts<W: ResponseWriter + ?Sized>(
     mut relay: WireRelay,
     writer: &mut W,
+    skip_ready_for_query: bool,
 ) -> GatewayResult<u64> {
     let mut total = 0u64;
     loop {
@@ -221,6 +236,17 @@ pub async fn write_wire_relay<W: ResponseWriter + ?Sized>(
             None => break,
             Some(batch) if batch.is_empty() => continue,
             Some(batch) => {
+                let batch = if skip_ready_for_query {
+                    batch
+                        .into_iter()
+                        .filter(|p| p.first() != Some(&b'Z'))
+                        .collect::<Vec<_>>()
+                } else {
+                    batch
+                };
+                if batch.is_empty() {
+                    continue;
+                }
                 total = total.saturating_add(batch.iter().map(|p| p.len() as u64).sum::<u64>());
                 writer.write_packets(batch).await?;
             }
@@ -775,6 +801,45 @@ mod tests {
         assert_eq!(bytes, 6 + 3 + 2);
         assert_eq!(writer.packets.len(), 3);
         assert_eq!(writer.packets[0][0], b'Z');
+    }
+
+    #[tokio::test]
+    async fn a08_write_wire_relay_opts_skips_ready_for_query() {
+        // Extended rewrite→simple Query TCP: strip backend Z so only Sync emits ReadyForQuery.
+        struct FakeWire {
+            batches: std::vec::IntoIter<Vec<Vec<u8>>>,
+        }
+
+        #[async_trait]
+        impl WireStream for FakeWire {
+            async fn poll_packets(
+                &mut self,
+                _max_packets: usize,
+            ) -> GatewayResult<Option<Vec<Vec<u8>>>> {
+                Ok(self.batches.next())
+            }
+        }
+
+        let relay = WireRelay {
+            stream: Box::new(FakeWire {
+                batches: vec![
+                    vec![
+                        vec![b'T', 0, 0, 0, 4],
+                        vec![b'D', 0, 0, 0, 4],
+                        vec![b'C', 0, 0, 0, 4],
+                        vec![b'Z', 0, 0, 0, 5, b'I'],
+                    ],
+                ]
+                .into_iter(),
+            }),
+        };
+        let mut writer = CollectingWriter::new();
+        let bytes = write_wire_relay_opts(relay, &mut writer, true).await.unwrap();
+        assert_eq!(bytes, 5 + 5 + 5);
+        assert_eq!(writer.packets.len(), 3);
+        assert!(writer.packets.iter().all(|p| p.first() != Some(&b'Z')));
+        assert_eq!(writer.packets[0][0], b'T');
+        assert_eq!(writer.packets[2][0], b'C');
     }
 
     #[tokio::test]
