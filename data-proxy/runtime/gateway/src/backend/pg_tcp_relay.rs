@@ -474,6 +474,70 @@ impl PgTcpSession {
         })
     }
 
+    /// A08: forward original client extended frames then Sync; stream until ReadyForQuery.
+    ///
+    /// `client_frames` should be the raw client Parse/Bind[/Describe]/ies]/Execute
+    /// messages for one unit. This method appends Sync so the backend unit completes.
+    /// Unlike re-encoded text-bind, these bytes are the **client's** frames (true
+    /// original-frame TCP relay for that unit). Multi-Execute pages that need hold
+    /// still use Streaming elsewhere; this path is one-shot per collected unit.
+    pub async fn client_frames_relay_into(
+        mut self,
+        client_frames: &[Vec<u8>],
+        return_to: SessionReturn,
+    ) -> GatewayResult<PgTcpWireStream> {
+        if client_frames.is_empty() {
+            return Err(GatewayError::Backend(
+                "pg client frame relay: empty frame list".into(),
+            ));
+        }
+        let mut out = BytesMut::with_capacity(
+            client_frames.iter().map(|f| f.len()).sum::<usize>() + 32,
+        );
+        // If the client unit omitted Describe, inject Describe(portal) after Bind so
+        // multi-column SELECTs still emit RowDescription. Portal name is taken from
+        // the Bind frame (empty string = unnamed).
+        let mut saw_describe = false;
+        let mut bound_portal: Option<String> = None;
+        for f in client_frames {
+            let tag = f.first().copied();
+            if tag == Some(b'D') {
+                saw_describe = true;
+            }
+            if tag == Some(b'B') && f.len() > 5 {
+                // Bind body starts at offset 5: portal cstring.
+                if let Some(end) = f[5..].iter().position(|&b| b == 0) {
+                    let name = String::from_utf8_lossy(&f[5..5 + end]).into_owned();
+                    bound_portal = Some(name);
+                }
+            }
+            if bound_portal.is_some() && !saw_describe && tag == Some(b'E') {
+                let portal = bound_portal.as_deref().unwrap_or("");
+                frontend::describe(b'P', portal, &mut out).map_err(|e| {
+                    GatewayError::Backend(format!("pg client-frame describe inject: {e}"))
+                })?;
+                saw_describe = true;
+            }
+            out.extend_from_slice(f);
+        }
+        if bound_portal.is_some() && !saw_describe {
+            let portal = bound_portal.as_deref().unwrap_or("");
+            frontend::describe(b'P', portal, &mut out).map_err(|e| {
+                GatewayError::Backend(format!("pg client-frame describe inject: {e}"))
+            })?;
+        }
+        frontend::sync(&mut out);
+        self.stream
+            .write_all(&out)
+            .await
+            .map_err(|e| GatewayError::Backend(format!("pg client frame write: {e}")))?;
+        Ok(PgTcpWireStream {
+            session: Some(self),
+            return_to,
+            done: false,
+        })
+    }
+
     /// A08: re-encode extended text-bind unit on backend TCP (Parse/Bind/Describe/Execute/Sync).
     ///
     /// Uses **unnamed** statement/portal so idle pool reuse stays safe. Params are

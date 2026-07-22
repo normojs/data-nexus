@@ -126,9 +126,10 @@ elif grep -q 'passthrough' "$PROXY_LOG" 2>/dev/null; then
   echo "log contains passthrough outcome"
 fi
 
-echo "==> A08 PostgreSQL extended text-bind under passthrough (backend re-encoded P/B/E TCP)"
-# Text-bindable $1 re-encodes as backend Parse/Bind/Execute/Sync (passthrough_extended).
-# Still NOT original client Parse/Bind frame relay. Backend 1/2/Z stripped until Sync.
+echo "==> A08 PostgreSQL extended text-bind under passthrough (client original frames TCP)"
+# Frontend buffers raw Parse/Bind/Execute; backend TCP-relays those frames + Sync.
+# Label: passthrough_client. Still unit-scoped (not free-form proxy); multi-Execute hold
+# remains Streaming. Backend Z stripped until client Sync.
 pg_ext_out="$(docker run --rm -i --add-host=host.docker.internal:host-gateway python:3.12-slim-bookworm \
   python - <<'PY'
 import socket, struct
@@ -206,7 +207,7 @@ assert rows >= 1, rows
 assert end in (b"C", b"s"), tags_ex
 assert "Z" not in tags_ex, f"backend ReadyForQuery leaked before Sync: {tags_ex}"
 assert "1" not in tags_ex and "2" not in tags_ex, f"backend Parse/BindComplete leaked: {tags_ex}"
-assert "T" in tags_ex, f"expected RowDescription from backend Describe(portal): {tags_ex}"
+assert "T" in tags_ex, f"expected RowDescription from client-frame relay/backend: {tags_ex}"
 assert "D" in tags_ex, tags_ex
 
 sock.sendall(msg(b"S", b""))
@@ -214,13 +215,13 @@ tags_sync, _, endz = drain_until(sock, frozenset({b"Z", b"E"}))
 print("after_sync", tags_sync, "end", endz)
 assert endz == b"Z", tags_sync
 print("pg_extended_under_passthrough_ok")
-print("a08_extended_wire_rowdesc_no_premature_ready_ok")
+print("a08_client_frame_wire_no_premature_ready_ok")
 sock.close()
 PY
 )"
 echo "$pg_ext_out"
 echo "$pg_ext_out" | grep -q 'pg_extended_under_passthrough_ok'
-echo "$pg_ext_out" | grep -q 'a08_extended_wire_rowdesc_no_premature_ready_ok'
+echo "$pg_ext_out" | grep -q 'a08_client_frame_wire_no_premature_ready_ok'
 
 echo "==> A08 MySQL COM_STMT under passthrough config (not WireRelay)"
 # Prepared Execute must demote to Streaming (COM_STMT path), not Complete materialize.
@@ -271,22 +272,22 @@ has_ext = (
     or "type=\"EXECUTE\"" in text
 )
 assert has_ext, "expected QUERY_PARAMS or EXECUTE after extended traffic"
-# A08: PG extended text-bind → backend re-encoded Parse/Bind/Execute TCP.
-# Honesty label: execute_path=passthrough_extended (aliases passthrough_rewrite).
-# MySQL COM_STMT remains streaming_demote. Still NOT original client frame relay.
-pg_qp_ext = any(
+# A08: PG extended → original client Parse/Bind/Execute frames on backend TCP.
+# Honesty label: execute_path=passthrough_client (fallback passthrough_extended).
+# MySQL COM_STMT remains streaming_demote. Multi-Execute hold still Streaming.
+pg_qp_client = any(
     ('QUERY_PARAMS' in ln)
-    and ('passthrough_extended' in ln or 'passthrough_rewrite' in ln)
+    and ('passthrough_client' in ln)
     and ('gateway_execute_path_total' in ln)
     for ln in text.splitlines() if not ln.startswith('#')
 )
-assert pg_qp_ext, "expected QUERY_PARAMS execute_path=passthrough_extended after PG text-bind"
+assert pg_qp_client, "expected QUERY_PARAMS execute_path=passthrough_client after PG client-frame relay"
 pg_qp_bytes = any(
     ('QUERY_PARAMS' in ln) and ('gateway_passthrough_bytes_total' in ln) and not ln.startswith('#')
     for ln in text.splitlines()
 )
-assert pg_qp_bytes, "expected passthrough_bytes for QUERY_PARAMS after PG text-bind"
-print("A08 honesty: PG QUERY_PARAMS text-bind → passthrough_extended + wire bytes")
+assert pg_qp_bytes, "expected passthrough_bytes for QUERY_PARAMS after PG extended"
+print("A08 honesty: PG QUERY_PARAMS → passthrough_client (or extended fallback) + wire bytes")
 # MySQL COM_STMT should still demote (binary bind unsafe as text rewrite)
 mysql_demote = any(
     ('EXECUTE' in ln) and ('streaming_demote' in ln or 'streaming' in ln) and ('mysql' in ln)
@@ -294,7 +295,7 @@ mysql_demote = any(
 )
 assert mysql_demote, "expected MySQL EXECUTE streaming_demote under passthrough"
 print("A08 honesty: MySQL COM_STMT remains streaming_demote (not text rewrite)")
-print("A08 still NOT original client Parse/Bind/Execute frame relay")
+print("A08 client-frame relay is unit-scoped (not free-form proxy; multi-Execute hold separate)")
 print("A05 metrics ok")
 for line in text.splitlines():
     if "gateway_execute_path_total" in line or "gateway_passthrough_bytes_total" in line:

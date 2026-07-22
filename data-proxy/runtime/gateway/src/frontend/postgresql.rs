@@ -176,6 +176,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 session.pg_portal_name = None;
                 session.pg_portal_skip_rows = 0;
                 session.pg_drop_portal_hold = true;
+                session.pg_client_extended_frames.clear();
                 Ok(vec![GatewayCommand::ClientWire {
                     packets: vec![encode_ready_for_query(transaction_status(session))],
                 }])
@@ -187,6 +188,8 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 param_types: _,
             } => {
                 session.pg_extended_query = true;
+                // A08: retain original client frame for optional TCP relay under passthrough.
+                session.pg_client_extended_frames.push(frame.to_vec());
                 let nparams = count_pg_placeholders_frontend(&query);
                 self.prepared_params.insert(statement.clone(), nparams);
                 // Infer explicit SELECT-list columns for Describe RowDescription.
@@ -208,6 +211,7 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 result_formats,
             } => {
                 session.pg_extended_query = true;
+                session.pg_client_extended_frames.push(frame.to_vec());
                 let sql = self.prepared.get(&statement).cloned().ok_or_else(|| {
                     GatewayError::Protocol(format!(
                         "postgresql Bind: unknown statement '{statement}'"
@@ -255,6 +259,8 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
                 }])
             }
             FrontendMessage::Describe { target, name } => {
+                // A08: retain original Describe for client-frame TCP relay when present.
+                session.pg_client_extended_frames.push(frame.to_vec());
                 // Describe statement ('S'): ParameterDescription + RowDescription|NoData.
                 // Describe portal ('P'): RowDescription|NoData only (params already bound).
                 // Explicit SELECT lists are inferred locally; wildcards fall through to
@@ -358,6 +364,8 @@ impl FrontendProtocolAdapter for PostgreSqlFrontendProtocol {
             }
             FrontendMessage::Execute { portal, max_rows } => {
                 session.pg_extended_query = true;
+                // A08: include Execute frame for optional original-frame TCP relay.
+                session.pg_client_extended_frames.push(frame.to_vec());
                 // Client Execute max_rows: 0 = unlimited. When > 0 and stream is
                 // truncated at this page, footer emits PortalSuspended.
                 session.pg_execute_max_rows = if max_rows > 0 {

@@ -47,7 +47,7 @@ Command metrics labels include listener, service, frontend protocol, backend pro
 | `unisql_proxy_gateway_execute_path_total` | counter | base + `execute_path` | hit-rate: passthrough / sum(all paths) |
 | `unisql_proxy_gateway_passthrough_bytes_total` | counter | base SQL labels | wire payload bytes on `GatewayResponse::Wire` |
 
-`execute_path` values: `passthrough` / `passthrough_extended` / `passthrough_rewrite`(=alias) / `streaming` / `streaming_demote` / `materialized` / `xproto_stream` / `n/a`.
+`execute_path` values: `passthrough` / `passthrough_client` / `passthrough_extended` / `passthrough_rewrite`(=extended alias) / `streaming` / `streaming_demote` / `materialized` / `xproto_stream` / `n/a`.
 
 ### A-track honesty (A06 / A08 / A09 / A10)
 
@@ -56,7 +56,7 @@ Do **not** treat path counters as proof of end-to-end zero-copy or process RSS b
 | Claim you might want | What the product actually guarantees today |
 |----------------------|--------------------------------------------|
 | Peak memory ≈ window | **Logical** encode peak is authoritative: `gateway_encode_peak_window_rows` (smoke ≤ `window_rows`). **Coarse process memory** smoke (`smoke-security-stream-rss`) runs **MySQL + PostgreSQL** large multi-window SELECTs, samples gateway memory via **cgroup → /proc VmRSS → ps** (`DN_RSS_MEM_SOURCE`), hard-fails if growth exceeds absolute cap (default 256 MiB), and requires **encode_windows multi-window floor** — catches catastrophic full-result materialize, **not** exact “1–2 window bytes”. Optional `DN_RSS_VS_FULL_MULT` relative bound is off by default (OS noise). |
-| Passthrough always wire | **Simple Query** same-protocol + no result obligations can be `passthrough` (PG TCP frame relay / MySQL wire). **Extended** under `passthrough=true`: PG text-bindable `QUERY_PARAMS`/`EXECUTE` may **re-encode backend Parse/Bind/Execute/Sync TCP** and label **`passthrough_extended`** + `passthrough_bytes` (smoke pins this; **not** original client frames; backend `1`/`2`/`Z` stripped until client Sync). If re-encode cannot apply (e.g. MySQL COM_STMT binary bind) → **`streaming_demote`**. |
+| Passthrough always wire | **Simple Query** → `passthrough`. **Extended** under `passthrough=true`: **prefer original client Parse/Bind/Execute frames on backend TCP** (`passthrough_client`, unit-scoped + backend Sync; Z stripped until client Sync); fallback **re-encoded** P/B/D/E/S (`passthrough_extended`); else **`streaming_demote`** (MySQL COM_STMT). Multi-Execute hold remains Streaming. |
 | Portal export is streaming | Multi-row SELECT Streaming → HTTP `x-data-nexus-stream: backend_window` (NDJSON/CSV/JSON) plus `x-data-nexus-window-rows`. **Complete** (INSERT/DDL/no RowStream) → `chunked` (HTTP windows; backend ResultSet may already be materialized). CSV has no body meta — use the window-rows header. Portal Admin path records Prometheus under `type=PORTAL_STREAM` / `PORTAL_CHUNKED` (same `gateway_execute_path_total` / `gateway_encode_peak_window_rows` series as protocol CoreEngine). Peak is still **logical window**, not process RSS. |
 | PG PortalSuspended = cursor | Client Execute `max_rows` page → `s` footer. Multi-Execute resume **prefers a held backend `RowStream`** (`hold_remainder`) so SQL is not re-run. If hold cannot apply, **logical skip** re-runs SQL and skips already-sent rows. Prometheus **`gateway_portal_resume_total{mode=hold\|resume_hold\|logical_skip}`** pins which path ran (smoke asserts hold+resume_hold when hold applies). **Not** a SQL `DECLARE … WITH HOLD` named cursor. Policy `max_rows` still ends with `C`. |
 | All traffic is Streaming | Control / empty Complete paths may label `n/a` or `materialized` depending on response shape. Row-returning Query* under obligations/max_rows should hit `streaming`. Extended under passthrough: text-bind rewrite → `passthrough_rewrite`; else `streaming_demote`. |
@@ -78,9 +78,10 @@ SQL base labels: `listener`, `service`, `frontend_protocol`, `backend_protocol`,
 Interpreting `execute_path` for dashboards:
 
 - **`passthrough`**: wire/TCP relay path for simple Query — count as “fast path hits”, not as “no security”.
-- **`passthrough_extended`**: A08 PG text-bind extended re-encoded as backend Parse/Bind/Execute/Sync TCP (still wire bytes; **not** original client frames). `passthrough_rewrite` normalizes to this label.
+- **`passthrough_client`**: A08 original client Parse/Bind/Execute frames TCP-relayed for one extended unit (not free-form proxy; multi-Execute hold separate).
+- **`passthrough_extended`**: A08 PG text-bind re-encoded as backend Parse/Bind/Execute/Sync TCP when client frames unavailable. `passthrough_rewrite` normalizes here.
 - **`streaming`**: windowed encode path (A06/A10 row streams with obligations).
-- **`streaming_demote`**: A08 extended under `passthrough=true` that could **not** text-bind TCP-relay (e.g. MySQL COM_STMT); still not original Parse/Bind frame relay.
+- **`streaming_demote`**: A08 extended under `passthrough=true` that could **not** TCP-relay (e.g. MySQL COM_STMT).
 - **`materialized` / `n/a`**: control packets, empty Complete, or responses without a row stream — **expected**, not a regression by itself.
 - **`xproto_stream`**: cross-protocol translation Streaming.
 

@@ -141,6 +141,12 @@ pub struct SessionState {
     /// A10: set by frontend on Bind/Close/Sync so CoreEngine drops any held stream.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pg_drop_portal_hold: bool,
+    /// A08: raw client extended-query frames for the current unit (Parse/Bind/Execute).
+    /// Frontend appends each original frame; backend may TCP-relay them under
+    /// passthrough (still not a free-form proxy — only when no result obligations).
+    /// Cleared on Sync / successful client-frame relay / demote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pg_client_extended_frames: Vec<Vec<u8>>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {

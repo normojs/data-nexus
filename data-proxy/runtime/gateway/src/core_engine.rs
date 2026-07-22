@@ -829,22 +829,26 @@ impl CoreGatewayConnection {
                     // strip it so only Sync emits ReadyForQuery (not original Parse/Bind relay).
                     let skip_z = self.session.pg_extended_query;
                     let wire_bytes = write_wire_relay_opts(relay, writer, skip_z).await?;
-                    // Honesty: simple Query wire = passthrough; QueryParams/Execute that
-                    // re-encoded extended text-bind (or legacy rewrite) to TCP wire =
-                    // passthrough_extended (still not original client Parse/Bind frames).
-                    // Keep passthrough_rewrite as alias for metrics continuity.
+                    // Honesty labels for WireRelay under passthrough:
+                    // - simple Query → passthrough
+                    // - QueryParams/Execute original client frames taken → passthrough_client
+                    // - QueryParams/Execute re-encoded text-bind (frames still buffered) →
+                    //   passthrough_extended (passthrough_rewrite aliases in metrics)
                     let execute_path = if command_type == "QUERY_PARAMS"
                         || command_type == "EXECUTE"
                     {
-                        "passthrough_extended"
+                        if self.session.pg_client_extended_frames.is_empty() {
+                            "passthrough_client"
+                        } else {
+                            // Re-encode did not consume client frames; clear leftover so
+                            // the next unit starts clean.
+                            self.session.pg_client_extended_frames.clear();
+                            "passthrough_extended"
+                        }
                     } else {
                         "passthrough"
                     };
-                    let outcome = if execute_path == "passthrough_extended" {
-                        "passthrough_extended"
-                    } else {
-                        "passthrough"
-                    };
+                    let outcome = execute_path;
                     command_span.record("outcome", outcome);
                     command_span.record("security_decision", "allow");
                     command_span.record("security_rule_class", "none");

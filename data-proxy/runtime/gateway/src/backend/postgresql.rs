@@ -395,6 +395,94 @@ impl PostgreSqlBackendConnector {
         }))
     }
 
+    /// A08: original client extended frames on backend TCP (not re-encoded).
+    ///
+    /// Takes `session.pg_client_extended_frames` (Parse/Bind/Execute raw messages),
+    /// appends Sync on the backend, and streams until ReadyForQuery. Caller strips
+    /// backend Z for client extended units. Clears the frame buffer on success.
+    async fn execute_client_extended_frames_tcp_relay(
+        &self,
+        endpoint: EndpointConfig,
+        session: &mut SessionState,
+        in_txn: bool,
+    ) -> GatewayResult<ExecuteOutcome> {
+        if session.pg_client_extended_frames.is_empty() {
+            return Err(GatewayError::Backend(
+                "pg client extended frames empty".into(),
+            ));
+        }
+        let frames = std::mem::take(&mut session.pg_client_extended_frames);
+        let database = effective_database(&endpoint, session)?;
+        if in_txn {
+            let (sess, is_new) = match self.take_or_open_tcp_txn(&endpoint, session).await {
+                Ok(v) => v,
+                Err(e) => {
+                    session.pg_client_extended_frames = frames;
+                    return Err(e);
+                }
+            };
+            let sess = if is_new {
+                match sess.simple_query_collect_reuse("BEGIN").await {
+                    Ok((sess, begin_packets)) => {
+                        if begin_packets.iter().any(|p| p.first() == Some(&b'E')) {
+                            session.pg_client_extended_frames = frames;
+                            return Ok(ExecuteOutcome::Complete(GatewayResponse::Wire {
+                                packets: begin_packets,
+                            }));
+                        }
+                        sess
+                    }
+                    Err(e) => {
+                        session.pg_client_extended_frames = frames;
+                        return Err(e);
+                    }
+                }
+            } else {
+                sess
+            };
+            match sess
+                .client_frames_relay_into(&frames, SessionReturn::Txn(self.tcp_txn.clone()))
+                .await
+            {
+                Ok(stream) => {
+                    return Ok(ExecuteOutcome::WireRelay(WireRelay {
+                        stream: Box::new(stream),
+                    }));
+                }
+                Err(e) => {
+                    session.pg_client_extended_frames = frames;
+                    return Err(e);
+                }
+            }
+        }
+        let key = PgTcpIdlePool::pool_key(&endpoint, &database);
+        let session_tcp = match self.tcp_idle.take_or_connect(&endpoint, &database).await {
+            Ok(s) => s,
+            Err(e) => {
+                session.pg_client_extended_frames = frames;
+                return Err(e);
+            }
+        };
+        match session_tcp
+            .client_frames_relay_into(
+                &frames,
+                SessionReturn::Idle {
+                    pool: self.tcp_idle.clone(),
+                    key,
+                },
+            )
+            .await
+        {
+            Ok(stream) => Ok(ExecuteOutcome::WireRelay(WireRelay {
+                stream: Box::new(stream),
+            })),
+            Err(e) => {
+                session.pg_client_extended_frames = frames;
+                Err(e)
+            }
+        }
+    }
+
     /// A08: re-encoded extended text-bind on backend TCP (not original client frames).
     ///
     /// Builds backend Parse/Bind/Execute/Sync with text params. Caller (core_engine)
@@ -1225,8 +1313,30 @@ impl BackendConnector for PostgreSqlBackendConnector {
             }
         }
 
-        // A08: extended text-bind → backend re-encoded Parse/Bind/Execute/Sync TCP.
+        // A08: prefer original client extended frames on TCP when frontend buffered them
+        // (Parse/Bind/Execute raw). Falls back to re-encoded text-bind, then demote.
         if matches!(mode, ExecuteMode::Passthrough) && (is_query_params || is_execute) {
+            if !session.pg_client_extended_frames.is_empty() {
+                // Multi-Execute resume (logical skip / hold) may have leftover frames
+                // from a prior unit — only use when we have at least Parse+Bind+Execute
+                // tags or simply non-empty after frontend push (one unit).
+                let endpoint = self.select_endpoint(session)?;
+                match self
+                    .execute_client_extended_frames_tcp_relay(endpoint, session, in_txn)
+                    .await
+                {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "data_nexus::gateway",
+                            error = %e,
+                            "a08 client-frame TCP relay failed; try re-encode / demote"
+                        );
+                        // frames already taken on success path; on failure restore empty
+                        // (execute_client_extended_frames takes them only after begin ok)
+                    }
+                }
+            }
             let try_relay = match &command {
                 GatewayCommand::QueryParams { sql, parameters } => {
                     Some((sql.clone(), parameters.clone()))
