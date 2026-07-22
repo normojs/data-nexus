@@ -288,6 +288,10 @@ export type AdminSecurityPolicies = {
     sample_max_bytes: number
     sample_inline: boolean
     sample_prefix: string
+    /** Always `L2` when sample_enabled is meaningful. */
+    requires_audit_level?: string
+    /** Always false — bounded sample only, not full-result L3. */
+    full_result_l3?: boolean
   }
   /** B07: audit queue policy (capacities; no secrets). */
   audit_queue?: {

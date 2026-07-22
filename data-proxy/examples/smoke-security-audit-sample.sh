@@ -85,7 +85,11 @@ assert int(data.get("sql_text_max_chars") or 0) >= 1, data.get("sql_text_max_cha
 s=data.get("audit_sample") or {}
 assert s.get("sample_enabled") is True, s
 assert int(s.get("sample_max_rows") or 0) == 2, s
+# B08 honesty fields: not L3 full-result archive; requires L2
+assert s.get("full_result_l3") is False, s
+assert (s.get("requires_audit_level") or "").upper() == "L2", s
 print("policies audit_sample", s, "sql_text_max_chars", data.get("sql_text_max_chars"))
+print("B08 honesty API: full_result_l3=false requires_audit_level=L2")
 PY2
 
 echo "==> security-policies exposes H05 state summary"

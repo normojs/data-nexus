@@ -343,7 +343,8 @@ onMounted(() => {
             · max_bytes={{ policy.audit_sample.sample_max_bytes }}
             · inline={{ policy.audit_sample.sample_inline }}
             · prefix={{ policy.audit_sample.sample_prefix || 'samples' }}
-            · needs L2
+            · needs {{ policy.audit_sample.requires_audit_level || 'L2' }}
+            · full_result_l3={{ policy.audit_sample.full_result_l3 ?? false }}
             <span class="hint-inline">
               (bounded post-mask sample only — not L3 full-result archive)
             </span>

@@ -77,7 +77,7 @@ cd data-proxy
 ## 2. P1 — 策略 / 合规 / 运维
 
 - [ ] **B08** L2 样本 / 大 payload  
-  - 已有：物化 ResultSet + Streaming 首窗（脱敏后）；`sample_enabled` 默认关；OpenDAL 可选；**validate：`sample_enabled` 必须 `default_audit_level=L2`**（防静默 no-op）；`OBSERVABILITY.md` + prod 模板诚实说明；smoke `smoke-security-audit-sample.sh` 断言 `sample_body` 有界且 **truncated 当 seed>max_rows**；UI 标明 **非 L3**；**`smoke-security-config-validate` 拒绝 L0+sample_enabled**  
+  - 已有：物化 ResultSet + Streaming 首窗（脱敏后）；`sample_enabled` 默认关；OpenDAL 可选；**validate：`sample_enabled` 必须 `default_audit_level=L2`**（防静默 no-op）；`OBSERVABILITY.md` + prod 模板诚实说明；smoke `smoke-security-audit-sample.sh` 断言 `sample_body` 有界且 **truncated 当 seed>max_rows**；UI 标明 **非 L3**；**`smoke-security-config-validate` 拒绝 L0+sample_enabled**；API/UI 暴露 **`requires_audit_level=L2` / `full_result_l3=false`**  
   - 仍欠：勿宣传「全量 L2 / L3 合规样本」；OpenDAL 上传仍需 feature；高 QPS 默认仍应关  
   - 路径：`security.rs` validate、`audit` sample attach、`OBSERVABILITY.md`、`smoke-security-audit-sample.sh`、`smoke-security-config-validate.sh`
 

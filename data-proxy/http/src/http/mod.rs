@@ -589,6 +589,10 @@ struct AdminSecurityAuditSampleSummary {
     sample_inline: bool,
     /// Empty uses default prefix `samples`.
     sample_prefix: String,
+    /// Must be L2 when sample_enabled (validate rejects other levels).
+    requires_audit_level: String,
+    /// Always false — samples are bounded rows/bytes, not full-result L3 archive.
+    full_result_l3: bool,
 }
 
 /// B07: audit queue policy (read-only; no secrets / paths with data).
@@ -1241,6 +1245,8 @@ impl AxumServer {
                             sample_max_bytes: security.audit.sample_max_bytes,
                             sample_inline: security.audit.sample_inline,
                             sample_prefix: security.audit.sample_prefix.clone(),
+                            requires_audit_level: "L2".into(),
+                            full_result_l3: false,
                         },
                         audit_queue: AdminSecurityAuditQueueSummary {
                             queue_capacity: security.audit.queue_capacity,
