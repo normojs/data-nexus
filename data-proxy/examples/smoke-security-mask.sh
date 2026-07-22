@@ -198,4 +198,35 @@ if echo "$metrics" | grep -q 'gateway_audit_queue_len'; then
   echo "$metrics" | grep 'gateway_audit_queue_len' | head -5 || true
 fi
 
+echo "==> A08 honesty: mask/row obligations force Streaming even when passthrough=true"
+# Config has passthrough=true but result obligations must never WireRelay/passthrough.
+# Expect execute_path=streaming (not only passthrough*) after mask traffic.
+curl -fsS http://127.0.0.1:8082/metrics | tee /tmp/dn-mask-metrics.txt >/dev/null
+python3 - <<'PY'
+import re
+text = open("/tmp/dn-mask-metrics.txt").read()
+paths = set()
+for ln in text.splitlines():
+    if "gateway_execute_path_total" not in ln or ln.startswith("#"):
+        continue
+    if "QUERY" not in ln:
+        continue
+    mp = re.search(r'execute_path="([^"]+)"', ln)
+    if mp:
+        paths.add(mp.group(1))
+print("execute_path labels (QUERY-ish):", sorted(paths))
+assert "streaming" in paths, f"expected streaming under mask+passthrough config, got {paths}"
+if paths and paths.issubset({"passthrough", "passthrough_client", "passthrough_extended", "n/a"}):
+    raise SystemExit(f"FAIL: mask traffic produced only passthrough-ish paths: {paths}")
+print("A08 honesty: result obligations demote off wire passthrough (streaming under passthrough=true config)")
+for ln in text.splitlines():
+    if "gateway_encode_peak_window_rows{" in ln and not ln.startswith("#"):
+        v = float(ln.split()[-1])
+        assert v <= 2.0 + 1e-9, f"peak_window_rows={v} exceeds window_rows=2 under mask: {ln}"
+print("A06: peak_window_rows ≤ window_rows=2 under mask path")
+for ln in text.splitlines():
+    if "gateway_execute_path_total" in ln and not ln.startswith("#") and "QUERY" in ln:
+        print(ln)
+PY
+
 echo "smoke-security-mask: OK"

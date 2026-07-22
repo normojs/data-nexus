@@ -59,7 +59,7 @@ cd data-proxy
 
 - [ ] **A08** PostgreSQL wire 透传 + backend TLS  
   - 已有：idle pool（cap/TTL/SELECT 1）；事务 `tcp_txn`；双协议 TLS；**PG simple Query 透传**；**passthrough 下 extended：优先客户端原包 P/B/E TCP**（`passthrough_client`）；**multi-Execute 连续 client-frame**（首页 hold 无 Sync；续页只中继 Execute；Sync→`PgBackendSync` 刷 Z）；回落 **backend 重编码**（`passthrough_extended`）；否则 **`streaming_demote`**（MySQL COM_STMT）  
-  - 仍欠：义务路径仍 Streaming；Streaming 仍用 pool；非自由代理  
+  - 仍欠：Streaming 仍用 pool；非自由代理（义务路径强制 Streaming 已有 smoke-security-mask 钉）  
   - 路径：`pg_client_extended_frames` + `pg_ext_tcp_hold`、`client_frames_relay_hold_into`、`PgBackendSync`、`smoke-security-passthrough.sh`
 
 - [ ] **A09** Portal 端到端流式  
