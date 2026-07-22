@@ -829,8 +829,22 @@ impl CoreGatewayConnection {
                     // strip it so only Sync emits ReadyForQuery (not original Parse/Bind relay).
                     let skip_z = self.session.pg_extended_query;
                     let wire_bytes = write_wire_relay_opts(relay, writer, skip_z).await?;
-                    let execute_path = "passthrough";
-                    command_span.record("outcome", "passthrough");
+                    // Honesty: simple Query wire = passthrough; QueryParams/Execute that
+                    // text-rewrote to simple Query TCP = passthrough_rewrite (still not
+                    // original Parse/Bind frame relay).
+                    let execute_path = if command_type == "QUERY_PARAMS"
+                        || command_type == "EXECUTE"
+                    {
+                        "passthrough_rewrite"
+                    } else {
+                        "passthrough"
+                    };
+                    let outcome = if execute_path == "passthrough_rewrite" {
+                        "passthrough_rewrite"
+                    } else {
+                        "passthrough"
+                    };
+                    command_span.record("outcome", outcome);
                     command_span.record("security_decision", "allow");
                     command_span.record("security_rule_class", "none");
                     command_span.record("execute_path", execute_path);
@@ -846,7 +860,7 @@ impl CoreGatewayConnection {
                         db_user = ?self.session.user,
                         database = ?self.session.database,
                         decision = gateway_core::AuditDecision::Execute.as_str(),
-                        outcome = "passthrough",
+                        outcome = %outcome,
                         latency_ms = started_at.elapsed().as_millis() as u64,
                         "gateway command audited"
                     );
@@ -866,7 +880,7 @@ impl CoreGatewayConnection {
                         command_type: Some(command_type.to_owned()),
                         endpoint: Some(label_owned[5].clone()),
                         database: self.session.database.clone(),
-                        outcome: Some("passthrough".into()),
+                        outcome: Some(outcome.into()),
                         latency_ms: Some(started_at.elapsed().as_millis() as u64),
                         audit_level: Some(self.default_audit_level.clone()),
                         sql_fingerprint: audit_sql.as_deref().map(gateway_core::sql_fingerprint),
@@ -886,7 +900,7 @@ impl CoreGatewayConnection {
                         labels[3],
                         command_type,
                         labels[5],
-                        "passthrough",
+                        outcome,
                         started_at,
                         &crate::otel_metrics::CommandOtelAttrs::security("allow", "none")
                             .with_execute_path(execute_path)

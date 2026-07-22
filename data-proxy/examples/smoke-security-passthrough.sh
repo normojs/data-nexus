@@ -269,25 +269,24 @@ has_ext = (
     or "type=\"EXECUTE\"" in text
 )
 assert has_ext, "expected QUERY_PARAMS or EXECUTE after extended traffic"
-# A08: PG extended text-bind should rewrite → simple Query TCP (passthrough on QUERY_PARAMS).
+# A08: PG extended text-bind should rewrite → simple Query TCP.
+# Honesty label: execute_path=passthrough_rewrite (not plain passthrough, not demote).
 # MySQL COM_STMT remains streaming_demote. Still NOT Parse/Bind/Execute frame relay.
-has_pg_qp_pt = (
-    'type="QUERY_PARAMS"' in text and 'execute_path="passthrough"' in text
-) or (
-    'type="QUERY_PARAMS"' in text and 'passthrough' in text
-)
-# Stronger: a single metric line with both labels
-pg_qp_pt_line = any(
-    ('QUERY_PARAMS' in ln) and ('passthrough' in ln) and ('gateway_execute_path_total' in ln)
+pg_qp_rewrite = any(
+    ('QUERY_PARAMS' in ln)
+    and ('passthrough_rewrite' in ln)
+    and ('gateway_execute_path_total' in ln)
     for ln in text.splitlines() if not ln.startswith('#')
 )
+# Accept legacy passthrough on QUERY_PARAMS only if rewrite label missing in older builds —
+# this smoke builds current binary, so require passthrough_rewrite.
+assert pg_qp_rewrite, "expected QUERY_PARAMS execute_path=passthrough_rewrite after PG text-bind rewrite"
 pg_qp_bytes = any(
     ('QUERY_PARAMS' in ln) and ('gateway_passthrough_bytes_total' in ln) and not ln.startswith('#')
     for ln in text.splitlines()
 )
-assert pg_qp_pt_line, "expected QUERY_PARAMS execute_path=passthrough after PG text-bind rewrite"
 assert pg_qp_bytes, "expected passthrough_bytes for QUERY_PARAMS after PG text-bind rewrite"
-print("A08 honesty: PG QUERY_PARAMS text-bind rewrite → passthrough + wire bytes")
+print("A08 honesty: PG QUERY_PARAMS text-bind rewrite → passthrough_rewrite + wire bytes")
 # MySQL COM_STMT should still demote (binary bind unsafe as text rewrite)
 mysql_demote = any(
     ('EXECUTE' in ln) and ('streaming_demote' in ln or 'streaming' in ln) and ('mysql' in ln)

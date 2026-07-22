@@ -269,3 +269,4 @@ examples/        smoke + gateway config 样例
 | A10 | portal resume metrics hold/resume_hold/logical_skip + stream smoke | feat(a10) |
 | A10 | PDP Execute inherits streaming.max_rows (COM_STMT cap under demote) | fix(a10) |
 | A08 | rewrite→wire strip backend ReadyForQuery under extended + smoke | feat(a08) |
+| A08 | execute_path=passthrough_rewrite for text-bind rewrite→wire | feat(a08) |
