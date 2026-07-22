@@ -318,14 +318,15 @@ onMounted(() => {
           <dd class="mono">
             {{ policy.streaming.passthrough }}
             <span class="hint-inline">
-              (simple Query wire only; extended demotes to Streaming — not TCP bind relay)
+              simple Query wire only when no result obligations; mask/row_filter/max_rows force Streaming
+              even if passthrough=true; extended may passthrough_client / streaming_demote — not free-form TCP bind relay
             </span>
           </dd>
         </div>
         <div v-if="policy.streaming">
           <dt>streaming peak</dt>
           <dd class="mono">
-            logical encode window ≤ window_rows · not process RSS CI
+            logical encode window ≤ window_rows · peak_window_bytes ≪ total encode_bytes · not process RSS CI
           </dd>
         </div>
         <div v-if="policy.streaming?.max_rows != null">
