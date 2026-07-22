@@ -425,6 +425,41 @@ async function adminFetch<T>(path: string, opts: Record<string, unknown> = {}, b
   }
 }
 
+export type SqlCursorMetricModes = {
+  declare: number
+  fetch: number
+  close: number
+  session_end: number
+}
+
+/** Parse Prometheus text for A10 process-local SQL cursor modes (best-effort). */
+export function parseSqlCursorMetrics(text: string): SqlCursorMetricModes {
+  const out: SqlCursorMetricModes = {
+    declare: 0,
+    fetch: 0,
+    close: 0,
+    session_end: 0,
+  }
+  for (const ln of text.split('\n')) {
+    if (!ln.includes('gateway_portal_resume_total') || ln.startsWith('#'))
+      continue
+    const m = ln.match(/mode="([^"]+)".*?\s([0-9]+(?:\.[0-9]+)?)\s*$/)
+    if (!m)
+      continue
+    const mode = m[1]
+    const n = Number(m[2]) || 0
+    if (mode === 'sql_cursor_declare')
+      out.declare += n
+    else if (mode === 'sql_cursor_fetch')
+      out.fetch += n
+    else if (mode === 'sql_cursor_close')
+      out.close += n
+    else if (mode === 'sql_cursor_session_end')
+      out.session_end += n
+  }
+  return out
+}
+
 async function getJson<T>(path: string, base?: string): Promise<T> {
   return adminFetch<T>(path, {}, base)
 }
@@ -435,6 +470,10 @@ export function useAdminApi() {
     authHeaders,
     asAdminApiAuthError,
     handleAdminApiAuthError,
+    parseSqlCursorMetrics,
+    /** Prometheus text (auth unless public_metrics). Soft-fail callers should catch. */
+    metricsText: (base?: string) =>
+      adminFetch<string>('/metrics', { responseType: 'text' }, base),
     version: (base?: string) =>
       $fetch<string>(`${normalizeBase(base)}/version`, { responseType: 'text' }),
     healthz: (base?: string) =>

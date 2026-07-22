@@ -9,6 +9,7 @@ import type {
   AdminSession,
   AdminTicket,
   AdminVaultLease,
+  SqlCursorMetricModes,
 } from '~/composables/useAdminApi'
 
 definePageMeta({ layout: 'admin' })
@@ -29,6 +30,7 @@ const auditStats = ref<AdminAuditStats | null>(null)
 const policies = ref<AdminSecurityPolicies | null>(null)
 const tickets = ref<AdminTicket[]>([])
 const leases = ref<AdminVaultLease[]>([])
+const sqlCursors = ref<SqlCursorMetricModes | null>(null)
 
 function setStatus(msg: string, kind: 'ok' | 'error' | '' = '') {
   status.value = msg
@@ -87,7 +89,7 @@ async function loadAll() {
   setStatus('Loading…')
   const base = apiBase.value
   try {
-    const [ver, ls, svcs, eps, pls, sess, astats, pol, tix, vls] = await Promise.all([
+    const [ver, ls, svcs, eps, pls, sess, astats, pol, tix, vls, metricsTxt] = await Promise.all([
       api.version(base).catch(() => 'Data Nexus'),
       api.listeners(base),
       api.services(base),
@@ -98,6 +100,7 @@ async function loadAll() {
       api.securityPolicies(base).catch(() => null),
       api.tickets(100, base).catch(() => [] as AdminTicket[]),
       api.vaultLeases(base).catch(() => [] as AdminVaultLease[]),
+      api.metricsText(base).catch(() => null as string | null),
     ])
     version.value = String(ver || 'Data Nexus').trim()
     listeners.value = ls
@@ -109,6 +112,7 @@ async function loadAll() {
     policies.value = pol
     tickets.value = tix
     leases.value = vls
+    sqlCursors.value = metricsTxt ? api.parseSqlCursorMetrics(metricsTxt) : null
     const secBit = pol
       ? ` · security=${pol.enabled ? 'on' : 'off'} pdp=${pol.pdp_backend || '—'}`
       : ''
@@ -238,6 +242,29 @@ onUnmounted(() => {
           </template>
         </div>
       </NuxtLink>
+      <div
+        v-if="sqlCursors"
+        class="stat-card"
+      >
+        <div class="label">
+          SQL cursors (process-local)
+        </div>
+        <div class="value mono">
+          d={{ sqlCursors.declare }}
+          · f={{ sqlCursors.fetch }}
+          · c={{ sqlCursors.close }}
+        </div>
+        <div class="sub mono">
+          session_end={{ sqlCursors.session_end }}
+          · not backend WITH HOLD
+          · <a
+            class="inline-link"
+            :href="`${apiBase}/metrics`"
+            target="_blank"
+            rel="noreferrer"
+          >/metrics</a>
+        </div>
+      </div>
       <NuxtLink
         class="stat-card link-card"
         to="/audit"
@@ -409,4 +436,6 @@ onUnmounted(() => {
 }
 .pill.on { background: #dafbe1; color: #1a7f37; }
 .pill.off { background: #eef1f4; color: #57606a; }
+.inline-link { color: #0969da; text-decoration: none; }
+.inline-link:hover { text-decoration: underline; }
 </style>

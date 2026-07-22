@@ -283,4 +283,5 @@ examples/        smoke + gateway config 样例
 | H05 | state API merge_strategy/crdt + LWW disk reload smoke | feat(h05) |
 | H05 | state API vault_password_zeroize + smoke pin (not mlock) | feat(h05) |
 | UI32 | Portal/Sessions process-local SQL cursor honesty hints | feat(ui) |
+| UI33 | Overview SQL cursor process-local metrics card | feat(ui) |
 | A10 | MOVE/FETCH ABSOLUTE fail-closed + runbook H05 honesty fields | feat(a10)/docs(h05) |
