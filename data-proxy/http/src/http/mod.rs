@@ -618,6 +618,12 @@ struct AdminSecurityStateSummary {
     ticket_encrypt_configured: bool,
     /// True when `vault_encrypt_key` is non-empty (value never returned).
     vault_encrypt_configured: bool,
+    /// H05 honesty: file backend uses full-file replace under advisory lock
+    /// (last writer wins). Not a CRDT / merge store.
+    last_writer_wins: bool,
+    /// H05 honesty: vault passwords use ZeroizeOnDrop / Zeroizing copies only.
+    /// Never mlock / secure heap.
+    mlock: bool,
 }
 
 /// F31/UI18: PDP backend snapshot (read-only; never returns remote_token / URL secrets).
@@ -1251,6 +1257,10 @@ impl AxumServer {
                                 .vault_encrypt_key
                                 .trim()
                                 .is_empty(),
+                            // File backend: advisory lock + full-file replace.
+                            // Memory backend is single-process only (still not CRDT).
+                            last_writer_wins: true,
+                            mlock: false,
                         },
                     })
                 }

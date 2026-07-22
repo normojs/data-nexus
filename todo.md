@@ -82,9 +82,9 @@ cd data-proxy
   - 路径：`security.rs` validate、`audit` sample attach、`OBSERVABILITY.md`、`smoke-security-audit-sample.sh`、`smoke-security-config-validate.sh`
 
 - [ ] **H05** 多实例状态外置（含 H08 vault 文件加密）  
-  - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板；**vault `backend_password` ZeroizeOnDrop + revoke zeroize**；**`backend_identity` → `Zeroizing<String>`**；**Admin `security-policies.state` 只读摘要**；**smoke `smoke-security-state-file`**：file backend + encrypt flags + 密文落盘 + **重启后 ticket/lease 仍在** + **`policy_path` mtime 热更 deny E2E**；UI Overview/Settings/Vault/Tickets 标明 **last-writer-wins / 非 CRDT / 非 mlock**  
-  - 仍欠：**全文件替换非 CRDT**；活跃 lease 密码仍在进程 RAM（非 mlock）；轮询默认 1s（smoke 用 200ms）  
-  - 路径：ticket/vault file backend、`vault.rs` zeroize、`security-state-file-gateway-config.toml`、`smoke-security-state-file.sh`、prod 模板、runbook
+  - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板；**vault `backend_password` ZeroizeOnDrop + revoke zeroize**；**`backend_identity` → `Zeroizing<String>`**；**Admin `security-policies.state` 只读摘要**含 **`last_writer_wins=true` / `mlock=false`**；**smoke `smoke-security-state-file`** 断言 encrypt flags + 密文 + 重启 + mtime 热更 + **LWW/mlock 诚实字段**；unit last-writer 全文件替换；UI Overview/Settings/Vault/Tickets/Policies 标明 **非 CRDT / 非 mlock**  
+  - 仍欠：**无 CRDT merge**（全文件替换 last-writer-wins）；活跃 lease 密码仍在进程 RAM（**非 mlock**）；轮询默认 1s（smoke 用 200ms）  
+  - 路径：ticket/vault file backend、`vault.rs` zeroize、`http` state summary、`smoke-security-state-file.sh`、prod 模板、runbook
 
 - [ ] **H04b** 真 IdP OIDC 联调  
   - 已有：文档 + 模板  
@@ -134,10 +134,10 @@ cd data-proxy
 
 建议优先级：
 
-1. **H05** CRDT / mlock（可选；Zeroizing 副本已交付）  
-2. **A08** extended TCP bind 帧中继（可选；`streaming_demote` 诚实标签已有）  
-3. **A06** 精密 cgroup/RSS 字节级 CI（可选；粗粒度 stream-rss 已有）  
-4. **A10** SQL `DECLARE … WITH HOLD` 命名游标（可选；进程内 RowStream hold 已有）  
+1. **A08** extended TCP bind 帧中继（可选；`streaming_demote` 诚实标签已有）  
+2. **A06** 精密 cgroup/RSS 字节级 CI（可选；粗粒度 stream-rss 已有）  
+3. **A10** SQL `DECLARE … WITH HOLD` 命名游标（可选；进程内 RowStream hold 已有）  
+4. **H05** CRDT merge / mlock（可选；LWW + Zeroize 诚实字段已有）  
 5. 体验小刀；**F30/P0x 延后项未点名勿做**
 
 ```bash

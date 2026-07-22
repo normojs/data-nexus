@@ -869,11 +869,30 @@ mod tests {
         });
         // Last exclusive write wins for full-file replace semantics; both must succeed
         // without panicking under lock. Reload sees a consistent JSON file.
-        let c = TicketStore::with_file(path, None).unwrap();
+        // Honesty: this is **not** CRDT merge — concurrent in-memory maps each
+        // replace the whole file; the later persist wins for keys only it holds.
+        let c = TicketStore::with_file(path.clone(), None).unwrap();
         let list = c.list(10);
         assert!(!list.is_empty());
         // At least the last writer's ticket is present.
         assert!(c.get(&t1.id).is_some() || c.get(&t2.id).is_some());
+        // Stronger honesty pin: after ordered re-persist, last writer is fully visible.
+        // Re-issue on b then reload — b's ticket must load (last full-file replace).
+        let t3 = b.issue(IssueTicketRequest {
+            subject_id: "c".into(),
+            sql: "SELECT 3".into(),
+            ticket_type: "high_risk".into(),
+            ttl_secs: 600,
+            max_uses: 1,
+            note: None,
+            issued_by: None,
+            dual_control: false,
+        });
+        let d = TicketStore::with_file(path, None).unwrap();
+        assert!(
+            d.get(&t3.id).is_some(),
+            "last full-file replace must reload the last writer's ticket (not CRDT merge)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

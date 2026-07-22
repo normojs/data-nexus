@@ -364,6 +364,11 @@ onMounted(() => {
             · ticket_enc={{ policy.state.ticket_encrypt_configured ? 'yes' : 'no' }}
             · vault_enc={{ policy.state.vault_encrypt_configured ? 'yes' : 'no' }}
             · poll_ms={{ policy.state.policy_poll_ms }}
+            · last_writer_wins={{ policy.state.last_writer_wins ?? true }}
+            · mlock={{ policy.state.mlock ?? false }}
+            <span class="hint-inline">
+              (file = full-file replace under lock, not CRDT; vault RAM zeroize only, not mlock)
+            </span>
           </dd>
         </div>
         <div v-if="policy.state && policy.state.backend === 'file'">

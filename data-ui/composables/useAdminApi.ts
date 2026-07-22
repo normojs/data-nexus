@@ -305,6 +305,10 @@ export type AdminSecurityPolicies = {
     policy_poll_ms: number
     ticket_encrypt_configured: boolean
     vault_encrypt_configured: boolean
+    /** Full-file replace under advisory lock (not CRDT). */
+    last_writer_wins?: boolean
+    /** Always false today — Zeroize only, never mlock. */
+    mlock?: boolean
   }
 }
 

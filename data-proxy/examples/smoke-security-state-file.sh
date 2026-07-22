@@ -89,10 +89,13 @@ assert s.get("ticket_encrypt_configured") is True, s
 assert s.get("vault_encrypt_configured") is True, s
 assert "h05-tickets" in (s.get("ticket_path") or "")
 assert "h05-vault" in (s.get("vault_path") or "")
+# H05 honesty pins (not CRDT / not mlock)
+assert s.get("last_writer_wins") is True, s
+assert s.get("mlock") is False, s
 raw=json.dumps(d)
 assert "ticket_encrypt_key" not in raw and "vault_encrypt_key" not in raw
 assert "0123456789abcdef" not in raw
-print("policies state file+enc ok", s.get("backend"), s.get("ticket_path"))
+print("policies state file+enc ok", s.get("backend"), "lww", s.get("last_writer_wins"), "mlock", s.get("mlock"))
 PY
 
 echo "==> issue ticket + vault lease"
