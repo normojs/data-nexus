@@ -994,6 +994,27 @@ echo "$pg_dual" | grep -qE '3\|c' || { echo "FAIL: dual cursor c_b first (DESC):
 echo "$pg_dual" | grep -qE '2\|b' || { echo "FAIL: dual cursor c_a second: $pg_dual" >&2; exit 1; }
 echo "a10_sql_cursor_dual_concurrent_ok"
 
+# Duplicate DECLARE must fail-closed; FETCH ALL drains remainder (process-local).
+# After stream is fully drained the process-local cursor is dropped (no CLOSE needed).
+pg_dup_all="$(docker run --rm -i --add-host=host.docker.internal:host-gateway postgres:16-alpine \
+  env PGPASSWORD=postgres \
+  psql -h host.docker.internal -p 9089 -U postgres -d analytics -v ON_ERROR_STOP=0 -A -t <<'SQL' 2>&1
+BEGIN;
+DECLARE c_all CURSOR WITH HOLD FOR SELECT id, name FROM stream_smoke ORDER BY id;
+DECLARE c_all CURSOR WITH HOLD FOR SELECT id FROM stream_smoke;
+FETCH 1 FROM c_all;
+FETCH ALL FROM c_all;
+COMMIT;
+SQL
+)"
+echo "$pg_dup_all"
+echo "$pg_dup_all" | grep -qiE 'already exists' \
+  || { echo "FAIL: expected duplicate DECLARE reject: $pg_dup_all" >&2; exit 1; }
+echo "$pg_dup_all" | grep -qE '1\|a' || { echo "FAIL: FETCH 1 before ALL: $pg_dup_all" >&2; exit 1; }
+echo "$pg_dup_all" | grep -qE '2\|b' || { echo "FAIL: FETCH ALL should include id=2: $pg_dup_all" >&2; exit 1; }
+echo "$pg_dup_all" | grep -qE '3\|c' || { echo "FAIL: FETCH ALL should include id=3: $pg_dup_all" >&2; exit 1; }
+echo "a10_sql_cursor_dup_declare_and_fetch_all_ok"
+
 curl -fsS "http://127.0.0.1:8082/metrics" | tee /tmp/dn-stream-cursor-metrics.txt >/dev/null
 python3 - <<'PYCUR'
 import re
@@ -1006,11 +1027,11 @@ for ln in text.splitlines():
     if m:
         modes[m.group(1)] = modes.get(m.group(1),0)+float(m.group(2))
 print("portal_resume modes after cursor:", modes)
-assert modes.get("sql_cursor_declare",0) >= 6, modes  # prior 4 + dual 2
-assert modes.get("sql_cursor_fetch",0) >= 8, modes  # prior 6 + dual 3
-assert modes.get("sql_cursor_close",0) >= 4, modes  # prior 2 + dual 2
+assert modes.get("sql_cursor_declare",0) >= 7, modes  # prior 6 + c_all
+assert modes.get("sql_cursor_fetch",0) >= 10, modes  # prior + FETCH1 + FETCH ALL
+assert modes.get("sql_cursor_close",0) >= 4, modes  # dual+multi+hold-survive; ALL auto-drops without CLOSE
 assert modes.get("sql_cursor_session_end",0) >= 1, modes
-print("A10 honesty: dual concurrent process-local cursors; multi-FETCH; txn/session lifecycle (not backend WITH HOLD)")
+print("A10 honesty: dual cursors; dup DECLARE reject; FETCH ALL drain; lifecycle (not backend WITH HOLD)")
 for ln in text.splitlines():
     if "gateway_portal_resume_total" in ln and not ln.startswith("#") and "sql_cursor" in ln:
         print(ln)
