@@ -186,6 +186,9 @@ onUnmounted(() => {
       <p class="hint">
         UI25: listener / protocol / database / peer filters are client-side over the
         auto-refresh snapshot (10s). Click chips or table cells to toggle filters.
+        Process-local SQL cursors (<code class="mono">DECLARE … [WITH HOLD]</code>) and
+        PortalSuspended holds live only while this session is connected — disconnect
+        clears them (not a backend server-side <code class="mono">WITH HOLD</code> cursor).
       </p>
       <div
         v-if="listenerCounts.length"

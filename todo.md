@@ -134,8 +134,8 @@ cd data-proxy
 
 建议优先级：
 
-1. **A10** backend SQL `DECLARE … WITH HOLD` 服务端游标（可选；进程内 `named_cursors` + `sql_cursor_*` 已有）  
-2. **H05** CRDT merge / mlock（可选；LWW + Zeroize 诚实字段已有）  
+1. **A10** backend SQL `DECLARE … WITH HOLD` 服务端游标（可选；进程内 `named_cursors` + `sql_cursor_*` + UI 诚实提示已有）  
+2. **H05** CRDT merge / mlock（可选；LWW + Zeroize + `vault_password_zeroize` 诚实字段已有）  
 3. **A06** 进程/cgroup 精确 1–2 窗字节 CI（可选；逻辑 peak_window_bytes 已有）  
 4. 体验小刀；**F30/P0x 延后项未点名勿做**
 
