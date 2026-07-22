@@ -234,7 +234,7 @@ onUnmounted(() => {
           </template>
           · state={{ stateBackend }}
           <template v-if="stateBackend === 'file'">
-            · last-writer-wins / crdt=false (not CRDT)
+            · last-writer-wins / crdt=false / vault_password_zeroize (not CRDT; not mlock)
           </template>
         </div>
       </NuxtLink>

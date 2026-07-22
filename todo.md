@@ -82,7 +82,7 @@ cd data-proxy
   - 路径：`security.rs` validate、`audit` sample attach、`OBSERVABILITY.md`、`smoke-security-audit-sample.sh`、`smoke-security-config-validate.sh`
 
 - [ ] **H05** 多实例状态外置（含 H08 vault 文件加密）  
-  - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板；**vault `backend_password` ZeroizeOnDrop + revoke zeroize**；**`backend_identity` → `Zeroizing<String>`**；**Admin `security-policies.state` 只读摘要**含 **`last_writer_wins=true` / `merge_strategy=last_writer_wins` / `crdt=false` / `mlock=false`**；**smoke `smoke-security-state-file`** 断言 encrypt flags + 密文 + 重启 + mtime 热更 + **LWW/crdt/mlock 诚实字段** + **磁盘 last-writer 全文件替换 reload**；unit last-writer 全文件替换；UI Overview/Settings/Vault/Tickets/Policies 标明 **非 CRDT / 非 mlock**  
+  - 已有：ticket/vault JSON+lock+**AES-GCM**；审计 SQLite multi-writer；LocalPdp `policy_path` mtime 轮询；prod `security.state` 模板；**vault `backend_password` ZeroizeOnDrop + revoke zeroize**；**`backend_identity` → `Zeroizing<String>`**；**Admin `security-policies.state` 只读摘要**含 **`last_writer_wins=true` / `merge_strategy=last_writer_wins` / `crdt=false` / `mlock=false` / `vault_password_zeroize=true`**；**smoke `smoke-security-state-file`** 断言 encrypt flags + 密文 + 重启 + mtime 热更 + **LWW/crdt/mlock 诚实字段** + **磁盘 last-writer 全文件替换 reload**；unit last-writer 全文件替换；UI Overview/Settings/Vault/Tickets/Policies 标明 **非 CRDT / 非 mlock**  
   - 仍欠：**无 CRDT merge**（全文件替换 last-writer-wins）；活跃 lease 密码仍在进程 RAM（**非 mlock**）；轮询默认 1s（smoke 用 200ms）  
   - 路径：ticket/vault file backend、`vault.rs` zeroize、`http` state summary、`smoke-security-state-file.sh`、prod 模板、runbook
 
@@ -120,7 +120,7 @@ cd data-proxy
 | 脱敏大数据 | A06 Streaming 真窗口（含 txn）；Query* Materialized 已升 Streaming；**逻辑 peak_window_rows + peak_window_bytes**（多窗 smoke peak_bytes≪total）；**粗粒度内存 smoke**（双协议；cgroup/proc/ps；多窗 encode 下限）；非进程精确 1–2 窗字节；控制语句/Complete 小结果仍可物化 |
 | PG/MySQL backend TLS | A08：simple Query `passthrough`；**extended 优先 `passthrough_client`（客户端原包单元 TCP）**；回落 `passthrough_extended`；MySQL COM_STMT `streaming_demote`；multi-Execute hold 仍 Streaming |
 | 预处理语句 | A10：协议 smoke + mysql description + **psycopg 同连接 rebind** + **PortalSuspended + multi-Execute 续读（优先 RowStream hold；logical skip 回落；`gateway_portal_resume_total`）**；**简单查询 DECLARE/FETCH/CLOSE 进程内游标**（`sql_cursor_*`；无 WITH HOLD 在 COMMIT 丢弃；WITH HOLD 跨 COMMIT 但**断连即死**；**非** backend 服务端游标）；策略截断仍 C |
-| 多副本 | H05：file+lock+可选 AES-GCM；全文件替换 last-writer-wins（`merge_strategy`/`crdt=false` API）；活跃 vault 密码在 RAM；revoke/prune/Drop zeroize；`backend_identity` 返回 Zeroizing（非 mlock） |
+| 多副本 | H05：file+lock+可选 AES-GCM；全文件替换 last-writer-wins（`merge_strategy`/`crdt=false` API）；活跃 vault 密码在 RAM；revoke/prune/Drop **Zeroize**（`vault_password_zeroize=true`，**非 mlock**）；`backend_identity` 返回 Zeroizing |
 | L2 样本 | B08：默认关；有界 rows/bytes；**sample_enabled 强制 L2**；OpenDAL 需 feature；**非全量 L3** |
 | Remote PDP | F31 已交付：表/动作 gate；超时 fail_closed；**非**热路径逐行 mask |
 | Cedar ABAC | F29 已交付：静态 `subject_attrs`/`table_attrs`；非动态 IdP 同步 |

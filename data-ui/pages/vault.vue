@@ -267,7 +267,7 @@ onMounted(() => {
     <div class="card form-card">
       <h3>Issue lease</h3>
       <p class="hint">
-        Short-lived portal credentials. Backend passwords stay in process memory (revoke/Drop zeroize; not mlock) and are
+        Short-lived portal credentials. Backend passwords stay in process memory (revoke/Drop ZeroizeOnDrop; vault_password_zeroize=true, not mlock) and are
         <strong>never</strong> returned to the browser (H03/H05).
       </p>
       <div class="form-grid">

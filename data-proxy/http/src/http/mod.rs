@@ -628,6 +628,9 @@ struct AdminSecurityStateSummary {
     /// H05 honesty: vault passwords use ZeroizeOnDrop / Zeroizing copies only.
     /// Never mlock / secure heap.
     mlock: bool,
+    /// H05 honesty: vault passwords are best-effort wiped (ZeroizeOnDrop /
+    /// Zeroizing) on revoke/prune/Drop — **not** mlock / secure heap.
+    vault_password_zeroize: bool,
 }
 
 /// F31/UI18: PDP backend snapshot (read-only; never returns remote_token / URL secrets).
@@ -1267,6 +1270,7 @@ impl AxumServer {
                             merge_strategy: "last_writer_wins".into(),
                             crdt: false,
                             mlock: false,
+                            vault_password_zeroize: true,
                         },
                     })
                 }

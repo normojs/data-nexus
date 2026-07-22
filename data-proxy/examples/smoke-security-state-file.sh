@@ -93,6 +93,7 @@ assert "h05-vault" in (s.get("vault_path") or "")
 assert s.get("last_writer_wins") is True, s
 assert s.get("mlock") is False, s
 assert s.get("crdt") is False, s
+assert s.get("vault_password_zeroize") is True, s
 assert (s.get("merge_strategy") or "") == "last_writer_wins", s
 raw=json.dumps(d)
 assert "ticket_encrypt_key" not in raw and "vault_encrypt_key" not in raw
@@ -108,6 +109,8 @@ print(
     s.get("crdt"),
     "mlock",
     s.get("mlock"),
+    "zeroize",
+    s.get("vault_password_zeroize"),
 )
 PY
 
@@ -304,7 +307,8 @@ assert s.get("last_writer_wins") is True
 assert s.get("crdt") is False
 assert s.get("merge_strategy") == "last_writer_wins"
 assert s.get("mlock") is False
-print("H05 honesty: last_writer_wins + crdt=false + merge_strategy (not CRDT merge)")
+assert s.get("vault_password_zeroize") is True
+print("H05 honesty: last_writer_wins + crdt=false + merge_strategy + zeroize (not CRDT/mlock)")
 PY
 
 echo "smoke-security-state-file: OK"

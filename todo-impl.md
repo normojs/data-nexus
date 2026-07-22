@@ -281,3 +281,4 @@ examples/        smoke + gateway config 样例
 | A10 | dual concurrent process-local cursors smoke (ASC+DESC interleave) | test(a10) |
 | A10 | dup DECLARE reject + FETCH ALL drain smoke | test(a10) |
 | H05 | state API merge_strategy/crdt + LWW disk reload smoke | feat(h05) |
+| H05 | state API vault_password_zeroize + smoke pin (not mlock) | feat(h05) |

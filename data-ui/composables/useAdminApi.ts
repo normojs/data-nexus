@@ -313,6 +313,8 @@ export type AdminSecurityPolicies = {
     crdt?: boolean
     /** Always false today — Zeroize only, never mlock. */
     mlock?: boolean
+    /** Always true today — ZeroizeOnDrop / Zeroizing wipe (not mlock). */
+    vault_password_zeroize?: boolean
   }
 }
 

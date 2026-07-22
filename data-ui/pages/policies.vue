@@ -368,8 +368,9 @@ onMounted(() => {
             · merge={{ policy.state.merge_strategy || 'last_writer_wins' }}
             · crdt={{ policy.state.crdt ?? false }}
             · mlock={{ policy.state.mlock ?? false }}
+            · vault_password_zeroize={{ policy.state.vault_password_zeroize ?? true }}
             <span class="hint-inline">
-              (file = full-file replace under lock, not CRDT; vault RAM zeroize only, not mlock)
+              (file = full-file replace under lock, not CRDT; vault RAM Zeroize wipe, not mlock)
             </span>
           </dd>
         </div>
